@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Reconciles local, per-node OPatch prerequisite results into RAC evidence.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+RECONCILIATION=""; PROCEDURE=""; OUT=""; declare -a RESULTS=() CHECKS=() FINDINGS=("")
+usage() { printf '%s\n' 'Usage: opu-compatibility-reconcile --reconciliation ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON --compatibility ABSOLUTE_JSON [--compatibility ABSOLUTE_JSON ...] [--output ABSOLUTE_JSON]'; }
+finding() { FINDINGS+=("$1|$2"); }
+has_findings() { local item; for item in "${FINDINGS[@]}"; do [ -n "$item" ] && return 0; done; return 1; }
+require_file() { local file=$1 label=$2; opu_validate_absolute_path "$file" "$label" || exit $?; [ -f "$file" ] && [ ! -L "$file" ] || { echo "$label is missing or symbolic link: $file" >&2; exit 66; }; }
+parse() { while [ "$#" -gt 0 ]; do case "$1" in --reconciliation) RECONCILIATION=${2:-}; shift 2;; --procedure-validation) PROCEDURE=${2:-}; shift 2;; --compatibility) RESULTS+=("${2:-}"); shift 2;; --output) OUT=${2:-}; shift 2;; -h|--help) usage; exit 0;; *) usage >&2; exit 64;; esac; done; [ "${#RESULTS[@]}" -gt 0 ] || { usage >&2; exit 64; }; require_file "$RECONCILIATION" reconciliation; require_file "$PROCEDURE" procedure-validation; for f in "${RESULTS[@]}"; do require_file "$f" compatibility; done; [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?; command -v jq >/dev/null || { echo 'jq is required' >&2; exit 69; }; }
+expected_pairs() {
+  if [ "$TARGET_FAMILY" = grid ]; then jq -r '.expected_nodes[] as $node | .cluster.grid_home as $home | [$node,$home] | @tsv' "$RECONCILIATION"; else jq -r '.expected_nodes[] as $node | [.databases[].oracle_home] | unique[] as $home | [$node,$home] | @tsv' "$RECONCILIATION"; fi
+}
+contract() {
+  jq -e '.schema_version == "1.0" and .status == "consistent" and (.expected_nodes | type == "array" and length > 0) and (.cluster.grid_home | type == "string") and (.oracle_homes | type == "array") and (.databases | type == "array")' "$RECONCILIATION" >/dev/null || { echo 'topology reconciliation is not consistent' >&2; exit 65; }
+  jq -e '.schema_version == "1.0" and .status == "ready_for_planning" and (.procedure.patch_id | test("^[0-9]{1,20}$")) and (.procedure.artifact_sha256 | test("^[a-f0-9]{64}$")) and (.procedure.target.family | IN("grid","database")) and (.procedure.target.platform_id | test("^[0-9]+$"))' "$PROCEDURE" >/dev/null || { echo 'procedure validation is not ready or lacks a sealed platform' >&2; exit 65; }
+  PATCH_ID=$(jq -r '.procedure.patch_id' "$PROCEDURE"); ARTIFACT_SHA=$(jq -r '.procedure.artifact_sha256' "$PROCEDURE"); TARGET_FAMILY=$(jq -r '.procedure.target.family' "$PROCEDURE"); TARGET_PLATFORM=$(jq -r '.procedure.target.platform_id' "$PROCEDURE")
+}
+collect() {
+  local result hash node home check key seen_keys=$'\n'
+  for result in "${RESULTS[@]}"; do
+    hash=$(opu_hash_file "$result")
+    jq -e --arg patch "$PATCH_ID" --arg sha "$ARTIFACT_SHA" --arg family "$TARGET_FAMILY" --arg platform "$TARGET_PLATFORM" '.schema_version == "1.0" and .patch_id == $patch and .artifact_sha256 == $sha and .target.family == $family and .target.platform_id == $platform and (.checks | type == "array")' "$result" >/dev/null || { finding COMPATIBILITY_DOCUMENT_INVALID "Compatibility evidence is not bound to this procedure and platform: $result"; continue; }
+    while IFS= read -r check; do
+      node=$(jq -r '.node' <<<"$check"); home=$(jq -r '.home' <<<"$check"); key="$node|$home"
+      if [[ "$seen_keys" == *$'\n'"$key"$'\n'* ]]; then finding COMPATIBILITY_DUPLICATE "More than one compatibility result exists for $node:$home."; continue; fi
+      seen_keys+="$key"$'\n'; CHECKS+=("$check")
+    done < <(jq -c '.checks[]' "$result")
+  done
+  while IFS=$'\t' read -r node home; do
+    key="$node|$home"; [[ "$seen_keys" == *$'\n'"$key"$'\n'* ]] || { finding COMPATIBILITY_MISSING "No compatibility result exists for $node:$home."; continue; }
+    check=$(for item in "${CHECKS[@]}"; do [ "$(jq -r '.node+"|"+.home' <<<"$item")" = "$key" ] && { printf '%s' "$item"; break; }; done)
+    jq -e --arg platform "$TARGET_PLATFORM" '.status == "passed" and .platform.status == "passed" and .platform.host_id == $platform and .platform.procedure_id == $platform and .platform.artifact_ids == [$platform] and .opatch.status == "passed" and .applicability_check.name == "CheckPatchApplicableOnCurrentPlatform" and .applicability_check.status == "passed" and .applicability_check.exit_code == 0 and (.applicability_check.evidence_path | startswith("/")) and (.applicability_check.evidence_sha256 | test("^[a-f0-9]{64}$")) and .conflict_check.name == "CheckConflictAgainstOHWithDetail" and .conflict_check.status == "passed" and .conflict_check.exit_code == 0 and (.conflict_check.evidence_path | startswith("/")) and (.conflict_check.evidence_sha256 | test("^[a-f0-9]{64}$"))' <<<"$check" >/dev/null || finding COMPATIBILITY_FAILED "Platform applicability or conflict prerequisite did not pass for $node:$home."
+  done < <(expected_pairs)
+}
+emit() {
+  local file=$1 status=passed first=1 item finding_item
+  has_findings || status=passed
+  printf '{"schema_version":"1.0","status":%s,"patch_id":%s,"artifact_sha256":%s,"target":{"family":%s,"platform_id":%s},"checks":[' "$(opu_json_string "$status")" "$(opu_json_string "$PATCH_ID")" "$(opu_json_string "$ARTIFACT_SHA")" "$(opu_json_string "$TARGET_FAMILY")" "$(opu_json_string "$TARGET_PLATFORM")" >"$file"
+  for item in "${CHECKS[@]}"; do [ "$first" -eq 1 ] || printf ',' >>"$file"; printf '%s' "$item" >>"$file"; first=0; done
+  printf '],"findings":[' >>"$file"; first=1
+  for finding_item in "${FINDINGS[@]}"; do [ -n "$finding_item" ] || continue; [ "$first" -eq 1 ] || printf ',' >>"$file"; jq -cn --arg code "${finding_item%%|*}" --arg message "${finding_item#*|}" '{code:$code,message:$message}' >>"$file"; first=0; done
+  printf ']}\n' >>"$file"
+}
+main() { parse "$@"; contract; collect; local tmp; if [ -n "$OUT" ]; then mkdir -p "$(dirname "$OUT")"; [ ! -L "$OUT" ] || { echo 'output cannot be a symbolic link' >&2; exit 64; }; tmp=$OUT; else tmp=$(mktemp "${TMPDIR:-/tmp}/opu-compatibility-reconcile.XXXXXX"); trap 'rm -f "${tmp:-}"' EXIT; fi; emit "$tmp"; cat "$tmp"; if has_findings; then exit 2; fi; exit 0; }
+main "$@"

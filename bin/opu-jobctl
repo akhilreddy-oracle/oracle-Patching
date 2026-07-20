@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OPU_PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$OPU_PROJECT_ROOT/lib/opu/common.sh"
+. "$OPU_PROJECT_ROOT/lib/opu/jobs.sh"
+opu_runtime_init || exit $?
+
+usage() {
+    printf '%s\n' \
+      'Usage:' \
+      '  opu-jobctl create --job-id ID --requester ID --topology grid-rolling --patch-id ID --patch-dir PATH --nodes FILE' \
+      '  opu-jobctl create --job-id ID --requester ID --topology database-rolling --database DB --grid-home PATH --patch-id ID --patch-dir PATH --nodes FILE' \
+      '  opu-jobctl submit --job-id ID --actor ID' \
+      '  opu-jobctl ready --job-id ID --actor ID --evidence-sha256 SHA256' \
+      '  opu-jobctl approve --job-id ID --actor ID' \
+      '  opu-jobctl start --job-id ID --actor ID' \
+      '  opu-jobctl next --job-id ID' \
+      '  opu-jobctl claim --job-id ID --actor ID [--lease-seconds 300]' \
+      '  opu-jobctl reconcile --job-id ID --actor ID' \
+      '  opu-jobctl complete --job-id ID --task-id ID --actor ID --status succeeded|failed --evidence-sha256 SHA256' \
+      '  opu-jobctl status --job-id ID'
+}
+need_pair() { [ "$#" -ge 2 ] || { opu_error "$1 requires a value"; exit 64; }; }
+job_actor() {
+    local job="" actor=""
+    while [ "$#" -gt 0 ]; do case "$1" in --job-id) need_pair "$@"; job=$2; shift 2;; --actor) need_pair "$@"; actor=$2; shift 2;; *) opu_error "unknown option: $1"; return 64;; esac; done
+    opu_validate_identifier "$job" "job ID" && opu_validate_identifier "$actor" "actor" || return
+    printf '%s|%s' "$job" "$actor"
+}
+main() {
+    local command pair job actor evidence task_id status
+    command=${1:-help}; [ "$#" -gt 0 ] && shift
+    case "$command" in
+      create) opu_job_create "$@";;
+      submit|approve|start|reconcile) pair=$(job_actor "$@") || return; job=${pair%%|*}; actor=${pair#*|}; opu_job_$command "$job" "$actor";;
+      ready)
+        job=""; actor=""; evidence=""; while [ "$#" -gt 0 ]; do case "$1" in --job-id) job=$2; shift 2;; --actor) actor=$2; shift 2;; --evidence-sha256) evidence=$2; shift 2;; *) opu_error "unknown option: $1"; return 64;; esac; done
+        opu_validate_identifier "$job" "job ID" && opu_validate_identifier "$actor" "actor" || return; opu_job_ready "$job" "$actor" "$evidence";;
+      next) [ "${1:-}" = --job-id ] && [ "$#" -eq 2 ] || { usage >&2; return 64; }; opu_job_next "$2";;
+      claim)
+        job=""; actor=""; lease_seconds=300; while [ "$#" -gt 0 ]; do case "$1" in --job-id) job=$2; shift 2;; --actor) actor=$2; shift 2;; --lease-seconds) lease_seconds=$2; shift 2;; *) opu_error "unknown option: $1"; return 64;; esac; done
+        opu_validate_identifier "$job" "job ID" && opu_validate_identifier "$actor" "actor" || return; opu_job_claim "$job" "$actor" "$lease_seconds";;
+      complete)
+        job=""; actor=""; task_id=""; status=""; evidence=""; while [ "$#" -gt 0 ]; do case "$1" in --job-id) job=$2; shift 2;; --task-id) task_id=$2; shift 2;; --actor) actor=$2; shift 2;; --status) status=$2; shift 2;; --evidence-sha256) evidence=$2; shift 2;; *) opu_error "unknown option: $1"; return 64;; esac; done
+        opu_job_complete "$job" "$task_id" "$actor" "$status" "$evidence";;
+      status) [ "${1:-}" = --job-id ] && [ "$#" -eq 2 ] || { usage >&2; return 64; }; opu_job_status "$2";;
+      help|-h|--help) usage;; *) opu_error "unknown command: $command"; usage >&2; return 64;;
+    esac
+}
+main "$@"

@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oracle-patching-utility.invalid/contracts/procedure/oracle-patch-procedure-v1.schema.json",
+  "title": "Oracle patch procedure manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "patch_id", "artifact_sha256", "target", "execution", "required_opatch_version", "oracle_references", "mandatory_prechecks", "mandatory_postchecks", "rollback"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "operation": {
+      "enum": [
+        "grid_rootcrs_prepatch", "grid_opatch_apply", "grid_rootadd_rdbms", "grid_rootcrs_postpatch",
+        "database_stop_instance", "database_opatch_apply", "database_start_instance", "database_datapatch",
+        "database_shutdown", "database_startup"
+      ]
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "patch_id": {"type": "string", "pattern": "^[0-9]{1,20}$"},
+    "artifact_sha256": {"$ref": "#/$defs/sha256"},
+    "target": {
+      "type": "object",
+      "required": ["family", "method", "platform_id"],
+      "properties": {
+        "family": {"enum": ["grid", "database"]},
+        "method": {"enum": ["opatch", "opatchauto", "switch_grid_home", "fpp"]},
+        "topology": {"enum": ["rac", "single_instance"]},
+        "database_unique_name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$"},
+        "platform_id": {"type": "string", "pattern": "^[0-9]+$"}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter", "operations"],
+      "properties": {
+        "adapter": {"enum": ["grid_rolling_opatch", "database_rolling_opatch", "database_single_instance_opatch"]},
+        "operations": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/operation"}}
+      }
+    },
+    "required_opatch_version": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+){2,4}$"},
+    "oracle_references": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "identifier", "sha256"],
+        "properties": {
+          "kind": {"enum": ["patch_readme", "mos_note", "oracle_doc"]},
+          "identifier": {"type": "string", "minLength": 1},
+          "sha256": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    },
+    "mandatory_prechecks": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string"},
+      "allOf": [
+        {"contains": {"const": "artifact_integrity"}},
+        {"contains": {"const": "platform_applicability"}},
+        {"contains": {"const": "opatch_version"}},
+        {"contains": {"const": "conflict_check"}},
+        {"contains": {"const": "backup_or_restore"}}
+      ]
+    },
+    "mandatory_postchecks": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string"},
+      "allOf": [
+        {"contains": {"const": "binary_inventory"}},
+        {"contains": {"const": "service_health"}}
+      ]
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "precondition"],
+      "properties": {
+        "mode": {"enum": ["opatch_rollback", "home_switch_back", "manual_recovery"]},
+        "precondition": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

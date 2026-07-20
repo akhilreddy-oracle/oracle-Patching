@@ -1,0 +1,3 @@
+# Oracle homes observed through the local oratab.
+ORCL:/u01/app/oracle/product/19c/dbhome_1:Y
+REPORTS:/u01/app/oracle/product/19c/dbhome_2:N

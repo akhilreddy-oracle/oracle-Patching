@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oracle-patching-utility.invalid/contracts/readiness/patch-readiness-result-v1.schema.json",
+  "title": "Oracle patch readiness result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "patch_id", "target", "evaluated_at", "valid_until", "snapshot_evidence", "gates", "evidence"],
+  "$defs": {"sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "status": {"enum": ["ready_for_approval", "blocked"]},
+    "patch_id": {"type": "string", "pattern": "^[0-9]{1,20}$"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "method", "platform_id"],
+      "properties": {
+        "family": {"enum": ["grid", "database"]},
+        "method": {"enum": ["opatch", "opatchauto", "switch_grid_home", "fpp"]},
+        "platform_id": {"type": "string", "pattern": "^[0-9]+$"}
+      }
+    },
+    "evaluated_at": {"type": "string", "format": "date-time"},
+    "valid_until": {"type": "string", "format": "date-time"},
+    "snapshot_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "host", "collected_at", "valid_until"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^/"},
+          "sha256": {"$ref": "#/$defs/sha256"},
+          "host": {"type": "string", "minLength": 1},
+          "collected_at": {"type": "string", "format": "date-time"},
+          "valid_until": {"type": "string", "format": "date-time"}
+        }
+      }
+    },
+    "gates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status", "detail"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "status": {"enum": ["pass", "blocker"]},
+          "detail": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reconciliation_sha256", "artifact_manifest_sha256", "procedure_validation_sha256", "compatibility_sha256", "policy_sha256"],
+      "properties": {
+        "reconciliation_sha256": {"$ref": "#/$defs/sha256"},
+        "artifact_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "procedure_validation_sha256": {"$ref": "#/$defs/sha256"},
+        "compatibility_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "ready_for_approval"}}},
+      "then": {"properties": {"gates": {"not": {"contains": {"properties": {"status": {"const": "blocker"}}}}}}}
+    }
+  ]
+}

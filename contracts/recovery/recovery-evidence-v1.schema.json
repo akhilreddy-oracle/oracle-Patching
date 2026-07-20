@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/oracle-patching/recovery-evidence-v1.schema.json",
+  "title": "Oracle Recovery Evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "collector",
+    "status",
+    "collected_at",
+    "target",
+    "backup",
+    "source_snapshot",
+    "verification",
+    "record_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "collector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"const": "oracle.recovery.evidence"},
+        "version": {"const": "1"}
+      }
+    },
+    "status": {"const": "passed"},
+    "collected_at": {"type": "string", "format": "date-time"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["database_unique_name", "oracle_home", "owner", "oracle_sid"],
+      "properties": {
+        "database_unique_name": {"type": "string", "minLength": 1},
+        "oracle_home": {"type": "string", "pattern": "^/"},
+        "owner": {"type": "string", "minLength": 1},
+        "oracle_sid": {"type": "string", "minLength": 1}
+      }
+    },
+    "backup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "checksum_manifest", "files", "oracle_home_archive", "rman_backup_set_keys", "selected_recovery_set", "coverage"],
+      "properties": {
+        "root": {"type": "string", "pattern": "^/"},
+        "checksum_manifest": {"$ref": "#/$defs/path_digest"},
+        "files": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"$ref": "#/$defs/digest_path"}
+        },
+        "oracle_home_archive": {"type": "string", "pattern": "^/"},
+        "rman_backup_set_keys": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "selected_recovery_set": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["observed_at", "oldest_datafile_backup_completed_at", "age_seconds_at_collection", "restore_piece_handles", "datafile_backup_sets"],
+          "properties": {
+            "observed_at": {"type": "string", "format": "date-time"},
+            "oldest_datafile_backup_completed_at": {"type": "string", "format": "date-time"},
+            "age_seconds_at_collection": {"type": "integer", "minimum": 0},
+            "restore_piece_handles": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+            "datafile_backup_sets": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1}}
+          }
+        },
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["datafiles_backed", "base_datafiles", "datafiles_current", "controlfile_records", "spfile_records", "outside_root_pieces", "unavailable_pieces"],
+          "properties": {
+            "datafiles_backed": {"type": "integer", "minimum": 1},
+            "base_datafiles": {"type": "integer", "minimum": 1},
+            "datafiles_current": {"type": "integer", "minimum": 1},
+            "controlfile_records": {"type": "integer", "minimum": 1},
+            "spfile_records": {"type": "integer", "minimum": 1},
+            "outside_root_pieces": {"const": 0},
+            "unavailable_pieces": {"const": 0}
+          }
+        }
+      }
+    },
+    "source_snapshot": {"$ref": "#/$defs/path_digest"},
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checksum_log", "oracle_home_archive_log", "rman_log"],
+      "properties": {
+        "checksum_log": {"$ref": "#/$defs/path_digest"},
+        "oracle_home_archive_log": {"$ref": "#/$defs/path_digest"},
+        "rman_log": {"$ref": "#/$defs/path_digest"}
+      }
+    },
+    "record_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "path_digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^/"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "digest_path": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "path"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "path": {"type": "string", "pattern": "^/"}
+      }
+    }
+  }
+}

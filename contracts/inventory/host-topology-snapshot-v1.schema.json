@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oracle-patching-utility.invalid/contracts/inventory/host-topology-snapshot-v1.schema.json",
+  "title": "Oracle host topology snapshot v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "collector", "collected_at", "host", "cluster", "oracle_homes", "databases", "warnings"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "nullableString": {"type": ["string", "null"]},
+    "platformEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "id", "name", "source", "source_sha256"],
+      "properties": {
+        "status": {"enum": ["collected", "failed", "unavailable"]},
+        "id": {"anyOf": [{"type": "string", "pattern": "^[0-9]+$"}, {"type": "null"}]},
+        "name": {"$ref": "#/$defs/nullableString"},
+        "source": {"anyOf": [{"const": "opatch_lsinventory_xml"}, {"type": "null"}]},
+        "source_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "collected"}}},
+          "then": {
+            "properties": {
+              "id": {"type": "string", "pattern": "^[0-9]+$"},
+              "name": {"type": "string", "minLength": 1},
+              "source": {"const": "opatch_lsinventory_xml"},
+              "source_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "unavailable"}}},
+          "then": {
+            "properties": {
+              "id": {"type": "null"},
+              "name": {"type": "null"},
+              "source": {"type": "null"},
+              "source_sha256": {"type": "null"}
+            }
+          }
+        }
+      ]
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "collector": {"type": "object"},
+    "collected_at": {"type": "string", "format": "date-time"},
+    "host": {"type": "object"},
+    "cluster": {"type": "object"},
+    "oracle_homes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "owner", "platform", "patches"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^/"},
+          "owner": {"type": "string", "minLength": 1},
+          "platform": {"$ref": "#/$defs/platformEvidence"},
+          "patches": {"type": "array", "items": {"type": "string", "pattern": "^[0-9]+$"}, "uniqueItems": true}
+        }
+      }
+    },
+    "databases": {"type": "array"},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  }
+}

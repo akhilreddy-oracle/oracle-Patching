@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Validates a patch-specific Oracle procedure manifest against a verified
+# artifact manifest. The document content is supplied from the patch README
+# and approved Oracle Support instructions; this command never invents steps.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+PROCEDURE=""; ARTIFACT=""; OUT=""
+usage() { printf '%s\n' 'Usage: opu-procedure-validate --procedure ABSOLUTE_JSON --artifact ABSOLUTE_JSON [--output ABSOLUTE_PATH]'; }
+parse() { while [ "$#" -gt 0 ]; do case "$1" in --procedure) PROCEDURE=${2:-}; shift 2;; --artifact) ARTIFACT=${2:-}; shift 2;; --output) OUT=${2:-}; shift 2;; -h|--help) usage; exit 0;; *) usage >&2; exit 64;; esac; done; for x in "$PROCEDURE" "$ARTIFACT"; do opu_validate_absolute_path "$x" input || exit $?; [ -f "$x" ] && [ ! -L "$x" ] || { echo "input is missing or symbolic link: $x" >&2; exit 66; }; done; [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?; command -v jq >/dev/null || { echo 'jq is required' >&2; exit 69; }; }
+validate() {
+  local artifact_sha procedure_sha expected_patch actual_patch artifact_platform procedure_platform
+  jq -e '
+    .artifact.status == "ready_for_catalog" and
+    (.artifact.sha256 | test("^[a-f0-9]{64}$")) and
+    (.artifact.patch_ids | length == 1) and
+    (.artifact.platforms | type == "array" and length == 1) and
+    (.artifact.platforms[0].id | test("^[0-9]+$")) and
+    (.artifact.platforms[0].name | type == "string" and length > 0) and
+    .artifact.platforms[0].source == "etc/config/inventory.xml" and
+    (.artifact.platforms[0].source_sha256 | test("^[a-f0-9]{64}$")) and
+    (.artifact.readme_files | type == "array" and length > 0) and
+    (all(.artifact.readme_files[];
+      (.path | type == "string" and length > 0) and
+      (.sha256 | test("^[a-f0-9]{64}$"))))
+  ' "$ARTIFACT" >/dev/null || { echo 'artifact manifest is not ready for catalog or has no hashed README' >&2; return 2; }
+  jq -e '
+    .schema_version == "1.0" and
+    (.patch_id | test("^[0-9]{1,20}$")) and
+    (.artifact_sha256 | test("^[a-f0-9]{64}$")) and
+    (.target.family | IN("grid","database")) and
+    (.target.platform_id | test("^[0-9]+$")) and
+    (.target.method | IN("opatch","opatchauto","switch_grid_home","fpp")) and
+    (.execution | type == "object" and
+      (.adapter | IN("grid_rolling_opatch","database_rolling_opatch","database_single_instance_opatch")) and
+      (.operations | type == "array" and length > 0) and
+      (all(.operations[]; IN("grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch","database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch","database_shutdown","database_startup")))) and
+    (if .target.family == "grid" then
+       .execution.adapter == "grid_rolling_opatch" and .target.method == "opatch" and
+       (.execution.operations == ["grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch"])
+     elif .execution.adapter == "database_rolling_opatch" then
+       .execution.adapter == "database_rolling_opatch" and .target.method == "opatch" and
+       (.target.topology == "rac") and
+       (.target.database_unique_name | test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$")) and
+     (.execution.operations == ["database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch"])
+     else
+       .execution.adapter == "database_single_instance_opatch" and .target.method == "opatch" and
+       (.target.topology == "single_instance") and
+       (.target.database_unique_name | test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$")) and
+       (.execution.operations == ["database_shutdown","database_opatch_apply","database_startup","database_datapatch"])
+     end) and
+    (.required_opatch_version | test("^[0-9]+(\\.[0-9]+){2,4}$")) and
+    (.oracle_references | type == "array" and length > 0) and
+    (all(.oracle_references[]; (.kind | IN("patch_readme","mos_note","oracle_doc")) and (.identifier | type == "string" and length > 0) and (.sha256 | test("^[a-f0-9]{64}$")))) and
+    (.mandatory_prechecks | type == "array" and (index("artifact_integrity") != null) and (index("platform_applicability") != null) and (index("opatch_version") != null) and (index("conflict_check") != null) and (index("backup_or_restore") != null)) and
+    (.mandatory_postchecks | type == "array" and (index("binary_inventory") != null) and (index("service_health") != null)) and
+    (.rollback | type == "object" and (.mode | IN("opatch_rollback","home_switch_back","manual_recovery")) and (.precondition | type == "string" and length > 0))
+  ' "$PROCEDURE" >/dev/null || { echo 'procedure manifest is incomplete or violates the Oracle procedure contract' >&2; return 2; }
+  artifact_sha=$(jq -r '.artifact.sha256' "$ARTIFACT"); procedure_sha=$(jq -r '.artifact_sha256' "$PROCEDURE"); expected_patch=$(jq -r '.artifact.patch_ids[0]' "$ARTIFACT"); actual_patch=$(jq -r '.patch_id' "$PROCEDURE")
+  [ "$artifact_sha" = "$procedure_sha" ] || { echo 'procedure artifact digest does not match inspected artifact' >&2; return 2; }
+  [ "$expected_patch" = "$actual_patch" ] || { echo 'procedure patch ID does not match inspected artifact' >&2; return 2; }
+  artifact_platform=$(jq -r '.artifact.platforms[0].id' "$ARTIFACT"); procedure_platform=$(jq -r '.target.platform_id' "$PROCEDURE")
+  [ "$artifact_platform" = "$procedure_platform" ] || { echo 'procedure target platform does not match authoritative artifact inventory.xml' >&2; return 2; }
+  jq -e --slurpfile artifact "$ARTIFACT" '
+    ([.oracle_references[] | select(.kind == "patch_readme") | .sha256]) as $references |
+    ($artifact[0].artifact.readme_files | map(.sha256)) as $readmes |
+    ($references | length == 1) and
+    all($references[]; . as $digest | $readmes | index($digest) != null)
+  ' "$PROCEDURE" >/dev/null || {
+    echo 'procedure must bind exactly one README digest from the inspected artifact' >&2
+    return 2
+  }
+}
+emit() { local file=$1 procedure_hash artifact_hash; procedure_hash=$(opu_hash_file "$PROCEDURE"); artifact_hash=$(opu_hash_file "$ARTIFACT"); jq -cn --arg procedure "$PROCEDURE" --arg procedure_sha256 "$procedure_hash" --arg artifact "$ARTIFACT" --arg artifact_manifest_sha256 "$artifact_hash" --slurpfile manifest "$PROCEDURE" '{schema_version:"1.0",status:"ready_for_planning",procedure:$manifest[0],evidence:{procedure_path:$procedure,procedure_sha256:$procedure_sha256,artifact_manifest_path:$artifact,artifact_manifest_sha256:$artifact_manifest_sha256}}' >"$file"; }
+main() { parse "$@"; validate; local tmp; if [ -n "$OUT" ]; then mkdir -p "$(dirname "$OUT")"; [ ! -L "$OUT" ] || { echo 'output cannot be a symbolic link' >&2; exit 64; }; tmp=$OUT; else tmp=$(mktemp "${TMPDIR:-/tmp}/opu-procedure.XXXXXX"); trap 'rm -f "${tmp:-}"' EXIT; fi; emit "$tmp"; cat "$tmp"; }
+main "$@"

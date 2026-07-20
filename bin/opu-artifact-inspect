@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Read-only inspection of a staged Oracle patch directory. The planner consumes
+# this manifest; it never infers a patch ID from a directory name.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+ARTIFACT=""; OUT=""; PRETTY=0
+usage() { printf '%s\n' 'Usage: opu-artifact-inspect --artifact ABSOLUTE_DIRECTORY [--output ABSOLUTE_PATH] [--pretty]'; }
+parse() { while [ "$#" -gt 0 ]; do case "$1" in --artifact) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; ARTIFACT=$2; shift 2;; --output) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; OUT=$2; shift 2;; --pretty) PRETTY=1; shift;; -h|--help) usage; exit 0;; *) usage >&2; exit 64;; esac; done; opu_validate_absolute_path "$ARTIFACT" artifact || exit $?; [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?; [ -d "$ARTIFACT" ] && [ ! -L "$ARTIFACT" ] || { echo 'artifact must be a non-symbolic-link directory' >&2; exit 66; }; command -v xmllint >/dev/null || { echo 'xmllint is required for authoritative Oracle platform metadata' >&2; exit 69; }; }
+artifact_digest() { find "$ARTIFACT" -xdev -type f -print0 | sort -z | while IFS= read -r -d '' file; do printf '%s\0' "${file#"$ARTIFACT"/}"; sha256sum "$file" | awk '{print $1}'; done | sha256sum | awk '{print $1}'; }
+json_files() {
+  local kind=$1 file first=1
+  printf '['
+  if [ "$kind" = metadata ]; then
+    while IFS= read -r -d '' file; do [ "$first" -eq 1 ] || printf ','; printf '{"path":%s,"sha256":%s}' "$(opu_json_string "${file#"$ARTIFACT"/}")" "$(opu_json_string "$(sha256sum "$file" | awk '{print $1}')")"; first=0; done < <(find "$ARTIFACT" -xdev -type f \( -iname 'actions.xml' -o -iname 'bundle.xml' -o -iname 'inventory.xml' -o -iname 'patch.xml' \) -print0 | sort -z)
+  else
+    while IFS= read -r -d '' file; do [ "$first" -eq 1 ] || printf ','; printf '{"path":%s,"sha256":%s}' "$(opu_json_string "${file#"$ARTIFACT"/}")" "$(opu_json_string "$(sha256sum "$file" | awk '{print $1}')")"; first=0; done < <(find "$ARTIFACT" -xdev -type f -iname 'README*' -print0 | sort -z)
+  fi
+  printf ']'
+}
+patch_ids() {
+  # Oracle RU metadata uses more than one schema across releases.  Treat the
+  # patch identifier as authoritative only when it occurs in a patch-specific
+  # attribute or element; never infer it from the staging directory name.
+  grep -RhoE 'patchID[[:space:]]*=[[:space:]]*"?[0-9]+|<patchID>[0-9]+</patchID>|<patch_id[[:space:]]+number="[0-9]+"' "$ARTIFACT" 2>/dev/null |
+    grep -Eo '[0-9]+' | sort -nu || true
+}
+metadata_files() { find "$ARTIFACT" -xdev -type f \( -iname 'actions.xml' -o -iname 'bundle.xml' -o -iname 'inventory.xml' -o -iname 'patch.xml' \) -print0; }
+emit() {
+  local file=$1 digest ids id first descriptions file_count patch_count status reason inventory platform_count platform_id platform_name platform_sha platforms_json
+  digest=$(artifact_digest); ids=$(patch_ids); descriptions=$(grep -RhiE 'release update|release update revision|one-off|database release update|grid infrastructure release update' "$ARTIFACT" --include='*.xml' --include='README*' 2>/dev/null | head -n 20 || true)
+  file_count=$(find "$ARTIFACT" -xdev -type f | wc -l | tr -d ' '); patch_count=$(grep -c . <<<"$ids" || true)
+  status=ready_for_catalog; reason=""
+  [ "$file_count" -gt 0 ] || { status=blocked; reason='artifact directory contains no regular files'; }
+  [ "$patch_count" -gt 0 ] || { status=blocked; reason='artifact metadata exposes no patch ID'; }
+  [ "$patch_count" -le 1 ] || { status=blocked; reason='artifact contains multiple patch IDs and requires explicit decomposition'; }
+  inventory="$ARTIFACT/etc/config/inventory.xml"; platforms_json='[]'
+  if [ ! -f "$inventory" ] || [ -L "$inventory" ] || [ ! -r "$inventory" ]; then
+    status=blocked; reason='artifact has no readable authoritative etc/config/inventory.xml'
+  elif ! xmllint --nonet --noout "$inventory" >/dev/null 2>&1; then
+    status=blocked; reason='authoritative artifact inventory.xml is malformed'
+  else
+    platform_count=$(xmllint --nonet --xpath 'count(//*[local-name()="os_platforms"]/*[local-name()="platform"])' "$inventory" 2>/dev/null || true)
+    if [ "$platform_count" != 1 ]; then
+      status=blocked; reason="artifact must declare exactly one Oracle platform; found ${platform_count:-unknown}"
+    else
+      platform_id=$(xmllint --nonet --xpath 'string((//*[local-name()="os_platforms"]/*[local-name()="platform"])[1]/@id)' "$inventory" 2>/dev/null || true)
+      platform_name=$(xmllint --nonet --xpath 'string((//*[local-name()="os_platforms"]/*[local-name()="platform"])[1]/@name)' "$inventory" 2>/dev/null || true)
+      if [[ ! "$platform_id" =~ ^[0-9]+$ ]] || [ -z "$platform_name" ]; then
+        status=blocked; reason='artifact Oracle platform ID or name is missing or invalid'
+      else
+        platform_sha=$(opu_hash_file "$inventory")
+        platforms_json=$(printf '[{"id":%s,"name":%s,"source":"etc/config/inventory.xml","source_sha256":%s}]' "$(opu_json_string "$platform_id")" "$(opu_json_string "$platform_name")" "$(opu_json_string "$platform_sha")")
+      fi
+    fi
+  fi
+  {
+    printf '{"schema_version":"1.0","artifact":{"status":%s,"reason":%s,"path":%s,"file_count":%s,"sha256":%s,"patch_ids":[' "$(opu_json_string "$status")" "$(opu_json_nullable_string "$reason")" "$(opu_json_string "$ARTIFACT")" "$file_count" "$(opu_json_string "$digest")"
+    first=1; while IFS= read -r id; do [ -n "$id" ] || continue; [ "$first" -eq 1 ] || printf ','; opu_json_string "$id"; first=0; done <<<"$ids"
+    printf '],"platforms":%s,"metadata_files":' "$platforms_json"; json_files metadata; printf ',"readme_files":'; json_files readme; printf ',"classification_evidence":'; opu_json_string "$descriptions"; printf '}}\n'
+  } >"$file"
+}
+main() { parse "$@"; local tmp status; if [ -n "$OUT" ]; then mkdir -p "$(dirname "$OUT")"; [ ! -L "$OUT" ] || { echo 'output cannot be a symbolic link' >&2; exit 64; }; tmp=$OUT; else tmp=$(mktemp "${TMPDIR:-/tmp}/opu-artifact.XXXXXX"); trap 'rm -f "${tmp:-}"' EXIT; fi; emit "$tmp"; if [ "$PRETTY" -eq 1 ]; then command -v jq >/dev/null || { echo 'jq is required for --pretty' >&2; exit 69; }; jq . "$tmp"; else cat "$tmp"; fi; status=$(jq -r '.artifact.status' "$tmp"); [ "$status" = ready_for_catalog ] || exit 2; }
+main "$@"

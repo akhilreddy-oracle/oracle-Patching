@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# Fixed, resumable Oracle Grid Infrastructure rolling one-off patch workflow.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C
+
+PROGRAM=${0##*/}; GRID_HOME=""; PATCH_DIR=""; PATCH_ID=""; MODE=""; NODE_FILE=""; LOG_ROOT=/var/tmp; REMOTE_USER=root; APPROVED=0; MIN_FREE_MB=4096
+LOCAL_HOST=$(hostname -s 2>/dev/null || hostname); GRID_OWNER=""; STATE_DIR=""; DONE_FILE=""; FAILED_FILE=""; MAIN_LOG=""; CURRENT_NODE=""
+declare -a NODES=()
+record_failure() {
+  [[ -n "$FAILED_FILE" ]] || return 0
+  printf 'time=%s\nnode=%s\nmode=%s\npatch_id=%s\nmessage=%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${CURRENT_NODE:-unknown}" "$MODE" "$PATCH_ID" "$*" >"$FAILED_FILE"
+}
+die() { record_failure "$*"; printf '%s: ERROR: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$MAIN_LOG"; }
+usage() { cat <<EOF
+Usage:
+  $PROGRAM --grid-home PATH --patch-dir PATH --mode analyze [--nodes FILE] [--remote-user USER] [--min-free-mb MB] [--log-root PATH]
+  $PROGRAM --grid-home PATH --patch-dir PATH --mode apply [--nodes FILE] --approve [--remote-user USER] [--min-free-mb MB] [--log-root PATH]
+  $PROGRAM --grid-home PATH --patch-id ID --mode rollback [--nodes FILE] --approve [--remote-user USER] [--min-free-mb MB] [--log-root PATH]
+
+When --nodes is omitted, active RAC nodes are discovered from Clusterware.
+Use --nodes only to provide an explicit rolling order. All nodes must expose
+the patch directory at the same absolute path. analyze is read-only.
+apply/rollback require --approve.
+
+Every run records a manifest, completed checkpoints, and a last-failure record
+under the selected log root. Patch metadata is checked from patch XML before
+any conflict check or mutation when the patch is not already installed.
+EOF
+}
+valid_path() { [[ "$1" == /* && "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != */../* && "$1" != */.. && "$1" != */./* && "$1" != */. ]]; }
+valid_node() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]]; }
+valid_patch_id() { [[ "$1" =~ ^[0-9]{1,20}$ ]]; }
+short_host() { printf '%s\n' "${1%%.*}"; }
+is_local() { [[ "$(short_host "$1")" == "$(short_host "$LOCAL_HOST")" ]]; }
+run_root() {
+  local node=$1; shift
+  if is_local "$node"; then "$@"
+  elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$node" -- "$@"
+  else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$node" -- sudo -n "$@"; fi
+}
+# Positional parameters avoid evaluating node, path, or patch input as shell text.
+run_grid() {
+  local node=$1; shift
+  # runuser preserves the command's positional arguments; unlike a shell -c
+  # wrapper it cannot drop the OPatch subcommand or reinterpret an argument.
+  if is_local "$node"; then runuser -u "$GRID_OWNER" -- "$@"
+  elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$node" -- runuser -u "$GRID_OWNER" -- "$@"
+  else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$node" -- sudo -n runuser -u "$GRID_OWNER" -- "$@"; fi
+}
+key() { printf '%s|%s|%s\n' "$MODE" "$1" "$2"; }
+done_step() { grep -Fqx "$(key "$1" "$2")" "$DONE_FILE" 2>/dev/null; }
+mark_step() { printf '%s\n' "$(key "$1" "$2")" >>"$DONE_FILE"; }
+write_manifest() {
+  {
+    printf 'schema_version=1.0\nstarted_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'mode=%s\npatch_id=%s\ngrid_home=%s\npatch_dir=%s\nremote_user=%s\nmin_free_mb=%s\n' \
+      "$MODE" "$PATCH_ID" "$GRID_HOME" "${PATCH_DIR:-}" "$REMOTE_USER" "$MIN_FREE_MB"
+    printf 'nodes=%s\n' "${NODES[*]}"
+  } >"$STATE_DIR/run.manifest"
+}
+add_node() { local node=$1; valid_node "$node" || die "invalid node name: $node"; [[ " ${NODES[*]-} " == *" $node "* ]] || NODES+=("$node"); }
+read_nodes() {
+  local node inventory
+  if [[ -n "$NODE_FILE" ]]; then
+    [[ -f "$NODE_FILE" && ! -L "$NODE_FILE" ]] || die "node file is missing or a symbolic link: $NODE_FILE"
+    while IFS= read -r node || [[ -n "$node" ]]; do node=${node%%#*}; node=${node//[[:space:]]/}; [[ -z "$node" ]] && continue; add_node "$node"; done <"$NODE_FILE"
+  else
+    inventory=$("$GRID_HOME/bin/olsnodes" -s -t 2>&1) || die "cannot discover active RAC nodes with olsnodes"
+    printf '=== discovered RAC nodes ===\n%s\n' "$inventory" >>"$MAIN_LOG"
+    while IFS= read -r node; do add_node "$node"; done < <(awk '$2 == "Active" {print $1}' <<<"$inventory")
+  fi
+  ((${#NODES[@]})) || die "no active RAC nodes discovered"
+}
+detect_patch_id() {
+  [[ -n "$PATCH_ID" ]] && return
+  PATCH_ID=$(basename "$PATCH_DIR" | grep -Eo '[0-9]{6,20}' | head -n1 || true)
+  valid_patch_id "$PATCH_ID" || die "cannot determine patch ID; pass --patch-id"
+}
+detect_grid_owner() {
+  # ODA and some hardened builds retain root ownership on the Grid home even
+  # though the active ASM/CRS stack is owned by the Grid account. Prefer the
+  # live process owner; only then fall back to filesystem ownership.
+  GRID_OWNER=$(ps -eo user=,args= | awk '$1 != "root" && $0 ~ /(asm_pmon|asm_smon|ora\.asm|crsd\.bin)/ {print $1; exit}')
+  if [[ -z "$GRID_OWNER" ]]; then
+    GRID_OWNER=$(stat -c '%U' "$GRID_HOME")
+  fi
+  [[ -n "$GRID_OWNER" && "$GRID_OWNER" != root ]] || die "cannot determine non-root Grid owner from active processes or Grid home"
+}
+validate_cluster_membership() {
+  local inventory node expected
+  inventory=$(run_root "$LOCAL_HOST" "$GRID_HOME/bin/olsnodes" -s -t 2>&1) || die "cannot read Clusterware node status"
+  printf '%s\n' "$inventory" >>"$MAIN_LOG"
+  for node in "${NODES[@]}"; do
+    expected=$(short_host "$node")
+    awk -v n="$expected" '$1 == n && $2 == "Active" {found=1} END {exit(found ? 0 : 1)}' <<<"$inventory" || \
+      die "node $node is not an active Clusterware member"
+  done
+}
+check_free_space() {
+  local node=$1 path=$2 out available
+  out=$(run_root "$node" df -Pm "$path" 2>&1) || die "$node: cannot inspect free space for $path"
+  printf '=== %s free space: %s ===\n%s\n' "$node" "$path" "$out" >>"$MAIN_LOG"
+  available=$(awk 'NR > 1 {v=$4} END {print v+0}' <<<"$out")
+  [ "$available" -ge "$MIN_FREE_MB" ] || die "$node: only ${available}MB free at $path; minimum is ${MIN_FREE_MB}MB"
+}
+verify_patch_metadata() {
+  local node=$1 out metadata_id
+  [[ "$MODE" == rollback ]] && return 0
+  out=$(run_root "$node" grep -RhoE 'patchID[[:space:]]*=[[:space:]]*"?[0-9]+' "$PATCH_DIR" 2>/dev/null || true)
+  metadata_id=$(grep -Eo '[0-9]+' <<<"$out" | head -n1 || true)
+  valid_patch_id "$metadata_id" || die "$node: patch XML does not expose a usable patchID under $PATCH_DIR"
+  [ "$metadata_id" = "$PATCH_ID" ] || die "$node: patch metadata ID $metadata_id does not match requested patch ID $PATCH_ID"
+  log "$node: patch metadata verified for $PATCH_ID"
+}
+validate_cluster_health() {
+  local node=$1
+  run_root "$node" "$GRID_HOME/bin/crsctl" check crs >>"$MAIN_LOG" 2>&1 || die "$node: CRS health check failed"
+  run_root "$node" "$GRID_HOME/bin/crsctl" check cluster -all >>"$MAIN_LOG" 2>&1 || die "$node: cluster health check failed"
+}
+preflight_node() {
+  local node=$1
+  run_root "$node" test -d "$GRID_HOME" || die "$node: missing Grid home"
+  run_root "$node" test -x "$GRID_HOME/bin/crsctl" || die "$node: missing crsctl"
+  run_root "$node" test -x "$GRID_HOME/OPatch/opatch" || die "$node: missing opatch"
+  run_root "$node" test -x "$GRID_HOME/crs/install/rootcrs.sh" || die "$node: missing rootcrs.sh"
+  run_root "$node" test -x "$GRID_HOME/rdbms/install/rootadd_rdbms.sh" || die "$node: missing rootadd_rdbms.sh"
+  [[ "$MODE" == rollback ]] || run_root "$node" test -d "$PATCH_DIR" || die "$node: missing patch directory"
+  check_free_space "$node" "$GRID_HOME"
+  [[ "$MODE" == rollback ]] || check_free_space "$node" "$PATCH_DIR"
+  validate_cluster_health "$node"
+}
+has_patch() {
+  local node=$1 output
+  output=$(run_grid "$node" "$GRID_HOME/OPatch/opatch" lspatches -oh "$GRID_HOME" 2>&1 || true)
+  printf '%s\n' "$output" >>"$MAIN_LOG"
+  grep -Eq "^[[:space:]]*${PATCH_ID}([;[:space:]]|$)" <<<"$output"
+}
+analyze_node() {
+  local node=$1
+  if has_patch "$node"; then log "$node: patch $PATCH_ID already installed"; return; fi
+  verify_patch_metadata "$node"
+  log "$node: checking patch conflicts"
+  run_grid "$node" "$GRID_HOME/OPatch/opatch" prereq CheckPatchApplicableOnCurrentPlatform -ph "$PATCH_DIR" -oh "$GRID_HOME" >>"$MAIN_LOG" 2>&1 || die "$node: platform applicability check failed"
+  run_grid "$node" "$GRID_HOME/OPatch/opatch" prereq CheckConflictAgainstOHWithDetail -ph "$PATCH_DIR" -oh "$GRID_HOME" >>"$MAIN_LOG" 2>&1 || die "$node: conflict check failed"
+}
+mutate_node() {
+  local node=$1 rootcrs="$GRID_HOME/crs/install/rootcrs.sh" rootadd="$GRID_HOME/rdbms/install/rootadd_rdbms.sh"
+  if [[ "$MODE" == apply ]] && has_patch "$node"; then log "$node: already applied; skipping"; return; fi
+  if [[ "$MODE" == rollback ]] && ! has_patch "$node"; then log "$node: not installed; skipping"; return; fi
+  verify_patch_metadata "$node"
+  if ! done_step "$node" prepatch; then
+    log "$node: rootcrs -prepatch"; run_root "$node" "$rootcrs" -prepatch >>"$MAIN_LOG" 2>&1 || die "$node: prepatch failed"; mark_step "$node" prepatch
+  fi
+  if ! done_step "$node" opatch; then
+    log "$node: OPatch $MODE"
+    if [[ "$MODE" == apply ]]; then run_grid "$node" "$GRID_HOME/OPatch/opatch" apply "$PATCH_DIR" -oh "$GRID_HOME" -local -silent >>"$MAIN_LOG" 2>&1 || die "$node: apply failed"
+    else run_grid "$node" "$GRID_HOME/OPatch/opatch" rollback -id "$PATCH_ID" -oh "$GRID_HOME" -local -silent >>"$MAIN_LOG" 2>&1 || die "$node: rollback failed"; fi
+    mark_step "$node" opatch
+  fi
+  if ! done_step "$node" postpatch; then
+    log "$node: rootadd_rdbms and rootcrs -postpatch"
+    run_root "$node" "$rootadd" >>"$MAIN_LOG" 2>&1 || die "$node: rootadd_rdbms failed"
+    run_root "$node" "$rootcrs" -postpatch >>"$MAIN_LOG" 2>&1 || die "$node: postpatch failed"; mark_step "$node" postpatch
+  fi
+  validate_cluster_health "$node"
+  log "$node: $MODE completed"
+}
+parse() {
+  while (($#)); do case "$1" in
+    --grid-home) GRID_HOME=${2:-}; shift 2;; --patch-dir) PATCH_DIR=${2:-}; shift 2;; --patch-id) PATCH_ID=${2:-}; shift 2;; --mode) MODE=${2:-}; shift 2;; --nodes) NODE_FILE=${2:-}; shift 2;; --log-root) LOG_ROOT=${2:-}; shift 2;; --remote-user) REMOTE_USER=${2:-}; shift 2;; --min-free-mb) MIN_FREE_MB=${2:-}; shift 2;; --approve) APPROVED=1; shift;; -h|--help) usage; exit 0;; *) die "unknown option: $1";; esac; done
+}
+main() {
+  parse "$@"; [[ $EUID -eq 0 ]] || die "must run as root"
+  [[ "$MODE" =~ ^(analyze|apply|rollback)$ ]] || die "--mode must be analyze, apply, or rollback"
+  valid_path "$GRID_HOME" || die "--grid-home must be a normalized absolute path"; [[ -z "$NODE_FILE" ]] || valid_path "$NODE_FILE" || die "--nodes must be a normalized absolute path"; valid_path "$LOG_ROOT" || die "--log-root must be a normalized absolute path"; valid_node "$REMOTE_USER" || die "--remote-user contains unsupported characters"; [[ "$MIN_FREE_MB" =~ ^[0-9]{1,7}$ ]] && [ "$MIN_FREE_MB" -ge 256 ] || die "--min-free-mb must be an integer of at least 256"
+  if [[ "$MODE" == rollback ]]; then valid_patch_id "$PATCH_ID" || die "rollback requires numeric --patch-id"; else valid_path "$PATCH_DIR" || die "--patch-dir must be a normalized absolute path"; fi
+  [[ "$MODE" == analyze || $APPROVED -eq 1 ]] || die "$MODE is destructive; pass --approve after change approval"
+  [[ -d "$GRID_HOME" ]] || die "local Grid home is missing"; detect_grid_owner
+  detect_patch_id; read_nodes; STATE_DIR="${LOG_ROOT%/}/opu-grid-rolling-${MODE}-${PATCH_ID}"; mkdir -p "$STATE_DIR"; DONE_FILE="$STATE_DIR/completed.steps"; FAILED_FILE="$STATE_DIR/last.failure"; MAIN_LOG="$STATE_DIR/$PROGRAM.log"; touch "$DONE_FILE" "$MAIN_LOG"; write_manifest
+  exec 9>"$STATE_DIR/.lock"; flock -n 9 || die "another run owns $STATE_DIR"
+  log "mode=$MODE patch_id=$PATCH_ID grid_home=$GRID_HOME nodes=${NODES[*]} minimum_free_mb=$MIN_FREE_MB"
+  validate_cluster_membership
+  local node; for node in "${NODES[@]}"; do CURRENT_NODE=$node; preflight_node "$node"; done
+  for node in "${NODES[@]}"; do CURRENT_NODE=$node; if [[ "$MODE" == analyze ]]; then analyze_node "$node"; else mutate_node "$node"; fi; done
+  CURRENT_NODE=cluster; validate_cluster_health "$LOCAL_HOST"
+  log "completed successfully; evidence=$STATE_DIR"
+}
+main "$@"

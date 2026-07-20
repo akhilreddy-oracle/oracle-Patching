@@ -1,0 +1,200 @@
+,<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" modified="2026-07-09T00:00:00.000Z" agent="Codex" version="24.7.17" type="device" compressed="false">
+  <diagram id="system-architecture" name="1. System Architecture">
+    <mxGraphModel dx="1600" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="p1-title" value="Oracle Patching Utility — Deployment-Neutral System Architecture" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=24;fontStyle=1;fontColor=#203748;" vertex="1" parent="1">
+          <mxGeometry x="250" y="20" width="1100" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-users-zone" value="USER AND ENTERPRISE ZONE" style="swimlane;html=1;rounded=1;horizontal=1;startSize=28;strokeColor=#B5852B;fillColor=#FFF8E8;fontColor=#7A5A00;fontStyle=1;dashed=1;dashPattern=8 4;" vertex="1" parent="1">
+          <mxGeometry x="30" y="100" width="240" height="260" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-operators" value="&lt;b&gt;Operators &amp;amp; Approvers&lt;/b&gt;&lt;br&gt;Web UI / CLI" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#B5852B;fontColor=#203748;fontSize=14;" vertex="1" parent="p1-users-zone">
+          <mxGeometry x="25" y="60" width="190" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-idp" value="&lt;b&gt;Enterprise Identity&lt;/b&gt;&lt;br&gt;OIDC / SAML / LDAP adapter" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#B5852B;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-users-zone">
+          <mxGeometry x="25" y="160" width="190" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-cp-zone" value="CONTROL PLANE" style="swimlane;html=1;rounded=1;horizontal=1;startSize=30;strokeColor=#2E74B5;fillColor=#E8EEF5;fontColor=#1F4D78;fontStyle=1;dashed=1;dashPattern=8 4;" vertex="1" parent="1">
+          <mxGeometry x="320" y="90" width="790" height="420" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-api" value="&lt;b&gt;Control Plane API&lt;/b&gt;&lt;br&gt;Versioned contracts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#2E74B5;fontColor=#203748;fontSize=14;" vertex="1" parent="p1-cp-zone">
+          <mxGeometry x="25" y="65" width="220" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-iam" value="&lt;b&gt;Identity, RBAC &amp;amp; Policy&lt;/b&gt;&lt;br&gt;Separation of duties" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-cp-zone">
+          <mxGeometry x="285" y="65" width="220" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-inventory" value="&lt;b&gt;Inventory &amp;amp; Reconciliation&lt;/b&gt;&lt;br&gt;Snapshots • identity • topology" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-cp-zone">
+          <mxGeometry x="545" y="65" width="220" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-catalog" value="&lt;b&gt;Patch Catalog &amp;amp; Compliance&lt;/b&gt;&lt;br&gt;Manifest • baseline • reasons" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-cp-zone">
+          <mxGeometry x="25" y="185" width="220" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-workflow" value="&lt;b&gt;Workflow &amp;amp; Approvals&lt;/b&gt;&lt;br&gt;DAG • locks • fencing • recovery" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-cp-zone">
+          <mxGeometry x="285" y="185" width="220" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-audit" value="&lt;b&gt;Audit &amp;amp; Evidence Metadata&lt;/b&gt;&lt;br&gt;Append-only • tamper-evident" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-cp-zone">
+          <mxGeometry x="545" y="185" width="220" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-taskq" value="&lt;b&gt;Database-Backed Task Leasing&lt;/b&gt;&lt;br&gt;At-least-once delivery • reconciliation" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F7FB;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-cp-zone">
+          <mxGeometry x="155" y="305" width="480" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-storage-zone" value="DATA AND ARTIFACT ZONE" style="swimlane;html=1;rounded=1;horizontal=1;startSize=28;strokeColor=#667085;fillColor=#F4F6F9;fontColor=#475467;fontStyle=1;dashed=1;dashPattern=8 4;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="90" width="400" height="420" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-postgres" value="&lt;b&gt;PostgreSQL&lt;/b&gt;&lt;br&gt;Inventory projection&lt;br&gt;Workflow • policy • audit metadata" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;fillColor=#FFFFFF;strokeColor=#667085;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-storage-zone">
+          <mxGeometry x="45" y="60" width="310" height="115" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-artifact" value="&lt;b&gt;Provider-Neutral ArtifactStore&lt;/b&gt;&lt;br&gt;Logical IDs • streaming • digest • retention" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#667085;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-storage-zone">
+          <mxGeometry x="45" y="215" width="310" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-adapters" value="Local filesystem  |  Shared NFS  |  Optional S3-compatible adapter" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F9FAFB;strokeColor=#98A2B3;fontColor=#475467;fontSize=12;" vertex="1" parent="p1-storage-zone">
+          <mxGeometry x="45" y="320" width="310" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-agent-zone" value="MANAGED HOST ZONE" style="swimlane;html=1;rounded=1;horizontal=1;startSize=30;strokeColor=#22643A;fillColor=#ECF8F0;fontColor=#22643A;fontStyle=1;dashed=1;dashPattern=8 4;" vertex="1" parent="1">
+          <mxGeometry x="120" y="580" width="620" height="260" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-agent" value="&lt;b&gt;Unprivileged Managed Agent&lt;/b&gt;&lt;br&gt;Heartbeat • task lease • discovery • local journal • evidence" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#22643A;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-agent-zone">
+          <mxGeometry x="30" y="65" width="270" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-broker" value="&lt;b&gt;Narrow Privilege Broker&lt;/b&gt;&lt;br&gt;Typed operations only&lt;br&gt;oracle / grid / root profiles" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#22643A;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-agent-zone">
+          <mxGeometry x="330" y="65" width="250" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-agent-note" value="No arbitrary shell • No user-supplied SQL • No inbound SSH" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontStyle=1;fontColor=#22643A;fontSize=13;" vertex="1" parent="p1-agent-zone">
+          <mxGeometry x="55" y="185" width="510" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-oracle-zone" value="ORACLE ESTATE" style="swimlane;html=1;rounded=1;horizontal=1;startSize=30;strokeColor=#9B1C1C;fillColor=#FFF4F2;fontColor=#9B1C1C;fontStyle=1;dashed=1;dashPattern=8 4;" vertex="1" parent="1">
+          <mxGeometry x="790" y="580" width="640" height="260" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-homes" value="&lt;b&gt;Oracle Homes&lt;/b&gt;&lt;br&gt;Inventory • OPatch • owners" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#9B1C1C;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-oracle-zone">
+          <mxGeometry x="25" y="65" width="180" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-dbs" value="&lt;b&gt;Databases&lt;/b&gt;&lt;br&gt;CDB/PDB • instances • SQL registry" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#9B1C1C;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-oracle-zone">
+          <mxGeometry x="230" y="65" width="180" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-services" value="&lt;b&gt;Listeners &amp;amp; Services&lt;/b&gt;&lt;br&gt;Endpoints • registrations" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#9B1C1C;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-oracle-zone">
+          <mxGeometry x="435" y="65" width="180" height="75" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-topology" value="Data Guard • Grid Infrastructure • RAC • ASM" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9F8;strokeColor=#9B1C1C;fontColor=#203748;fontSize=13;" vertex="1" parent="p1-oracle-zone">
+          <mxGeometry x="80" y="175" width="480" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="p1-edge-user-api" value="authenticated requests" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#667085;fontColor=#475467;" edge="1" parent="1" source="p1-operators" target="p1-api"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p1-edge-idp" value="identity" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#B5852B;fontColor=#7A5A00;" edge="1" parent="1" source="p1-idp" target="p1-iam"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p1-edge-api-pg" value="transactions" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#667085;fontColor=#475467;" edge="1" parent="1" source="p1-api" target="p1-postgres"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p1-edge-cat-art" value="logical artifact IDs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#667085;fontColor=#475467;" edge="1" parent="1" source="p1-catalog" target="p1-artifact"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p1-edge-art-adapter" value="adapter" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#667085;fontColor=#475467;" edge="1" parent="1" source="p1-artifact" target="p1-adapters"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p1-edge-agent-task" value="outbound mTLS: heartbeat / lease / events" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#22643A;fontColor=#22643A;" edge="1" parent="1" source="p1-agent" target="p1-taskq"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p1-edge-agent-broker" value="validated operation" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#22643A;fontColor=#22643A;" edge="1" parent="1" source="p1-agent" target="p1-broker"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p1-edge-broker-oracle" value="observe • act • verify" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;fontColor=#9B1C1C;" edge="1" parent="1" source="p1-broker" target="p1-homes"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="discovery-reconciliation" name="2. Discovery and Reconciliation">
+    <mxGraphModel dx="1600" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0d"/>
+        <mxCell id="1d" parent="0d"/>
+        <mxCell id="p2-title" value="OEM-Style Dynamic Discovery and Deterministic Reconciliation" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontSize=24;fontStyle=1;fontColor=#203748;" vertex="1" parent="1d"><mxGeometry x="220" y="20" width="1160" height="40" as="geometry"/></mxCell>
+        <mxCell id="p2-sources" value="EVIDENCE SOURCES" style="swimlane;html=1;rounded=1;horizontal=1;startSize=30;strokeColor=#667085;fillColor=#F4F6F9;fontColor=#475467;fontStyle=1;dashed=1;" vertex="1" parent="1d"><mxGeometry x="30" y="100" width="270" height="650" as="geometry"/></mxCell>
+        <mxCell id="p2-src-os" value="&lt;b&gt;Host / OS&lt;/b&gt;&lt;br&gt;machine identity • OS • mounts • capacity • clock" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#98A2B3;fontColor=#203748;" vertex="1" parent="p2-sources"><mxGeometry x="25" y="55" width="220" height="70" as="geometry"/></mxCell>
+        <mxCell id="p2-src-inv" value="&lt;b&gt;Oracle Inventory&lt;/b&gt;&lt;br&gt;oraInst • inventory XML • oratab • services" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#98A2B3;fontColor=#203748;" vertex="1" parent="p2-sources"><mxGeometry x="25" y="150" width="220" height="70" as="geometry"/></mxCell>
+        <mxCell id="p2-src-runtime" value="&lt;b&gt;Runtime&lt;/b&gt;&lt;br&gt;PMON • listener • ASM • Clusterware • owners" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#98A2B3;fontColor=#203748;" vertex="1" parent="p2-sources"><mxGeometry x="25" y="245" width="220" height="70" as="geometry"/></mxCell>
+        <mxCell id="p2-src-sql" value="&lt;b&gt;Fixed SQL Collectors&lt;/b&gt;&lt;br&gt;DBID • role • open mode • PDBs • registry" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#98A2B3;fontColor=#203748;" vertex="1" parent="p2-sources"><mxGeometry x="25" y="340" width="220" height="70" as="geometry"/></mxCell>
+        <mxCell id="p2-src-topo" value="&lt;b&gt;Topology Tools&lt;/b&gt;&lt;br&gt;srvctl • crsctl • broker • ASM evidence" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#98A2B3;fontColor=#203748;" vertex="1" parent="p2-sources"><mxGeometry x="25" y="435" width="220" height="70" as="geometry"/></mxCell>
+        <mxCell id="p2-src-ext" value="&lt;b&gt;Optional Enrichment&lt;/b&gt;&lt;br&gt;CMDB • backup • DNS • monitoring" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#98A2B3;fontColor=#203748;" vertex="1" parent="p2-sources"><mxGeometry x="25" y="530" width="220" height="70" as="geometry"/></mxCell>
+        <mxCell id="p2-agent" value="&lt;b&gt;Managed Discovery Agent&lt;/b&gt;&lt;br&gt;Fixed plugins • typed parameters • narrow privilege profiles&lt;br&gt;timeouts • limits • redaction • source coverage" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ECF8F0;strokeColor=#22643A;fontColor=#203748;fontSize=14;" vertex="1" parent="1d"><mxGeometry x="360" y="170" width="280" height="150" as="geometry"/></mxCell>
+        <mxCell id="p2-snapshot" value="&lt;b&gt;Immutable Discovery Snapshot&lt;/b&gt;&lt;br&gt;observations • relationships • errors&lt;br&gt;source • time • confidence • evidence digest&lt;br&gt;collector/schema/rule versions" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EEF5;strokeColor=#2E74B5;fontColor=#203748;fontSize=14;" vertex="1" parent="1d"><mxGeometry x="700" y="150" width="310" height="185" as="geometry"/></mxCell>
+        <mxCell id="p2-identity" value="&lt;b&gt;Identity Matcher&lt;/b&gt;&lt;br&gt;stable IDs • match score • reason codes&lt;br&gt;clone detection • conflict quarantine" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF8E8;strokeColor=#B5852B;fontColor=#203748;fontSize=14;" vertex="1" parent="1d"><mxGeometry x="1070" y="130" width="300" height="145" as="geometry"/></mxCell>
+        <mxCell id="p2-reconcile" value="&lt;b&gt;Versioned Reconciliation&lt;/b&gt;&lt;br&gt;create • update • unchanged • conflict&lt;br&gt;candidate_missing • replayable rules" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF8E8;strokeColor=#B5852B;fontColor=#203748;fontSize=14;" vertex="1" parent="1d"><mxGeometry x="1070" y="330" width="300" height="130" as="geometry"/></mxCell>
+        <mxCell id="p2-projection" value="&lt;b&gt;Current Inventory Projection&lt;/b&gt;&lt;br&gt;resources • topology • history • staleness&lt;br&gt;identity conflicts • shared-home blast radius" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EEF5;strokeColor=#2E74B5;fontColor=#203748;fontSize=14;" vertex="1" parent="1d"><mxGeometry x="700" y="420" width="310" height="145" as="geometry"/></mxCell>
+        <mxCell id="p2-decision" value="&lt;b&gt;Compliance and Readiness&lt;/b&gt;&lt;br&gt;explainable reasons • freshness policy&lt;br&gt;workflow target eligibility" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ECF8F0;strokeColor=#22643A;fontColor=#203748;fontSize=14;" vertex="1" parent="1d"><mxGeometry x="360" y="430" width="280" height="130" as="geometry"/></mxCell>
+        <mxCell id="p2-partial" value="&lt;b&gt;Safety invariant&lt;/b&gt;&lt;br&gt;A partial or failed scan may reduce confidence; it never silently deletes a resource." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4F2;strokeColor=#9B1C1C;fontColor=#9B1C1C;fontStyle=1;fontSize=14;" vertex="1" parent="1d"><mxGeometry x="360" y="640" width="650" height="80" as="geometry"/></mxCell>
+        <mxCell id="p2-ownership" value="&lt;b&gt;Field ownership&lt;/b&gt;&lt;br&gt;Agent: technical observations&lt;br&gt;Administrator: environment / criticality / window / policy&lt;br&gt;Integration: CMDB / backup / change ticket&lt;br&gt;Computed: compliance / confidence / staleness / risk" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F4F6F9;strokeColor=#667085;fontColor=#203748;fontSize=13;" vertex="1" parent="1d"><mxGeometry x="1070" y="540" width="300" height="180" as="geometry"/></mxCell>
+        <mxCell id="p2-e1" value="collect" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#667085;" edge="1" parent="1d" source="p2-sources" target="p2-agent"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2-e2" value="observations" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#22643A;" edge="1" parent="1d" source="p2-agent" target="p2-snapshot"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2-e3" value="match" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#2E74B5;" edge="1" parent="1d" source="p2-snapshot" target="p2-identity"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2-e4" value="decisions" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#B5852B;" edge="1" parent="1d" source="p2-identity" target="p2-reconcile"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2-e5" value="project" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#B5852B;" edge="1" parent="1d" source="p2-reconcile" target="p2-projection"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p2-e6" value="evaluate" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#2E74B5;" edge="1" parent="1d" source="p2-projection" target="p2-decision"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="patch-lifecycle" name="3. Patch Lifecycle and Recovery">
+    <mxGraphModel dx="1800" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0p"/>
+        <mxCell id="1p" parent="0p"/>
+        <mxCell id="p3-title" value="Approved Patch Lifecycle — Observe, Act, Verify, Reconcile" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontSize=24;fontStyle=1;fontColor=#203748;" vertex="1" parent="1p"><mxGeometry x="300" y="20" width="1200" height="40" as="geometry"/></mxCell>
+        <mxCell id="p3-plan" value="&lt;b&gt;1. Immutable Change &amp;amp; Plan&lt;/b&gt;&lt;br&gt;targets • topology revision • artifact digests • recovery" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EEF5;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="40" y="120" width="240" height="85" as="geometry"/></mxCell>
+        <mxCell id="p3-rediscover" value="&lt;b&gt;2. Freeze &amp;amp; Rediscover&lt;/b&gt;&lt;br&gt;identity • topology • inventory • blast radius" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EEF5;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="330" y="120" width="240" height="85" as="geometry"/></mxCell>
+        <mxCell id="p3-artifact" value="&lt;b&gt;3. Validate Artifact&lt;/b&gt;&lt;br&gt;digest • metadata • platform • safe staging" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EEF5;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="620" y="120" width="240" height="85" as="geometry"/></mxCell>
+        <mxCell id="p3-precheck" value="Prechecks ready?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFF8E8;strokeColor=#B5852B;fontColor=#203748;fontStyle=1;fontSize=14;" vertex="1" parent="1p"><mxGeometry x="920" y="105" width="190" height="115" as="geometry"/></mxCell>
+        <mxCell id="p3-blocked" value="&lt;b&gt;BLOCKED&lt;/b&gt;&lt;br&gt;Publish reason-coded findings and evidence" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4F2;strokeColor=#9B1C1C;fontColor=#9B1C1C;fontStyle=1;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="930" y="280" width="190" height="80" as="geometry"/></mxCell>
+        <mxCell id="p3-approval" value="&lt;b&gt;4. Approval Gate&lt;/b&gt;&lt;br&gt;bind plan hash • targets • topology • artifacts • policy • window" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF8E8;strokeColor=#B5852B;fontColor=#203748;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="1170" y="120" width="260" height="85" as="geometry"/></mxCell>
+        <mxCell id="p3-window" value="Window and approvals valid?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFF8E8;strokeColor=#B5852B;fontColor=#203748;fontStyle=1;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="1490" y="105" width="210" height="115" as="geometry"/></mxCell>
+        <mxCell id="p3-quiesce" value="&lt;b&gt;5. Quiesce&lt;/b&gt;&lt;br&gt;drain traffic • stop only approved services" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9F8;strokeColor=#9B1C1C;fontColor=#203748;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="1460" y="310" width="240" height="80" as="geometry"/></mxCell>
+        <mxCell id="p3-apply" value="&lt;b&gt;6. Apply Binary Patch&lt;/b&gt;&lt;br&gt;typed adapter • durable local supervisor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9F8;strokeColor=#9B1C1C;fontColor=#203748;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="1170" y="310" width="240" height="80" as="geometry"/></mxCell>
+        <mxCell id="p3-binverify" value="&lt;b&gt;7. Verify Binary State&lt;/b&gt;&lt;br&gt;re-observe inventory and exact expected patch" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9F8;strokeColor=#9B1C1C;fontColor=#203748;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="880" y="310" width="240" height="80" as="geometry"/></mxCell>
+        <mxCell id="p3-start" value="&lt;b&gt;8. Start Database&lt;/b&gt;&lt;br&gt;required mode • listeners • services • PDB states" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9F8;strokeColor=#9B1C1C;fontColor=#203748;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="590" y="310" width="240" height="80" as="geometry"/></mxCell>
+        <mxCell id="p3-sql" value="&lt;b&gt;9. SQL Patch&lt;/b&gt;&lt;br&gt;approved datapatch profile • every required container" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9F8;strokeColor=#9B1C1C;fontColor=#203748;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="300" y="310" width="240" height="80" as="geometry"/></mxCell>
+        <mxCell id="p3-post" value="Postchecks pass?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFF8E8;strokeColor=#B5852B;fontColor=#203748;fontStyle=1;fontSize=14;" vertex="1" parent="1p"><mxGeometry x="50" y="295" width="190" height="110" as="geometry"/></mxCell>
+        <mxCell id="p3-success" value="&lt;b&gt;SUCCEEDED&lt;/b&gt;&lt;br&gt;release traffic • update compliance • retain evidence and recovery point" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ECF8F0;strokeColor=#22643A;fontColor=#22643A;fontStyle=1;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="40" y="500" width="260" height="90" as="geometry"/></mxCell>
+        <mxCell id="p3-reconcile" value="&lt;b&gt;Outcome Reconciliation&lt;/b&gt;&lt;br&gt;observe process, inventory, DB state, SQL registry, and logs&lt;br&gt;COMPLETE • NOT_STARTED • RUNNING • PARTIAL • INDETERMINATE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EEF5;strokeColor=#2E74B5;fontColor=#203748;fontSize=14;" vertex="1" parent="1p"><mxGeometry x="540" y="500" width="520" height="120" as="geometry"/></mxCell>
+        <mxCell id="p3-recoverygate" value="Safe recovery path?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#FFF8E8;strokeColor=#B5852B;fontColor=#203748;fontStyle=1;fontSize=14;" vertex="1" parent="1p"><mxGeometry x="1140" y="500" width="200" height="120" as="geometry"/></mxCell>
+        <mxCell id="p3-rollback" value="&lt;b&gt;Approved Recovery Plan&lt;/b&gt;&lt;br&gt;binary rollback / switchback / SQL recovery / RMAN / topology recovery" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF8E8;strokeColor=#B5852B;fontColor=#203748;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="1430" y="490" width="300" height="100" as="geometry"/></mxCell>
+        <mxCell id="p3-manual" value="&lt;b&gt;MANUAL INTERVENTION&lt;/b&gt;&lt;br&gt;preserve evidence • block retries • run approved DBA procedure" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4F2;strokeColor=#9B1C1C;fontColor=#9B1C1C;fontStyle=1;fontSize=13;" vertex="1" parent="1p"><mxGeometry x="1120" y="720" width="300" height="95" as="geometry"/></mxCell>
+        <mxCell id="p3-rule" value="&lt;b&gt;Execution invariant&lt;/b&gt;&lt;br&gt;Transport failure is not Oracle failure. Exit code zero is not sufficient. Every destructive phase advances only after an independently observed completion predicate." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F7FB;strokeColor=#2E74B5;fontColor=#1F4D78;fontStyle=1;fontSize=14;" vertex="1" parent="1p"><mxGeometry x="300" y="720" width="700" height="95" as="geometry"/></mxCell>
+        <mxCell id="p3-e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#2E74B5;" edge="1" parent="1p" source="p3-plan" target="p3-rediscover"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#2E74B5;" edge="1" parent="1p" source="p3-rediscover" target="p3-artifact"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#2E74B5;" edge="1" parent="1p" source="p3-artifact" target="p3-precheck"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e4" value="no" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;fontColor=#9B1C1C;" edge="1" parent="1p" source="p3-precheck" target="p3-blocked"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e5" value="yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#22643A;fontColor=#22643A;" edge="1" parent="1p" source="p3-precheck" target="p3-approval"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#B5852B;" edge="1" parent="1p" source="p3-approval" target="p3-window"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e7" value="yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#22643A;fontColor=#22643A;" edge="1" parent="1p" source="p3-window" target="p3-quiesce"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e8" value="no / expired" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;fontColor=#9B1C1C;" edge="1" parent="1p" source="p3-window" target="p3-blocked"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;" edge="1" parent="1p" source="p3-quiesce" target="p3-apply"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;" edge="1" parent="1p" source="p3-apply" target="p3-binverify"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;" edge="1" parent="1p" source="p3-binverify" target="p3-start"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;" edge="1" parent="1p" source="p3-start" target="p3-sql"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;" edge="1" parent="1p" source="p3-sql" target="p3-post"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e14" value="yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#22643A;fontColor=#22643A;" edge="1" parent="1p" source="p3-post" target="p3-success"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e15" value="failure / unknown" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;fontColor=#9B1C1C;" edge="1" parent="1p" source="p3-post" target="p3-reconcile"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e16" value="failure / lost acknowledgement" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;fontColor=#9B1C1C;dashed=1;" edge="1" parent="1p" source="p3-apply" target="p3-reconcile"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#2E74B5;" edge="1" parent="1p" source="p3-reconcile" target="p3-recoverygate"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e18" value="approved and supported" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#B5852B;fontColor=#7A5A00;" edge="1" parent="1p" source="p3-recoverygate" target="p3-rollback"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p3-e19" value="ambiguous / unsupported" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;fontColor=#9B1C1C;" edge="1" parent="1p" source="p3-recoverygate" target="p3-manual"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="delivery-waves" name="4. Delivery Waves and Gates">
+    <mxGraphModel dx="1700" dy="950" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="950" math="0" shadow="0">
+      <root>
+        <mxCell id="0w"/>
+        <mxCell id="1w" parent="0w"/>
+        <mxCell id="p4-title" value="Contract-First Parallel Delivery — 114 Independently Testable Work Packages" style="text;html=1;strokeColor=none;fillColor=none;align=center;fontSize=24;fontStyle=1;fontColor=#203748;" vertex="1" parent="1w"><mxGeometry x="250" y="20" width="1200" height="40" as="geometry"/></mxCell>
+        <mxCell id="p4-start" value="&lt;b&gt;START HERE&lt;/b&gt;&lt;br&gt;CON-01 Canonical identities" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ECF8F0;strokeColor=#22643A;fontColor=#22643A;fontStyle=1;fontSize=15;" vertex="1" parent="1w"><mxGeometry x="40" y="100" width="240" height="90" as="geometry"/></mxCell>
+        <mxCell id="p4-w0" value="&lt;b&gt;Wave 0 — Freeze System Language&lt;/b&gt;&lt;br&gt;IDs • schemas • errors • task/result/event contracts • compatibility" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EEF5;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="1w"><mxGeometry x="340" y="100" width="300" height="90" as="geometry"/></mxCell>
+        <mxCell id="p4-w1" value="&lt;b&gt;Wave 1 — Parallel Foundations&lt;/b&gt;&lt;br&gt;agent transport • inventory persistence • artifact store • security/audit • workflow kernel • CI/lab" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EEF5;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="1w"><mxGeometry x="700" y="100" width="380" height="90" as="geometry"/></mxCell>
+        <mxCell id="p4-w2" value="&lt;b&gt;Wave 2 — Trustworthy Inventory&lt;/b&gt;&lt;br&gt;standalone discovery • identity reconciliation • conflicts • history • accuracy metrics" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8EEF5;strokeColor=#2E74B5;fontColor=#203748;fontSize=13;" vertex="1" parent="1w"><mxGeometry x="1140" y="100" width="380" height="90" as="geometry"/></mxCell>
+        <mxCell id="p4-w3" value="&lt;b&gt;Wave 3 — Readiness Product&lt;/b&gt;&lt;br&gt;patch metadata • compliance • policy • approvals • locks • read-only prechecks" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF8E8;strokeColor=#B5852B;fontColor=#203748;fontSize=13;" vertex="1" parent="1w"><mxGeometry x="1140" y="300" width="380" height="90" as="geometry"/></mxCell>
+        <mxCell id="p4-w4" value="&lt;b&gt;Wave 4 — Fault-Injected Simulator&lt;/b&gt;&lt;br&gt;duplicate • restart • expiry • storage failure • approval drift • recovery ordering" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF8E8;strokeColor=#B5852B;fontColor=#203748;fontSize=13;" vertex="1" parent="1w"><mxGeometry x="700" y="300" width="380" height="90" as="geometry"/></mxCell>
+        <mxCell id="p4-w5" value="&lt;b&gt;Wave 5 — Standalone Oracle Lab&lt;/b&gt;&lt;br&gt;RU execution • interruption matrix • rollback/recovery drills • disabled-by-default production gate" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9F8;strokeColor=#9B1C1C;fontColor=#203748;fontSize=13;" vertex="1" parent="1w"><mxGeometry x="260" y="300" width="380" height="90" as="geometry"/></mxCell>
+        <mxCell id="p4-w6" value="&lt;b&gt;Wave 6 — Productize and Pilot&lt;/b&gt;&lt;br&gt;UI • integrations • on-prem/air-gapped packaging • recovery drill • non-production canary" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ECF8F0;strokeColor=#22643A;fontColor=#203748;fontSize=13;" vertex="1" parent="1w"><mxGeometry x="260" y="500" width="380" height="90" as="geometry"/></mxCell>
+        <mxCell id="p4-w7" value="&lt;b&gt;Wave 7 — Topology Expansion&lt;/b&gt;&lt;br&gt;OJVM • Data Guard • GI/RAC through separate adapters and release gates" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ECF8F0;strokeColor=#22643A;fontColor=#203748;fontSize=13;" vertex="1" parent="1w"><mxGeometry x="700" y="500" width="380" height="90" as="geometry"/></mxCell>
+        <mxCell id="p4-gates" value="&lt;b&gt;QUALITY GATES&lt;/b&gt;&lt;br&gt;Q0 Contract → Q1 Read-only safety → Q2 Discovery accuracy → Q3 Degraded operation → Q4 Simulation → Q5 Standalone lab → Q6 Topology → Q7 Pilot/production" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F7FB;strokeColor=#2E74B5;fontColor=#1F4D78;fontStyle=1;fontSize=14;" vertex="1" parent="1w"><mxGeometry x="1140" y="480" width="380" height="130" as="geometry"/></mxCell>
+        <mxCell id="p4-lanes" value="&lt;b&gt;Parallel workstreams after contract freeze&lt;/b&gt;&lt;br&gt;Agent | Discovery | Inventory | Artifact/Compliance | Security | Workflow | Readiness | Execution | Experience | Quality/Platform" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F4F6F9;strokeColor=#667085;fontColor=#203748;fontSize=14;" vertex="1" parent="1w"><mxGeometry x="260" y="700" width="1260" height="90" as="geometry"/></mxCell>
+        <mxCell id="p4-rule" value="Production execution remains disabled until the relevant quality gate is signed off with retained evidence." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF4F2;strokeColor=#9B1C1C;fontColor=#9B1C1C;fontStyle=1;fontSize=14;" vertex="1" parent="1w"><mxGeometry x="480" y="840" width="820" height="55" as="geometry"/></mxCell>
+        <mxCell id="p4-e0" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#22643A;" edge="1" parent="1w" source="p4-start" target="p4-w0"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4-e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#2E74B5;" edge="1" parent="1w" source="p4-w0" target="p4-w1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4-e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#2E74B5;" edge="1" parent="1w" source="p4-w1" target="p4-w2"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4-e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#B5852B;" edge="1" parent="1w" source="p4-w2" target="p4-w3"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4-e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#B5852B;" edge="1" parent="1w" source="p4-w3" target="p4-w4"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4-e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#9B1C1C;" edge="1" parent="1w" source="p4-w4" target="p4-w5"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4-e6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#22643A;" edge="1" parent="1w" source="p4-w5" target="p4-w6"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="p4-e7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#22643A;" edge="1" parent="1w" source="p4-w6" target="p4-w7"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

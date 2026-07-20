@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+OPU_PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+# These are fixed, package-owned modules. No user-controlled path is sourced.
+# shellcheck source=../lib/opu/common.sh
+. "$OPU_PROJECT_ROOT/lib/opu/common.sh"
+# shellcheck source=../lib/opu/journal.sh
+. "$OPU_PROJECT_ROOT/lib/opu/journal.sh"
+# shellcheck source=../lib/opu/discovery.sh
+. "$OPU_PROJECT_ROOT/lib/opu/discovery.sh"
+# shellcheck source=../operations/discovery/host.sh
+. "$OPU_PROJECT_ROOT/operations/discovery/host.sh"
+# shellcheck source=../operations/discovery/oracle_homes.sh
+. "$OPU_PROJECT_ROOT/operations/discovery/oracle_homes.sh"
+# shellcheck source=../lib/opu/registry.sh
+. "$OPU_PROJECT_ROOT/lib/opu/registry.sh"
+
+opu_runtime_init || exit $?
+
+opu_usage() {
+    printf '%s\n' \
+        'Usage:' \
+        '  opu-agent operations' \
+        '  opu-agent version' \
+        '  opu-agent doctor' \
+        '  opu-agent run --operation NAME --operation-version VERSION \' \
+        '      --task-id ID --idempotency-key KEY [--state-dir ABSOLUTE_PATH]' \
+        '  opu-agent result --idempotency-key KEY [--state-dir ABSOLUTE_PATH]'
+}
+
+opu_result_error_json() {
+    local code message retryable
+    code=$1
+    message=$2
+    retryable=$3
+    printf '{"code":%s,"message":%s,"retryable":%s}' \
+        "$(opu_json_string "$code")" \
+        "$(opu_json_string "$message")" \
+        "$retryable"
+}
+
+opu_write_result_envelope() {
+    local destination status task_id operation operation_version idempotency_key
+    local mutability started_at finished_at exit_code payload_file run_dir
+    local error_code error_message error_retryable request_hash payload_hash stdout_hash stderr_hash
+
+    destination=$1
+    status=$2
+    task_id=$3
+    operation=$4
+    operation_version=$5
+    idempotency_key=$6
+    mutability=$7
+    started_at=$8
+    finished_at=$9
+    exit_code=${10}
+    payload_file=${11}
+    run_dir=${12}
+    request_hash=${13}
+    error_code=${14}
+    error_message=${15}
+    error_retryable=${16}
+
+    payload_hash=$(opu_hash_file "$payload_file") || return
+    stdout_hash=$(opu_hash_file "$run_dir/stdout.log") || return
+    stderr_hash=$(opu_hash_file "$run_dir/stderr.log") || return
+
+    {
+        printf '{\n'
+        printf '  "schema_version": %s,\n' "$(opu_json_string "$OPU_RESULT_SCHEMA_VERSION")"
+        printf '  "agent_version": %s,\n' "$(opu_json_string "$OPU_AGENT_VERSION")"
+        printf '  "task_id": %s,\n' "$(opu_json_string "$task_id")"
+        printf '  "operation": {'
+        printf '"name":%s,' "$(opu_json_string "$operation")"
+        printf '"version":%s,' "$(opu_json_string "$operation_version")"
+        printf '"mutability":%s' "$(opu_json_string "$mutability")"
+        printf '},\n'
+        printf '  "idempotency_key": %s,\n' "$(opu_json_string "$idempotency_key")"
+        printf '  "status": %s,\n' "$(opu_json_string "$status")"
+        printf '  "started_at": %s,\n' "$(opu_json_string "$started_at")"
+        printf '  "finished_at": %s,\n' "$(opu_json_string "$finished_at")"
+        printf '  "exit_code": %s,\n' "$exit_code"
+        if [ "$status" = "succeeded" ]; then
+            printf '  "error": null,\n'
+        else
+            printf '  "error": %s,\n' \
+                "$(opu_result_error_json "$error_code" "$error_message" "$error_retryable")"
+        fi
+        printf '  "evidence": {'
+        printf '"run_directory":%s,' "$(opu_json_string "$run_dir")"
+        printf '"request_sha256":%s,' "$(opu_json_string "$request_hash")"
+        printf '"payload_sha256":%s,' "$(opu_json_string "$payload_hash")"
+        printf '"stdout_sha256":%s,' "$(opu_json_string "$stdout_hash")"
+        printf '"stderr_sha256":%s' "$(opu_json_string "$stderr_hash")"
+        printf '},\n'
+        printf '  "payload": '
+        while IFS= read -r line || [ -n "$line" ]; do
+            printf '%s\n' "$line"
+        done <"$payload_file"
+        printf '}\n'
+    } >"$destination"
+}
+
+opu_run() {
+    local operation operation_version task_id idempotency_key
+    local completion_dir run_dir result_file result_rc
+    local started_at finished_at operation_rc status payload_file result_tmp
+    local error_code error_message error_retryable request_hash existing_request_hash
+
+    operation=""
+    operation_version=""
+    task_id=""
+    idempotency_key=""
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --operation)
+                [ "$#" -ge 2 ] || { opu_error "--operation requires a value"; return 64; }
+                operation=$2
+                shift 2
+                ;;
+            --operation-version)
+                [ "$#" -ge 2 ] || { opu_error "--operation-version requires a value"; return 64; }
+                operation_version=$2
+                shift 2
+                ;;
+            --task-id)
+                [ "$#" -ge 2 ] || { opu_error "--task-id requires a value"; return 64; }
+                task_id=$2
+                shift 2
+                ;;
+            --idempotency-key)
+                [ "$#" -ge 2 ] || { opu_error "--idempotency-key requires a value"; return 64; }
+                idempotency_key=$2
+                shift 2
+                ;;
+            --state-dir)
+                [ "$#" -ge 2 ] || { opu_error "--state-dir requires a value"; return 64; }
+                OPU_STATE_DIR=$2
+                shift 2
+                ;;
+            *)
+                opu_error "unknown run argument: $1"
+                return 64
+                ;;
+        esac
+    done
+
+    opu_check_runtime || return
+    opu_validate_operation_name "$operation" || return
+    opu_validate_identifier "$task_id" "task ID" || return
+    opu_validate_identifier "$idempotency_key" "idempotency key" || return
+    case "$operation_version" in
+        "" | *[!0-9]*)
+            opu_error "operation version must be a positive integer"
+            return 64
+            ;;
+    esac
+    if [ "${#operation_version}" -gt 9 ]; then
+        opu_error "operation version is outside the supported numeric range"
+        return 64
+    fi
+    if [ "$operation_version" -lt 1 ]; then
+        opu_error "operation version must be a positive integer"
+        return 64
+    fi
+
+    opu_validate_absolute_path "$OPU_FS_ROOT" "filesystem root" || return
+    if [ "$OPU_FS_ROOT" != "/" ] && [ "$OPU_TEST_MODE" != "1" ]; then
+        opu_error "an alternate filesystem root is permitted only in test mode"
+        return 64
+    fi
+
+    opu_registry_resolve "$operation" "$operation_version" || return
+    opu_prepare_state_directory || return
+    opu_bind_task_id "$task_id" "$idempotency_key" || return
+    opu_acquire_lock "$idempotency_key" || return
+    trap 'opu_release_lock' EXIT
+    trap 'opu_release_lock; exit 130' HUP INT TERM
+
+    completion_dir="$OPU_STATE_DIR/results/$idempotency_key"
+    request_hash=$(opu_hash_string \
+        "task_id=${task_id}\noperation=${operation}\nversion=${operation_version}\nidempotency_key=${idempotency_key}") || return
+    if [ -f "$completion_dir/complete" ]; then
+        opu_verify_completed_result "$completion_dir" || return
+        if ! IFS= read -r existing_request_hash <"$completion_dir/request.sha256"; then
+            opu_error "completed result is missing its request fingerprint"
+            return 74
+        fi
+        if [ "$existing_request_hash" != "$request_hash" ]; then
+            opu_error "idempotency key was reused with a different request"
+            return 65
+        fi
+        result_file="$completion_dir/result.json"
+        if ! IFS= read -r result_rc <"$completion_dir/exit_code"; then
+            opu_error "completed result is missing its exit code"
+            return 74
+        fi
+        while IFS= read -r line || [ -n "$line" ]; do
+            printf '%s\n' "$line"
+        done <"$result_file"
+        opu_release_lock
+        trap - EXIT HUP INT TERM
+        return "$result_rc"
+    fi
+
+    run_dir="$OPU_STATE_DIR/runs/$task_id"
+    if ! mkdir "$run_dir" 2>/dev/null; then
+        opu_error "an incomplete run already exists for task $task_id; outcome is unknown"
+        return 76
+    fi
+    printf '%s\n' "$request_hash" >"$run_dir/request.sha256" || return 74
+
+    started_at=$(opu_now_utc) || return
+    opu_append_event "$run_dir/events.jsonl" "operation_started" "running" || return
+    : >"$run_dir/stdout.log" || return 74
+    : >"$run_dir/stderr.log" || return 74
+    payload_file="$run_dir/payload.json"
+    OPU_ERROR_CODE=""
+    OPU_ERROR_MESSAGE=""
+    OPU_ERROR_RETRYABLE=false
+
+    "$OPU_OPERATION_FUNCTION" "$payload_file" \
+        >"$run_dir/stdout.log" 2>"$run_dir/stderr.log"
+    operation_rc=$?
+
+    if [ "$operation_rc" -eq 0 ] && [ ! -s "$payload_file" ]; then
+        operation_rc=70
+        opu_operation_error \
+            "AGENT_EMPTY_OPERATION_RESULT" \
+            "The registered operation returned no payload." \
+            false
+    fi
+
+    if [ "$operation_rc" -eq 0 ]; then
+        status="succeeded"
+        error_code=""
+        error_message=""
+        error_retryable=false
+    else
+        status="failed"
+        error_code=${OPU_ERROR_CODE:-AGENT_OPERATION_FAILED}
+        error_message=${OPU_ERROR_MESSAGE:-The registered operation failed.}
+        error_retryable=${OPU_ERROR_RETRYABLE:-false}
+        if [ ! -s "$payload_file" ]; then
+            printf '{}\n' >"$payload_file"
+        fi
+    fi
+
+    case "$error_retryable" in
+        true | false) ;;
+        *) error_retryable=false ;;
+    esac
+
+    finished_at=$(opu_now_utc) || return
+    result_tmp="$run_dir/result.json"
+    opu_write_result_envelope \
+        "$result_tmp" "$status" "$task_id" "$operation" "$operation_version" \
+        "$idempotency_key" "$OPU_OPERATION_MUTABILITY" "$started_at" "$finished_at" \
+        "$operation_rc" "$payload_file" "$run_dir" "$request_hash" "$error_code" "$error_message" \
+        "$error_retryable" || return
+    opu_append_event "$run_dir/events.jsonl" "operation_finished" "$status" || return
+    opu_publish_completion "$result_tmp" "$operation_rc" "$request_hash" "$completion_dir" || {
+        opu_error "could not atomically publish task completion"
+        return 74
+    }
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$line"
+    done <"$completion_dir/result.json"
+
+    opu_release_lock
+    trap - EXIT HUP INT TERM
+    return "$operation_rc"
+}
+
+opu_get_result() {
+    local idempotency_key completion_dir
+    idempotency_key=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --idempotency-key)
+                [ "$#" -ge 2 ] || { opu_error "--idempotency-key requires a value"; return 64; }
+                idempotency_key=$2
+                shift 2
+                ;;
+            --state-dir)
+                [ "$#" -ge 2 ] || { opu_error "--state-dir requires a value"; return 64; }
+                OPU_STATE_DIR=$2
+                shift 2
+                ;;
+            *)
+                opu_error "unknown result argument: $1"
+                return 64
+                ;;
+        esac
+    done
+    opu_validate_identifier "$idempotency_key" "idempotency key" || return
+    opu_validate_absolute_path "$OPU_STATE_DIR" "state directory" || return
+    completion_dir="$OPU_STATE_DIR/results/$idempotency_key"
+    if [ ! -f "$completion_dir/complete" ]; then
+        opu_error "no completed result exists for idempotency key: $idempotency_key"
+        return 66
+    fi
+    opu_verify_completed_result "$completion_dir" || return
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$line"
+    done <"$completion_dir/result.json"
+}
+
+opu_doctor() {
+    local bash_status flock_status hash_status overall
+    bash_status="pass"
+    flock_status="pass"
+    hash_status="pass"
+    overall="pass"
+
+    if ! opu_check_runtime >/dev/null 2>&1; then
+        bash_status="blocker"
+        overall="blocker"
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        flock_status="blocker"
+        overall="blocker"
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        hash_status="blocker"
+        overall="blocker"
+    fi
+
+    printf '{"status":%s,"checks":{' "$(opu_json_string "$overall")"
+    printf '"bash":%s,' "$(opu_json_string "$bash_status")"
+    printf '"flock":%s,' "$(opu_json_string "$flock_status")"
+    printf '"sha256sum":%s' "$(opu_json_string "$hash_status")"
+    printf '},"bash_version":%s}\n' "$(opu_json_string "$BASH_VERSION")"
+
+    [ "$overall" = "pass" ]
+}
+
+opu_main() {
+    local command
+    command=${1:-help}
+    if [ "$#" -gt 0 ]; then
+        shift
+    fi
+
+    case "$command" in
+        operations) opu_registry_print ;;
+        version) printf '%s\n' "$OPU_AGENT_VERSION" ;;
+        doctor) opu_doctor ;;
+        run) opu_run "$@" ;;
+        result) opu_get_result "$@" ;;
+        help | --help | -h) opu_usage ;;
+        *)
+            opu_error "unknown command: $command"
+            opu_usage >&2
+            return 64
+            ;;
+    esac
+}
+
+opu_main "$@"

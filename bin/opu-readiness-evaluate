@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Produces a fail-closed, evidence-bound readiness decision. This command is
+# read-only: a ready result permits generation of an approval request only.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+RECONCILIATION=""; ARTIFACT=""; PROCEDURE=""; COMPATIBILITY=""; POLICY=""; OUT=""
+declare -a SNAPSHOTS=() GATES=()
+usage() { printf '%s\n' 'Usage: opu-readiness-evaluate --reconciliation ABSOLUTE_JSON --snapshot ABSOLUTE_JSON [--snapshot ABSOLUTE_JSON ...] --artifact ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON --compatibility ABSOLUTE_JSON --policy ABSOLUTE_JSON [--output ABSOLUTE_JSON]'; }
+gate() { GATES+=("$1|$2|$3"); }
+require_file() { local f=$1 label=$2; opu_validate_absolute_path "$f" "$label" || exit $?; [ -f "$f" ] && [ ! -L "$f" ] || { echo "$label is missing or symbolic link: $f" >&2; exit 66; }; }
+parse() {
+  while [ "$#" -gt 0 ]; do case "$1" in
+    --reconciliation) RECONCILIATION=${2:-}; shift 2;; --snapshot) SNAPSHOTS+=("${2:-}"); shift 2;;
+    --artifact) ARTIFACT=${2:-}; shift 2;; --procedure-validation) PROCEDURE=${2:-}; shift 2;;
+    --compatibility) COMPATIBILITY=${2:-}; shift 2;; --policy) POLICY=${2:-}; shift 2;;
+    --output) OUT=${2:-}; shift 2;; -h|--help) usage; exit 0;; *) usage >&2; exit 64;; esac; done
+  [ "${#SNAPSHOTS[@]}" -gt 0 ] || { usage >&2; exit 64; }
+  for pair in "$RECONCILIATION|reconciliation" "$ARTIFACT|artifact" "$PROCEDURE|procedure-validation" "$COMPATIBILITY|compatibility" "$POLICY|policy"; do require_file "${pair%%|*}" "${pair#*|}"; done
+  for f in "${SNAPSHOTS[@]}"; do require_file "$f" snapshot; done
+  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  command -v jq >/dev/null || { echo 'jq is required' >&2; exit 69; }
+}
+epoch() { date -u -d "$1" +%s 2>/dev/null || date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || return 1; }
+iso_from_epoch() { date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || return 1; }
+gate_json() { local item first=1; printf '['; for item in "${GATES[@]}"; do [ "$first" -eq 1 ] || printf ','; jq -cn --arg name "${item%%|*}" --arg status "$(cut -d'|' -f2 <<<"$item")" --arg detail "$(cut -d'|' -f3- <<<"$item")" '{name:$name,status:$status,detail:$detail}'; first=0; done; printf ']'; }
+has_blocker() { local item; for item in "${GATES[@]}"; do [ "$(cut -d'|' -f2 <<<"$item")" = blocker ] && return 0; done; return 1; }
+check_contracts() {
+  jq -e '.schema_version == "1.0" and (.maximum_snapshot_age_seconds | type == "number" and . > 0) and (.require_xml_inventory | type == "boolean") and (.recovery.require_backup | type == "boolean") and (.recovery.max_backup_age_minutes | type == "number" and . >= 0) and (.recovery.minimum_fra_free_bytes | type == "number" and . >= 0) and (.recovery.require_guaranteed_restore_point | type == "boolean") and (.database.require_primary_read_write | type == "boolean") and (.database.maximum_invalid_objects | type == "number" and . >= 0)' "$POLICY" >/dev/null || { echo 'readiness policy violates the v1 contract' >&2; exit 65; }
+  jq -e '.schema_version == "1.0" and (.status == "ready_for_planning") and (.procedure.patch_id | test("^[0-9]{1,20}$")) and (.procedure.artifact_sha256 | test("^[a-f0-9]{64}$")) and (.procedure.target.platform_id | test("^[0-9]+$"))' "$PROCEDURE" >/dev/null || { echo 'procedure validation result is not ready or lacks a sealed platform' >&2; exit 65; }
+}
+target_homes() { local snapshot=$1; if [ "$TARGET_FAMILY" = grid ]; then jq -r '[.cluster.grid_home] | .[] | select(type == "string" and length > 0) | [. , "grid"] | @tsv' "$snapshot"; else jq -r '.databases[] | [.oracle_home, .db_unique_name] | @tsv' "$snapshot"; fi; }
+check_recovery() {
+  local snapshot=$1 host=$2 db=$3 require_backup max_age min_free require_grp age limit used free grp
+  require_backup=$(jq -r '.recovery.require_backup' "$POLICY"); max_age=$(jq -r '.recovery.max_backup_age_minutes' "$POLICY"); min_free=$(jq -r '.recovery.minimum_fra_free_bytes' "$POLICY"); require_grp=$(jq -r '.recovery.require_guaranteed_restore_point' "$POLICY")
+  # Discovery v1 emits backup_age_minutes. Accept the earlier internal name
+  # as a compatibility fallback so valid recovery evidence is never ignored.
+  age=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | (.runtime.backup_age_minutes // .runtime.latest_backup_age_minutes // -1)' "$snapshot")
+  limit=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.fra_space_limit_bytes // -1' "$snapshot"); used=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.fra_space_used_bytes // -1' "$snapshot"); free=$((limit-used))
+  grp=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.guaranteed_restore_points // -1' "$snapshot")
+  [ "$require_backup" = false ] || { [ "$age" -ge 0 ] 2>/dev/null && [ "$age" -le "$max_age" ] || gate recovery_backup blocker "$host database $db has no backup within policy age."; }
+  [ "$free" -ge "$min_free" ] 2>/dev/null || gate recovery_fra blocker "$host database $db has insufficient FRA free capacity."
+  [ "$require_grp" = false ] || { [ "$grp" -gt 0 ] 2>/dev/null || gate recovery_restore_point blocker "$host database $db has no guaranteed restore point."; }
+}
+check_snapshots() {
+  local expected host collected now age max_age source grid_status upgrade target_path db runtime invalid sqlpatch pdb
+  local snapshot snapshot_sha supplied_evidence='[]' reconciled_evidence
+  expected=$(jq -cr '.expected_nodes | sort | unique' "$RECONCILIATION")
+  [ "$(jq -r '.status' "$RECONCILIATION")" = consistent ] && gate topology pass 'All supplied topology snapshots reconcile.' || gate topology blocker 'Topology reconciliation is blocked.'
+  [ "$(jq -r '.require_xml_inventory' "$POLICY")" = true ] && source=xml || source=any
+  max_age=$(jq -r '.maximum_snapshot_age_seconds' "$POLICY"); now=$(date -u +%s)
+  local seen_hosts=" "
+  for snapshot in "${SNAPSHOTS[@]}"; do
+    snapshot_sha=$(opu_hash_file "$snapshot")
+    supplied_evidence=$(jq -cn --argjson current "$supplied_evidence" --arg path "$snapshot" --arg sha "$snapshot_sha" '$current + [{path:$path,sha256:$sha}]')
+    jq -e '.schema_version == "1.0" and .collector.name == "oracle.topology.discover"' "$snapshot" >/dev/null || { gate snapshot_contract blocker "Invalid topology snapshot: $snapshot"; continue; }
+    host=$(jq -r '.host.name | split(".")[0]' "$snapshot"); [[ "$seen_hosts" != *" $host "* ]] || { gate snapshot_duplicate blocker "Duplicate snapshot for node $host."; continue; }; seen_hosts+="$host "
+    jq -e --arg h "$host" '.expected_nodes | index($h)' "$RECONCILIATION" >/dev/null || gate snapshot_membership blocker "Snapshot node $host is not in reconciled active membership."
+    collected=$(jq -r '.collected_at' "$snapshot"); if age=$(epoch "$collected"); then age=$((now-age)); [ "$age" -ge 0 ] && [ "$age" -le "$max_age" ] || gate snapshot_freshness blocker "Snapshot for $host is stale or future-dated ($collected)."; else gate snapshot_freshness blocker "Snapshot for $host has an unparsable timestamp."; fi
+    if [ "$TARGET_FAMILY" = grid ]; then
+      grid_status=$(jq -r '.cluster.runtime.status // "unknown"' "$snapshot"); upgrade=$(jq -r '.cluster.runtime.upgrade_state // "unknown"' "$snapshot")
+      [ "$grid_status" = healthy ] && [ "$upgrade" = NORMAL ] || gate grid_runtime blocker "$host reports Grid runtime=$grid_status upgrade_state=$upgrade."
+    fi
+    while IFS=$'\t' read -r target_path _; do
+      [ -n "$target_path" ] || continue
+      jq -e --arg h "$target_path" '.oracle_homes[] | select(.path == $h and (.owner|type == "string" and length>0) and (.version|type == "string" and length>0) and (.opatch_version|type == "string" and length>0))' "$snapshot" >/dev/null || gate home_inventory blocker "$host lacks complete Oracle inventory for $target_path."
+      jq -e --arg h "$target_path" --arg platform "$TARGET_PLATFORM" '.oracle_homes[] | select(.path == $h and .platform.status == "collected" and .platform.id == $platform and (.platform.name | type == "string" and length > 0) and .platform.source == "opatch_lsinventory_xml" and (.platform.source_sha256 | test("^[a-f0-9]{64}$")))' "$snapshot" >/dev/null || gate platform_inventory blocker "$host target home $target_path does not match sealed Oracle platform $TARGET_PLATFORM."
+      if [ "$source" = xml ]; then jq -e --arg h "$target_path" '.oracle_homes[] | select(.path == $h and .patch_inventory_source == "opatch_lsinventory_xml" and (.opatch_inventory_xml_sha256 | test("^[a-f0-9]{64}$")))' "$snapshot" >/dev/null || gate authoritative_inventory blocker "$host has no authoritative OPatch XML inventory for $target_path."; fi
+      jq -e --arg h "$target_path" --arg p "$PATCH_ID" '.oracle_homes[] | select(.path == $h) | (.patches | index($p))' "$snapshot" >/dev/null && gate patch_not_installed blocker "$host already has patch $PATCH_ID in $target_path."
+    done < <(target_homes "$snapshot")
+    while IFS=$'\t' read -r db runtime; do
+      [ -n "$db" ] || continue
+      [ "$runtime" = complete ] || { gate database_runtime blocker "$host database $db runtime is incomplete."; continue; }
+      if [ "$(jq -r '.database.require_primary_read_write' "$POLICY")" = true ]; then jq -e --arg d "$db" '.databases[] | select(.db_unique_name == $d and .runtime.database_role == "PRIMARY" and .runtime.open_mode == "READ WRITE" and .runtime.instance_state == "OPEN")' "$snapshot" >/dev/null || gate database_open blocker "$host database $db is not PRIMARY/READ WRITE/OPEN."; fi
+      invalid=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.invalid_objects // -1' "$snapshot"); sqlpatch=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.sqlpatch_non_success // -1' "$snapshot"); pdb=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.pdb_not_read_write // -1' "$snapshot")
+      [ "$invalid" -le "$(jq -r '.database.maximum_invalid_objects' "$POLICY")" ] 2>/dev/null || gate database_invalid_objects blocker "$host database $db exceeds invalid-object policy."
+      [ "$sqlpatch" = 0 ] && [ "$pdb" = 0 ] || gate database_sql_state blocker "$host database $db has failed SQL patches or non-read-write PDBs."
+      check_recovery "$snapshot" "$host" "$db"
+    done < <(jq -r '.databases[] | [.db_unique_name, (.runtime.status // "unknown")] | @tsv' "$snapshot")
+  done
+  while IFS= read -r host; do
+    [[ "$seen_hosts" == *" $host "* ]] || gate snapshot_missing blocker "No current snapshot was supplied for active node $host."
+  done < <(jq -r '.[]' <<<"$expected")
+  supplied_evidence=$(jq -cS 'sort_by(.path)' <<<"$supplied_evidence")
+  reconciled_evidence=$(jq -cS '(.snapshot_evidence // []) | sort_by(.path)' "$RECONCILIATION")
+  [ "$supplied_evidence" = "$reconciled_evidence" ] ||
+    gate snapshot_binding blocker 'Readiness snapshots do not exactly match the reconciled snapshot evidence.'
+}
+required_checks() { local snapshot node target_path; for snapshot in "${SNAPSHOTS[@]}"; do node=$(jq -r '.host.name | split(".")[0]' "$snapshot"); while IFS=$'\t' read -r target_path _; do [ -n "$target_path" ] && printf '%s\t%s\n' "$node" "$target_path"; done < <(target_homes "$snapshot"); done | sort -u; }
+check_compatibility() {
+  local node target_path
+  jq -e --arg p "$PATCH_ID" --arg a "$ARTIFACT_SHA" --arg platform "$TARGET_PLATFORM" '.schema_version == "1.0" and .status == "passed" and .patch_id == $p and .artifact_sha256 == $a and .target.platform_id == $platform and (.checks | type == "array")' "$COMPATIBILITY" >/dev/null || { gate compatibility_contract blocker 'Compatibility evidence is missing, failed, or not bound to this artifact and platform.'; return; }
+  while IFS=$'\t' read -r node target_path; do jq -e --arg n "$node" --arg h "$target_path" --arg platform "$TARGET_PLATFORM" '.checks[] | select(.node == $n and .home == $h and .status == "passed" and .platform.status == "passed" and .platform.host_id == $platform and .platform.procedure_id == $platform and .platform.artifact_ids == [$platform] and .opatch.status == "passed" and .applicability_check.name == "CheckPatchApplicableOnCurrentPlatform" and .applicability_check.status == "passed" and .applicability_check.exit_code == 0 and (.applicability_check.evidence_path | startswith("/")) and (.applicability_check.evidence_sha256 | test("^[a-f0-9]{64}$")) and .conflict_check.name == "CheckConflictAgainstOHWithDetail" and .conflict_check.status == "passed" and .conflict_check.exit_code == 0 and (.conflict_check.evidence_path | startswith("/")) and (.conflict_check.evidence_sha256 | test("^[a-f0-9]{64}$")))' "$COMPATIBILITY" >/dev/null || gate compatibility_home blocker "No passing, hashed platform-applicability and conflict result for $node:$target_path."; done < <(required_checks)
+}
+emit() {
+  local file=$1 status hashes snapshot snapshot_json='[]' host collected collected_epoch valid_epoch valid_at
+  local evaluated_at max_age earliest_valid=0 snapshot_sha
+  if has_blocker; then status=blocked; else status=ready_for_approval; fi
+  evaluated_at=$(opu_now_utc)
+  max_age=$(jq -r '.maximum_snapshot_age_seconds' "$POLICY")
+  for snapshot in "${SNAPSHOTS[@]}"; do
+    host=$(jq -r '.host.name | ascii_downcase | split(".")[0]' "$snapshot")
+    collected=$(jq -r '.collected_at' "$snapshot")
+    collected_epoch=$(epoch "$collected") || collected_epoch=0
+    valid_epoch=$((collected_epoch + max_age))
+    valid_at=$(iso_from_epoch "$valid_epoch") || valid_at=1970-01-01T00:00:00Z
+    snapshot_sha=$(opu_hash_file "$snapshot")
+    snapshot_json=$(jq -cn --argjson current "$snapshot_json" --arg path "$snapshot" --arg sha "$snapshot_sha" \
+      --arg host "$host" --arg collected "$collected" --arg valid "$valid_at" \
+      '$current + [{path:$path,sha256:$sha,host:$host,collected_at:$collected,valid_until:$valid}]')
+    if [ "$earliest_valid" -eq 0 ] || [ "$valid_epoch" -lt "$earliest_valid" ]; then earliest_valid=$valid_epoch; fi
+  done
+  snapshot_json=$(jq -cS 'sort_by(.path)' <<<"$snapshot_json")
+  valid_at=$(iso_from_epoch "$earliest_valid") || valid_at=1970-01-01T00:00:00Z
+  hashes=$(jq -cn --arg reconciliation "$(opu_hash_file "$RECONCILIATION")" --arg artifact "$(opu_hash_file "$ARTIFACT")" --arg procedure_validation "$(opu_hash_file "$PROCEDURE")" --arg compatibility "$(opu_hash_file "$COMPATIBILITY")" --arg policy "$(opu_hash_file "$POLICY")" '{reconciliation_sha256:$reconciliation,artifact_manifest_sha256:$artifact,procedure_validation_sha256:$procedure_validation,compatibility_sha256:$compatibility,policy_sha256:$policy}')
+  jq -cn --arg status "$status" --arg patch "$PATCH_ID" --arg family "$TARGET_FAMILY" --arg method "$TARGET_METHOD" --arg platform "$TARGET_PLATFORM" \
+    --arg evaluated_at "$evaluated_at" --arg valid_until "$valid_at" --argjson snapshots "$snapshot_json" \
+    --argjson gates "$(gate_json)" --argjson evidence "$hashes" \
+    '{schema_version:"1.0",status:$status,patch_id:$patch,target:{family:$family,method:$method,platform_id:$platform},evaluated_at:$evaluated_at,valid_until:$valid_until,snapshot_evidence:$snapshots,gates:$gates,evidence:$evidence}' >"$file"
+}
+main() {
+  parse "$@"; check_contracts
+  PATCH_ID=$(jq -r '.procedure.patch_id' "$PROCEDURE"); ARTIFACT_SHA=$(jq -r '.procedure.artifact_sha256' "$PROCEDURE"); TARGET_FAMILY=$(jq -r '.procedure.target.family' "$PROCEDURE"); TARGET_METHOD=$(jq -r '.procedure.target.method' "$PROCEDURE"); TARGET_PLATFORM=$(jq -r '.procedure.target.platform_id' "$PROCEDURE")
+  jq -e --arg p "$PATCH_ID" --arg a "$ARTIFACT_SHA" --arg platform "$TARGET_PLATFORM" '.artifact.status == "ready_for_catalog" and .artifact.patch_ids == [$p] and .artifact.sha256 == $a and (.artifact.platforms | length == 1) and .artifact.platforms[0].id == $platform and (.artifact.platforms[0].source_sha256 | test("^[a-f0-9]{64}$"))' "$ARTIFACT" >/dev/null || gate artifact blocker 'Inspected artifact is not exactly the artifact and platform approved by the procedure.'
+  check_snapshots; check_compatibility
+  local tmp; if [ -n "$OUT" ]; then mkdir -p "$(dirname "$OUT")"; [ ! -L "$OUT" ] || { echo 'output cannot be a symbolic link' >&2; exit 64; }; tmp=$OUT; else tmp=$(mktemp "${TMPDIR:-/tmp}/opu-readiness.XXXXXX"); trap 'rm -f "${tmp:-}"' EXIT; fi
+  emit "$tmp"; cat "$tmp"
+  if has_blocker; then exit 2; fi
+  exit 0
+}
+main "$@"

@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oracle-patching-utility.invalid/contracts/readiness/compatibility-evidence-v1.schema.json",
+  "title": "Oracle per-home compatibility evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "patch_id", "artifact_sha256", "target", "checks"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "prerequisite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "status", "exit_code", "patch_option", "patch_source", "evidence_path", "evidence_sha256"],
+      "properties": {
+        "name": {"enum": ["CheckPatchApplicableOnCurrentPlatform", "CheckConflictAgainstOHWithDetail"]},
+        "status": {"enum": ["passed", "failed", "unknown"]},
+        "exit_code": {"type": "integer", "minimum": 0, "maximum": 255},
+        "patch_option": {"const": "-ph"},
+        "patch_source": {"type": "string", "pattern": "^/"},
+        "evidence_path": {"type": "string", "pattern": "^/"},
+        "evidence_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "status": {"enum": ["passed", "blocked"]},
+    "patch_id": {"type": "string", "pattern": "^[0-9]{1,20}$"},
+    "artifact_sha256": {"$ref": "#/$defs/sha256"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "platform_id"],
+      "properties": {
+        "family": {"enum": ["grid", "database"]},
+        "platform_id": {"type": "string", "pattern": "^[0-9]+$"}
+      }
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node", "home", "owner", "status", "platform", "opatch", "applicability_check", "conflict_check"],
+        "properties": {
+          "node": {"type": "string", "minLength": 1},
+          "home": {"type": "string", "pattern": "^/"},
+          "owner": {"type": "string", "minLength": 1},
+          "status": {"enum": ["passed", "blocked"]},
+          "platform": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["host_id", "host_name", "artifact_ids", "procedure_id", "status"],
+            "properties": {
+              "host_id": {"type": "string", "pattern": "^[0-9]+$"},
+              "host_name": {"type": "string", "minLength": 1},
+              "artifact_ids": {"type": "array", "minItems": 1, "maxItems": 1, "items": {"type": "string", "pattern": "^[0-9]+$"}},
+              "procedure_id": {"type": "string", "pattern": "^[0-9]+$"},
+              "status": {"enum": ["passed", "failed"]}
+            }
+          },
+          "opatch": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["required_version", "status"],
+            "properties": {
+              "actual_version": {"type": "string", "minLength": 1},
+              "required_version": {"type": "string", "minLength": 1},
+              "status": {"enum": ["passed", "failed", "unknown"]}
+            }
+          },
+          "applicability_check": {"allOf": [{"$ref": "#/$defs/prerequisite"}, {"properties": {"name": {"const": "CheckPatchApplicableOnCurrentPlatform"}}}]},
+          "conflict_check": {"allOf": [{"$ref": "#/$defs/prerequisite"}, {"properties": {"name": {"const": "CheckConflictAgainstOHWithDetail"}}}]}
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "passed"}}},
+      "then": {
+        "properties": {
+          "checks": {
+            "items": {
+              "properties": {
+                "status": {"const": "passed"},
+                "platform": {"properties": {"status": {"const": "passed"}}},
+                "opatch": {"properties": {"status": {"const": "passed"}}},
+                "applicability_check": {"properties": {"status": {"const": "passed"}, "exit_code": {"const": 0}}},
+                "conflict_check": {"properties": {"status": {"const": "passed"}, "exit_code": {"const": 0}}}
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

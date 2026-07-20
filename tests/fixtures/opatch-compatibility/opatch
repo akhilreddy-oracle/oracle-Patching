@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+case "$1" in
+  version) echo 'OPatch Version: 12.2.0.1.51' ;;
+  prereq) printf 'OPatch prereq completed successfully: %s\n' "$*" ;;
+  *) exit 64 ;;
+esac

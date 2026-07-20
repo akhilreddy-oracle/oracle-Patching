@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Oracle patch readiness policy v1",
+  "type": "object",
+  "required": ["schema_version", "maximum_snapshot_age_seconds", "require_xml_inventory", "recovery", "database"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "maximum_snapshot_age_seconds": {"type": "integer", "minimum": 1},
+    "require_xml_inventory": {"type": "boolean"},
+    "recovery": {"type": "object"},
+    "database": {"type": "object"}
+  }
+}

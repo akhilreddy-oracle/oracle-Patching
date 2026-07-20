@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Collects Oracle OPatch prerequisite evidence for every locally selected home.
+# Inputs are evidence documents, never operator-supplied Oracle home paths.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+SNAPSHOT=""; ARTIFACT=""; MANIFEST=""; PROCEDURE=""; OUT=""; EVIDENCE_DIR=""
+declare -a CHECKS=()
+usage() { printf '%s\n' 'Usage: opu-opatch-compatibility-collect --snapshot ABSOLUTE_JSON --artifact ABSOLUTE_DIRECTORY --artifact-manifest ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON [--evidence-dir ABSOLUTE_DIRECTORY] [--output ABSOLUTE_JSON]'; }
+require_file() { local file=$1 label=$2; opu_validate_absolute_path "$file" "$label" || exit $?; [ -f "$file" ] && [ ! -L "$file" ] || { echo "$label is missing or symbolic link: $file" >&2; exit 66; }; }
+parse() {
+  while [ "$#" -gt 0 ]; do case "$1" in
+    --snapshot) SNAPSHOT=${2:-}; shift 2;; --artifact) ARTIFACT=${2:-}; shift 2;; --artifact-manifest) MANIFEST=${2:-}; shift 2;; --procedure-validation) PROCEDURE=${2:-}; shift 2;;
+    --evidence-dir) EVIDENCE_DIR=${2:-}; shift 2;; --output) OUT=${2:-}; shift 2;; -h|--help) usage; exit 0;; *) usage >&2; exit 64;; esac; done
+  for pair in "$SNAPSHOT|snapshot" "$MANIFEST|artifact-manifest" "$PROCEDURE|procedure-validation"; do require_file "${pair%%|*}" "${pair#*|}"; done
+  opu_validate_absolute_path "$ARTIFACT" artifact || exit $?; [ -d "$ARTIFACT" ] && [ ! -L "$ARTIFACT" ] || { echo 'artifact must be a non-symbolic-link directory' >&2; exit 66; }
+  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  [ -z "$EVIDENCE_DIR" ] || opu_validate_absolute_path "$EVIDENCE_DIR" evidence-dir || exit $?
+  command -v jq >/dev/null || { echo 'jq is required' >&2; exit 69; }
+}
+as_owner() { local owner=$1; shift; if [ "$(id -un)" = "$owner" ]; then "$@"; elif [ "$(id -u)" -eq 0 ]; then runuser -u "$owner" -- "$@"; else return 126; fi; }
+opatch_as_owner() {
+  local owner=$1 home=$2
+  shift 2
+  if [ -x "$home/jdk/bin/java" ]; then
+    as_owner "$owner" env -u JAVA_HOME -u OPATCH_JRE "ORACLE_HOME=$home" "PATH=$home/OPatch:$home/bin:/usr/bin:/bin" "$home/OPatch/opatch" "$@" -jdk "$home/jdk"
+  else
+    as_owner "$owner" env -u JAVA_HOME -u OPATCH_JRE "ORACLE_HOME=$home" "PATH=$home/OPatch:$home/bin:/usr/bin:/bin" "$home/OPatch/opatch" "$@"
+  fi
+}
+version_ge() {
+  awk -v actual="$1" -v required="$2" 'BEGIN { n=split(actual,a,"."); m=split(required,b,"."); lim=(n>m?n:m); for(i=1;i<=lim;i++){x=(i<=n?a[i]:0)+0;y=(i<=m?b[i]:0)+0;if(x>y)exit 0;if(x<y)exit 1}exit 0 }'
+}
+target_homes() {
+  if [ "$TARGET_FAMILY" = grid ]; then
+    jq -r '.cluster.grid_home as $g | .oracle_homes[] | select(.path == $g) | [.path,.owner,.platform.id,.platform.name] | @tsv' "$SNAPSHOT"
+  else
+    # Preserve the complete snapshot while deriving distinct database homes.
+    # Without the outer binding, jq changes `.` to the intermediate array and
+    # the following `.oracle_homes` lookup fails for standalone databases.
+    jq -r '. as $snapshot | ([$snapshot.databases[].oracle_home] | unique[]) as $home | $snapshot.oracle_homes[] | select(.path == $home) | [.path,.owner,.platform.id,.platform.name] | @tsv' "$SNAPSHOT"
+  fi
+}
+contract() {
+  jq -e '.schema_version == "1.0" and .collector.name == "oracle.topology.discover"' "$SNAPSHOT" >/dev/null || { echo 'snapshot violates topology contract' >&2; exit 65; }
+  jq -e '.schema_version == "1.0" and .artifact.status == "ready_for_catalog" and (.artifact.path | type == "string") and (.artifact.sha256 | test("^[a-f0-9]{64}$")) and (.artifact.patch_ids | length == 1) and (.artifact.platforms | type == "array" and length == 1) and (.artifact.platforms[0].id | test("^[0-9]+$")) and (.artifact.platforms[0].name | type == "string" and length > 0)' "$MANIFEST" >/dev/null || { echo 'artifact manifest is not ready or lacks one authoritative platform' >&2; exit 65; }
+  jq -e '.schema_version == "1.0" and .status == "ready_for_planning" and (.procedure.patch_id | test("^[0-9]{1,20}$")) and (.procedure.artifact_sha256 | test("^[a-f0-9]{64}$")) and (.procedure.target.platform_id | test("^[0-9]+$")) and (.procedure.required_opatch_version | test("^[0-9]+(\\.[0-9]+){2,4}$"))' "$PROCEDURE" >/dev/null || { echo 'procedure validation is not ready or lacks a sealed platform' >&2; exit 65; }
+  PATCH_ID=$(jq -r '.procedure.patch_id' "$PROCEDURE"); ARTIFACT_SHA=$(jq -r '.procedure.artifact_sha256' "$PROCEDURE"); REQUIRED_OPATCH=$(jq -r '.procedure.required_opatch_version' "$PROCEDURE"); TARGET_FAMILY=$(jq -r '.procedure.target.family' "$PROCEDURE"); ARTIFACT_PLATFORM=$(jq -r '.artifact.platforms[0].id' "$MANIFEST"); PROCEDURE_PLATFORM=$(jq -r '.procedure.target.platform_id' "$PROCEDURE")
+  [ "$ARTIFACT_PLATFORM" = "$PROCEDURE_PLATFORM" ] || { echo 'artifact and procedure platform IDs differ' >&2; exit 65; }
+  jq -e --arg p "$PATCH_ID" --arg a "$ARTIFACT_SHA" --arg path "$ARTIFACT" '.artifact.patch_ids == [$p] and .artifact.sha256 == $a and .artifact.path == $path' "$MANIFEST" >/dev/null || { echo 'artifact manifest is not bound to the procedure or staged path' >&2; exit 65; }
+  case "$TARGET_FAMILY" in grid|database) ;; *) echo 'unsupported target family' >&2; exit 65;; esac
+}
+check_home() {
+  local home=$1 owner=$2 host_platform=$3 host_platform_name=$4 host actual status version_status platform_status applicability_status conflict_status applicability_log applicability_rc applicability_sha conflict_log conflict_rc conflict_sha message
+  host=$(jq -r '.host.name | split(".")[0]' "$SNAPSHOT")
+  status=passed; version_status=passed; platform_status=passed; applicability_status=passed; conflict_status=passed
+  applicability_log="$EVIDENCE_DIR/${host}-$(basename "$home")-opatch-platform-${PATCH_ID}.log"
+  conflict_log="$EVIDENCE_DIR/${host}-$(basename "$home")-opatch-conflict-${PATCH_ID}.log"
+  applicability_rc=126; conflict_rc=126
+  [ "$host_platform" = "$ARTIFACT_PLATFORM" ] && [ "$host_platform" = "$PROCEDURE_PLATFORM" ] || { platform_status=failed; status=blocked; }
+  if [ -z "$owner" ] || [ "$owner" = unknown ] || [ ! -x "$home/OPatch/opatch" ]; then
+    status=blocked; applicability_status=unknown; conflict_status=unknown; version_status=unknown; actual=""; message='OPatch executable or Oracle home owner is unavailable.'
+    printf '%s\n' "$message" >"$applicability_log"; printf '%s\n' "$message" >"$conflict_log"
+  else
+    actual=$(opatch_as_owner "$owner" "$home" version 2>&1 | sed -nE 's/.*Version:[[:space:]]*([^[:space:]]+).*/\1/p' | head -n1 || true)
+    if [ -z "$actual" ] || ! version_ge "$actual" "$REQUIRED_OPATCH"; then version_status=failed; status=blocked; fi
+    # Discovery and artifact inspection may run as root, but OPatch runs as
+    # the Oracle Home owner.  Verify that owner can traverse and read the
+    # immutable metadata before invoking OPatch; otherwise its Java error
+    # misleadingly reports the files as missing.
+    if ! as_owner "$owner" test -r "$ARTIFACT/etc/config/actions.xml" ||
+       ! as_owner "$owner" test -r "$ARTIFACT/etc/config/inventory.xml"; then
+      applicability_rc=126; conflict_rc=126; applicability_status=failed; conflict_status=failed; status=blocked
+      message="Verified artifact metadata is not readable by Oracle Home owner '$owner': $ARTIFACT/etc/config/actions.xml or $ARTIFACT/etc/config/inventory.xml"
+      printf '%s\n' "$message" >"$applicability_log"; printf '%s\n' "$message" >"$conflict_log"
+    else
+      set +e
+      opatch_as_owner "$owner" "$home" prereq CheckPatchApplicableOnCurrentPlatform -ph "$ARTIFACT" -oh "$home" >"$applicability_log" 2>&1
+      applicability_rc=$?
+      opatch_as_owner "$owner" "$home" prereq CheckConflictAgainstOHWithDetail -ph "$ARTIFACT" -oh "$home" >"$conflict_log" 2>&1
+      conflict_rc=$?
+      set -e
+      if [ "$applicability_rc" -ne 0 ] || grep -E 'Prerequisite check .* failed|Prereq .* is not executed|OPatch (failed|returns) with error code' "$applicability_log" >/dev/null 2>&1; then applicability_status=failed; status=blocked; fi
+      if [ "$conflict_rc" -ne 0 ] || grep -E 'Prerequisite check .* failed|Prereq .* is not executed|OPatch (failed|returns) with error code' "$conflict_log" >/dev/null 2>&1; then conflict_status=failed; status=blocked; fi
+    fi
+  fi
+  applicability_sha=$(opu_hash_file "$applicability_log"); conflict_sha=$(opu_hash_file "$conflict_log")
+  CHECKS+=("$(jq -cn --arg node "$host" --arg home "$home" --arg owner "$owner" --arg actual "$actual" --arg required "$REQUIRED_OPATCH" --arg host_platform "$host_platform" --arg host_platform_name "$host_platform_name" --arg artifact_platform "$ARTIFACT_PLATFORM" --arg procedure_platform "$PROCEDURE_PLATFORM" --arg ps "$platform_status" --arg vs "$version_status" --arg aps "$applicability_status" --arg cs "$conflict_status" --arg patch_source "$ARTIFACT" --arg applicability_log "$applicability_log" --arg applicability_sha "$applicability_sha" --arg conflict_log "$conflict_log" --arg conflict_sha "$conflict_sha" --argjson applicability_rc "$applicability_rc" --argjson conflict_rc "$conflict_rc" '{node:$node,home:$home,owner:$owner,status:(if $ps == "passed" and $vs == "passed" and $aps == "passed" and $cs == "passed" then "passed" else "blocked" end),platform:{host_id:$host_platform,host_name:$host_platform_name,artifact_ids:[$artifact_platform],procedure_id:$procedure_platform,status:$ps},opatch:{actual_version:($actual|select(length>0)),required_version:$required,status:$vs},applicability_check:{name:"CheckPatchApplicableOnCurrentPlatform",status:$aps,exit_code:$applicability_rc,patch_option:"-ph",patch_source:$patch_source,evidence_path:$applicability_log,evidence_sha256:$applicability_sha},conflict_check:{name:"CheckConflictAgainstOHWithDetail",status:$cs,exit_code:$conflict_rc,patch_option:"-ph",patch_source:$patch_source,evidence_path:$conflict_log,evidence_sha256:$conflict_sha}}')")
+}
+emit() {
+  local file=$1 first=1 item status=passed; for item in "${CHECKS[@]}"; do [ "$(jq -r '.status' <<<"$item")" = passed ] || status=blocked; done
+  printf '{"schema_version":"1.0","status":%s,"patch_id":%s,"artifact_sha256":%s,"target":{"family":%s,"platform_id":%s},"checks":[' "$(opu_json_string "$status")" "$(opu_json_string "$PATCH_ID")" "$(opu_json_string "$ARTIFACT_SHA")" "$(opu_json_string "$TARGET_FAMILY")" "$(opu_json_string "$ARTIFACT_PLATFORM")" >"$file"
+  for item in "${CHECKS[@]}"; do [ "$first" -eq 1 ] || printf ',' >>"$file"; printf '%s' "$item" >>"$file"; first=0; done; printf ']}\n' >>"$file"
+}
+main() {
+  parse "$@"; contract
+  [ -n "$EVIDENCE_DIR" ] || EVIDENCE_DIR="${TMPDIR:-/tmp}/opu-opatch-compatibility-${PATCH_ID}"
+  mkdir -p "$EVIDENCE_DIR"; [ ! -L "$EVIDENCE_DIR" ] || { echo 'evidence directory cannot be a symbolic link' >&2; exit 64; }
+  local home owner host_platform host_platform_name target_count=0
+  while IFS=$'\t' read -r home owner host_platform host_platform_name; do [ -n "$home" ] || continue; target_count=$((target_count+1)); check_home "$home" "$owner" "$host_platform" "$host_platform_name"; done < <(target_homes)
+  [ "$target_count" -gt 0 ] || { echo 'snapshot contains no target Oracle home for this procedure' >&2; exit 65; }
+  local tmp; if [ -n "$OUT" ]; then mkdir -p "$(dirname "$OUT")"; [ ! -L "$OUT" ] || { echo 'output cannot be a symbolic link' >&2; exit 64; }; tmp=$OUT; else tmp=$(mktemp "${TMPDIR:-/tmp}/opu-opatch-compatibility.XXXXXX"); trap 'rm -f "${tmp:-}"' EXIT; fi
+  emit "$tmp"; cat "$tmp"; jq -e '.status == "passed"' "$tmp" >/dev/null || exit 2
+}
+main "$@"

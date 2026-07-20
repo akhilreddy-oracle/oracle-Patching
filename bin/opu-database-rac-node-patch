@@ -1,0 +1,1132 @@
+#!/usr/bin/env bash
+# Local, evidence-bound worker for the database_rolling_opatch adapter.
+#
+# This executable never connects to another host.  Its only selectors are the
+# immutable plan and the controller-issued task lease.  Cluster operations are
+# performed through local Clusterware and every Oracle command uses fixed argv.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+PLAN_STATE_DIR=${OPU_PLAN_STATE_DIR:-/var/lib/oracle-patching-plans}
+EXECUTION_STATE_DIR=${OPU_RAC_DATABASE_STATE_DIR:-/var/lib/oracle-patching-utility/database-rac}
+TEST_MODE=${OPU_RAC_DATABASE_TEST_MODE:-0}
+PLAN_TOOL="$ROOT/bin/opu-patch-plan"
+EXECUTOR_LOCK_USES_FLOCK=0
+if [ "$TEST_MODE" = 1 ] && [ -n "${OPU_RAC_DATABASE_TEST_PLAN_TOOL:-}" ]; then
+  PLAN_TOOL=$OPU_RAC_DATABASE_TEST_PLAN_TOOL
+fi
+
+usage() {
+  printf '%s\n' \
+    "Usage: ${0##*/} execute --plan-id ID --task-id ID --actor ID [--lease-seconds 3600]"
+}
+
+die() { opu_error "$*"; exit 65; }
+valid_sha() { [[ ${1:-} =~ ^[a-f0-9]{64}$ ]]; }
+epoch() { date -u -d "$1" +%s 2>/dev/null || date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || return 1; }
+
+require_root() {
+  [ "${EUID:-$(id -u)}" -eq 0 ] || [ "$TEST_MODE" = 1 ] ||
+    die 'RAC database patch execution must run as root'
+}
+
+as_owner() {
+  local owner_name=$1
+  shift
+  if [ "$TEST_MODE" = 1 ] || [ "$(id -un)" = "$owner_name" ]; then
+    "$@"
+  else
+    runuser -u "$owner_name" -- "$@"
+  fi
+}
+
+owner_for_path() {
+  if [ "$TEST_MODE" = 1 ] && [ -n "${OPU_RAC_DATABASE_TEST_OWNER:-}" ]; then
+    printf '%s\n' "$OPU_RAC_DATABASE_TEST_OWNER"
+  else
+    stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null || true
+  fi
+}
+
+current_short_host() {
+  local observed
+  if [ "$TEST_MODE" = 1 ] && [ -n "${OPU_RAC_DATABASE_TEST_HOSTNAME:-}" ]; then
+    observed=$OPU_RAC_DATABASE_TEST_HOSTNAME
+  else
+    observed=$(hostname -s 2>/dev/null || hostname)
+  fi
+  printf '%s\n' "${observed%%.*}" | tr '[:upper:]' '[:lower:]'
+}
+
+node_key() { printf '%s\n' "${1%%.*}" | tr '[:upper:]' '[:lower:]'; }
+same_node() { [ "$(node_key "$1")" = "$(node_key "$2")" ]; }
+
+verify_sealed_json() {
+  local file_path=$1 seal_field=$2 expected canonical actual
+  [ -f "$file_path" ] && [ ! -L "$file_path" ] || return 66
+  expected=$(jq -r ".$seal_field // empty" "$file_path")
+  valid_sha "$expected" || return 74
+  canonical=$(jq -cS "del(.$seal_field)" "$file_path") || return 74
+  actual=$(opu_hash_string "$canonical") || return
+  [ "$actual" = "$expected" ]
+}
+
+task_definition() {
+  jq -cS '{schema_version,task_id,plan_id,plan_sha256,stage,node,adapter,authorization_sha256,authorization_record_sha256}' "$1"
+}
+
+verify_task_definition() {
+  local task_path=$1 expected actual
+  [ -f "$task_path" ] && [ ! -L "$task_path" ] || return 66
+  expected=$(jq -r '.task_definition_sha256 // empty' "$task_path")
+  valid_sha "$expected" || return 74
+  actual=$(opu_hash_string "$(task_definition "$task_path")") || return
+  [ "$actual" = "$expected" ]
+}
+
+verify_task_authorization() {
+  local task_path=$1 authorization_file authorization_sha authorization_record
+  authorization_file="$PLAN_STATE_DIR/plans/$PLAN_ID/authorization.json"
+  verify_sealed_json "$authorization_file" record_sha256 || die 'sealed plan authorization is missing or changed'
+  authorization_sha=$(opu_hash_file "$authorization_file"); authorization_record=$(jq -r '.record_sha256' "$authorization_file")
+  jq -e --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" --arg authorization_sha "$authorization_sha" --arg authorization_record "$authorization_record" '
+    .plan_id == $plan and .plan_sha256 == $plan_sha and
+    .authorization_sha256 == $authorization_sha and .authorization_record_sha256 == $authorization_record
+  ' "$task_path" >/dev/null || die 'task is not bound to the sealed plan authorization'
+  jq -e --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" '.decision == "execution_authorized" and .plan_id == $plan and .plan_sha256 == $plan_sha' "$authorization_file" >/dev/null || die 'sealed authorization does not bind this plan'
+}
+
+verify_completed_task_result() {
+  local task_path=$1 expected actual manifest_path manifest_sha manifest_record canonical custody_dir entry custody_path custody_parent
+  expected=$(jq -r '.task_result_sha256 // empty' "$task_path")
+  valid_sha "$expected" || die 'completed task has no sealed result digest'
+  actual=$(opu_hash_string "$(jq -cS 'del(.task_result_sha256)' "$task_path")")
+  [ "$actual" = "$expected" ] || die 'completed task result integrity verification failed'
+  manifest_path=$(jq -r '.evidence_custody.manifest_path // empty' "$task_path")
+  manifest_sha=$(jq -r '.evidence_custody.manifest_sha256 // empty' "$task_path")
+  manifest_record=$(jq -r '.evidence_custody.record_sha256 // empty' "$task_path")
+  opu_validate_absolute_path "$manifest_path" evidence-custody-manifest >/dev/null || die 'completed task has no controller custody manifest'
+  [ -f "$manifest_path" ] && [ ! -L "$manifest_path" ] && [ "$(opu_hash_file "$manifest_path")" = "$manifest_sha" ] || die 'controller evidence custody manifest is missing or changed'
+  canonical=$(jq -cS 'del(.record_sha256)' "$manifest_path"); actual=$(opu_hash_string "$canonical")
+  [ "$actual" = "$manifest_record" ] && [ "$(jq -r '.record_sha256 // empty' "$manifest_path")" = "$manifest_record" ] || die 'controller evidence custody record integrity verification failed'
+  jq -e --arg plan "$PLAN_ID" --arg task "$(jq -r '.task_id' "$task_path")" --arg evidence "$(jq -r '.evidence_path' "$task_path")" --arg evidence_sha "$(jq -r '.evidence_sha256' "$task_path")" --arg evidence_record "$(jq -r '.evidence_record_sha256' "$task_path")" '
+    .collector.name == "oracle.patch.controller.evidence_custody" and .collector.version == "1" and
+    .plan_id == $plan and .task_id == $task and .evidence.custody_path == $evidence and
+    .evidence.sha256 == $evidence_sha and .evidence.record_sha256 == $evidence_record
+  ' "$manifest_path" >/dev/null || die 'controller custody manifest does not bind this completed task'
+  custody_dir=$(CDPATH= cd -- "$(dirname -- "$manifest_path")" && pwd -P) || die 'controller custody directory cannot be resolved'
+  while IFS= read -r entry; do
+    custody_path=$(jq -r '.custody_path' <<<"$entry")
+    custody_parent=$(CDPATH= cd -- "$(dirname -- "$custody_path")" && pwd -P) || die 'custodied evidence file directory cannot be resolved'
+    [ "$custody_parent" = "$custody_dir" ] && [ -f "$custody_path" ] && [ ! -L "$custody_path" ] &&
+      [ "$(opu_hash_file "$custody_path")" = "$(jq -r '.sha256' <<<"$entry")" ] || die "controller-custodied evidence file is missing or changed: $custody_path"
+  done < <(jq -c '.files[]' "$manifest_path")
+}
+
+verify_open_window() {
+  local now start_epoch end_epoch
+  start_epoch=$(epoch "$(jq -r '.maintenance_window.start' "$PLAN_FILE")") ||
+    die 'plan has an invalid maintenance-window start'
+  end_epoch=$(epoch "$(jq -r '.maintenance_window.end' "$PLAN_FILE")") ||
+    die 'plan has an invalid maintenance-window end'
+  now=$(date -u +%s)
+  [ "$now" -ge "$start_epoch" ] && [ "$now" -lt "$end_epoch" ] ||
+    die 'maintenance window is not open'
+}
+
+verify_source_documents() {
+  local document_name entry document_path expected actual
+  for document_name in readiness reconciliation artifact_manifest procedure_validation compatibility policy; do
+    entry=$(jq -c --arg name "$document_name" '.source_documents[$name] // empty' "$PLAN_FILE")
+    [ -n "$entry" ] || die "plan lacks sealed $document_name source evidence"
+    document_path=$(jq -r '.path' <<<"$entry")
+    expected=$(jq -r '.sha256' <<<"$entry")
+    opu_validate_absolute_path "$document_path" "$document_name-source" >/dev/null ||
+      die "plan contains an invalid $document_name source path"
+    valid_sha "$expected" || die "plan contains an invalid $document_name source digest"
+    [ -f "$document_path" ] && [ ! -L "$document_path" ] ||
+      die "sealed source document is missing or symbolic link: $document_path"
+    actual=$(opu_hash_file "$document_path")
+    [ "$actual" = "$expected" ] || die "sealed source document changed: $document_path"
+  done
+}
+
+verify_recovery() {
+  local mode=${1:-metadata} manifest_path expected_file expected_record actual_file internal canonical actual_record
+  local checksum_path checksum_sha
+  manifest_path=$(jq -r '.recovery.manifest_path // empty' "$PLAN_FILE")
+  expected_file=$(jq -r '.recovery.manifest_sha256 // empty' "$PLAN_FILE")
+  expected_record=$(jq -r '.recovery.record_sha256 // empty' "$PLAN_FILE")
+  opu_validate_absolute_path "$manifest_path" recovery-manifest >/dev/null ||
+    die 'plan has no valid recovery manifest'
+  valid_sha "$expected_file" && valid_sha "$expected_record" ||
+    die 'plan recovery seals are invalid'
+  [ -f "$manifest_path" ] && [ ! -L "$manifest_path" ] ||
+    die 'recovery manifest is missing or symbolic link'
+  actual_file=$(opu_hash_file "$manifest_path")
+  [ "$actual_file" = "$expected_file" ] || die 'recovery manifest file digest changed'
+  internal=$(jq -r '.record_sha256 // empty' "$manifest_path")
+  canonical=$(jq -cS 'del(.record_sha256)' "$manifest_path")
+  actual_record=$(opu_hash_string "$canonical")
+  [ "$internal" = "$expected_record" ] && [ "$actual_record" = "$expected_record" ] ||
+    die 'recovery manifest record integrity verification failed'
+  jq -e --arg database "$DATABASE" --arg oracle_target "$ORACLE_HOME_TARGET" '
+    .schema_version == "1.0" and
+    .collector.name == "oracle.recovery.evidence" and
+    .status == "passed" and
+    .target.database_unique_name == $database and
+    .target.oracle_home == $oracle_target and
+    (.backup.checksum_manifest.path | type == "string" and startswith("/")) and
+    (.backup.checksum_manifest.sha256 | test("^[a-f0-9]{64}$"))
+  ' "$manifest_path" >/dev/null || die 'recovery evidence does not authorize this RAC database home'
+  checksum_path=$(jq -r '.backup.checksum_manifest.path' "$manifest_path")
+  checksum_sha=$(jq -r '.backup.checksum_manifest.sha256' "$manifest_path")
+  [ -f "$checksum_path" ] && [ ! -L "$checksum_path" ] &&
+    [ "$(opu_hash_file "$checksum_path")" = "$checksum_sha" ] ||
+    die 'recovery checksum manifest changed'
+  if [ "$mode" = full ]; then
+    (cd / && sha256sum -c "$checksum_path") >"$TASK_DIR/recovery-checksums.log" 2>&1 ||
+      die 'recovery backup checksum verification failed immediately before RAC execution'
+  fi
+  RECOVERY_FILE_SHA=$expected_file
+  RECOVERY_RECORD_SHA=$expected_record
+}
+
+artifact_digest() {
+  find "$PATCH_DIR" -xdev -type f -print0 | sort -z |
+    while IFS= read -r -d '' artifact_file; do
+      printf '%s\0' "${artifact_file#"$PATCH_DIR"/}"
+      opu_hash_file "$artifact_file"
+    done | sha256sum | awk '{print $1}'
+}
+
+verify_artifact() {
+  local actual inventory platform_count platform_id platform_name
+  [ -d "$PATCH_DIR" ] && [ ! -L "$PATCH_DIR" ] ||
+    die 'sealed patch directory is missing or symbolic link'
+  [ -z "$(find "$PATCH_DIR" -xdev -type l -print -quit)" ] ||
+    die 'sealed patch directory contains symbolic links'
+  actual=$(artifact_digest)
+  [ "$actual" = "$ARTIFACT_SHA" ] || die 'staged patch artifact digest changed'
+  inventory="$PATCH_DIR/etc/config/inventory.xml"
+  [ -f "$inventory" ] && [ ! -L "$inventory" ] && [ -r "$inventory" ] || die 'sealed patch artifact has no readable authoritative inventory.xml'
+  xmllint --nonet --noout "$inventory" >/dev/null 2>&1 || die 'sealed patch inventory.xml is malformed'
+  platform_count=$(xmllint --nonet --xpath 'count(//*[local-name()="os_platforms"]/*[local-name()="platform"])' "$inventory" 2>/dev/null || true)
+  [ "$platform_count" = 1 ] || die 'sealed patch artifact must declare exactly one authoritative platform'
+  platform_id=$(xmllint --nonet --xpath 'string((//*[local-name()="os_platforms"]/*[local-name()="platform"])[1]/@id)' "$inventory" 2>/dev/null || true)
+  platform_name=$(xmllint --nonet --xpath 'string((//*[local-name()="os_platforms"]/*[local-name()="platform"])[1]/@name)' "$inventory" 2>/dev/null || true)
+  [[ "$platform_id" =~ ^[0-9]+$ ]] && [ -n "$platform_name" ] && [ "$platform_id" = "$TARGET_PLATFORM_ID" ] || die 'patch artifact platform differs from the sealed RAC target platform'
+}
+
+verify_readme_procedure() {
+  local procedure_file reference_sha candidate digest matches=0
+  procedure_file=$(jq -r '.source_documents.procedure_validation.path' "$PLAN_FILE")
+  jq -e --arg patch "$PATCH_ID" --arg artifact "$ARTIFACT_SHA" --arg database "$DATABASE" --arg required "$REQUIRED_OPATCH" '
+    .schema_version == "1.0" and .status == "ready_for_planning" and
+    .procedure.patch_id == $patch and .procedure.artifact_sha256 == $artifact and
+    .procedure.target.family == "database" and .procedure.target.method == "opatch" and
+    .procedure.target.topology == "rac" and .procedure.target.database_unique_name == $database and
+    .procedure.execution.adapter == "database_rolling_opatch" and
+    .procedure.execution.operations == ["database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch"] and
+    .procedure.required_opatch_version == $required and .procedure.rollback.mode == "opatch_rollback" and
+    ([.procedure.oracle_references[]? | select(.kind == "patch_readme")] | length) == 1
+  ' "$procedure_file" >/dev/null || die 'sealed procedure is not the supported README-derived RAC database method'
+  reference_sha=$(jq -r '.procedure.oracle_references[] | select(.kind == "patch_readme") | .sha256' "$procedure_file")
+  valid_sha "$reference_sha" || die 'sealed RAC procedure has no valid README digest'
+  while IFS= read -r candidate; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    digest=$(opu_hash_file "$candidate")
+    if [ "$digest" = "$reference_sha" ]; then matches=$((matches + 1)); RAC_README=$candidate; fi
+  done < <(find "$PATCH_DIR" -maxdepth 1 -type f \( -iname 'README.html' -o -iname 'README.htm' -o -iname 'README.txt' \) -print | sort)
+  [ "$matches" -eq 1 ] || die "expected exactly one artifact README matching the sealed RAC procedure, found $matches"
+  LC_ALL=C grep -aE 'srvctl[[:space:]]+stop[[:space:]]+instance' "$RAC_README" >/dev/null || die 'sealed RAC README does not contain the instance stop step'
+  LC_ALL=C grep -aE 'opatch[[:space:]]+apply' "$RAC_README" >/dev/null || die 'sealed RAC README does not contain the OPatch apply step'
+  LC_ALL=C grep -aE 'srvctl[[:space:]]+start[[:space:]]+instance' "$RAC_README" >/dev/null || die 'sealed RAC README does not contain the instance start step'
+  LC_ALL=C grep -aE 'datapatch[[:space:]]+-verbose' "$RAC_README" >/dev/null || die 'sealed RAC README does not contain datapatch -verbose'
+}
+
+version_ge() {
+  local actual_version=$1 required_version=$2
+  awk -v actual="$actual_version" -v required="$required_version" 'BEGIN {
+    na=split(actual,a,"."); nr=split(required,r,"."); n=(na>nr?na:nr)
+    for(i=1;i<=n;i++){av=a[i]+0;rv=r[i]+0;if(av>rv)exit 0;if(av<rv)exit 1}
+    exit 0
+  }'
+}
+
+srvctl_run() { "$GRID_HOME_TARGET/bin/srvctl" "$@"; }
+
+opatch_run() {
+  if [ -x "$ORACLE_HOME_TARGET/jdk/bin/java" ]; then
+    as_owner "$ORACLE_OWNER" env -u JAVA_HOME -u OPATCH_JRE \
+      "ORACLE_HOME=$ORACLE_HOME_TARGET" \
+      "PATH=$ORACLE_HOME_TARGET/OPatch:$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" \
+      "$ORACLE_HOME_TARGET/OPatch/opatch" "$@" -jdk "$ORACLE_HOME_TARGET/jdk"
+  else
+    as_owner "$ORACLE_OWNER" env -u JAVA_HOME -u OPATCH_JRE \
+      "ORACLE_HOME=$ORACLE_HOME_TARGET" \
+      "PATH=$ORACLE_HOME_TARGET/OPatch:$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" \
+      "$ORACLE_HOME_TARGET/OPatch/opatch" "$@"
+  fi
+}
+
+opatch_prereq_check() {
+  local prereq=$1 output_file=$2 rc
+  set +e
+  (cd "$PATCH_DIR" && opatch_run prereq "$prereq" -ph "$PATCH_DIR" -oh "$ORACLE_HOME_TARGET") >"$output_file" 2>&1
+  rc=$?
+  set -e
+  printf '%s\n' "$rc" >"$output_file.exit-code"
+  if [ "$rc" -ne 0 ] || grep -E 'Prerequisite check .* failed|Prereq .* is not executed|OPatch (failed|returns) with error code' "$output_file" >/dev/null 2>&1; then
+    cat "$output_file" >&2
+    printf 'OPatch prerequisite %s failed with exit code %s\n' "$prereq" "$rc" >&2
+    [ "$rc" -ne 0 ] || rc=65
+    return "$rc"
+  fi
+  cat "$output_file"
+}
+
+sqlplus_fixed() {
+  local oracle_sid=$1
+  as_owner "$ORACLE_OWNER" env \
+    "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$oracle_sid" \
+    "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" \
+    "$ORACLE_HOME_TARGET/bin/sqlplus" -L -s '/ as sysdba'
+}
+
+database_probe() {
+  local oracle_sid=$1 output_path=$2
+  cat <<'SQL' | sqlplus_fixed "$oracle_sid" >"$output_path" 2>&1
+whenever sqlerror exit failure
+set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
+select 'INSTANCE_NAME=' || instance_name from v$instance;
+select 'INSTANCE_STATUS=' || status from v$instance;
+select 'DATABASE_UNIQUE_NAME=' || db_unique_name from v$database;
+select 'DATABASE_ROLE=' || database_role from v$database;
+select 'OPEN_MODE=' || open_mode from v$database;
+select 'INVALID_OBJECTS=' || count(*) from dba_objects where status = 'INVALID';
+exit;
+SQL
+}
+
+probe_value() {
+  sed -n "s/^$1=//p" "$2" | tail -n1 | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'
+}
+
+healthy_probe() {
+  local probe_path=$1 expected_sid=$2
+  [ "$(probe_value DATABASE_UNIQUE_NAME "$probe_path")" = "$DATABASE" ] &&
+    [ "$(probe_value INSTANCE_NAME "$probe_path")" = "$expected_sid" ] &&
+    [ "$(probe_value INSTANCE_STATUS "$probe_path")" = OPEN ] &&
+    [ "$(probe_value DATABASE_ROLE "$probe_path")" = PRIMARY ] &&
+    [ "$(probe_value OPEN_MODE "$probe_path")" = 'READ WRITE' ]
+}
+
+query_instance_on_node() {
+  local node_name=$1 output_path=$2 line rc=0 parsed_sid parsed_node match_count=0 observed_state="" observed_sid=""
+  : >"$output_path"
+  srvctl_run status instance -db "$DATABASE" -node "$node_name" >"$output_path" 2>&1 || rc=$?
+  INSTANCE_QUERY_STATE=unknown
+  INSTANCE_QUERY_SID=""
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^Instance[[:space:]]+([A-Za-z0-9_.\$#-]+)[[:space:]]+is[[:space:]]+running[[:space:]]+on[[:space:]]+node[[:space:]]+([A-Za-z0-9.-]+)[[:space:]]*$ ]]; then
+      parsed_sid=${BASH_REMATCH[1]}; parsed_node=${BASH_REMATCH[2]}
+      same_node "$parsed_node" "$node_name" || continue
+      match_count=$((match_count + 1)); observed_state=running; observed_sid=$parsed_sid
+    fi
+    if [[ "$line" =~ ^Instance[[:space:]]+([A-Za-z0-9_.\$#-]+)[[:space:]]+is[[:space:]]+not[[:space:]]+running[[:space:]]+on[[:space:]]+node[[:space:]]+([A-Za-z0-9.-]+)[[:space:]]*$ ]]; then
+      parsed_sid=${BASH_REMATCH[1]}; parsed_node=${BASH_REMATCH[2]}
+      same_node "$parsed_node" "$node_name" || continue
+      match_count=$((match_count + 1)); observed_state=stopped; observed_sid=$parsed_sid
+    fi
+  done <"$output_path"
+  [ "$rc" -eq 0 ] && [ "$match_count" -eq 1 ] || return 2
+  INSTANCE_QUERY_STATE=$observed_state; INSTANCE_QUERY_SID=$observed_sid
+}
+
+query_bound_instance() {
+  local output_path=$1
+  query_instance_on_node "$LOCAL_NODE" "$output_path" || return 2
+  [ "$INSTANCE_QUERY_SID" = "$ORACLE_SID" ] || return 2
+}
+
+require_bound_instance_state() {
+  local expected_state=$1 output_path=$2
+  query_bound_instance "$output_path" || die 'srvctl instance status is unavailable or ambiguous'
+  [ "$INSTANCE_QUERY_STATE" = "$expected_state" ] ||
+    die "local RAC instance is $INSTANCE_QUERY_STATE, expected $expected_state"
+}
+
+query_inventory() {
+  local output_path=$1 rc=0
+  : >"$output_path"
+  opatch_run lspatches -oh "$ORACLE_HOME_TARGET" >"$output_path" 2>"$output_path.stderr" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    INVENTORY_STATE=unknown
+    return 2
+  fi
+  if awk -F';' -v patch="$PATCH_ID" '$1 == patch {found=1} END {exit !found}' "$output_path"; then
+    INVENTORY_STATE=installed
+  else
+    INVENTORY_STATE=absent
+  fi
+  return 0
+}
+
+require_inventory_state() {
+  local expected_state=$1 output_path=$2
+  query_inventory "$output_path" || die 'OPatch inventory query failed; binary patch state is unknown'
+  [ "$INVENTORY_STATE" = "$expected_state" ] ||
+    die "binary patch state is $INVENTORY_STATE, expected $expected_state"
+}
+
+parse_configured_oracle_home() {
+  sed -nE 's/^[Oo]racle[[:space:]]+[Hh]ome:[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$1" | head -n1
+}
+
+reject_shared_oracle_home() {
+  local database_list="$TASK_DIR/srvctl-databases.log" candidate config_path candidate_target seen_target=0
+  srvctl_run config database >"$database_list" 2>&1 || die 'cannot enumerate Clusterware databases that may share the Oracle home'
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    opu_validate_identifier "$candidate" registered-database >/dev/null || die 'srvctl returned an invalid registered database name'
+    config_path="$TASK_DIR/srvctl-config-$candidate.log"
+    srvctl_run config database -db "$candidate" >"$config_path" 2>&1 || die "cannot inspect registered database $candidate"
+    candidate_target=$(parse_configured_oracle_home "$config_path")
+    opu_validate_absolute_path "$candidate_target" registered-oracle-home >/dev/null || die "registered database $candidate has an invalid Oracle home"
+    if [ "$candidate" = "$DATABASE" ]; then seen_target=1; continue; fi
+    [ "$candidate_target" != "$ORACLE_HOME_TARGET" ] || die "registered database $candidate shares the target Oracle home and is not bound to this plan"
+  done <"$database_list"
+  [ "$seen_target" -eq 1 ] || die 'target database is absent from the Clusterware database inventory'
+}
+
+require_oracle_home_quiesced() {
+  local proc_path executable_path found=0 evidence_path="$TASK_DIR/oracle-home-processes.log"
+  : >"$evidence_path"
+  for proc_path in /proc/[0-9]*; do
+    [ -d "$proc_path" ] || continue
+    executable_path=$(readlink "$proc_path/exe" 2>/dev/null || true)
+    case "$executable_path" in
+      "$ORACLE_HOME_TARGET"/*)
+        printf '%s %s\n' "${proc_path##*/}" "$executable_path" >>"$evidence_path"
+        found=1
+        ;;
+    esac
+  done
+  [ "$found" -eq 0 ] || die 'an active local process still executes from the target Oracle home'
+}
+
+discover_and_bind() {
+  local config_path instance_path configured_target actual_owner tmp canonical digest
+  config_path="$TASK_DIR/srvctl-config-database.log"
+  srvctl_run config database -db "$DATABASE" >"$config_path" 2>&1 ||
+    die 'database is not registered with the sealed Grid home'
+  configured_target=$(parse_configured_oracle_home "$config_path")
+  [ "$configured_target" = "$ORACLE_HOME_TARGET" ] ||
+    die 'srvctl database Oracle home differs from the sealed plan'
+  actual_owner=$(owner_for_path "$ORACLE_HOME_TARGET")
+  [ "$actual_owner" = "$ORACLE_OWNER" ] &&
+    { [ "$ORACLE_OWNER" != root ] || [ "$TEST_MODE" = 1 ]; } ||
+    die 'live Oracle-home owner differs from the sealed plan'
+  instance_path="$TASK_DIR/srvctl-local-instance.log"
+  query_instance_on_node "$LOCAL_NODE" "$instance_path" ||
+    die 'cannot determine the local RAC instance from srvctl'
+  [ "$INSTANCE_QUERY_STATE" = running ] ||
+    die 'local RAC instance is not positively reported as running by srvctl'
+  ORACLE_SID=$INSTANCE_QUERY_SID
+  opu_validate_identifier "$ORACLE_SID" oracle-sid >/dev/null ||
+    die 'srvctl returned an invalid local instance name'
+  database_probe "$ORACLE_SID" "$TASK_DIR/precheck-database-health.log" &&
+    healthy_probe "$TASK_DIR/precheck-database-health.log" "$ORACLE_SID" ||
+    die 'local RAC database health does not match the sealed target'
+  tmp="$BINDING_FILE.tmp.$$"
+  jq -cn --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" \
+    --arg database "$DATABASE" --arg oracle_target "$ORACLE_HOME_TARGET" \
+    --arg grid_target "$GRID_HOME_TARGET" --arg owner "$ORACLE_OWNER" \
+    --arg node "$LOCAL_NODE" --arg oracle_sid "$ORACLE_SID" \
+    '{schema_version:"1.0",plan_id:$plan,plan_sha256:$plan_sha,target:{database_unique_name:$database,oracle_home:$oracle_target,grid_home:$grid_target,owner:$owner,node:$node,oracle_sid:$oracle_sid}}' >"$tmp"
+  canonical=$(jq -cS . "$tmp"); digest=$(opu_hash_string "$canonical")
+  jq --arg digest "$digest" '.record_sha256=$digest' "$tmp" >"$BINDING_FILE"
+  rm -f "$tmp"
+}
+
+load_binding() {
+  verify_sealed_json "$BINDING_FILE" record_sha256 ||
+    die 'local RAC target binding is missing or its integrity check failed'
+  jq -e --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" \
+    --arg database "$DATABASE" --arg oracle_target "$ORACLE_HOME_TARGET" \
+    --arg grid_target "$GRID_HOME_TARGET" --arg owner "$ORACLE_OWNER" \
+    --arg node "$LOCAL_NODE" '
+      .plan_id == $plan and .plan_sha256 == $plan_sha and
+      .target.database_unique_name == $database and
+      .target.oracle_home == $oracle_target and .target.grid_home == $grid_target and
+      .target.owner == $owner and .target.node == $node
+    ' "$BINDING_FILE" >/dev/null || die 'local RAC target binding differs from the sealed plan'
+  ORACLE_SID=$(jq -r '.target.oracle_sid' "$BINDING_FILE")
+}
+
+collect_running_instances() {
+  local excluded_node=${1:-} node_name status_path
+  RUNNING_NODES=()
+  RUNNING_INSTANCES=()
+  while IFS= read -r node_name; do
+    [ -n "$excluded_node" ] && same_node "$node_name" "$excluded_node" && continue
+    status_path="$TASK_DIR/status-$(node_key "$node_name").log"
+    query_instance_on_node "$node_name" "$status_path" ||
+      die "srvctl status for node $node_name is unavailable or ambiguous"
+    if [ "$INSTANCE_QUERY_STATE" = running ]; then
+      RUNNING_NODES+=("$node_name")
+      RUNNING_INSTANCES+=("$INSTANCE_QUERY_SID")
+    fi
+  done < <(jq -r '.nodes[]' "$PLAN_FILE")
+}
+
+require_surviving_instance() {
+  collect_running_instances "$LOCAL_NODE"
+  [ "${#RUNNING_INSTANCES[@]}" -ge 1 ] ||
+    die 'no surviving RAC instance is positively reported as running'
+  SURVIVOR_INSTANCE=${RUNNING_INSTANCES[0]}
+  SURVIVOR_NODE=${RUNNING_NODES[0]}
+}
+
+service_status() {
+  local output_path=$1 rc=0
+  srvctl_run status service -db "$DATABASE" >"$output_path" 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || return 2
+}
+
+service_rows() {
+  local status_path=$1 line service_name instance_csv
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^Service[[:space:]]+([A-Za-z0-9_.:-]+)[[:space:]]+is[[:space:]]+running[[:space:]]+on[[:space:]]+instance\(s\)[[:space:]]+(.+[^[:space:]])[[:space:]]*$ ]]; then
+      service_name=${BASH_REMATCH[1]}; instance_csv=${BASH_REMATCH[2]}
+      printf '%s|%s\n' "$service_name" "$instance_csv"
+    elif [[ "$line" =~ ^Service[[:space:]]+([A-Za-z0-9_.:-]+)[[:space:]]+is[[:space:]]+not[[:space:]]+running ]]; then
+      printf '%s|\n' "${BASH_REMATCH[1]}"
+    elif [ -n "$line" ]; then
+      return 2
+    fi
+  done <"$status_path"
+}
+
+csv_has_instance() {
+  local csv=$1 wanted=$2 item
+  csv=${csv//,/ }
+  for item in $csv; do [ "$item" = "$wanted" ] && return 0; done
+  return 1
+}
+
+verify_services_available() {
+  local mode=${1:-any} status_path rows_path service_name instance_csv found=0
+  status_path="$TASK_DIR/services-$mode.log"; rows_path="$TASK_DIR/services-$mode.rows"
+  service_status "$status_path" || die 'srvctl service status query failed; service state is unknown'
+  service_rows "$status_path" >"$rows_path" || die 'srvctl service status output is ambiguous'
+  while IFS='|' read -r service_name instance_csv; do
+    [ -n "$service_name" ] || continue
+    found=1
+    [ -n "$instance_csv" ] || die "service $service_name is not running"
+    if [ "$mode" = away-from-local ] && csv_has_instance "$instance_csv" "$ORACLE_SID"; then
+      csv_has_instance "$instance_csv" "$SURVIVOR_INSTANCE" ||
+        die "service $service_name remains only on the instance selected for patching"
+    fi
+  done <"$rows_path"
+  # An empty service configuration is valid; database availability is enforced separately.
+  : "$found"
+}
+
+drain_services() {
+  local status_path rows_path service_name instance_csv tmp canonical digest
+  status_path="$TASK_DIR/services-before-drain.log"; rows_path="$TASK_DIR/services-before-drain.rows"
+  service_status "$status_path" || die 'cannot query services before drain'
+  service_rows "$status_path" >"$rows_path" || die 'service status is ambiguous before drain'
+  : >"$TASK_DIR/relocated-services"
+  while IFS='|' read -r service_name instance_csv; do
+    [ -n "$service_name" ] || continue
+    opu_validate_identifier "$service_name" service >/dev/null || die 'srvctl returned an invalid service name'
+    [ -n "$instance_csv" ] || die "service $service_name is not running before drain"
+    if csv_has_instance "$instance_csv" "$ORACLE_SID" &&
+       ! csv_has_instance "$instance_csv" "$SURVIVOR_INSTANCE"; then
+      srvctl_run relocate service -db "$DATABASE" -service "$service_name" \
+        -oldinst "$ORACLE_SID" -newinst "$SURVIVOR_INSTANCE" \
+        -drain_timeout "$DRAIN_TIMEOUT_SECONDS"
+      printf '%s\n' "$service_name" >>"$TASK_DIR/relocated-services"
+    fi
+  done <"$rows_path"
+  verify_services_available away-from-local
+  tmp="$DRAIN_FILE.tmp.$$"
+  jq -Rn --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" --arg node "$LOCAL_NODE" \
+    --arg instance "$ORACLE_SID" --arg survivor_node "$SURVIVOR_NODE" \
+    --arg survivor_instance "$SURVIVOR_INSTANCE" \
+    '[inputs | select(length > 0)] as $services |
+     {schema_version:"1.0",plan_id:$plan,plan_sha256:$plan_sha,node:$node,instance:$instance,survivor:{node:$survivor_node,instance:$survivor_instance},relocated_services:$services}' \
+    <"$TASK_DIR/relocated-services" >"$tmp"
+  canonical=$(jq -cS . "$tmp"); digest=$(opu_hash_string "$canonical")
+  jq --arg digest "$digest" '.record_sha256=$digest' "$tmp" >"$DRAIN_FILE"
+  rm -f "$tmp"
+}
+
+load_drain_state() {
+  verify_sealed_json "$DRAIN_FILE" record_sha256 || die 'service-drain state is missing or invalid'
+  jq -e --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" --arg node "$LOCAL_NODE" --arg instance "$ORACLE_SID" \
+    '.plan_id == $plan and .plan_sha256 == $plan_sha and .node == $node and .instance == $instance' "$DRAIN_FILE" >/dev/null ||
+    die 'service-drain state differs from the sealed local target'
+}
+
+restore_drained_services() {
+  local service_name survivor_instance status_path rows_path instance_csv restored=0
+  survivor_instance=$(jq -r '.survivor.instance' "$DRAIN_FILE")
+  opu_validate_identifier "$survivor_instance" survivor-instance >/dev/null || die 'sealed drain state has an invalid survivor instance'
+  while IFS= read -r service_name; do
+    [ -n "$service_name" ] || continue
+    opu_validate_identifier "$service_name" service >/dev/null || die 'sealed drain state has an invalid service name'
+    srvctl_run relocate service -db "$DATABASE" -service "$service_name" \
+      -oldinst "$survivor_instance" -newinst "$ORACLE_SID" \
+      -drain_timeout "$DRAIN_TIMEOUT_SECONDS"
+    restored=$((restored + 1))
+  done < <(jq -r '.relocated_services[]' "$DRAIN_FILE")
+  [ "$restored" -gt 0 ] || return 0
+  status_path="$TASK_DIR/services-after-restore.log"; rows_path="$TASK_DIR/services-after-restore.rows"
+  service_status "$status_path" || die 'cannot query services after restoring placement'
+  service_rows "$status_path" >"$rows_path" || die 'service status is ambiguous after restoring placement'
+  while IFS= read -r service_name; do
+    instance_csv=$(awk -F'|' -v service="$service_name" '$1 == service {print $2; exit}' "$rows_path")
+    [ -n "$instance_csv" ] && csv_has_instance "$instance_csv" "$ORACLE_SID" ||
+      die "service $service_name was not restored to the patched instance"
+  done < <(jq -r '.relocated_services[]' "$DRAIN_FILE")
+}
+
+wait_bound_instance() {
+  local wanted=$1 attempts=${OPU_RAC_DATABASE_WAIT_ATTEMPTS:-60}
+  while [ "$attempts" -gt 0 ]; do
+    if query_bound_instance "$TASK_DIR/wait-instance-$wanted.log" && [ "$INSTANCE_QUERY_STATE" = "$wanted" ]; then
+      return 0
+    fi
+    attempts=$((attempts - 1)); sleep 2
+  done
+  return 1
+}
+
+start_local_instance_safely() {
+  local start_rc=0
+  query_bound_instance "$TASK_DIR/restoration-before-start.log" || return 1
+  if [ "$INSTANCE_QUERY_STATE" = stopped ]; then
+    srvctl_run start instance -db "$DATABASE" -instance "$ORACLE_SID" >"$TASK_DIR/restoration-start.log" 2>&1 || start_rc=$?
+    [ "$start_rc" -eq 0 ] || return 1
+  fi
+  wait_bound_instance running || return 1
+  database_probe "$ORACLE_SID" "$TASK_DIR/restoration-health.log" &&
+    healthy_probe "$TASK_DIR/restoration-health.log" "$ORACLE_SID" || return 1
+  verify_services_available any || return 1
+  rm -f "$TASK_DIR/instance-down"
+}
+
+mutation_exit_guard() {
+  local original_rc=$1
+  trap - EXIT
+  if [ "$original_rc" -ne 0 ] && [ "${BINARY_MUTATION_STARTED:-0}" = 1 ]; then
+    query_inventory "$TASK_DIR/failure-reconciliation-lspatches.log" || true
+    : >"$TASK_DIR/binary-state-unknown"
+    : >"$TASK_DIR/instance-down"
+    printf '%s\n' 'OPatch returned nonzero after mutation began; inventory is observational only and automatic startup is prohibited.' >"$TASK_DIR/failure-service-restoration.log"
+  fi
+  exit "$original_rc"
+}
+
+sqlpatch_latest() {
+  local output_path=$1
+  cat <<SQL | sqlplus_fixed "$ORACLE_SID" >"$output_path" 2>&1
+whenever sqlerror exit failure
+set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
+select 'SQLPATCH_LATEST_ACTION=' || action from (select action, row_number() over (order by action_time desc, install_id desc) rn from dba_registry_sqlpatch where patch_id=$PATCH_ID) where rn=1;
+select 'SQLPATCH_LATEST_STATUS=' || status from (select status, row_number() over (order by action_time desc, install_id desc) rn from dba_registry_sqlpatch where patch_id=$PATCH_ID) where rn=1;
+exit;
+SQL
+}
+
+require_sqlpatch_apply_success() {
+  local output_path=$1 action status
+  sqlpatch_latest "$output_path" || die 'could not query DBA_REGISTRY_SQLPATCH'
+  action=$(probe_value SQLPATCH_LATEST_ACTION "$output_path")
+  status=$(probe_value SQLPATCH_LATEST_STATUS "$output_path")
+  [ "$action" = APPLY ] && [ "$status" = SUCCESS ] ||
+    die "latest SQL patch action is not APPLY/SUCCESS for patch $PATCH_ID"
+}
+
+verify_all_nodes_running() {
+  local node_name status_path
+  while IFS= read -r node_name; do
+    status_path="$TASK_DIR/all-nodes-$(node_key "$node_name").log"
+    query_instance_on_node "$node_name" "$status_path" ||
+      die "instance state for $node_name is unavailable or ambiguous"
+    [ "$INSTANCE_QUERY_STATE" = running ] || die "instance on $node_name is not running"
+  done < <(jq -r '.nodes[]' "$PLAN_FILE")
+}
+
+verify_prior_node_validations() {
+  local node_name match_count task_path evidence_path expected_evidence actual_evidence expected_record actual_record canonical
+  while IFS= read -r node_name; do
+    match_count=0
+    for task_path in "$PLAN_STATE_DIR/plans/$PLAN_ID/tasks"/*.json; do
+      [ -e "$task_path" ] || continue
+      verify_task_definition "$task_path" || die 'a prior task definition failed integrity verification'
+      if jq -e --arg node "$node_name" '.stage == "rac_node_validate" and .node == $node' "$task_path" >/dev/null; then
+        match_count=$((match_count + 1))
+        verify_completed_task_result "$task_path"
+        jq -e '.status == "succeeded" and (.evidence_path | type == "string" and startswith("/")) and (.evidence_sha256 | test("^[a-f0-9]{64}$")) and (.evidence_record_sha256 | test("^[a-f0-9]{64}$"))' "$task_path" >/dev/null ||
+          die "node validation task for $node_name is not successfully sealed"
+        evidence_path=$(jq -r '.evidence_path' "$task_path")
+        expected_evidence=$(jq -r '.evidence_sha256' "$task_path")
+        expected_record=$(jq -r '.evidence_record_sha256' "$task_path")
+        [ -f "$evidence_path" ] && [ ! -L "$evidence_path" ] || die "node validation evidence is missing for $node_name"
+        actual_evidence=$(opu_hash_file "$evidence_path")
+        canonical=$(jq -cS 'del(.record_sha256)' "$evidence_path")
+        actual_record=$(opu_hash_string "$canonical")
+        [ "$actual_evidence" = "$expected_evidence" ] && [ "$actual_record" = "$expected_record" ] &&
+          [ "$(jq -r '.record_sha256' "$evidence_path")" = "$expected_record" ] ||
+          die "node validation evidence changed for $node_name"
+        jq -e --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" --arg node "$node_name" --arg patch "$PATCH_ID" '
+          .plan_id == $plan and .plan_sha256 == $plan_sha and .stage == "rac_node_validate" and
+          .status == "succeeded" and .outcome_class == "binary_state_known" and
+          .target.node == $node and .patch.patch_id == $patch
+        ' "$evidence_path" >/dev/null || die "node validation evidence does not bind $node_name to this plan"
+      fi
+    done
+    [ "$match_count" -eq 1 ] || die "expected exactly one node validation task for $node_name, found $match_count"
+  done < <(jq -r '.nodes[]' "$PLAN_FILE")
+}
+
+stage_rac_precheck() {
+  local actual_version
+  verify_source_documents; verify_recovery full; verify_artifact; verify_readme_procedure
+  [ -x "$GRID_HOME_TARGET/bin/srvctl" ] || die 'sealed Grid home has no executable srvctl'
+  [ -x "$ORACLE_HOME_TARGET/bin/sqlplus" ] && [ -x "$ORACLE_HOME_TARGET/OPatch/opatch" ] &&
+    [ -x "$ORACLE_HOME_TARGET/OPatch/datapatch" ] || die 'required Oracle executables are missing'
+  discover_and_bind
+  reject_shared_oracle_home
+  actual_version=$(opatch_run version 2>&1 | sed -nE 's/.*Version:[[:space:]]*([^[:space:]]+).*/\1/p' | head -n1)
+  [[ "$actual_version" =~ ^[0-9]+(\.[0-9]+){2,4}$ ]] && version_ge "$actual_version" "$REQUIRED_OPATCH" ||
+    die "OPatch $actual_version is below required $REQUIRED_OPATCH"
+  require_inventory_state absent "$TASK_DIR/precheck-lspatches.log"
+  opatch_prereq_check CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/precheck-platform-applicability.log"
+  opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/precheck-conflict.log"
+  require_surviving_instance
+  verify_services_available any
+}
+
+stage_rac_drain() {
+  load_binding; verify_source_documents; verify_recovery; verify_artifact; verify_open_window
+  require_bound_instance_state running "$TASK_DIR/drain-local-instance.log"
+  require_surviving_instance
+  drain_services
+}
+
+stage_rac_stop() {
+  load_binding; load_drain_state; verify_source_documents; verify_recovery; verify_artifact; verify_open_window
+  require_bound_instance_state running "$TASK_DIR/stop-before-instance.log"
+  require_surviving_instance
+  verify_services_available away-from-local
+  opatch_prereq_check CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/stop-platform-applicability.log"
+  opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/stop-conflict.log"
+  srvctl_run stop instance -db "$DATABASE" -instance "$ORACLE_SID" -stopoption immediate
+  wait_bound_instance stopped || die 'local instance did not stop through Clusterware'
+  : >"$TASK_DIR/instance-down"
+  require_surviving_instance
+  verify_services_available any
+}
+
+stage_rac_opatch_apply() {
+  local actual_version opatch_rc=0
+  BINARY_MUTATION_STARTED=0
+  trap 'mutation_exit_guard "$?"' EXIT
+  load_binding; load_drain_state; verify_source_documents; verify_recovery full; verify_artifact; verify_open_window
+  require_bound_instance_state stopped "$TASK_DIR/apply-before-instance.log"
+  : >"$TASK_DIR/instance-down"
+  require_surviving_instance
+  verify_services_available any
+  require_oracle_home_quiesced
+  actual_version=$(opatch_run version 2>&1 | sed -nE 's/.*Version:[[:space:]]*([^[:space:]]+).*/\1/p' | head -n1)
+  [[ "$actual_version" =~ ^[0-9]+(\.[0-9]+){2,4}$ ]] && version_ge "$actual_version" "$REQUIRED_OPATCH" ||
+    die 'OPatch version changed below the sealed requirement'
+  require_inventory_state absent "$TASK_DIR/apply-before-lspatches.log"
+  opatch_prereq_check CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/apply-platform-applicability.log"
+  opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/apply-conflict.log"
+  verify_open_window
+  BINARY_MUTATION_STARTED=1
+  : >"$TASK_DIR/binary-state-unknown"
+  set +e
+  (cd "$PATCH_DIR" && opatch_run apply -silent -local -oh "$ORACLE_HOME_TARGET") >"$TASK_DIR/opatch-apply.log" 2>&1
+  opatch_rc=$?
+  set -e
+  printf '%s\n' "$opatch_rc" >"$TASK_DIR/opatch-apply.exit-code"
+  if [ "$opatch_rc" -ne 0 ]; then
+    printf 'OPatch apply returned %s after mutation began; binary state requires reconciliation\n' "$opatch_rc" >&2
+    return "$opatch_rc"
+  fi
+  if ! query_inventory "$TASK_DIR/apply-after-lspatches.log"; then
+    die 'OPatch finished but inventory cannot establish the binary outcome'
+  fi
+  rm -f "$TASK_DIR/binary-state-unknown"
+  : >"$TASK_DIR/binary-state-known"
+  [ "$INVENTORY_STATE" = installed ] ||
+    die "OPatch returned success but patch $PATCH_ID is absent from inventory"
+  trap - EXIT
+}
+
+stage_rac_start() {
+  load_binding; load_drain_state; verify_source_documents; verify_recovery; verify_open_window
+  require_inventory_state installed "$TASK_DIR/start-lspatches.log"
+  require_bound_instance_state stopped "$TASK_DIR/start-before-instance.log"
+  srvctl_run start instance -db "$DATABASE" -instance "$ORACLE_SID"
+  wait_bound_instance running || { : >"$TASK_DIR/instance-down"; die 'local RAC instance did not start'; }
+  rm -f "$TASK_DIR/instance-down"
+  database_probe "$ORACLE_SID" "$TASK_DIR/start-health.log" &&
+    healthy_probe "$TASK_DIR/start-health.log" "$ORACLE_SID" || die 'local database health failed after startup'
+  restore_drained_services
+  verify_services_available any
+}
+
+stage_rac_node_validate() {
+  load_binding; verify_source_documents; verify_recovery; verify_artifact
+  require_inventory_state installed "$TASK_DIR/node-validate-lspatches.log"
+  opatch_run lsinventory -xml "$TASK_DIR/node-validate-inventory.xml" -oh "$ORACLE_HOME_TARGET" >/dev/null ||
+    die 'OPatch XML inventory failed; inventory state is unknown'
+  require_bound_instance_state running "$TASK_DIR/node-validate-instance.log"
+  database_probe "$ORACLE_SID" "$TASK_DIR/node-validate-health.log" &&
+    healthy_probe "$TASK_DIR/node-validate-health.log" "$ORACLE_SID" || die 'local RAC database validation failed'
+  verify_services_available any
+}
+
+stage_cluster_datapatch() {
+  load_binding; verify_source_documents; verify_recovery; verify_artifact; verify_open_window
+  verify_prior_node_validations
+  verify_all_nodes_running
+  verify_services_available any
+  require_inventory_state installed "$TASK_DIR/cluster-datapatch-lspatches.log"
+  database_probe "$ORACLE_SID" "$TASK_DIR/cluster-datapatch-pre-health.log" &&
+    healthy_probe "$TASK_DIR/cluster-datapatch-pre-health.log" "$ORACLE_SID" || die 'coordinator database health failed before datapatch'
+  as_owner "$ORACLE_OWNER" env \
+    "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" \
+    "PATH=$ORACLE_HOME_TARGET/bin:$ORACLE_HOME_TARGET/OPatch:/usr/bin:/bin" \
+    "$ORACLE_HOME_TARGET/OPatch/datapatch" -verbose
+  require_sqlpatch_apply_success "$TASK_DIR/cluster-datapatch-sqlpatch.log"
+}
+
+stage_cluster_final_validate() {
+  local invalid_count maximum_invalid policy_path
+  load_binding; verify_source_documents; verify_recovery; verify_artifact
+  verify_prior_node_validations
+  verify_all_nodes_running
+  verify_services_available any
+  require_inventory_state installed "$TASK_DIR/cluster-final-lspatches.log"
+  database_probe "$ORACLE_SID" "$TASK_DIR/cluster-final-health.log" &&
+    healthy_probe "$TASK_DIR/cluster-final-health.log" "$ORACLE_SID" || die 'cluster final database health failed'
+  require_sqlpatch_apply_success "$TASK_DIR/cluster-final-sqlpatch.log"
+  invalid_count=$(probe_value INVALID_OBJECTS "$TASK_DIR/cluster-final-health.log")
+  policy_path=$(jq -r '.source_documents.policy.path' "$PLAN_FILE")
+  maximum_invalid=$(jq -r '.database.maximum_invalid_objects' "$policy_path")
+  [[ "$invalid_count" =~ ^[0-9]+$ ]] && [[ "$maximum_invalid" =~ ^[0-9]+$ ]] &&
+    [ "$invalid_count" -le "$maximum_invalid" ] ||
+    die 'invalid-object count exceeds the sealed policy after RAC patching'
+}
+
+load_plan() {
+  local duplicate_count
+  PLAN_FILE="$PLAN_STATE_DIR/plans/$PLAN_ID/plan.json"
+  verify_sealed_json "$PLAN_FILE" plan_sha256 || die 'immutable plan is missing or its integrity check failed'
+  PLAN_SHA=$(jq -r '.plan_sha256' "$PLAN_FILE")
+  jq -e '
+    .schema_version == "1.0" and .intent == "patch_apply" and
+    .target.family == "database" and .target.method == "opatch" and .target.topology == "rac" and (.target.platform_id | test("^[0-9]+$")) and
+    .procedure.adapter == "database_rolling_opatch" and .procedure.platform_id == .target.platform_id and
+    .procedure.operations == ["database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch"] and
+    (.nodes | type == "array" and length >= 2) and
+    (.target.coordinator_node | type == "string" and length > 0) and
+    (.target.coordinator_node as $coordinator | .nodes | index($coordinator) != null) and
+    (.target.database_unique_name | type == "string" and length > 0) and
+    (.target.oracle_home | type == "string" and startswith("/")) and
+    (.target.grid_home | type == "string" and startswith("/")) and
+    (.target.owner | type == "string" and length > 0) and
+    (.patch_id | test("^[0-9]{1,20}$")) and
+    (.artifact.path | type == "string" and startswith("/")) and
+    (.artifact.sha256 | test("^[a-f0-9]{64}$")) and (.artifact.platforms | type == "array" and length == 1) and .artifact.platforms[0].id == .target.platform_id and
+    (.recovery.manifest_sha256 | test("^[a-f0-9]{64}$")) and
+    (.recovery.record_sha256 | test("^[a-f0-9]{64}$"))
+  ' "$PLAN_FILE" >/dev/null || die 'plan is not a supported sealed RAC Database OPatch procedure'
+  duplicate_count=$(jq '[.nodes[]] | length - (unique | length)' "$PLAN_FILE")
+  [ "$duplicate_count" -eq 0 ] || die 'plan contains duplicate RAC nodes'
+  DATABASE=$(jq -r '.target.database_unique_name' "$PLAN_FILE")
+  ORACLE_HOME_TARGET=$(jq -r '.target.oracle_home' "$PLAN_FILE")
+  GRID_HOME_TARGET=$(jq -r '.target.grid_home' "$PLAN_FILE")
+  ORACLE_OWNER=$(jq -r '.target.owner' "$PLAN_FILE")
+  COORDINATOR_NODE=$(jq -r '.target.coordinator_node' "$PLAN_FILE")
+  PATCH_ID=$(jq -r '.patch_id' "$PLAN_FILE")
+  PATCH_DIR=$(jq -r '.artifact.path' "$PLAN_FILE")
+  ARTIFACT_SHA=$(jq -r '.artifact.sha256' "$PLAN_FILE")
+  REQUIRED_OPATCH=$(jq -r '.procedure.required_opatch_version' "$PLAN_FILE")
+  TARGET_PLATFORM_ID=$(jq -r '.target.platform_id' "$PLAN_FILE")
+  DRAIN_TIMEOUT_SECONDS=$(jq -r '.procedure.drain_timeout_seconds // 300' "$PLAN_FILE")
+  opu_validate_identifier "$DATABASE" database >/dev/null || die 'plan database name is invalid'
+  opu_validate_absolute_path "$ORACLE_HOME_TARGET" oracle-home >/dev/null || die 'plan Oracle home is invalid'
+  opu_validate_absolute_path "$GRID_HOME_TARGET" grid-home >/dev/null || die 'plan Grid home is invalid'
+  opu_validate_identifier "$ORACLE_OWNER" owner >/dev/null || die 'plan Oracle owner is invalid'
+  opu_validate_absolute_path "$PATCH_DIR" patch-directory >/dev/null || die 'plan patch directory is invalid'
+  [[ "$REQUIRED_OPATCH" =~ ^[0-9]+(\.[0-9]+){2,4}$ ]] || die 'plan required OPatch version is invalid'
+  [[ "$DRAIN_TIMEOUT_SECONDS" =~ ^[0-9]{1,4}$ ]] && [ "$DRAIN_TIMEOUT_SECONDS" -ge 0 ] && [ "$DRAIN_TIMEOUT_SECONDS" -le 3600 ] ||
+    die 'sealed service drain timeout must be between 0 and 3600 seconds'
+  verify_open_window
+}
+
+load_task_after_claim() {
+  local actual_host
+  TASK_FILE="$PLAN_STATE_DIR/plans/$PLAN_ID/tasks/$TASK_ID.json"
+  verify_task_definition "$TASK_FILE" || die 'claimed task definition failed integrity verification'
+  verify_task_authorization "$TASK_FILE"
+  jq -e --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg actor "$ACTOR" --arg plan_sha "$PLAN_SHA" '
+    .plan_id == $plan and .task_id == $task and .claimed_by == $actor and
+    .plan_sha256 == $plan_sha and .adapter == "database_rolling_opatch" and
+    .status == "running" and
+    (.stage | IN("rac_precheck","rac_drain","rac_stop","rac_opatch_apply","rac_start","rac_node_validate","cluster_datapatch","cluster_final_validate"))
+  ' "$TASK_FILE" >/dev/null || die 'claimed task does not match the RAC database executor contract'
+  STAGE=$(jq -r '.stage' "$TASK_FILE")
+  TASK_NODE=$(jq -r '.node' "$TASK_FILE")
+  actual_host=$(current_short_host)
+  case "$STAGE" in
+    cluster_datapatch|cluster_final_validate)
+      same_node "$TASK_NODE" "$COORDINATOR_NODE" && same_node "$TASK_NODE" "$actual_host" ||
+        die 'cluster-wide task is not bound to this coordinator host'
+      ;;
+    *)
+      jq -e --arg node "$TASK_NODE" '.nodes | index($node) != null' "$PLAN_FILE" >/dev/null ||
+        die 'local RAC task node is absent from the sealed topology'
+      same_node "$TASK_NODE" "$actual_host" || die 'task is not bound to this local host'
+      ;;
+  esac
+  LOCAL_NODE=$TASK_NODE
+}
+
+run_typed_stage() {
+  case "$STAGE" in
+    rac_precheck) stage_rac_precheck ;;
+    rac_drain) stage_rac_drain ;;
+    rac_stop) stage_rac_stop ;;
+    rac_opatch_apply) stage_rac_opatch_apply ;;
+    rac_start) stage_rac_start ;;
+    rac_node_validate) stage_rac_node_validate ;;
+    cluster_datapatch) stage_cluster_datapatch ;;
+    cluster_final_validate) stage_cluster_final_validate ;;
+    *) die "unsupported sealed RAC stage: $STAGE" ;;
+  esac
+}
+
+acquire_executor_lock() {
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"$NODE_RUN_DIR/executor.lock"
+    flock -n 8 || die 'another RAC executor owns this node and plan'
+    EXECUTOR_LOCK_USES_FLOCK=1
+  elif [ "$TEST_MODE" = 1 ]; then
+    EXECUTOR_LOCK_DIR="$NODE_RUN_DIR/executor.lock.d"
+    mkdir "$EXECUTOR_LOCK_DIR" 2>/dev/null || die 'another RAC executor owns this node and plan'
+    trap 'rmdir "${EXECUTOR_LOCK_DIR:-}" 2>/dev/null || true' EXIT
+  else
+    die 'flock is required for RAC database patch execution'
+  fi
+}
+
+close_inherited_executor_lock() {
+  [ "${EXECUTOR_LOCK_USES_FLOCK:-0}" -eq 1 ] || return 0
+  exec 8>&-
+}
+
+heartbeat() {
+  local stage_pid=$1 interval=$((LEASE_SECONDS / 3)) elapsed=0
+  [ "$interval" -le 60 ] || interval=60
+  [ "$interval" -ge 10 ] || interval=10
+  while kill -0 "$stage_pid" 2>/dev/null; do
+    sleep 1
+    kill -0 "$stage_pid" 2>/dev/null || break
+    elapsed=$((elapsed + 1))
+    [ "$elapsed" -ge "$interval" ] || continue
+    elapsed=0
+    if ! env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" renew \
+      --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" \
+      --lease-seconds "$LEASE_SECONDS" >/dev/null 2>"$TASK_DIR/heartbeat-error.log"; then
+      : >"$TASK_DIR/heartbeat-failed"
+      return 1
+    fi
+  done
+}
+
+stage_success_outcome() {
+  case "$STAGE" in
+    rac_precheck) printf '%s\n' no_mutation ;;
+    rac_drain) printf '%s\n' service_state_known ;;
+    rac_stop) printf '%s\n' database_down ;;
+    *) printf '%s\n' binary_state_known ;;
+  esac
+}
+
+derive_outcome() {
+  if [ -f "$TASK_DIR/binary-state-unknown" ]; then
+    printf '%s\n' binary_state_unknown
+  elif [ -f "$TASK_DIR/instance-down" ]; then
+    printf '%s\n' database_down
+  elif [ -f "$TASK_DIR/binary-state-known" ] ||
+       [[ "$STAGE" =~ ^(rac_start|rac_node_validate|cluster_datapatch|cluster_final_validate)$ ]]; then
+    printf '%s\n' binary_state_known
+  else
+    printf '%s\n' no_mutation
+  fi
+}
+
+collect_task_artifacts() {
+  local artifact_path artifact_sha unexpected_entry
+  unexpected_entry=$(find "$TASK_DIR" -mindepth 1 -maxdepth 1 ! -type f -print -quit)
+  [ -z "$unexpected_entry" ] || die "task evidence directory contains a non-regular entry: $unexpected_entry"
+  while IFS= read -r -d '' artifact_path; do
+    artifact_sha=$(opu_hash_file "$artifact_path")
+    jq -cn --arg path "$artifact_path" --arg sha256 "$artifact_sha" '{path:$path,sha256:$sha256}'
+  done < <(find "$TASK_DIR" -maxdepth 1 -type f \
+    ! -name 'evidence.json' ! -name 'evidence.tmp' \
+    ! -name 'stdout.log' ! -name 'stderr.log' -print0 | sort -z) | jq -s '.'
+}
+
+emit_evidence() {
+  local status=$1 postcondition=$2 exit_code=$3 detail=$4 finished_at=$5 outcome_class=$6
+  local stdout_sha stderr_sha tmp canonical record_sha sid_value="" artifacts
+  [ -f "$BINDING_FILE" ] && verify_sealed_json "$BINDING_FILE" record_sha256 &&
+    sid_value=$(jq -r '.target.oracle_sid' "$BINDING_FILE")
+  stdout_sha=$(opu_hash_file "$TASK_DIR/stdout.log")
+  stderr_sha=$(opu_hash_file "$TASK_DIR/stderr.log")
+  artifacts=$(collect_task_artifacts)
+  tmp="$TASK_DIR/evidence.tmp"
+  jq -cn \
+    --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg plan_sha "$PLAN_SHA" \
+    --arg status "$status" --arg postcondition "$postcondition" --arg detail "$detail" \
+    --arg outcome "$outcome_class" --arg started "$STARTED_AT" --arg finished "$finished_at" \
+    --arg actor "$ACTOR" --arg stage "$STAGE" --arg database "$DATABASE" \
+    --arg oracle_target "$ORACLE_HOME_TARGET" --arg grid_target "$GRID_HOME_TARGET" \
+    --arg owner "$ORACLE_OWNER" --arg topology rac --arg coordinator "$COORDINATOR_NODE" \
+    --arg node "$LOCAL_NODE" --arg oracle_sid "$sid_value" --arg patch "$PATCH_ID" \
+    --arg artifact_sha "$ARTIFACT_SHA" --arg recovery_sha "$RECOVERY_FILE_SHA" \
+    --arg recovery_record "$RECOVERY_RECORD_SHA" \
+    --arg readiness_sha "$(jq -r '.source_documents.readiness.sha256' "$PLAN_FILE")" \
+    --arg reconciliation_sha "$(jq -r '.source_documents.reconciliation.sha256' "$PLAN_FILE")" \
+    --arg artifact_manifest_sha "$(jq -r '.source_documents.artifact_manifest.sha256' "$PLAN_FILE")" \
+    --arg procedure_sha "$(jq -r '.source_documents.procedure_validation.sha256' "$PLAN_FILE")" \
+    --arg compatibility_sha "$(jq -r '.source_documents.compatibility.sha256' "$PLAN_FILE")" \
+    --arg policy_sha "$(jq -r '.source_documents.policy.sha256' "$PLAN_FILE")" \
+    --arg stdout_path "$TASK_DIR/stdout.log" --arg stdout_sha "$stdout_sha" \
+    --arg stderr_path "$TASK_DIR/stderr.log" --arg stderr_sha "$stderr_sha" \
+    --argjson artifacts "$artifacts" \
+    --argjson exit_code "$exit_code" '
+      {schema_version:"1.0",collector:{name:"oracle.database.rac.node.executor",version:"1"},
+       intent:"patch_apply",plan_id:$plan,task_id:$task,plan_sha256:$plan_sha,status:$status,
+       postcondition:{status:$postcondition,detail:$detail},outcome_class:$outcome,
+       started_at:$started,finished_at:$finished,exit_code:$exit_code,actor:$actor,stage:$stage,
+       target:{database_unique_name:$database,oracle_home:$oracle_target,grid_home:$grid_target,
+               owner:$owner,topology:$topology,coordinator_node:$coordinator,node:$node,
+               oracle_sid:(if $oracle_sid == "" then null else $oracle_sid end)},
+       patch:{patch_id:$patch,artifact_sha256:$artifact_sha},
+       source_documents:{readiness:$readiness_sha,reconciliation:$reconciliation_sha,
+                         artifact_manifest:$artifact_manifest_sha,procedure_validation:$procedure_sha,
+                         compatibility:$compatibility_sha,policy:$policy_sha},
+       recovery:{manifest_sha256:$recovery_sha,record_sha256:$recovery_record},artifacts:$artifacts,
+       logs:{stdout:{path:$stdout_path,sha256:$stdout_sha},stderr:{path:$stderr_path,sha256:$stderr_sha}}}
+    ' >"$tmp"
+  canonical=$(jq -cS . "$tmp")
+  record_sha=$(opu_hash_string "$canonical")
+  jq --arg record_sha "$record_sha" '.record_sha256=$record_sha' "$tmp" >"$TASK_DIR/evidence.json"
+  rm -f "$tmp"
+}
+
+execute_task() {
+  local claim_output stage_pid heartbeat_pid stage_rc finished_at status postcondition detail outcome_class complete_rc
+  require_root
+  load_plan
+  verify_source_documents
+  verify_recovery
+  mkdir -p "$EXECUTION_STATE_DIR/plans/$PLAN_ID/nodes"
+  NODE_RUN_DIR="$EXECUTION_STATE_DIR/plans/$PLAN_ID/nodes/$(node_key "${OPU_RAC_DATABASE_TEST_HOSTNAME:-$(current_short_host)}")"
+  mkdir -p "$NODE_RUN_DIR/tasks"
+  TASK_DIR="$NODE_RUN_DIR/tasks/$TASK_ID"
+  [ ! -e "$TASK_DIR" ] || die "execution evidence already exists for task $TASK_ID"
+  BINDING_FILE="$NODE_RUN_DIR/target-binding.json"
+  DRAIN_FILE="$NODE_RUN_DIR/drain-state.json"
+  acquire_executor_lock
+  claim_output=$(env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" claim \
+    --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --lease-seconds "$LEASE_SECONDS") ||
+    die 'could not claim the sealed RAC task'
+  mkdir "$TASK_DIR"
+  printf '%s\n' "$claim_output" >"$TASK_DIR/claim.json"
+  load_task_after_claim
+  # Re-key the run directory from the sealed task node, not an untrusted environment value.
+  local sealed_node_dir="$EXECUTION_STATE_DIR/plans/$PLAN_ID/nodes/$(node_key "$LOCAL_NODE")"
+  if [ "$sealed_node_dir" != "$NODE_RUN_DIR" ]; then
+    die 'test/local hostname and the sealed task node resolve to different run directories'
+  fi
+  STARTED_AT=$(opu_now_utc)
+  set +e
+  (set -e; close_inherited_executor_lock; run_typed_stage) >"$TASK_DIR/stdout.log" 2>"$TASK_DIR/stderr.log" &
+  stage_pid=$!
+  (close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
+  wait "$stage_pid"; stage_rc=$?
+  kill "$heartbeat_pid" 2>/dev/null || true
+  wait "$heartbeat_pid" 2>/dev/null || true
+  set -e
+  finished_at=$(opu_now_utc)
+  if [ -f "$TASK_DIR/heartbeat-failed" ]; then
+    status=failed; postcondition=unknown
+    detail='task lease heartbeat failed; Oracle outcome requires controller reconciliation'
+    stage_rc=75; outcome_class=$(derive_outcome)
+  elif [ "$stage_rc" -eq 0 ]; then
+    status=succeeded; postcondition=passed; detail="$STAGE postcondition passed"
+    outcome_class=$(stage_success_outcome)
+  else
+    status=failed
+    if [ -f "$TASK_DIR/binary-state-unknown" ]; then postcondition=unknown; else postcondition=failed; fi
+    detail="$STAGE failed; inspect sealed task logs"
+    outcome_class=$(derive_outcome)
+  fi
+  emit_evidence "$status" "$postcondition" "$stage_rc" "$detail" "$finished_at" "$outcome_class"
+  set +e
+  env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" complete \
+    --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" \
+    --status "$status" --evidence "$TASK_DIR/evidence.json"
+  complete_rc=$?
+  set -e
+  [ "$complete_rc" -eq 0 ] || die 'RAC task evidence was written but the controller could not complete the lease; reconcile the plan'
+  cat "$TASK_DIR/evidence.json"
+  [ "$status" = succeeded ] && return 0
+  return "$stage_rc"
+}
+
+main() {
+  local command=${1:-}
+  [ "$#" -gt 0 ] && shift
+  [ "$command" = execute ] || { usage >&2; exit 64; }
+  PLAN_ID=""; TASK_ID=""; ACTOR=""; LEASE_SECONDS=3600
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --plan-id) PLAN_ID=${2:-}; shift 2 ;;
+      --task-id) TASK_ID=${2:-}; shift 2 ;;
+      --actor) ACTOR=${2:-}; shift 2 ;;
+      --lease-seconds) LEASE_SECONDS=${2:-}; shift 2 ;;
+      *) usage >&2; exit 64 ;;
+    esac
+  done
+  opu_validate_identifier "$PLAN_ID" plan-id >/dev/null &&
+    opu_validate_identifier "$TASK_ID" task-id >/dev/null &&
+    opu_validate_identifier "$ACTOR" actor >/dev/null || die 'plan, task, or actor identifier is invalid'
+  [[ "$LEASE_SECONDS" =~ ^[0-9]{1,4}$ ]] && [ "$LEASE_SECONDS" -ge 30 ] && [ "$LEASE_SECONDS" -le 3600 ] ||
+    die 'lease seconds must be between 30 and 3600'
+  opu_validate_absolute_path "$PLAN_STATE_DIR" plan-state-directory >/dev/null || die 'invalid plan state directory'
+  opu_validate_absolute_path "$EXECUTION_STATE_DIR" execution-state-directory >/dev/null || die 'invalid execution state directory'
+  command -v jq >/dev/null && command -v sha256sum >/dev/null && command -v xmllint >/dev/null || die 'jq, sha256sum, and xmllint are required'
+  execute_task
+}
+
+main "$@"

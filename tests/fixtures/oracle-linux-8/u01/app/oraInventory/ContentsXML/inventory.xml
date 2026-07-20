@@ -1,0 +1,13 @@
+<?xml version="1.0" standalone="yes" ?>
+<INVENTORY>
+  <VERSION_INFO><SAVED_WITH>12.2.0.7.0</SAVED_WITH></VERSION_INFO>
+  <HOME_LIST>
+    <HOME NAME="OraDB19Home1" LOC="/u01/app/oracle/product/19c/dbhome_1" TYPE="O" IDX="1"/>
+    <HOME
+      TYPE="O"
+      LOC="/u01/app/oracle/product/19c/dbhome_2"
+      IDX="2"
+      NAME="OraDB19Home2"/>
+    <HOME NAME="OldHome" LOC="/u01/app/oracle/product/19c/old_home" TYPE="O" IDX="3" REMOVED="T"/>
+  </HOME_LIST>
+</INVENTORY>

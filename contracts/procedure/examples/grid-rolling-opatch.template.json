@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.0",
+  "patch_id": "REPLACE_WITH_PATCH_ID",
+  "artifact_sha256": "REPLACE_WITH_ARTIFACT_SHA256",
+  "target": {
+    "family": "grid",
+    "method": "opatch",
+    "platform_id": "REPLACE_WITH_ARTIFACT_ARU_PLATFORM_ID"
+  },
+  "execution": {
+    "adapter": "grid_rolling_opatch",
+    "operations": [
+      "grid_rootcrs_prepatch",
+      "grid_opatch_apply",
+      "grid_rootadd_rdbms",
+      "grid_rootcrs_postpatch"
+    ]
+  },
+  "required_opatch_version": "REPLACE_WITH_README_MINIMUM",
+  "oracle_references": [
+    {
+      "kind": "patch_readme",
+      "identifier": "REPLACE_WITH_README_RELATIVE_PATH",
+      "sha256": "REPLACE_WITH_README_SHA256"
+    },
+    {
+      "kind": "mos_note",
+      "identifier": "REPLACE_WITH_APPROVED_MOS_NOTE",
+      "sha256": "REPLACE_WITH_APPROVED_EXPORT_SHA256"
+    }
+  ],
+  "mandatory_prechecks": [
+    "artifact_integrity",
+    "platform_applicability",
+    "opatch_version",
+    "conflict_check",
+    "backup_or_restore"
+  ],
+  "mandatory_postchecks": [
+    "binary_inventory",
+    "service_health"
+  ],
+  "rollback": {
+    "mode": "opatch_rollback",
+    "precondition": "REPLACE_WITH_EXACT_README_ROLLBACK_CONDITION"
+  }
+}

@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# Read-only per-host inventory. It takes no Oracle topology inputs: discovery
+# happens locally, and a control plane reconciles snapshots from every host.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/oracle_inventory.sh"
+
+OUT=""; PRETTY=0; GRID_HOME=""; GRID_STATUS=unavailable
+declare -a WARNINGS=() HOMES=() DBS=() NODES=()
+usage() { cat <<'EOF'
+Usage: opu-topology-discover [--output ABSOLUTE_PATH] [--pretty]
+
+Collect a read-only snapshot of this host's OS, Oracle homes, Clusterware
+membership, registered databases, services, and OPatch inventory. Run locally
+on each managed host; no SSH, node list, database name, or Oracle-home path is
+accepted as an input.
+EOF
+}
+warn() { WARNINGS+=("$1"); }
+valid_name() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$ ]]; }
+array_json() { local x first=1; printf '['; for x in "$@"; do [ -n "$x" ] || continue; [ "$first" -eq 1 ] || printf ','; opu_json_string "$x"; first=0; done; printf ']'; }
+add_home() { local x=$1 y; for y in "${HOMES[@]:-}"; do [ "$y" = "$x" ] && return 0; done; [ -d "$x" ] && HOMES+=("$x"); return 0; }
+parse() { while [ "$#" -gt 0 ]; do case "$1" in --output) [ "$#" -ge 2 ] || { echo '--output requires a value' >&2; exit 64; }; OUT=$2; shift 2;; --pretty) PRETTY=1; shift;; -h|--help) usage; exit 0;; *) echo "unknown option: $1" >&2; exit 64;; esac; done; [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?; }
+
+discover_grid() {
+  local candidate proc
+  candidate=$(command -v srvctl 2>/dev/null || true)
+  [ -n "$candidate" ] && GRID_HOME=$(dirname "$(dirname "$candidate")")
+  if [ -z "$GRID_HOME" ] || [ ! -x "$GRID_HOME/bin/srvctl" ]; then
+    GRID_HOME=""
+    while IFS= read -r proc; do
+      candidate=${proc%/bin/*}; [ "$candidate" = "$proc" ] && continue
+      [ -x "$candidate/bin/srvctl" ] || continue; GRID_HOME=$candidate; break
+    done < <(ps -eo args= 2>/dev/null | awk '/\/bin\/(ohasd\.bin|crsd\.bin|ocssd\.bin)([[:space:]]|$)/ {print $1}')
+  fi
+  [ -n "$GRID_HOME" ] && GRID_STATUS=detected || warn 'Clusterware home was not detected from PATH or active processes.'
+}
+discover_homes() {
+  local line rest home ptr inventory_home
+  if [ -r /etc/oratab ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ''|'#'*) continue;; esac
+      rest=${line#*:}; [ "$rest" = "$line" ] && continue; home=${rest%%:*}; [ "$home" = "$rest" ] && continue; add_home "$home"
+    done </etc/oratab
+  else warn '/etc/oratab is unavailable.'; fi
+  [ -n "$GRID_HOME" ] && add_home "$GRID_HOME"
+  ptr=$(awk -F= '$1 == "inventory_loc" {print $2; exit}' /etc/oraInst.loc 2>/dev/null || true)
+  if [ -n "$ptr" ] && [ -r "$ptr/ContentsXML/inventory.xml" ]; then
+    while IFS= read -r inventory_home; do add_home "$inventory_home"; done < <(sed -nE 's/.*LOC="([^"]+)".*/\1/p' "$ptr/ContentsXML/inventory.xml")
+  fi
+}
+as_owner() { local owner=$1; shift; if [ "$(id -un)" = "$owner" ]; then "$@"; elif [ "$(id -u)" -eq 0 ]; then runuser -u "$owner" -- "$@"; else return 126; fi; }
+# Recent OPatch distributions may not include a runnable bundled JRE on
+# Oracle Linux 8.  Use the JDK delivered with the target Oracle home whenever
+# it is available; this is also safe for older OPatch releases.
+opatch_as_owner() {
+  local owner=$1 home=$2
+  shift 2
+  if [ -x "$home/jdk/bin/java" ]; then
+    as_owner "$owner" env -u JAVA_HOME -u OPATCH_JRE "ORACLE_HOME=$home" "PATH=$home/OPatch:$home/bin:/usr/bin:/bin" "$home/OPatch/opatch" "$@" -jdk "$home/jdk"
+  else
+    as_owner "$owner" env -u JAVA_HOME -u OPATCH_JRE "ORACLE_HOME=$home" "PATH=$home/OPatch:$home/bin:/usr/bin:/bin" "$home/OPatch/opatch" "$@"
+  fi
+}
+runtime_owner() {
+  local home=$1 owner
+  # A Grid home can contain binaries launched by database-owned resources
+  # (for example listeners).  For Grid inventory, prefer the ASM/Clusterware
+  # process owner; falling back to any home process would misclassify it.
+  if [ "$home" = "$GRID_HOME" ]; then
+    owner=$(ps -eo user=,args= 2>/dev/null | awk '$1 != "root" && $0 ~ /(asm_pmon|asm_smon|ora\.asm|crsd\.bin)/ {print $1; exit}')
+  fi
+  [ -n "${owner:-}" ] || owner=$(ps -eo user=,args= 2>/dev/null | awk -v home="$home" '$1 != "root" && index($0, home "/bin/") {print $1; exit}')
+  if [ -n "$owner" ]; then printf '%s' "$owner"; else stat -c '%U' "$home" 2>/dev/null || printf '%s' unknown; fi
+}
+home_json() {
+  local home=$1 owner version opatch patch_list xml_inventory xml_patches xml_sha inventory_source xml_status xml_dir xml_file xml_command_output patch platform_id platform_name platform_status platform_source platform_record
+  owner=$(runtime_owner "$home")
+  version=$(awk -F= '$1 == "VERSION" {print $2; exit}' "$home/inventory/ContentsXML/comps.xml" 2>/dev/null || true)
+  [ -n "$version" ] || version=$(as_owner "$owner" env "ORACLE_HOME=$home" "PATH=$home/bin:/usr/bin:/bin" "$home/bin/sqlplus" -version 2>/dev/null | sed -nE 's/.*Release ([0-9.]+).*/\1/p' | head -n1 || true)
+  [ -n "$version" ] || version=$("$home/bin/crsctl" query crs activeversion 2>/dev/null | sed -nE 's/.*\[([^]]+)\].*/\1/p' | head -n1 || true)
+  opatch=""; patch_list=""; xml_inventory=""; xml_patches=""; xml_sha=""; inventory_source=unavailable; xml_status=unavailable
+  platform_id=""; platform_name=""; platform_status=unavailable; platform_source=""
+  if [ -x "$home/OPatch/opatch" ] && [ "$owner" != unknown ]; then
+    opatch=$(opatch_as_owner "$owner" "$home" version 2>/dev/null | sed -nE 's/.*Version: ([^[:space:]]+).*/\1/p' | head -n1 || true)
+    patch_list=$(opatch_as_owner "$owner" "$home" lspatches -oh "$home" 2>/dev/null | awk -F';' '/^[[:space:]]*[0-9]+/ {gsub(/^[[:space:]]+/,"",$1); print $1}' || true)
+    # OPatch documents -xml as requiring a file argument. Do not assume XML is
+    # printed to stdout: doing so silently downgrades authoritative inventory
+    # to lspatches on current OPatch releases.
+    xml_dir=$(mktemp -d "${TMPDIR:-/var/tmp}/opu-opatch-xml.XXXXXX" 2>/dev/null || true)
+    if [ -n "$xml_dir" ]; then
+      if [ "$(id -u)" -eq 0 ]; then chown "$owner" "$xml_dir" 2>/dev/null || true; chmod 700 "$xml_dir" 2>/dev/null || true; fi
+      xml_file="$xml_dir/lsinventory.xml"
+      xml_command_output=$(opatch_as_owner "$owner" "$home" lsinventory -xml "$xml_file" -oh "$home" 2>&1 || true)
+      [ -f "$xml_file" ] && xml_inventory=$(<"$xml_file") || xml_inventory=""
+      if grep -q '<' <<<"$xml_inventory"; then
+        platform_source=opatch_lsinventory_xml
+        xml_status=collected
+        if platform_record=$(opu_extract_opatch_platform "$xml_file"); then
+          IFS=$'\t' read -r platform_id platform_name <<<"$platform_record"
+          platform_status=collected
+        else
+          platform_status=failed
+        fi
+      else xml_status=failed; platform_status=failed; fi
+      rm -rf "$xml_dir"
+    fi
+    if [ "$xml_status" = collected ]; then
+      xml_sha=$(opu_hash_string "$xml_inventory")
+      xml_patches=$(grep -Eo '<patchID>[0-9]+</patchID>|patchID[[:space:]]*=[[:space:]]*"?[0-9]+|<patch_id[[:space:]]+number="[0-9]+"' <<<"$xml_inventory" | grep -Eo '[0-9]+' | sort -nu || true)
+      if [ -n "$xml_patches" ]; then patch_list=$xml_patches; inventory_source=opatch_lsinventory_xml; else inventory_source=opatch_lspatches_fallback; fi
+    elif [ -n "$patch_list" ]; then inventory_source=opatch_lspatches_fallback; fi
+  fi
+  printf '{"path":%s,"owner":%s,"version":%s,"opatch_version":%s,"platform":{"status":%s,"id":%s,"name":%s,"source":%s,"source_sha256":%s},"patch_inventory_source":%s,"opatch_inventory_xml_status":%s,"opatch_inventory_xml_sha256":%s,"patches":[' "$(opu_json_string "$home")" "$(opu_json_string "$owner")" "$(opu_json_nullable_string "$version")" "$(opu_json_nullable_string "$opatch")" "$(opu_json_string "$platform_status")" "$(opu_json_nullable_string "$platform_id")" "$(opu_json_nullable_string "$platform_name")" "$(opu_json_nullable_string "$platform_source")" "$(opu_json_nullable_string "$xml_sha")" "$(opu_json_string "$inventory_source")" "$(opu_json_string "$xml_status")" "$(opu_json_nullable_string "$xml_sha")"
+  local first=1; while IFS= read -r patch; do [ -n "$patch" ] || continue; [ "$first" -eq 1 ] || printf ','; opu_json_string "$patch"; first=0; done <<<"$patch_list"; printf ']}'
+}
+discover_nodes() {
+  local line node state
+  [ -x "${GRID_HOME:-/nonexistent}/bin/olsnodes" ] || return 0
+  while IFS= read -r line; do node=$(awk '{print $1}' <<<"$line"); state=$(awk '{print $2}' <<<"$line"); valid_name "$node" && [ -n "$state" ] && NODES+=("$node|$state"); done < <("$GRID_HOME/bin/olsnodes" -s -t 2>/dev/null || true)
+}
+discover_databases() {
+  local db line rest home
+  if [ -n "$GRID_HOME" ] && [ -x "$GRID_HOME/bin/srvctl" ]; then
+    while IFS= read -r db; do valid_name "$db" && DBS+=("rac|$db"); done < <("$GRID_HOME/bin/srvctl" config database 2>/dev/null || true)
+    return 0
+  fi
+  # A standalone Oracle home does not have srvctl. /etc/oratab is the
+  # configuration source; the subsequent local SYSDBA query establishes the
+  # actual DB_UNIQUE_NAME rather than treating an ORACLE_SID as a database ID.
+  [ -r /etc/oratab ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue;; esac
+    db=${line%%:*}; rest=${line#*:}; [ "$rest" = "$line" ] && continue; home=${rest%%:*}
+    valid_name "$db" && [ -d "$home" ] && DBS+=("standalone|$db|$home")
+  done </etc/oratab
+}
+grid_runtime_json() {
+  local active health version upgrade patch_level health_state
+  [ -x "${GRID_HOME:-/nonexistent}/bin/crsctl" ] || { printf '{"status":"unavailable"}'; return 0; }
+  active=$("$GRID_HOME/bin/crsctl" query crs activeversion -f 2>&1 || true)
+  health=$("$GRID_HOME/bin/crsctl" check crs 2>&1 || true)
+  version=$(sed -nE 's/.*active version on the cluster is \[([^]]+)\].*/\1/p' <<<"$active" | head -n1)
+  upgrade=$(sed -nE 's/.*upgrade state is \[([^]]+)\].*/\1/p' <<<"$active" | head -n1)
+  patch_level=$(sed -nE 's/.*active patch level is \[([^]]+)\].*/\1/p' <<<"$active" | head -n1)
+  grep -qi 'online\|running' <<<"$health" && health_state=healthy || health_state=unknown
+  printf '{"status":%s,"active_version":%s,"upgrade_state":%s,"active_patch_level":%s,"evidence":%s}' \
+    "$(opu_json_string "$health_state")" "$(opu_json_nullable_string "$version")" "$(opu_json_nullable_string "$upgrade")" "$(opu_json_nullable_string "$patch_level")" "$(opu_json_string "$active")"
+}
+local_instance() {
+  local db=$1 node status
+  node=$(hostname -s 2>/dev/null || hostname)
+  status=$("$GRID_HOME/bin/srvctl" status instance -db "$db" -node "$node" 2>&1 || true)
+  sed -nE 's/^[Ii]nstance[[:space:]]+([^[:space:]]+)[[:space:]]+is[[:space:]]+running.*/\1/p' <<<"$status" | head -n1
+}
+db_runtime_json() {
+  local db=$1 home=$2 supplied_sid=${3:-} owner sid output line db_version role mode log_mode cdb instance instance_state pdb_non_rw sqlpatch_bad invalid fra_limit fra_used backup_time backup_age_minutes restore_points
+  owner=$(runtime_owner "$home"); sid=${supplied_sid:-$(local_instance "$db")}
+  if [ -z "$sid" ] || [ ! -x "$home/bin/sqlplus" ] || [ "$owner" = unknown ]; then
+    printf '{"status":"unavailable","reason":%s}' "$(opu_json_string "local running instance or SQL*Plus unavailable")"; return 0
+  fi
+  output=$(printf '%s\n' \
+    'set pages 0 feedback off heading off verify off echo off trimspool on lines 1000' \
+    "select 'DB|'||version from v\$instance;" \
+    "select 'ROLE|'||database_role||'|'||open_mode||'|'||log_mode||'|'||cdb from v\$database;" \
+    "select 'INSTANCE|'||instance_name||'|'||status from v\$instance;" \
+    "select 'PDB_NON_RW|'||count(*) from v\$pdbs where con_id > 2 and open_mode <> 'READ WRITE';" \
+    "select 'SQLPATCH_BAD|'||count(*) from dba_registry_sqlpatch where status <> 'SUCCESS';" \
+    "select 'INVALID|'||count(*) from dba_objects where status = 'INVALID';" \
+    "select 'FRA|'||nvl(space_limit,0)||'|'||nvl(space_used,0) from v\$recovery_file_dest;" \
+    "select 'BACKUP|'||nvl(to_char(max(completion_time),'YYYY-MM-DD\"T\"HH24:MI:SS'),'NONE') from v\$backup_set_details where status = 'A';" \
+    "select 'BACKUP_AGE_MINUTES|'||nvl(round((sysdate - max(completion_time))*1440),-1) from v\$backup_set_details where status = 'A';" \
+    "select 'GRP|'||count(*) from v\$restore_point where guarantee_flashback_database = 'YES';" \
+    'exit' | as_owner "$owner" env "ORACLE_HOME=$home" "ORACLE_SID=$sid" "PATH=$home/bin:/usr/bin:/bin" "$home/bin/sqlplus" -L -s '/ as sysdba' 2>&1 || true)
+  if grep -qiE '(^|[[:space:]])ORA-[0-9]+|SP2-[0-9]+' <<<"$output"; then
+    printf '{"status":"unavailable","reason":%s,"evidence":%s}' "$(opu_json_string "SYSDBA discovery query returned an Oracle error")" "$(opu_json_string "$output")"; return 0
+  fi
+  db_version=$(awk -F'|' '$1 == "DB" {print $2; exit}' <<<"$output"); role=$(awk -F'|' '$1 == "ROLE" {print $2; exit}' <<<"$output"); mode=$(awk -F'|' '$1 == "ROLE" {print $3; exit}' <<<"$output"); log_mode=$(awk -F'|' '$1 == "ROLE" {print $4; exit}' <<<"$output"); cdb=$(awk -F'|' '$1 == "ROLE" {print $5; exit}' <<<"$output")
+  instance=$(awk -F'|' '$1 == "INSTANCE" {print $2; exit}' <<<"$output"); instance_state=$(awk -F'|' '$1 == "INSTANCE" {print $3; exit}' <<<"$output"); pdb_non_rw=$(awk -F'|' '$1 == "PDB_NON_RW" {print $2; exit}' <<<"$output"); sqlpatch_bad=$(awk -F'|' '$1 == "SQLPATCH_BAD" {print $2; exit}' <<<"$output"); invalid=$(awk -F'|' '$1 == "INVALID" {print $2; exit}' <<<"$output"); fra_limit=$(awk -F'|' '$1 == "FRA" {print $2; exit}' <<<"$output"); fra_used=$(awk -F'|' '$1 == "FRA" {print $3; exit}' <<<"$output"); backup_time=$(awk -F'|' '$1 == "BACKUP" {print $2; exit}' <<<"$output"); backup_age_minutes=$(awk -F'|' '$1 == "BACKUP_AGE_MINUTES" {print $2; exit}' <<<"$output"); restore_points=$(awk -F'|' '$1 == "GRP" {print $2; exit}' <<<"$output")
+  [ "$backup_time" = NONE ] && backup_time=""
+  printf '{"status":"complete","database_version":%s,"instance":%s,"database_role":%s,"open_mode":%s,"log_mode":%s,"cdb":%s,"instance_state":%s,"pdb_not_read_write":%s,"sqlpatch_non_success":%s,"invalid_objects":%s,"fra_space_limit_bytes":%s,"fra_space_used_bytes":%s,"latest_backup_completed_at":%s,"backup_age_minutes":%s,"guaranteed_restore_points":%s}' \
+    "$(opu_json_nullable_string "$db_version")" "$(opu_json_nullable_string "$instance")" "$(opu_json_nullable_string "$role")" "$(opu_json_nullable_string "$mode")" "$(opu_json_nullable_string "$log_mode")" "$(opu_json_nullable_string "$cdb")" "$(opu_json_nullable_string "$instance_state")" "${pdb_non_rw:-null}" "${sqlpatch_bad:-null}" "${invalid:-null}" "${fra_limit:-null}" "${fra_used:-null}" "$(opu_json_nullable_string "$backup_time")" "${backup_age_minutes:-null}" "${restore_points:-null}"
+}
+rac_db_json() {
+  local db=$1 cfg home status services service first=1 runtime
+  cfg=$("$GRID_HOME/bin/srvctl" config database -db "$db" 2>&1 || true)
+  home=$(awk -F: 'tolower($1) ~ /^oracle home$/ {gsub(/^[[:space:]]+/,"",$2); print $2; exit}' <<<"$cfg")
+  status=$("$GRID_HOME/bin/srvctl" status database -db "$db" 2>&1 || true)
+  services=$("$GRID_HOME/bin/srvctl" config service -db "$db" 2>/dev/null || true)
+  runtime=$(db_runtime_json "$db" "$home")
+  printf '{"db_unique_name":%s,"oracle_home":%s,"srvctl_status":%s,"services":[' "$(opu_json_string "$db")" "$(opu_json_nullable_string "$home")" "$(opu_json_string "$status")"
+  while IFS= read -r service; do valid_name "$service" || continue; [ "$first" -eq 1 ] || printf ','; opu_json_string "$service"; first=0; done <<<"$services"; printf '],"runtime":%s}' "$runtime"
+}
+standalone_db_json() {
+  local sid=$1 home=$2 owner output db runtime
+  owner=$(runtime_owner "$home")
+  if [ ! -x "$home/bin/sqlplus" ] || [ "$owner" = unknown ]; then
+    printf '{"db_unique_name":%s,"oracle_home":%s,"discovery_source":"oratab","srvctl_status":null,"services":[],"runtime":{"status":"unavailable","reason":"SQL*Plus or Oracle owner unavailable"}}' "$(opu_json_string "$sid")" "$(opu_json_string "$home")"; return 0
+  fi
+  output=$(printf '%s\n' 'set pages 0 feedback off heading off verify off echo off' 'select db_unique_name from v$database;' 'exit' | as_owner "$owner" env "ORACLE_HOME=$home" "ORACLE_SID=$sid" "PATH=$home/bin:/usr/bin:/bin" "$home/bin/sqlplus" -L -s '/ as sysdba' 2>&1 || true)
+  db=$(awk 'NF && $0 !~ /^(Connected|SQL\*Plus|Version|Copyright|ORA-|SP2-)/ {print $1; exit}' <<<"$output")
+  valid_name "$db" || db=$sid
+  runtime=$(db_runtime_json "$db" "$home" "$sid")
+  printf '{"db_unique_name":%s,"oracle_home":%s,"discovery_source":"oratab","srvctl_status":null,"services":[],"runtime":%s}' "$(opu_json_string "$db")" "$(opu_json_string "$home")" "$runtime"
+}
+emit() {
+  local file=$1 host os kernel now item first
+  host=$(hostname -f 2>/dev/null || hostname); os=$(awk -F= '$1 == "PRETTY_NAME" {gsub(/^"|"$/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null || true); kernel=$(uname -r); now=$(opu_now_utc)
+  {
+    printf '{\n  "schema_version":"1.0",\n  "collector":{"name":"oracle.topology.discover","version":"1"},\n'
+    printf '  "collected_at":%s,\n  "host":{"name":%s,"os":%s,"kernel":%s},\n' "$(opu_json_string "$now")" "$(opu_json_string "$host")" "$(opu_json_nullable_string "$os")" "$(opu_json_nullable_string "$kernel")"
+    printf '  "cluster":{"status":%s,"grid_home":%s,"runtime":%s,"nodes":[' "$(opu_json_string "$GRID_STATUS")" "$(opu_json_nullable_string "$GRID_HOME")" "$(grid_runtime_json)"; first=1
+    for item in "${NODES[@]:-}"; do [ -n "$item" ] || continue; [ "$first" -eq 1 ] || printf ','; printf '{"name":%s,"status":%s}' "$(opu_json_string "${item%%|*}")" "$(opu_json_string "${item#*|}")"; first=0; done
+    printf ']},\n  "oracle_homes":['; first=1; for item in "${HOMES[@]:-}"; do [ -n "$item" ] || continue; [ "$first" -eq 1 ] || printf ','; home_json "$item"; first=0; done
+    printf '],\n  "databases":['; first=1; for item in "${DBS[@]:-}"; do [ -n "$item" ] || continue; [ "$first" -eq 1 ] || printf ','; case "$item" in rac\|*) rac_db_json "${item#rac|}";; standalone\|*) local db_record; db_record=${item#standalone|}; standalone_db_json "${db_record%%|*}" "${db_record#*|}";; esac; first=0; done
+    printf '],\n  "warnings":'; array_json "${WARNINGS[@]:-}"; printf '\n}\n'
+  } >"$file"
+}
+main() { parse "$@"; discover_grid; discover_homes; discover_nodes; discover_databases; local tmp; if [ -n "$OUT" ]; then mkdir -p "$(dirname "$OUT")"; [ ! -L "$OUT" ] || { echo 'output cannot be a symbolic link' >&2; exit 64; }; tmp=$OUT; else tmp=$(mktemp "${TMPDIR:-/tmp}/opu-topology.XXXXXX"); trap 'rm -f "${tmp:-}"' EXIT; fi; emit "$tmp"; if [ "$PRETTY" -eq 1 ]; then command -v jq >/dev/null || { echo 'jq is required for --pretty' >&2; exit 69; }; jq . "$tmp"; else cat "$tmp"; fi; }
+main "$@"

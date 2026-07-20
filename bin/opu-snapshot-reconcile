@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Reconciles immutable, per-host topology snapshots into a cluster inventory.
+# This is read-only and deliberately cannot select or execute a patch.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+OUT=""; declare -a SNAPSHOTS=() FINDINGS=()
+usage() { printf '%s\n' 'Usage: opu-snapshot-reconcile --snapshot ABSOLUTE_PATH [--snapshot ABSOLUTE_PATH ...] [--output ABSOLUTE_PATH]'; }
+add_finding() { FINDINGS+=("$1|$2|$3"); }
+has_blocker() { local item; for item in "${FINDINGS[@]:-}"; do [ "$(cut -d'|' -f2 <<<"$item")" = blocker ] && return 0; done; return 1; }
+parse() { while [ "$#" -gt 0 ]; do case "$1" in --snapshot) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; opu_validate_absolute_path "$2" snapshot || exit $?; SNAPSHOTS+=("$2"); shift 2;; --output) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; opu_validate_absolute_path "$2" output || exit $?; OUT=$2; shift 2;; -h|--help) usage; exit 0;; *) usage >&2; exit 64;; esac; done; ((${#SNAPSHOTS[@]})) || { usage >&2; exit 64; }; command -v jq >/dev/null || { echo 'jq is required' >&2; exit 69; }; }
+short_host() { printf '%s' "${1%%.*}"; }
+valid_snapshot() { jq -e '.schema_version == "1.0" and .collector.name == "oracle.topology.discover" and (.cluster | type == "object") and (.oracle_homes | type == "array") and (.databases | type == "array")' "$1" >/dev/null 2>&1; }
+json_array() { local x first=1; printf '['; for x in "$@"; do [ "$first" -eq 1 ] || printf ','; printf '%s' "$x"; first=0; done; printf ']'; }
+emit() {
+  local file=$1 status expected_json captured_json hashes_json findings_json grid_json homes_json db_json item first
+  status=consistent; if has_blocker; then status=blocked; fi
+  expected_json=$(jq -cn '$ARGS.positional | sort | unique' --args "${EXPECTED[@]:-}")
+  captured_json=$(jq -cn '$ARGS.positional | sort | unique' --args "${CAPTURED[@]:-}")
+  hashes_json=$(json_array "${HASHES[@]:-}")
+  findings_json='['; first=1
+  for item in "${FINDINGS[@]:-}"; do [ -n "$item" ] || continue; [ "$first" -eq 1 ] || findings_json+=','; findings_json+=$(jq -cn --arg code "${item%%|*}" --arg severity "$(cut -d'|' -f2 <<<"$item")" --arg message "$(cut -d'|' -f3- <<<"$item")" '{code:$code,severity:$severity,message:$message}'); first=0; done
+  findings_json+=']'
+  grid_json=${GRID_JSON:-null}; homes_json=${HOMES_JSON:-[]}; db_json=${DATABASES_JSON:-[]}
+  printf '{"schema_version":"1.0","status":%s,"expected_nodes":%s,"captured_nodes":%s,"cluster":%s,"oracle_homes":%s,"databases":%s,"snapshot_evidence":%s,"findings":%s}\n' \
+    "$(opu_json_string "$status")" "$expected_json" "$captured_json" "$grid_json" "$homes_json" "$db_json" "$hashes_json" "$findings_json" >"$file"
+}
+main() {
+  local snapshot host expected grid homes dbs warnings hash baseline_expected baseline_grid baseline_homes baseline_dbs node
+  declare -a EXPECTED=() CAPTURED=() HASHES=()
+  parse "$@"; baseline_expected=""; baseline_grid=""; baseline_homes=""; baseline_dbs=""
+  for snapshot in "${SNAPSHOTS[@]}"; do
+    [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || { add_finding SNAPSHOT_UNAVAILABLE blocker "Snapshot is missing or a symbolic link: $snapshot"; continue; }
+    valid_snapshot "$snapshot" || { add_finding SNAPSHOT_INVALID blocker "Snapshot does not satisfy the topology contract: $snapshot"; continue; }
+    hash=$(opu_hash_file "$snapshot") || exit; HASHES+=("$(jq -cn --arg path "$snapshot" --arg sha256 "$hash" '{path:$path,sha256:$sha256}')")
+    host=$(short_host "$(jq -r '.host.name' "$snapshot")"); CAPTURED+=("$host")
+    expected=$(jq -c '[.cluster.nodes[].name] | sort | unique' "$snapshot")
+    # A standalone host has no Clusterware node list. Its local host is the
+    # complete target membership and must not be rejected as "not active".
+    [ "$expected" != '[]' ] || expected=$(jq -cn --arg host "$host" '[$host]')
+    grid=$(jq -c '.cluster | {grid_home, runtime: {status: .runtime.status, active_version: .runtime.active_version, upgrade_state: .runtime.upgrade_state, active_patch_level: .runtime.active_patch_level}}' "$snapshot")
+    homes=$(jq -c '.oracle_homes | sort_by(.path) | map({path,owner,version,opatch_version,platform:{status:.platform.status,id:.platform.id,name:.platform.name,source:.platform.source,source_sha256:.platform.source_sha256},patches:(.patches|sort)})' "$snapshot")
+    dbs=$(jq -c '.databases | sort_by(.db_unique_name) | map({db_unique_name,oracle_home})' "$snapshot")
+    warnings=$(jq -r '.warnings[]?' "$snapshot")
+    if [ -z "$baseline_expected" ]; then baseline_expected=$expected; baseline_grid=$grid; baseline_homes=$homes; baseline_dbs=$dbs; GRID_JSON=$grid; HOMES_JSON=$homes; DATABASES_JSON=$dbs
+    else
+      [ "$baseline_expected" = "$expected" ] || add_finding CLUSTER_MEMBERSHIP_MISMATCH blocker "Cluster node membership differs between snapshots."
+      [ "$baseline_grid" = "$grid" ] || add_finding GRID_INVENTORY_MISMATCH blocker "Grid home, active version, patch level, or upgrade state differs between snapshots."
+      [ "$baseline_homes" = "$homes" ] || add_finding ORACLE_HOME_INVENTORY_MISMATCH blocker "Oracle home owner, version, OPatch level, or patch inventory differs between snapshots."
+      [ "$baseline_dbs" = "$dbs" ] || add_finding DATABASE_CONFIGURATION_MISMATCH blocker "Registered database names or Oracle homes differ between snapshots."
+    fi
+    if jq -e '.cluster.nodes | length > 0' "$snapshot" >/dev/null 2>&1; then
+      jq -e --arg host "$host" '.cluster.nodes[] | select(.name == $host and .status == "Active")' "$snapshot" >/dev/null 2>&1 || add_finding SNAPSHOT_HOST_NOT_ACTIVE blocker "Snapshot host $host is not an active Clusterware node."
+    fi
+    while IFS= read -r node; do
+      [ -n "$node" ] && add_finding ORACLE_HOME_PLATFORM_UNAVAILABLE blocker "$host: Oracle home $node has no authoritative OPatch platform evidence."
+    done < <(jq -r '.oracle_homes[] | select(.platform.status != "collected" or ((.platform.id // "") | test("^[0-9]+$") | not) or ((.platform.name // "") | type != "string" or length == 0) or .platform.source != "opatch_lsinventory_xml" or ((.platform.source_sha256 // "") | test("^[a-f0-9]{64}$") | not)) | .path' "$snapshot")
+    while IFS= read -r node; do [ -n "$node" ] && add_finding DISCOVERY_WARNING warning "$host: $node"; done <<<"$warnings"
+  done
+  if [ -n "$baseline_expected" ]; then
+    while IFS= read -r node; do EXPECTED+=("$node"); done < <(jq -r '.[]' <<<"$baseline_expected")
+    for node in "${EXPECTED[@]}"; do [[ " ${CAPTURED[*]} " == *" $node "* ]] || add_finding SNAPSHOT_MISSING blocker "No snapshot was supplied for active node $node."; done
+  else add_finding NO_VALID_SNAPSHOTS blocker 'No valid topology snapshot was supplied.'; fi
+  local tmp; if [ -n "$OUT" ]; then mkdir -p "$(dirname "$OUT")"; [ ! -L "$OUT" ] || { echo 'output cannot be a symbolic link' >&2; exit 64; }; tmp=$OUT; else tmp=$(mktemp "${TMPDIR:-/tmp}/opu-reconcile.XXXXXX"); trap 'rm -f "${tmp:-}"' EXIT; fi
+  emit "$tmp"; cat "$tmp"
+  if has_blocker; then exit 2; fi
+}
+main "$@"

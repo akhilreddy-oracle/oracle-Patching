@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# Read-only validation of a prepared Grid Infrastructure recovery bundle.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+SNAPSHOT=""
+BUNDLE=""
+OUT=""
+ORAINST_LIVE=${OPU_GRID_RECOVERY_ORAINST_LOC:-/etc/oraInst.loc}
+
+usage() {
+  printf '%s\n' 'Usage: opu-grid-recovery-evidence-collect --snapshot ABSOLUTE_JSON --bundle ABSOLUTE_JSON --output ABSOLUTE_JSON'
+}
+
+die() { opu_error "$*"; exit 65; }
+valid_sha() { [[ ${1:-} =~ ^[a-f0-9]{64}$ ]]; }
+require_root() { [ "${EUID:-$(id -u)}" -eq 0 ] || [ "${OPU_GRID_RECOVERY_TEST_ALLOW_NONROOT:-0}" = 1 ] || die 'Grid recovery validation must run as root'; }
+owner_for_path() { stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null || true; }
+
+safe_path() {
+  opu_validate_absolute_path "$1" "$2" >/dev/null || return
+  case "$1" in *[!A-Za-z0-9._/+:-]*) opu_error "$2 contains characters that cannot be bound safely"; return 64 ;; esac
+}
+
+parse() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --snapshot) SNAPSHOT=${2:-}; shift 2 ;;
+      --bundle) BUNDLE=${2:-}; shift 2 ;;
+      --output) OUT=${2:-}; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; exit 64 ;;
+    esac
+  done
+  require_root
+  safe_path "$SNAPSHOT" snapshot || exit $?
+  safe_path "$BUNDLE" bundle || exit $?
+  safe_path "$OUT" output || exit $?
+  [ -f "$SNAPSHOT" ] && [ ! -L "$SNAPSHOT" ] || die 'snapshot is missing or symbolic link'
+  [ -f "$BUNDLE" ] && [ ! -L "$BUNDLE" ] || die 'Grid recovery bundle manifest is missing or symbolic link'
+  [ ! -L "$OUT" ] || die 'output cannot be a symbolic link'
+  command -v jq >/dev/null && command -v sha256sum >/dev/null && command -v tar >/dev/null || die 'jq, sha256sum, and tar are required'
+}
+
+verify_record() {
+  local file=$1 field=$2 expected canonical actual
+  expected=$(jq -r ".$field // empty" "$file"); valid_sha "$expected" || return 74
+  canonical=$(jq -cS "del(.$field)" "$file") || return 74
+  actual=$(opu_hash_string "$canonical") || return
+  [ "$actual" = "$expected" ]
+}
+
+resolve_target() {
+  local owner_count active_count node_count node
+  jq -e '.schema_version == "1.0" and .collector.name == "oracle.topology.discover" and .cluster.status == "detected" and .cluster.runtime.status == "healthy" and .cluster.runtime.upgrade_state == "NORMAL" and (.cluster.grid_home | type == "string" and startswith("/")) and (.cluster.nodes | type == "array" and length > 0)' "$SNAPSHOT" >/dev/null || die 'snapshot is not a healthy Grid topology'
+  node_count=$(jq -r '.cluster.nodes | length' "$SNAPSHOT"); active_count=$(jq -r '[.cluster.nodes[] | select(.status == "Active")] | length' "$SNAPSHOT")
+  [ "$node_count" -eq "$active_count" ] || die 'every Grid node must be Active'
+  [ "$(jq -r '[.cluster.nodes[].name] | length == (unique | length)' "$SNAPSHOT")" = true ] || die 'Grid topology contains duplicate node names'
+  while IFS= read -r node; do opu_validate_identifier "$node" 'Grid node' || exit $?; done < <(jq -r '.cluster.nodes[].name' "$SNAPSHOT")
+  TARGET_NODES=$(jq -c '[.cluster.nodes[].name]' "$SNAPSHOT")
+  GRID_HOME=$(jq -r '.cluster.grid_home' "$SNAPSHOT"); safe_path "$GRID_HOME" grid-home || exit $?
+  [ -d "$GRID_HOME" ] && [ ! -L "$GRID_HOME" ] || die 'discovered Grid home is missing or symbolic link'
+  owner_count=$(jq -r --arg grid_home "$GRID_HOME" '[.oracle_homes[] | select(.path == $grid_home and (.owner | type == "string" and length > 0))] | length' "$SNAPSHOT")
+  [ "$owner_count" -eq 1 ] || die 'snapshot must map the Grid home owner exactly once'
+  GRID_OWNER=$(jq -r --arg grid_home "$GRID_HOME" '.oracle_homes[] | select(.path == $grid_home) | .owner' "$SNAPSHOT")
+  [ "$(owner_for_path "$GRID_HOME")" = "$GRID_OWNER" ] || die 'live Grid-home owner differs from the snapshot'
+  [ -f "$ORAINST_LIVE" ] && [ ! -L "$ORAINST_LIVE" ] || die 'live oraInst.loc is missing or symbolic link'
+  CENTRAL_INVENTORY=$(sed -nE 's/^[[:space:]]*inventory_loc[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$/\1/p' "$ORAINST_LIVE" | head -n1)
+  safe_path "$CENTRAL_INVENTORY" central-inventory || exit $?
+  [ -d "$CENTRAL_INVENTORY" ] && [ ! -L "$CENTRAL_INVENTORY" ] || die 'live Central Inventory is missing or symbolic link'
+}
+
+verify_bundle() {
+  local role entry path digest canonical_root canonical_path node
+  verify_record "$BUNDLE" record_sha256 || die 'Grid recovery bundle record integrity verification failed'
+  jq -e --arg grid_home "$GRID_HOME" --arg owner "$GRID_OWNER" --arg inventory "$CENTRAL_INVENTORY" --arg orainst "$ORAINST_LIVE" '
+    .schema_version == "1.0" and
+    .collector.name == "oracle.grid.recovery.bundle" and .collector.version == "1" and
+    .status == "prepared" and
+    .target.grid_home == $grid_home and .target.owner == $owner and
+    .target.central_inventory == $inventory and .target.oraInst_loc == $orainst and
+    (.backup.root | type == "string" and startswith("/")) and
+    (.backup.checksum_manifest.path | type == "string" and startswith("/")) and
+    (.backup.checksum_manifest.sha256 | test("^[a-f0-9]{64}$")) and
+    (all(.backup | [.grid_home_archive,.central_inventory_archive,.oraInst_loc,.ocr_backup][];
+      (.path | type == "string" and startswith("/")) and (.sha256 | test("^[a-f0-9]{64}$")))) and
+    (.backup.olr_backups | type == "array" and length > 0) and
+    (all(.backup.olr_backups[];
+      (.node | type == "string" and length > 0) and
+      (.path | type == "string" and startswith("/")) and
+      (.source_path | type == "string" and startswith("/")) and
+      (.sha256 | test("^[a-f0-9]{64}$"))))
+  ' "$BUNDLE" >/dev/null || die 'Grid recovery bundle manifest is incomplete or targets another Grid home'
+  jq -e --slurpfile snapshot "$SNAPSHOT" '
+    ([.backup.olr_backups[].node] | sort) == ([$snapshot[0].cluster.nodes[].name] | sort) and
+    ([.backup.olr_backups[].node] | length) == ([.backup.olr_backups[].node] | unique | length)
+  ' "$BUNDLE" >/dev/null || die 'Grid recovery bundle must contain exactly one OLR backup for every cluster node'
+  BACKUP_ROOT=$(jq -r '.backup.root' "$BUNDLE"); safe_path "$BACKUP_ROOT" backup-root || exit $?
+  [ -d "$BACKUP_ROOT" ] && [ ! -L "$BACKUP_ROOT" ] || die 'Grid recovery backup root is missing or symbolic link'
+  canonical_root=$(readlink -f -- "$BACKUP_ROOT")
+  [ -n "$canonical_root" ] || die 'Grid recovery backup root cannot be resolved'
+  CHECKSUM_MANIFEST=$(jq -r '.backup.checksum_manifest.path' "$BUNDLE")
+  for role in checksum_manifest grid_home_archive central_inventory_archive oraInst_loc ocr_backup; do
+    entry=$(jq -c --arg role "$role" '.backup[$role]' "$BUNDLE"); path=$(jq -r '.path' <<<"$entry"); digest=$(jq -r '.sha256' <<<"$entry")
+    safe_path "$path" "$role" || exit $?
+    [ -f "$path" ] && [ ! -L "$path" ] || die "$role is missing or symbolic link"
+    canonical_path=$(readlink -f -- "$path")
+    case "$canonical_path" in "$canonical_root"/*) ;; *) die "$role resolves outside the sealed backup root" ;; esac
+    [ "$(opu_hash_file "$path")" = "$digest" ] || die "$role digest changed"
+  done
+  while IFS= read -r entry; do
+    node=$(jq -r '.node' <<<"$entry"); opu_validate_identifier "$node" 'OLR backup node' || return
+    path=$(jq -r '.path' <<<"$entry"); digest=$(jq -r '.sha256' <<<"$entry")
+    safe_path "$path" olr-backup || return
+    [ -f "$path" ] && [ ! -L "$path" ] || die "OLR backup for $node is missing or symbolic link"
+    canonical_path=$(readlink -f -- "$path")
+    case "$canonical_path" in "$canonical_root"/*) ;; *) die "OLR backup for $node resolves outside the sealed backup root" ;; esac
+    [ "$(opu_hash_file "$path")" = "$digest" ] || die "OLR backup digest changed for $node"
+  done < <(jq -c '.backup.olr_backups[]' "$BUNDLE")
+  [ "$(jq -r '.backup.grid_home_archive.source_path // empty' "$BUNDLE")" = "$GRID_HOME" ] || die 'Grid-home archive source path is not bound'
+  [ "$(jq -r '.backup.central_inventory_archive.source_path // empty' "$BUNDLE")" = "$CENTRAL_INVENTORY" ] || die 'Central Inventory archive source path is not bound'
+  [ "$(jq -r '.backup.oraInst_loc.source_path // empty' "$BUNDLE")" = "$ORAINST_LIVE" ] || die 'oraInst.loc backup source path is not bound'
+}
+
+verify_checksums_and_archives() {
+  local role path digest extra canonical_root canonical_path expected_paths manifest_paths
+  canonical_root=$(readlink -f -- "$BACKUP_ROOT")
+  expected_paths="$EVIDENCE_DIR/expected-backup-paths"
+  manifest_paths="$EVIDENCE_DIR/manifest-backup-paths"
+  for role in grid_home_archive central_inventory_archive oraInst_loc ocr_backup; do
+    jq -r --arg role "$role" '.backup[$role].path' "$BUNDLE"
+  done >"$expected_paths"
+  jq -r '.backup.olr_backups[].path' "$BUNDLE" >>"$expected_paths"
+  sort -u -o "$expected_paths" "$expected_paths"
+  : >"$manifest_paths"
+  while IFS=' ' read -r digest path extra; do
+    valid_sha "$digest" && [ -n "$path" ] && [ -z "$extra" ] || die 'Grid recovery checksum manifest has an invalid row'
+    safe_path "$path" checksum-entry || exit $?
+    canonical_path=$(readlink -f -- "$path")
+    case "$canonical_path" in "$canonical_root"/*) ;; *) die 'Grid recovery checksum manifest references a file outside the backup root' ;; esac
+    printf '%s\n' "$path" >>"$manifest_paths"
+  done <"$CHECKSUM_MANIFEST"
+  sort -u -o "$manifest_paths" "$manifest_paths"
+  cmp -s "$expected_paths" "$manifest_paths" || die 'Grid recovery checksum manifest is not the exact sealed recovery file set'
+  CHECKSUM_LOG="$EVIDENCE_DIR/sha256-verify.log"
+  (cd / && sha256sum -c "$CHECKSUM_MANIFEST") >"$CHECKSUM_LOG" 2>&1 || die 'Grid recovery checksum verification failed'
+  GRID_ARCHIVE=$(jq -r '.backup.grid_home_archive.path' "$BUNDLE")
+  INVENTORY_ARCHIVE=$(jq -r '.backup.central_inventory_archive.path' "$BUNDLE")
+  GRID_ARCHIVE_LOG="$EVIDENCE_DIR/grid-home-archive-verify.log"; tar -tzf "$GRID_ARCHIVE" >"$GRID_ARCHIVE_LOG" 2>&1 || die 'Grid-home archive validation failed'
+  INVENTORY_ARCHIVE_LOG="$EVIDENCE_DIR/central-inventory-archive-verify.log"; tar -tzf "$INVENTORY_ARCHIVE" >"$INVENTORY_ARCHIVE_LOG" 2>&1 || die 'Central Inventory archive validation failed'
+  [ -s "$GRID_ARCHIVE_LOG" ] && [ -s "$INVENTORY_ARCHIVE_LOG" ] || die 'Grid recovery archive is empty'
+  ! grep -Eq '(^/|(^|/)\.\.(/|$))' "$GRID_ARCHIVE_LOG" "$INVENTORY_ARCHIVE_LOG" || die 'Grid recovery archive contains an unsafe member path'
+  ORAINST_BACKUP=$(jq -r '.backup.oraInst_loc.path' "$BUNDLE"); cmp -s "$ORAINST_LIVE" "$ORAINST_BACKUP" || die 'oraInst.loc backup does not match the live file'
+}
+
+verify_ocr_and_cluster() {
+  local ocr_backup entry node path log digest tmp
+  ocr_backup=$(jq -r '.backup.ocr_backup.path' "$BUNDLE")
+  [ -x "$GRID_HOME/bin/ocrdump" ] && [ -x "$GRID_HOME/bin/ocrcheck" ] && [ -x "$GRID_HOME/bin/crsctl" ] || die 'Grid recovery verification tools are unavailable'
+  OCR_DUMP_LOG="$EVIDENCE_DIR/ocr-backup-verify.log"
+  "$GRID_HOME/bin/ocrdump" -stdout -backupfile "$ocr_backup" >"$OCR_DUMP_LOG" 2>&1 || die 'OCR backup could not be read by ocrdump'
+  [ -s "$OCR_DUMP_LOG" ] || die 'OCR backup validation produced no evidence'
+  OLR_LOGS_FILE="$EVIDENCE_DIR/olr-backup-verification.json"
+  printf '[]\n' >"$OLR_LOGS_FILE"
+  while IFS= read -r entry; do
+    node=$(jq -r '.node' <<<"$entry"); path=$(jq -r '.path' <<<"$entry")
+    log="$EVIDENCE_DIR/olr-backup-$node-verify.log"
+    "$GRID_HOME/bin/ocrdump" -local -stdout -backupfile "$path" >"$log" 2>&1 || die "OLR backup for $node could not be read by ocrdump"
+    [ -s "$log" ] || die "OLR backup validation produced no evidence for $node"
+    digest=$(opu_hash_file "$log"); tmp="$OLR_LOGS_FILE.tmp.$$"
+    jq --arg node "$node" --arg path "$log" --arg sha "$digest" '. + [{node:$node,path:$path,sha256:$sha}]' "$OLR_LOGS_FILE" >"$tmp" && mv "$tmp" "$OLR_LOGS_FILE" || return 74
+  done < <(jq -c '.backup.olr_backups[]' "$BUNDLE")
+  CRS_LOG="$EVIDENCE_DIR/crs-health.log"; "$GRID_HOME/bin/crsctl" check crs >"$CRS_LOG" 2>&1 || die 'local CRS health check failed'
+  ACTIVE_VERSION_LOG="$EVIDENCE_DIR/active-version.log"; "$GRID_HOME/bin/crsctl" query crs activeversion -f >"$ACTIVE_VERSION_LOG" 2>&1 || die 'cluster active-version query failed'
+  grep -q 'upgrade state is \[NORMAL\]' "$ACTIVE_VERSION_LOG" || die 'cluster upgrade state is not NORMAL'
+  OCRCHECK_LOG="$EVIDENCE_DIR/ocrcheck.log"; "$GRID_HOME/bin/ocrcheck" >"$OCRCHECK_LOG" 2>&1 || die 'live OCR integrity check failed'
+  VOTING_LOG="$EVIDENCE_DIR/voting-disks.log"; "$GRID_HOME/bin/crsctl" query css votedisk >"$VOTING_LOG" 2>&1 || die 'voting-disk query failed'
+  grep -Eq 'ONLINE|Located [1-9][0-9]* voting disk' "$VOTING_LOG" || die 'voting-disk evidence is empty or unhealthy'
+}
+
+emit_record() {
+  local tmp canonical record_sha
+  tmp="$OUT.tmp.$$"
+  jq -cn \
+    --arg collected_at "$(opu_now_utc)" --arg grid_home "$GRID_HOME" --arg owner "$GRID_OWNER" --arg inventory "$CENTRAL_INVENTORY" --arg orainst "$ORAINST_LIVE" \
+    --argjson nodes "$TARGET_NODES" \
+    --arg snapshot "$SNAPSHOT" --arg snapshot_sha "$(opu_hash_file "$SNAPSHOT")" --arg bundle "$BUNDLE" --arg bundle_sha "$(opu_hash_file "$BUNDLE")" --arg bundle_record "$(jq -r '.record_sha256' "$BUNDLE")" \
+    --arg checksum "$CHECKSUM_MANIFEST" --arg checksum_sha "$(opu_hash_file "$CHECKSUM_MANIFEST")" \
+    --arg grid_archive "$GRID_ARCHIVE" --arg grid_archive_sha "$(opu_hash_file "$GRID_ARCHIVE")" \
+    --arg inventory_archive "$INVENTORY_ARCHIVE" --arg inventory_archive_sha "$(opu_hash_file "$INVENTORY_ARCHIVE")" \
+    --arg orainst_backup "$ORAINST_BACKUP" --arg orainst_backup_sha "$(opu_hash_file "$ORAINST_BACKUP")" \
+    --arg ocr_backup "$(jq -r '.backup.ocr_backup.path' "$BUNDLE")" --arg ocr_backup_sha "$(jq -r '.backup.ocr_backup.sha256' "$BUNDLE")" \
+    --argjson olr_backups "$(jq -c '[.backup.olr_backups[] | {node,path,sha256}]' "$BUNDLE")" --argjson olr_logs "$(jq -c . "$OLR_LOGS_FILE")" \
+    --arg checksum_log "$CHECKSUM_LOG" --arg checksum_log_sha "$(opu_hash_file "$CHECKSUM_LOG")" \
+    --arg grid_log "$GRID_ARCHIVE_LOG" --arg grid_log_sha "$(opu_hash_file "$GRID_ARCHIVE_LOG")" \
+    --arg inventory_log "$INVENTORY_ARCHIVE_LOG" --arg inventory_log_sha "$(opu_hash_file "$INVENTORY_ARCHIVE_LOG")" \
+    --arg ocr_log "$OCR_DUMP_LOG" --arg ocr_log_sha "$(opu_hash_file "$OCR_DUMP_LOG")" \
+    --arg crs_log "$CRS_LOG" --arg crs_log_sha "$(opu_hash_file "$CRS_LOG")" \
+    --arg active_log "$ACTIVE_VERSION_LOG" --arg active_log_sha "$(opu_hash_file "$ACTIVE_VERSION_LOG")" \
+    --arg ocrcheck_log "$OCRCHECK_LOG" --arg ocrcheck_log_sha "$(opu_hash_file "$OCRCHECK_LOG")" \
+    --arg voting_log "$VOTING_LOG" --arg voting_log_sha "$(opu_hash_file "$VOTING_LOG")" \
+    '{schema_version:"1.0",collector:{name:"oracle.grid.recovery.evidence",version:"1"},status:"passed",collected_at:$collected_at,target:{grid_home:$grid_home,owner:$owner,nodes:$nodes,central_inventory:$inventory,oraInst_loc:$orainst},source_snapshot:{path:$snapshot,sha256:$snapshot_sha},source_bundle:{path:$bundle,sha256:$bundle_sha,record_sha256:$bundle_record},backup:{checksum_manifest:{path:$checksum,sha256:$checksum_sha},grid_home_archive:{path:$grid_archive,sha256:$grid_archive_sha},central_inventory_archive:{path:$inventory_archive,sha256:$inventory_archive_sha},oraInst_loc:{path:$orainst_backup,sha256:$orainst_backup_sha},ocr_backup:{path:$ocr_backup,sha256:$ocr_backup_sha},olr_backups:$olr_backups},verification:{checksum_log:{path:$checksum_log,sha256:$checksum_log_sha},grid_home_archive_log:{path:$grid_log,sha256:$grid_log_sha},central_inventory_archive_log:{path:$inventory_log,sha256:$inventory_log_sha},ocr_backup_log:{path:$ocr_log,sha256:$ocr_log_sha},olr_backup_logs:$olr_logs,crs_health_log:{path:$crs_log,sha256:$crs_log_sha},active_version_log:{path:$active_log,sha256:$active_log_sha},ocrcheck_log:{path:$ocrcheck_log,sha256:$ocrcheck_log_sha},voting_disks_log:{path:$voting_log,sha256:$voting_log_sha}}}' >"$tmp"
+  canonical=$(jq -cS . "$tmp"); record_sha=$(opu_hash_string "$canonical")
+  jq --arg record_sha "$record_sha" '.record_sha256=$record_sha' "$tmp" >"$OUT"; rm -f "$tmp"; cat "$OUT"
+}
+
+main() {
+  parse "$@"; resolve_target; verify_bundle
+  mkdir -p "$(dirname "$OUT")"; EVIDENCE_DIR="${OUT%.json}.d"
+  [ ! -e "$EVIDENCE_DIR" ] || die "Grid recovery evidence directory already exists: $EVIDENCE_DIR"
+  mkdir "$EVIDENCE_DIR"
+  verify_checksums_and_archives; verify_ocr_and_cluster; emit_record
+}
+
+main "$@"

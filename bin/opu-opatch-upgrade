@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# Controlled replacement of OPatch from a verified staging directory.  This is
+# deliberately separate from database patch application: it is a bootstrap
+# action that must complete before any compatibility test or RU apply.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+STATE_ROOT=${OPU_OPATCH_UPGRADE_STATE_DIR:-/var/lib/oracle-patching-utility/opatch-upgrades}
+
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  opu-opatch-upgrade create --request-id ID --requester ID --oracle-home ABSOLUTE_DIR --stage-dir ABSOLUTE_DIR --artifact ABSOLUTE_ZIP --artifact-sha256 SHA256 --required-version VERSION --backup-root ABSOLUTE_DIR' \
+    '  opu-opatch-upgrade approve --request-id ID --actor ID --approval-ticket ID' \
+    '  opu-opatch-upgrade analyze --request-id ID' \
+    '  opu-opatch-upgrade quiesce --request-id ID --actor ID' \
+    '  opu-opatch-upgrade apply --request-id ID --actor ID' \
+    '  opu-opatch-upgrade rollback --request-id ID --actor ID' \
+    '  opu-opatch-upgrade resume --request-id ID --actor ID' \
+    '  opu-opatch-upgrade status --request-id ID'
+}
+
+die() { opu_error "$*"; exit 65; }
+require_root() { [ "${EUID:-$(id -u)}" -eq 0 ] || [ "${OPU_OPATCH_UPGRADE_TEST_ALLOW_NONROOT:-0}" = 1 ] || die 'this operation must run as root'; }
+request_dir() { printf '%s/%s' "$STATE_ROOT" "$1"; }
+request_file() { printf '%s/request.json' "$(request_dir "$1")"; }
+valid_sha() { [[ ${1:-} =~ ^[a-f0-9]{64}$ ]]; }
+valid_version() { [[ ${1:-} =~ ^[0-9]+(\.[0-9]+){2,4}$ ]]; }
+valid_id() { opu_validate_identifier "${1:-}" request-id >/dev/null 2>&1; }
+validate_path() { opu_validate_absolute_path "$1" "$2" >/dev/null || die "invalid $2"; [ ! -L "$1" ] || die "$2 cannot be a symbolic link"; }
+sha_file() { opu_hash_file "$1"; }
+tree_sha() {
+  local dir=$1
+  find "$dir" -xdev -type f -print0 | sort -z | while IFS= read -r -d '' f; do
+    printf '%s\0' "${f#"$dir"/}"
+    sha_file "$f"
+  done | sha256sum | awk '{print $1}'
+}
+opatch_version() {
+  local dir=$1 owner=$2 home=$3 out
+  if [ -x "$home/jdk/bin/java" ]; then
+    out=$(as_owner "$owner" env -u JAVA_HOME -u OPATCH_JRE "ORACLE_HOME=$home" "PATH=$dir:$home/bin:/usr/bin:/bin" "$dir/opatch" version -jdk "$home/jdk" 2>&1) || return
+  else
+    out=$(as_owner "$owner" env -u JAVA_HOME -u OPATCH_JRE "ORACLE_HOME=$home" "PATH=$dir:$home/bin:/usr/bin:/bin" "$dir/opatch" version 2>&1) || return
+  fi
+  sed -nE 's/.*Version:[[:space:]]*([^[:space:]]+).*/\1/p' <<<"$out" | head -n1
+}
+as_owner() {
+  local owner=$1
+  shift
+  if [ "$(id -un)" = "$owner" ]; then
+    "$@"
+  else
+    runuser -u "$owner" -- "$@"
+  fi
+}
+owner_for_home() {
+  stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null || true
+}
+running_from_home() {
+  local home=$1 owner pid exe user comm args
+  owner=$(owner_for_home "$home")
+  for pid in /proc/[0-9]*; do
+    exe=$(readlink -f "$pid/exe" 2>/dev/null || true)
+    case "$exe" in "$home"/*) printf '%s\n' "${pid##*/}";; esac
+  done
+  # PMON command lines normally do not retain the full Oracle-home path.  Any
+  # database PMON owned by this home owner is a fail-closed maintenance block.
+  # Listener command lines do retain the Oracle-home path and are caught here
+  # even when /proc executable links are hidden by host hardening.
+  while read -r pid user comm args; do
+    case "$args" in *"$home"/*) printf '%s\n' "$pid";; esac
+    if [ "$user" = "$owner" ]; then
+      case "$comm" in ora_pmon_*) printf '%s\n' "$pid";; esac
+    fi
+  done < <(ps -eo pid=,user=,comm=,args= 2>/dev/null || true)
+}
+pmon_sids() {
+  local owner=$1 user args
+  # ps "comm" may normalize the SID case on some Linux builds.  Oracle SIDs
+  # are case-sensitive for local shared-memory attachment, so use args.
+  while read -r user args; do
+    [ "$user" = "$owner" ] || continue
+    case "$args" in ora_pmon_*) printf '%s\n' "${args#ora_pmon_}";; esac
+  done < <(ps -eo user=,args= 2>/dev/null || true)
+}
+listener_names() {
+  local home=$1 owner=$2
+  ps -eo user=,comm=,args= 2>/dev/null | awk -v home="$home" -v owner="$owner" '
+    $1 == owner && $2 == "tnslsnr" && index($0, home "/") {
+      for (i = 3; i < NF; i++) if ($i ~ /\/tnslsnr$/) { print $(i + 1); break }
+    }'
+}
+one_value() {
+  local values=$1 label=$2 count
+  count=$(printf '%s\n' "$values" | sed '/^$/d' | wc -l | tr -d ' ')
+  [ "$count" -eq 1 ] || die "expected exactly one $label, found $count"
+  printf '%s\n' "$values" | sed '/^$/d' | head -n1
+}
+write_request() {
+  local file=$1 id=$2 requester=$3 home=$4 owner=$5 stage=$6 artifact=$7 artifact_sha=$8 stage_sha=$9 required=${10} backup=${11} current=${12}
+  jq -cn --arg id "$id" --arg requester "$requester" --arg home "$home" --arg owner "$owner" --arg stage "$stage" --arg artifact "$artifact" --arg artifact_sha "$artifact_sha" --arg stage_sha "$stage_sha" --arg required "$required" --arg backup "$backup" --arg current "$current" --arg created "$(opu_now_utc)" \
+    '{schema_version:"1.0",request_id:$id,requester:$requester,state:"awaiting_approval",created_at:$created,target:{oracle_home:$home,owner:$owner,current_opatch_version:$current},artifact:{zip_path:$artifact,zip_sha256:$artifact_sha,stage_dir:$stage,stage_sha256:$stage_sha,staged_opatch_version:$required},backup_root:$backup,required_opatch_version:$required}' >"$file"
+}
+verify_request() {
+  local file=$1 expected actual
+  jq -e '.schema_version == "1.0" and (.request_id|type == "string") and (.state|IN("awaiting_approval","approved","quiesced","applied","rolled_back","completed","blocked")) and (.artifact.zip_sha256|test("^[a-f0-9]{64}$")) and (.artifact.stage_sha256|test("^[a-f0-9]{64}$")) and (.required_opatch_version|test("^[0-9]+(\\.[0-9]+){2,4}$"))' "$file" >/dev/null || die 'request record is malformed'
+  expected=$(jq -r '.record_sha256 // empty' "$file")
+  [ -n "$expected" ] || die 'request record is missing its integrity hash'
+  actual=$(jq -c 'del(.record_sha256)' "$file" | sha256sum | awk '{print $1}')
+  [ "$actual" = "$expected" ] || die 'request record integrity check failed'
+}
+seal() {
+  local file=$1 tmp hash
+  tmp="$file.tmp"
+  jq -c 'del(.record_sha256)' "$file" >"$tmp"
+  hash=$(sha256sum "$tmp" | awk '{print $1}')
+  jq --arg hash "$hash" '.record_sha256=$hash' "$tmp" >"$file"
+  rm -f "$tmp"
+}
+load_request() { ID=$1; valid_id "$ID" || die 'invalid request-id'; FILE=$(request_file "$ID"); [ -f "$FILE" ] && [ ! -L "$FILE" ] || die "request does not exist: $ID"; verify_request "$FILE"; }
+
+create() {
+  local id='' requester='' home='' stage='' artifact='' artifact_sha='' required='' backup='' owner staged current dir
+  while [ "$#" -gt 0 ]; do case "$1" in
+    --request-id) id=${2:-}; shift 2;; --requester) requester=${2:-}; shift 2;; --oracle-home) home=${2:-}; shift 2;; --stage-dir) stage=${2:-}; shift 2;; --artifact) artifact=${2:-}; shift 2;; --artifact-sha256) artifact_sha=${2:-}; shift 2;; --required-version) required=${2:-}; shift 2;; --backup-root) backup=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
+  require_root; valid_id "$id" || die 'invalid request-id'; opu_validate_identifier "$requester" requester >/dev/null || die 'invalid requester'; valid_sha "$artifact_sha" || die 'artifact-sha256 must be a SHA-256 hex value'; valid_version "$required" || die 'required-version is invalid'
+  for pair in "$home|oracle-home" "$stage|stage-dir" "$artifact|artifact" "$backup|backup-root"; do validate_path "${pair%%|*}" "${pair#*|}"; done
+  [ -d "$home" ] && [ -d "$stage" ] && [ -f "$artifact" ] || die 'home, stage directory, or artifact is missing'
+  [ -x "$stage/OPatch/opatch" ] || die 'stage-dir must contain OPatch/opatch'
+  owner=$(owner_for_home "$home"); [ -n "$owner" ] && { [ "$owner" != root ] || [ "${OPU_OPATCH_UPGRADE_TEST_ALLOW_NONROOT:-0}" = 1 ]; } || die 'Oracle home must have a non-root owner'
+  [ "$(sha_file "$artifact")" = "$artifact_sha" ] || die 'artifact hash does not match the approved digest'
+  staged=$(opatch_version "$stage/OPatch" "$owner" "$home" || true); [ "$staged" = "$required" ] || die "staged OPatch version is '$staged', expected '$required'"
+  current=$(opatch_version "$home/OPatch" "$owner" "$home" || true); valid_version "$current" || die 'current Oracle-home OPatch version cannot be determined'
+  dir=$(request_dir "$id"); mkdir -p "$STATE_ROOT"; mkdir "$dir" 2>/dev/null || die "request already exists: $id"
+  write_request "$dir/request.json" "$id" "$requester" "$home" "$owner" "$stage" "$artifact" "$artifact_sha" "$(tree_sha "$stage/OPatch")" "$required" "$backup" "$current"
+  seal "$dir/request.json"; cat "$dir/request.json"
+}
+
+approve() {
+  local id='' actor='' ticket=''
+  while [ "$#" -gt 0 ]; do case "$1" in --request-id) id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; --approval-ticket) ticket=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
+  require_root; load_request "$id"; opu_validate_identifier "$actor" actor >/dev/null || die 'invalid actor'; opu_validate_identifier "$ticket" approval-ticket >/dev/null || die 'invalid approval-ticket'
+  [ "$(jq -r '.state' "$FILE")" = awaiting_approval ] || die 'request is not awaiting approval'; [ "$actor" != "$(jq -r '.requester' "$FILE")" ] || die 'requester cannot approve its own OPatch upgrade'
+  jq --arg actor "$actor" --arg ticket "$ticket" --arg at "$(opu_now_utc)" '.state="approved" | .approval={actor:$actor,ticket:$ticket,approved_at:$at} | del(.record_sha256)' "$FILE" >"$FILE.tmp" && mv "$FILE.tmp" "$FILE"; seal "$FILE"; cat "$FILE"
+}
+
+analyze() {
+  local id=''
+  [ "$#" -eq 2 ] && [ "$1" = --request-id ] || { usage >&2; exit 64; }; id=$2
+  load_request "$id"
+  local home owner stage artifact expected_zip expected_tree required actual_zip actual_tree staged current processes status=passed reason=''
+  home=$(jq -r '.target.oracle_home' "$FILE"); owner=$(jq -r '.target.owner' "$FILE"); stage=$(jq -r '.artifact.stage_dir' "$FILE"); artifact=$(jq -r '.artifact.zip_path' "$FILE"); expected_zip=$(jq -r '.artifact.zip_sha256' "$FILE"); expected_tree=$(jq -r '.artifact.stage_sha256' "$FILE"); required=$(jq -r '.required_opatch_version' "$FILE")
+  actual_zip=$(sha_file "$artifact" 2>/dev/null || true); actual_tree=$(tree_sha "$stage/OPatch" 2>/dev/null || true); staged=$(opatch_version "$stage/OPatch" "$owner" "$home" || true); current=$(opatch_version "$home/OPatch" "$owner" "$home" || true); processes=$(running_from_home "$home" | paste -sd, -)
+  [ "$actual_zip" = "$expected_zip" ] || { status=blocked; reason='approved OPatch ZIP digest changed'; }; [ "$actual_tree" = "$expected_tree" ] || { status=blocked; reason='staged OPatch content changed'; }; [ "$staged" = "$required" ] || { status=blocked; reason='staged OPatch version does not match request'; }; valid_version "$current" || { status=blocked; reason='current OPatch version unavailable'; }
+  jq -cn --arg id "$id" --arg status "$status" --arg reason "$reason" --arg home "$home" --arg owner "$owner" --arg expected "$expected_zip" --arg actual "$actual_zip" --arg required "$required" --arg staged "$staged" --arg current "$current" --arg processes "$processes" '{schema_version:"1.0",request_id:$id,status:$status,reason:(if $reason == "" then null else $reason end),target:{oracle_home:$home,owner:$owner,current_opatch_version:$current},artifact:{expected_zip_sha256:$expected,actual_zip_sha256:$actual,staged_opatch_version:$staged,required_opatch_version:$required},runtime:{process_ids:($processes|if length==0 then [] else split(",") end)}}'
+  [ "$status" = passed ] || exit 2
+}
+
+quiesce() {
+  local id='' actor='' home owner sid listener listeners evidence_dir db_log listener_log active listener_count
+  while [ "$#" -gt 0 ]; do case "$1" in --request-id) id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
+  require_root; load_request "$id"; opu_validate_identifier "$actor" actor >/dev/null || die 'invalid actor'; [ "$(jq -r '.state' "$FILE")" = approved ] || die 'request must be approved before services can be quiesced'
+  home=$(jq -r '.target.oracle_home' "$FILE"); owner=$(jq -r '.target.owner' "$FILE"); sid=$(one_value "$(pmon_sids "$owner")" 'database PMON')
+  listeners=$(listener_names "$home" "$owner"); listener_count=$(printf '%s\n' "$listeners" | sed '/^$/d' | wc -l | tr -d ' '); [ "$listener_count" -le 1 ] || die 'multiple listeners from the Oracle home require an explicit maintenance procedure'; listener=$(printf '%s\n' "$listeners" | sed '/^$/d' | head -n1)
+  evidence_dir="$(request_dir "$id")/evidence"; mkdir -p "$evidence_dir"; db_log="$evidence_dir/quiesce-database.log"; listener_log="$evidence_dir/quiesce-listener.log"
+  if ! as_owner "$owner" env "ORACLE_HOME=$home" "ORACLE_SID=$sid" "PATH=$home/bin:/usr/bin:/bin" "$home/bin/sqlplus" -L -s '/ as sysdba' >"$db_log" 2>&1 <<'EOF'
+whenever sqlerror exit failure
+shutdown immediate;
+exit;
+EOF
+  then
+    die "database shutdown failed; listener was not stopped; see $db_log"
+  fi
+  if [ -n "$listener" ]; then
+    as_owner "$owner" env "ORACLE_HOME=$home" "PATH=$home/bin:/usr/bin:/bin" "$home/bin/lsnrctl" stop "$listener" >"$listener_log" 2>&1 || die "listener stop failed after database shutdown; see $listener_log"
+  else
+    printf '%s\n' 'No listener from target Oracle home was running.' >"$listener_log"
+  fi
+  active=$(running_from_home "$home" | sort -u | paste -sd, -); [ -z "$active" ] || die "Oracle-home services remain active after quiesce: $active"
+  jq --arg actor "$actor" --arg at "$(opu_now_utc)" --arg sid "$sid" --arg listener "$listener" --arg db_log "$db_log" --arg listener_log "$listener_log" --arg db_sha "$(sha_file "$db_log")" --arg listener_sha "$(sha_file "$listener_log")" '.state="quiesced" | .quiesce={actor:$actor,quiesced_at:$at,oracle_sid:$sid,listener:($listener|if length == 0 then null else . end),database_log:$db_log,database_log_sha256:$db_sha,listener_log:$listener_log,listener_log_sha256:$listener_sha} | del(.record_sha256)' "$FILE" >"$FILE.tmp" && mv "$FILE.tmp" "$FILE"; seal "$FILE"; cat "$FILE"
+}
+
+apply() {
+  local id='' actor=''
+  while [ "$#" -gt 0 ]; do case "$1" in --request-id) id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
+  require_root; load_request "$id"; opu_validate_identifier "$actor" actor >/dev/null || die 'invalid actor'; case "$(jq -r '.state' "$FILE")" in approved|quiesced) ;; *) die 'request is not approved for application';; esac
+  local analysis home owner stage backup before after current required processes
+  analysis=$(analyze --request-id "$id") || die 'OPatch upgrade analysis failed; no change made'; home=$(jq -r '.target.oracle_home' "$FILE"); owner=$(jq -r '.target.owner' "$FILE"); stage=$(jq -r '.artifact.stage_dir' "$FILE"); backup=$(jq -r '.backup_root' "$FILE"); required=$(jq -r '.required_opatch_version' "$FILE")
+  processes=$(jq -r '.runtime.process_ids | join(",")' <<<"$analysis"); [ -z "$processes" ] || die "Oracle processes are still running from this home: $processes"
+  mkdir -p "$backup"; chown "$owner" "$backup"; chmod 0700 "$backup"; before="$backup/${id}-OPatch-before"; [ ! -e "$before" ] || die "backup already exists: $before"
+  as_owner "$owner" mv "$home/OPatch" "$before" || die 'could not preserve current OPatch directory'
+  if ! as_owner "$owner" cp -a "$stage/OPatch" "$home/OPatch"; then as_owner "$owner" mv "$before" "$home/OPatch" || true; die 'OPatch replacement failed and original was restored'; fi
+  current=$(opatch_version "$home/OPatch" "$owner" "$home" || true)
+  if [ "$current" != "$required" ]; then rm -rf "$home/OPatch"; as_owner "$owner" mv "$before" "$home/OPatch" || true; die "replacement verification failed (got '$current'); original was restored"; fi
+  after=$(tree_sha "$home/OPatch"); jq --arg actor "$actor" --arg at "$(opu_now_utc)" --arg backup "$before" --arg before_sha "$(tree_sha "$before")" --arg after_sha "$after" '.state="applied" | .apply={actor:$actor,applied_at:$at,backup_path:$backup,backup_sha256:$before_sha,new_opatch_sha256:$after_sha} | del(.record_sha256)' "$FILE" >"$FILE.tmp" && mv "$FILE.tmp" "$FILE"; seal "$FILE"; cat "$FILE"
+}
+
+rollback() {
+  local id='' actor=''
+  while [ "$#" -gt 0 ]; do case "$1" in --request-id) id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
+  require_root; load_request "$id"; opu_validate_identifier "$actor" actor >/dev/null || die 'invalid actor'; [ "$(jq -r '.state' "$FILE")" = applied ] || die 'only an applied request can be rolled back'
+  local home owner backup processes; home=$(jq -r '.target.oracle_home' "$FILE"); owner=$(jq -r '.target.owner' "$FILE"); backup=$(jq -r '.apply.backup_path' "$FILE"); [ -d "$backup" ] && [ ! -L "$backup" ] || die 'saved OPatch backup is missing'; processes=$(running_from_home "$home" | paste -sd, -); [ -z "$processes" ] || die "Oracle processes are still running from this home: $processes"
+  as_owner "$owner" mv "$home/OPatch" "${backup}.replaced" || die 'could not preserve replacement OPatch'; as_owner "$owner" mv "$backup" "$home/OPatch" || { as_owner "$owner" mv "${backup}.replaced" "$home/OPatch" || true; die 'rollback failed; replacement was restored'; }
+  jq --arg actor "$actor" --arg at "$(opu_now_utc)" '.state="rolled_back" | .rollback={actor:$actor,rolled_back_at:$at} | del(.record_sha256)' "$FILE" >"$FILE.tmp" && mv "$FILE.tmp" "$FILE"; seal "$FILE"; cat "$FILE"
+}
+
+resume() {
+  local id='' actor='' home owner sid listener evidence_dir db_log listener_log started
+  while [ "$#" -gt 0 ]; do case "$1" in --request-id) id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
+  require_root; load_request "$id"; opu_validate_identifier "$actor" actor >/dev/null || die 'invalid actor'; case "$(jq -r '.state' "$FILE")" in applied|rolled_back) ;; *) die 'request must be applied or rolled back before resume';; esac
+  home=$(jq -r '.target.oracle_home' "$FILE"); owner=$(jq -r '.target.owner' "$FILE"); sid=$(jq -r '.quiesce.oracle_sid // empty' "$FILE"); [ -n "$sid" ] || die 'no quiesce evidence is recorded'; listener=$(jq -r '.quiesce.listener // empty' "$FILE")
+  evidence_dir="$(request_dir "$id")/evidence"; db_log="$evidence_dir/resume-database.log"; listener_log="$evidence_dir/resume-listener.log"
+  as_owner "$owner" env "ORACLE_HOME=$home" "ORACLE_SID=$sid" "PATH=$home/bin:/usr/bin:/bin" "$home/bin/sqlplus" -L -s '/ as sysdba' >"$db_log" 2>&1 <<'EOF'
+whenever sqlerror exit failure
+startup;
+exit;
+EOF
+  started=$(pmon_sids "$owner"); printf '%s\n' "$started" | grep -Fx "$sid" >/dev/null || die "database PMON for $sid did not return after startup"
+  if [ -n "$listener" ]; then
+    as_owner "$owner" env "ORACLE_HOME=$home" "PATH=$home/bin:/usr/bin:/bin" "$home/bin/lsnrctl" start "$listener" >"$listener_log" 2>&1 || die "listener start failed; database is running; see $listener_log"
+  else
+    printf '%s\n' 'No listener was stopped by quiesce.' >"$listener_log"
+  fi
+  jq --arg actor "$actor" --arg at "$(opu_now_utc)" --arg db_log "$db_log" --arg listener_log "$listener_log" --arg db_sha "$(sha_file "$db_log")" --arg listener_sha "$(sha_file "$listener_log")" '.state="completed" | .resume={actor:$actor,resumed_at:$at,database_log:$db_log,database_log_sha256:$db_sha,listener_log:$listener_log,listener_log_sha256:$listener_sha} | del(.record_sha256)' "$FILE" >"$FILE.tmp" && mv "$FILE.tmp" "$FILE"; seal "$FILE"; cat "$FILE"
+}
+
+status() { [ "$#" -eq 2 ] && [ "$1" = --request-id ] || { usage >&2; exit 64; }; load_request "$2"; cat "$FILE"; }
+main() { opu_runtime_init; command -v jq >/dev/null || { opu_error 'jq is required'; exit 69; }; local cmd=${1:-}; [ "$#" -gt 0 ] && shift; case "$cmd" in create) create "$@";; approve) approve "$@";; analyze) analyze "$@";; quiesce) quiesce "$@";; apply) apply "$@";; rollback) rollback "$@";; resume) resume "$@";; status) status "$@";; *) usage >&2; exit 64;; esac; }
+main "$@"
