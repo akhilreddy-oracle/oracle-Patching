@@ -228,6 +228,46 @@ class Handler(BaseHTTPRequestHandler):
             self._post_plan_action("create", None, self._read_json_body())
             return
 
+        if path == "/api/plans/testmode-demo":
+            body = self._read_json_body()
+            try:
+                plan_id = body["plan_id"]
+            except KeyError as exc:
+                self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
+                return
+
+            def run(_record, body=body):
+                return planctl.create_testmode_demo(body["plan_id"], body["requester"], body["window_start"], body["window_end"])
+
+            try:
+                record = pipeline_runner.start_run("plan", f"plan:{plan_id}:testmode-demo", run)
+            except pipeline_runner.RunConflict as exc:
+                self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
+                return
+            self._send_json(202, {"run_id": record.run_id})
+            return
+
+        if path.startswith("/api/plans/") and path.endswith("/execute-next"):
+            plan_id = path[len("/api/plans/"):-len("/execute-next")]
+            body = self._read_json_body()
+            try:
+                actor = body["actor"]
+            except KeyError as exc:
+                self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
+                return
+
+            def run(_record, plan_id=plan_id, actor=actor):
+                result = planctl.execute_next_task(plan_id, actor)
+                return {"task_result": result, "no_pending_task": result is None}
+
+            try:
+                record = pipeline_runner.start_run("plan", f"plan:{plan_id}:execute-next", run)
+            except pipeline_runner.RunConflict as exc:
+                self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
+                return
+            self._send_json(202, {"run_id": record.run_id})
+            return
+
         if path.startswith("/api/plans/") and path.endswith("/approve"):
             plan_id = path[len("/api/plans/"):-len("/approve")]
             self._post_plan_action("approve", plan_id, self._read_json_body())

@@ -14,11 +14,20 @@ import subprocess
 from pathlib import Path
 
 import evidence
+import testmode_fixtures
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLAN_TOOL = REPO_ROOT / "bin" / "opu-patch-plan"
 PLAN_STATE_DIR = Path(__file__).resolve().parent / "var" / "plans"
+TESTMODE_DIR = Path(__file__).resolve().parent / "var" / "testmode"
 DEFAULT_TIMEOUT_SECONDS = 30
+
+# Only adapters with a verified TEST_MODE fixture are wired up. Real
+# (non-fixture) execution against a live host is not implemented — every
+# plan runnable through execute_next_task() is a synthetic demo plan.
+EXECUTOR_BY_ADAPTER = {
+    "database_single_instance_opatch": REPO_ROOT / "bin" / "opu-database-single-instance-patch",
+}
 
 
 class PlanError(Exception):
@@ -133,6 +142,67 @@ def list_tasks(plan_id: str) -> list[dict]:
         except json.JSONDecodeError:
             tasks.append({"task_id": entry.stem, "status": "unreadable"})
     return tasks
+
+
+def create_testmode_demo(plan_id: str, requester: str, window_start: str, window_end: str) -> dict:
+    """Builds a fresh single-instance TEST_MODE fixture and creates a plan
+    directly from its evidence. This is a self-contained demo path — the
+    plan targets the fixture's fake Oracle home, not any real host in
+    hosts.json, so it can only ever run against the fixture.
+    """
+    fixture_dir = TESTMODE_DIR / plan_id
+    fx = testmode_fixtures.build(fixture_dir)
+    ev = fx["evidence"]
+    args = [
+        "create", "--plan-id", plan_id, "--requester", requester,
+        "--readiness", str(ev["readiness"]), "--reconciliation", str(ev["reconciliation"]),
+        "--artifact-manifest", str(ev["artifact"]), "--procedure-validation", str(ev["procedure"]),
+        "--compatibility", str(ev["compatibility"]), "--policy", str(ev["policy"]),
+        "--recovery-evidence", str(ev["recovery"]),
+        "--window-start", window_start, "--window-end", window_end,
+    ]
+    return _run(args)
+
+
+def execute_next_task(plan_id: str, actor: str) -> dict | None:
+    """Runs the plan's next pending task through its real TEST_MODE fixture
+    executor. Returns None when there is no pending task. Raises PlanError
+    if the plan's adapter has no verified fixture wired up yet, or the
+    fixture directory (created by create_testmode_demo) is missing.
+    """
+    plan_state = status(plan_id).get("state")
+    if plan_state == "succeeded":
+        return None
+    if plan_state != "running":
+        raise PlanError(f"plan {plan_id} is {plan_state}, not running — nothing to execute")
+
+    task = next_task(plan_id)
+    if task is None:
+        return None
+
+    adapter = task.get("adapter")
+    executor = EXECUTOR_BY_ADAPTER.get(adapter)
+    if executor is None:
+        raise PlanError(f"No TEST_MODE executor is wired up for adapter: {adapter}")
+
+    fixture_dir = TESTMODE_DIR / plan_id
+    if not fixture_dir.is_dir():
+        raise PlanError(f"No TEST_MODE fixture found for plan {plan_id} — was it created via the TEST_MODE demo flow?")
+    fx_env = testmode_fixtures.env_for(fixture_dir)
+
+    exec_env = os.environ.copy()
+    exec_env["OPU_PLAN_STATE_DIR"] = str(PLAN_STATE_DIR)
+    exec_env.update(fx_env)
+
+    argv = [str(executor), "execute", "--plan-id", plan_id, "--task-id", task["task_id"], "--actor", actor, "--lease-seconds", "60"]
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=exec_env)
+    except subprocess.TimeoutExpired:
+        raise PlanError(f"executor for task {task['task_id']} timed out") from None
+
+    if not result.stdout.strip():
+        raise PlanError(f"executor exited {result.returncode} with no output", stderr=result.stderr.strip())
+    return json.loads(result.stdout)
 
 
 def list_plans() -> list[dict]:

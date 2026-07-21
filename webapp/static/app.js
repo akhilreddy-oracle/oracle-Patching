@@ -1,7 +1,7 @@
 import { renderEstate } from "./estate.js";
 import { renderHost } from "./host.js";
 import { renderPipeline } from "./pipeline.js";
-import { renderPlanList, renderPlanNew, renderPlanDetail } from "./plan.js";
+import { renderPlanList, renderPlanNew, renderPlanDetail, renderPlanDemoNew } from "./plan.js";
 import { mountActorWidget } from "./actor.js";
 
 const app = document.getElementById("app");
@@ -14,6 +14,7 @@ function parseRoute() {
   }
   if (parts[0] === "hosts" && parts[1]) return { name: "host", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "plans" && parts[1] === "new" && parts[2]) return { name: "plan-new", hostId: decodeURIComponent(parts[2]) };
+  if (parts[0] === "plans" && parts[1] === "demo-new") return { name: "plan-demo-new" };
   if (parts[0] === "plans" && parts[1]) return { name: "plan-detail", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "plans") return { name: "plan-list" };
   return { name: "estate" };
@@ -27,6 +28,8 @@ async function render() {
     await renderHost(app, route.id);
   } else if (route.name === "plan-new") {
     await renderPlanNew(app, route.hostId);
+  } else if (route.name === "plan-demo-new") {
+    await renderPlanDemoNew(app);
   } else if (route.name === "plan-detail") {
     await renderPlanDetail(app, route.id);
   } else if (route.name === "plan-list") {
