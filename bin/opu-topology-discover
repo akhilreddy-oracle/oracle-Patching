@@ -70,14 +70,18 @@ runtime_owner() {
   # A Grid home can contain binaries launched by database-owned resources
   # (for example listeners).  For Grid inventory, prefer the ASM/Clusterware
   # process owner; falling back to any home process would misclassify it.
+  # awk's early `exit` can close the pipe before `ps` finishes writing on a
+  # host with a large process table; scope pipefail off so ps's resulting
+  # SIGPIPE does not abort this script even though the match already
+  # succeeded.
   if [ "$home" = "$GRID_HOME" ]; then
-    owner=$(ps -eo user=,args= 2>/dev/null | awk '$1 != "root" && $0 ~ /(asm_pmon|asm_smon|ora\.asm|crsd\.bin)/ {print $1; exit}')
+    owner=$(set +o pipefail; ps -eo user=,args= 2>/dev/null | awk '$1 != "root" && $0 ~ /(asm_pmon|asm_smon|ora\.asm|crsd\.bin)/ {print $1; exit}')
   fi
-  [ -n "${owner:-}" ] || owner=$(ps -eo user=,args= 2>/dev/null | awk -v home="$home" '$1 != "root" && index($0, home "/bin/") {print $1; exit}')
+  [ -n "${owner:-}" ] || owner=$(set +o pipefail; ps -eo user=,args= 2>/dev/null | awk -v home="$home" '$1 != "root" && index($0, home "/bin/") {print $1; exit}')
   if [ -n "$owner" ]; then printf '%s' "$owner"; else stat -c '%U' "$home" 2>/dev/null || printf '%s' unknown; fi
 }
 home_json() {
-  local home=$1 owner version opatch patch_list xml_inventory xml_patches xml_sha inventory_source xml_status xml_dir xml_file xml_command_output patch platform_id platform_name platform_status platform_source platform_record
+  local home=$1 owner version opatch patch_list xml_inventory xml_patches xml_sha inventory_source xml_status xml_dir xml_file patch platform_id platform_name platform_status platform_source platform_record
   owner=$(runtime_owner "$home")
   version=$(awk -F= '$1 == "VERSION" {print $2; exit}' "$home/inventory/ContentsXML/comps.xml" 2>/dev/null || true)
   [ -n "$version" ] || version=$(as_owner "$owner" env "ORACLE_HOME=$home" "PATH=$home/bin:/usr/bin:/bin" "$home/bin/sqlplus" -version 2>/dev/null | sed -nE 's/.*Release ([0-9.]+).*/\1/p' | head -n1 || true)
@@ -94,7 +98,7 @@ home_json() {
     if [ -n "$xml_dir" ]; then
       if [ "$(id -u)" -eq 0 ]; then chown "$owner" "$xml_dir" 2>/dev/null || true; chmod 700 "$xml_dir" 2>/dev/null || true; fi
       xml_file="$xml_dir/lsinventory.xml"
-      xml_command_output=$(opatch_as_owner "$owner" "$home" lsinventory -xml "$xml_file" -oh "$home" 2>&1 || true)
+      opatch_as_owner "$owner" "$home" lsinventory -xml "$xml_file" -oh "$home" >/dev/null 2>&1 || true
       [ -f "$xml_file" ] && xml_inventory=$(<"$xml_file") || xml_inventory=""
       if grep -q '<' <<<"$xml_inventory"; then
         platform_source=opatch_lsinventory_xml

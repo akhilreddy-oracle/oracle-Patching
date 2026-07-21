@@ -6,7 +6,6 @@ trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 mkdir -p "$TMP/home/OPatch" "$TMP/home/jdk/bin" "$TMP/stage/OPatch" "$TMP/backups"
 cp /usr/bin/true "$TMP/home/jdk/bin/java"
 chmod 700 "$TMP/home/jdk/bin/java"
-owner=$(id -un)
 make_opatch() { local path=$1 version=$2; printf '#!/bin/bash\nprintf "OPatch Version: %%s\\n" "%s"\n' "$version" >"$path"; chmod 700 "$path"; }
 make_opatch "$TMP/home/OPatch/opatch" 12.2.0.1.17
 make_opatch "$TMP/stage/OPatch/opatch" 12.2.0.1.51

@@ -1,0 +1,22 @@
+# Established, deliberate idioms in this codebase that shellcheck otherwise
+# flags. Each one was verified, not blanket-silenced:
+#
+# SC1007 - `VAR= cmd ...` (e.g. `CDPATH= cd -- ...`) clears an env var for one
+#          command invocation; it is not a broken assignment.
+# SC1091 - lib/operations files are sourced from a runtime-computed
+#          $OPU_PROJECT_ROOT path shellcheck cannot follow even with -x. The
+#          test suite exercises every source path for real.
+# SC1003 - literal backslash inside single-quoted CLI usage/help text, meant
+#          to show the user a shell line-continuation character.
+# SC2015 - `check1 && check2 || die '...'` fail-closed guard clauses used
+#          throughout the executors. Verified: die is the correct fallback
+#          whether check1 or check2 fails; this is not an if/else bug.
+# SC2016 - jq filters written in single quotes with `--arg`/`--argjson`
+#          bindings. This is the safe pattern: double-quoting would let the
+#          shell expand `$name` before jq sees it, which is the bug, not the
+#          fix.
+disable=SC1007
+disable=SC1091
+disable=SC1003
+disable=SC2015
+disable=SC2016

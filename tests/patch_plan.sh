@@ -5,7 +5,7 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/opu-plan.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 PLAN="$ROOT/bin/opu-patch-plan"; digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 now=$(date -u +%s); start=$(date -u -r "$((now-60))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '@'$((now-60)) '+%Y-%m-%dT%H:%M:%SZ'); end=$(date -u -r "$((now+3600))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '@'$((now+3600)) '+%Y-%m-%dT%H:%M:%SZ')
-collected=$(date -u -r "$now" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '@'$now '+%Y-%m-%dT%H:%M:%SZ')
+collected=$(date -u -r "$now" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '@'"$now" '+%Y-%m-%dT%H:%M:%SZ')
 grid_path="$TMP/grid"
 grid_owner=$(id -un)
 mkdir -p "$grid_path" "$TMP/grid-recovery"

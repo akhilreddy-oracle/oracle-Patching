@@ -216,7 +216,7 @@ verify_recovery() {
   if [ "$mode" = full ]; then
     (cd / && sha256sum -c "$checksum_path") >"$TASK_DIR/recovery-checksums.log" 2>&1 || die 'Grid recovery checksum verification failed immediately before mutation'
   fi
-  RECOVERY_FILE_SHA=$expected_file; RECOVERY_RECORD_SHA=$expected_record
+  RECOVERY_RECORD_SHA=$expected_record
 }
 
 version_ge() {

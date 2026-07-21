@@ -1,4 +1,4 @@
-.PHONY: test lint check
+.PHONY: test lint contracts check
 
 test:
 	./tests/run.sh
@@ -19,8 +19,13 @@ test:
 	./tests/rac_database_patch.sh
 	./tests/grid_node_patch.sh
 	./tests/readiness.sh
+	./tests/database_rolling_patch.sh
+	./tests/grid_rolling_patch.sh
 
 lint:
 	./scripts/lint.sh
 
-check: lint test
+contracts:
+	./scripts/check_contracts.sh
+
+check: lint contracts test

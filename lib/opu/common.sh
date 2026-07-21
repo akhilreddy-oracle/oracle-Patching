@@ -3,7 +3,9 @@
 # Shared primitives for the Oracle Patching Utility agent.
 # This file is sourced only from code shipped with the agent.
 
+# shellcheck disable=SC2034 # read by bin/opu-agent, which sources this file
 OPU_AGENT_VERSION="0.1.0"
+# shellcheck disable=SC2034 # read by bin/opu-agent, which sources this file
 OPU_RESULT_SCHEMA_VERSION="1.0"
 OPU_MINIMUM_BASH_MAJOR=4
 OPU_MINIMUM_BASH_MINOR=4
@@ -213,7 +215,10 @@ opu_check_runtime() {
 }
 
 opu_operation_error() {
+    # shellcheck disable=SC2034 # read by bin/opu-agent after calling this function
     OPU_ERROR_CODE=$1
+    # shellcheck disable=SC2034 # read by bin/opu-agent after calling this function
     OPU_ERROR_MESSAGE=$2
+    # shellcheck disable=SC2034 # read by bin/opu-agent after calling this function
     OPU_ERROR_RETRYABLE=${3:-false}
 }

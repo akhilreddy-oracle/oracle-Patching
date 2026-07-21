@@ -51,7 +51,7 @@ opu_job_lock() {
         [ "$attempts" -lt "$max_attempts" ] || { opu_error "timed out waiting for job lock: $job_id"; return 75; }
         sleep 0.1
     done
-    OPU_JOB_LOCK_MODE=mkdir
+    OPU_JOB_LOCK_MODE="mkdir"
 }
 
 opu_job_unlock() {

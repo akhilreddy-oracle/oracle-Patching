@@ -1064,7 +1064,8 @@ execute_task() {
   printf '%s\n' "$claim_output" >"$TASK_DIR/claim.json"
   load_task_after_claim
   # Re-key the run directory from the sealed task node, not an untrusted environment value.
-  local sealed_node_dir="$EXECUTION_STATE_DIR/plans/$PLAN_ID/nodes/$(node_key "$LOCAL_NODE")"
+  local sealed_node_dir
+  sealed_node_dir="$EXECUTION_STATE_DIR/plans/$PLAN_ID/nodes/$(node_key "$LOCAL_NODE")"
   if [ "$sealed_node_dir" != "$NODE_RUN_DIR" ]; then
     die 'test/local hostname and the sealed task node resolve to different run directories'
   fi

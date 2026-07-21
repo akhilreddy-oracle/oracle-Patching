@@ -10,11 +10,15 @@ opu_registry_resolve() {
 
     case "${operation}@${version}" in
         host.discover@1)
+            # shellcheck disable=SC2034 # read by bin/opu-agent, which sources this file
             OPU_OPERATION_FUNCTION="opu_operation_host_discover_v1"
+            # shellcheck disable=SC2034 # read by bin/opu-agent, which sources this file
             OPU_OPERATION_MUTABILITY="read_only"
             ;;
         oracle_homes.discover@1)
+            # shellcheck disable=SC2034 # read by bin/opu-agent, which sources this file
             OPU_OPERATION_FUNCTION="opu_operation_oracle_homes_discover_v1"
+            # shellcheck disable=SC2034 # read by bin/opu-agent, which sources this file
             OPU_OPERATION_MUTABILITY="read_only"
             ;;
         *)

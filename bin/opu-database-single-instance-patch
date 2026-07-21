@@ -14,13 +14,11 @@ OPERATION=${OPU_SINGLE_INSTANCE_OPERATION:-apply}
 case "$OPERATION" in
   apply)
     EXECUTION_STATE_DIR=${OPU_SINGLE_INSTANCE_STATE_DIR:-/var/lib/oracle-patching-utility/single-instance}
-    EXECUTOR_ADAPTER=database_single_instance_opatch
     EXECUTOR_COLLECTOR=oracle.database.single_instance.executor
     EXECUTOR_INTENT=patch_apply
     ;;
   rollback)
     EXECUTION_STATE_DIR=${OPU_SINGLE_INSTANCE_ROLLBACK_STATE_DIR:-/var/lib/oracle-patching-utility/single-instance-rollback}
-    EXECUTOR_ADAPTER=database_single_instance_opatch_rollback
     EXECUTOR_COLLECTOR=oracle.database.single_instance.rollback.executor
     EXECUTOR_INTENT=patch_rollback
     ;;
@@ -247,6 +245,9 @@ discover_target() {
   local sid candidate_home restart_flag extra candidate_count=0 listeners listener_count probe_file instance
   : >"$TASK_DIR/candidate-sids"
   [ -f "$ORATAB" ] && [ ! -L "$ORATAB" ] || die 'oratab is missing or symbolic link'
+  # restart_flag: oratab's third (autostart Y/N) field, kept for line-shape
+  # clarity though this collector does not act on it.
+  # shellcheck disable=SC2034
   while IFS=: read -r sid candidate_home restart_flag extra; do
     case "$sid" in ''|'#'*) continue ;; esac
     [ -z "${extra:-}" ] || continue

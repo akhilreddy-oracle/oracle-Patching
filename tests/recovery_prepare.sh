@@ -203,8 +203,14 @@ jq -e '.execution.phase == "completed"' "$TMP/completed.json" >/dev/null
 [ "$(wc -l <"$BACKUP_PARENT/recovery-ok/SHA256SUMS" | tr -d ' ')" -ge 7 ]
 (cd / && sha256sum -c "$BACKUP_PARENT/recovery-ok/SHA256SUMS") >/dev/null
 jq -e '.collector.name == "oracle.database.recovery.preparation" and .target.dbid == "12345"' "$BACKUP_PARENT/recovery-ok/PREPARATION.json" >/dev/null
-! grep -Eiq '^[[:space:]]*whenever([[:space:]]|$)' "$STATE_ROOT/recovery-ok/evidence/backup.rman"
-! grep -Eiq '^[[:space:]]*whenever([[:space:]]|$)' "$BACKUP_PARENT/recovery-ok/rman/backup.rman.cmd"
+if grep -Eiq '^[[:space:]]*whenever([[:space:]]|$)' "$STATE_ROOT/recovery-ok/evidence/backup.rman"; then
+  echo 'RMAN backup evidence must not contain a WHENEVER directive' >&2
+  exit 1
+fi
+if grep -Eiq '^[[:space:]]*whenever([[:space:]]|$)' "$BACKUP_PARENT/recovery-ok/rman/backup.rman.cmd"; then
+  echo 'RMAN backup command file must not contain a WHENEVER directive' >&2
+  exit 1
+fi
 [ "$(cat "$STATE_ROOT/recovery-ok/evidence/backup-rman-syntax.exit-code")" = 0 ]
 [ "$(cat "$STATE_ROOT/recovery-ok/evidence/backup-rman.exit-code")" = 0 ]
 grep -q 'listener:stop LISTENER' "$RUNTIME/order.log"

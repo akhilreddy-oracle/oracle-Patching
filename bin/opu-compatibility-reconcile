@@ -21,9 +21,8 @@ contract() {
   PATCH_ID=$(jq -r '.procedure.patch_id' "$PROCEDURE"); ARTIFACT_SHA=$(jq -r '.procedure.artifact_sha256' "$PROCEDURE"); TARGET_FAMILY=$(jq -r '.procedure.target.family' "$PROCEDURE"); TARGET_PLATFORM=$(jq -r '.procedure.target.platform_id' "$PROCEDURE")
 }
 collect() {
-  local result hash node home check key seen_keys=$'\n'
+  local result node home check key seen_keys=$'\n'
   for result in "${RESULTS[@]}"; do
-    hash=$(opu_hash_file "$result")
     jq -e --arg patch "$PATCH_ID" --arg sha "$ARTIFACT_SHA" --arg family "$TARGET_FAMILY" --arg platform "$TARGET_PLATFORM" '.schema_version == "1.0" and .patch_id == $patch and .artifact_sha256 == $sha and .target.family == $family and .target.platform_id == $platform and (.checks | type == "array")' "$result" >/dev/null || { finding COMPATIBILITY_DOCUMENT_INVALID "Compatibility evidence is not bound to this procedure and platform: $result"; continue; }
     while IFS= read -r check; do
       node=$(jq -r '.node' <<<"$check"); home=$(jq -r '.home' <<<"$check"); key="$node|$home"

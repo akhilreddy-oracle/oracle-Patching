@@ -33,7 +33,7 @@ main() {
     command=${1:-help}; [ "$#" -gt 0 ] && shift
     case "$command" in
       create) opu_job_create "$@";;
-      submit|approve|start|reconcile) pair=$(job_actor "$@") || return; job=${pair%%|*}; actor=${pair#*|}; opu_job_$command "$job" "$actor";;
+      submit|approve|start|reconcile) pair=$(job_actor "$@") || return; job=${pair%%|*}; actor=${pair#*|}; "opu_job_$command" "$job" "$actor";;
       ready)
         job=""; actor=""; evidence=""; while [ "$#" -gt 0 ]; do case "$1" in --job-id) job=$2; shift 2;; --actor) actor=$2; shift 2;; --evidence-sha256) evidence=$2; shift 2;; *) opu_error "unknown option: $1"; return 64;; esac; done
         opu_validate_identifier "$job" "job ID" && opu_validate_identifier "$actor" "actor" || return; opu_job_ready "$job" "$actor" "$evidence";;

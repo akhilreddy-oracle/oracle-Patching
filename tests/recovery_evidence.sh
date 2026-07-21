@@ -99,7 +99,10 @@ jq -e --arg backup_root "$backup_root" --arg oracle_home "$oracle_home" '
   (.record_sha256 | test("^[a-f0-9]{64}$"))
 ' "$TMP/result.json" >/dev/null
 
-! grep -Eiq '^[[:space:]]*whenever([[:space:]]|$)' "$TMP/recovery.d/rman-validate.cmd"
+if grep -Eiq '^[[:space:]]*whenever([[:space:]]|$)' "$TMP/recovery.d/rman-validate.cmd"; then
+  echo 'RMAN validate command must not contain a WHENEVER directive' >&2
+  exit 1
+fi
 [ "$(cat "$TMP/recovery.d/rman-validate-syntax.exit-code")" = 0 ]
 [ "$(cat "$TMP/recovery.d/rman-validate.exit-code")" = 0 ]
 

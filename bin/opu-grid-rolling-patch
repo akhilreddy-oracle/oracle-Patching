@@ -6,6 +6,7 @@ export LC_ALL=C LANG=C
 
 PROGRAM=${0##*/}; GRID_HOME=""; PATCH_DIR=""; PATCH_ID=""; MODE=""; NODE_FILE=""; LOG_ROOT=/var/tmp; REMOTE_USER=root; APPROVED=0; MIN_FREE_MB=4096
 LOCAL_HOST=$(hostname -s 2>/dev/null || hostname); GRID_OWNER=""; STATE_DIR=""; DONE_FILE=""; FAILED_FILE=""; MAIN_LOG=""; CURRENT_NODE=""
+TEST_MODE=${OPU_GRID_ROLLING_TEST_MODE:-0}
 declare -a NODES=()
 record_failure() {
   [[ -n "$FAILED_FILE" ]] || return 0
@@ -46,9 +47,23 @@ run_grid() {
   local node=$1; shift
   # runuser preserves the command's positional arguments; unlike a shell -c
   # wrapper it cannot drop the OPatch subcommand or reinterpret an argument.
-  if is_local "$node"; then runuser -u "$GRID_OWNER" -- "$@"
+  if [[ "$TEST_MODE" == 1 ]] && is_local "$node"; then "$@"
+  elif is_local "$node"; then runuser -u "$GRID_OWNER" -- "$@"
   elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$node" -- runuser -u "$GRID_OWNER" -- "$@"
   else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$node" -- sudo -n runuser -u "$GRID_OWNER" -- "$@"; fi
+}
+acquire_lock() {
+  local dir=$1 flock_command=flock
+  if [[ "$TEST_MODE" == 1 && -n "${OPU_GRID_ROLLING_TEST_FLOCK:-}" ]]; then
+    flock_command=$OPU_GRID_ROLLING_TEST_FLOCK
+    [[ -x "$flock_command" ]] || die 'test flock command is not executable'
+  fi
+  if [[ "$flock_command" != flock ]] || command -v flock >/dev/null 2>&1; then
+    exec 9>"$dir/.lock"
+    "$flock_command" -n 9 || die "another run owns $dir"
+  else
+    die 'flock is required for Grid rolling patch execution'
+  fi
 }
 key() { printf '%s|%s|%s\n' "$MODE" "$1" "$2"; }
 done_step() { grep -Fqx "$(key "$1" "$2")" "$DONE_FILE" 2>/dev/null; }
@@ -83,9 +98,13 @@ detect_grid_owner() {
   # ODA and some hardened builds retain root ownership on the Grid home even
   # though the active ASM/CRS stack is owned by the Grid account. Prefer the
   # live process owner; only then fall back to filesystem ownership.
-  GRID_OWNER=$(ps -eo user=,args= | awk '$1 != "root" && $0 ~ /(asm_pmon|asm_smon|ora\.asm|crsd\.bin)/ {print $1; exit}')
+  # awk's early `exit` can close the pipe before `ps` finishes writing on a
+  # host with a large process table; scope pipefail off so ps's resulting
+  # SIGPIPE does not abort this script even though the match already
+  # succeeded.
+  GRID_OWNER=$(set +o pipefail; ps -eo user=,args= | awk '$1 != "root" && $0 ~ /(asm_pmon|asm_smon|ora\.asm|crsd\.bin)/ {print $1; exit}')
   if [[ -z "$GRID_OWNER" ]]; then
-    GRID_OWNER=$(stat -c '%U' "$GRID_HOME")
+    GRID_OWNER=$(stat -c '%U' "$GRID_HOME" 2>/dev/null || stat -f '%Su' "$GRID_HOME" 2>/dev/null || true)
   fi
   [[ -n "$GRID_OWNER" && "$GRID_OWNER" != root ]] || die "cannot determine non-root Grid owner from active processes or Grid home"
 }
@@ -173,14 +192,14 @@ parse() {
     --grid-home) GRID_HOME=${2:-}; shift 2;; --patch-dir) PATCH_DIR=${2:-}; shift 2;; --patch-id) PATCH_ID=${2:-}; shift 2;; --mode) MODE=${2:-}; shift 2;; --nodes) NODE_FILE=${2:-}; shift 2;; --log-root) LOG_ROOT=${2:-}; shift 2;; --remote-user) REMOTE_USER=${2:-}; shift 2;; --min-free-mb) MIN_FREE_MB=${2:-}; shift 2;; --approve) APPROVED=1; shift;; -h|--help) usage; exit 0;; *) die "unknown option: $1";; esac; done
 }
 main() {
-  parse "$@"; [[ $EUID -eq 0 ]] || die "must run as root"
+  parse "$@"; [[ $EUID -eq 0 ]] || [[ "$TEST_MODE" == 1 ]] || die "must run as root"
   [[ "$MODE" =~ ^(analyze|apply|rollback)$ ]] || die "--mode must be analyze, apply, or rollback"
   valid_path "$GRID_HOME" || die "--grid-home must be a normalized absolute path"; [[ -z "$NODE_FILE" ]] || valid_path "$NODE_FILE" || die "--nodes must be a normalized absolute path"; valid_path "$LOG_ROOT" || die "--log-root must be a normalized absolute path"; valid_node "$REMOTE_USER" || die "--remote-user contains unsupported characters"; [[ "$MIN_FREE_MB" =~ ^[0-9]{1,7}$ ]] && [ "$MIN_FREE_MB" -ge 256 ] || die "--min-free-mb must be an integer of at least 256"
   if [[ "$MODE" == rollback ]]; then valid_patch_id "$PATCH_ID" || die "rollback requires numeric --patch-id"; else valid_path "$PATCH_DIR" || die "--patch-dir must be a normalized absolute path"; fi
   [[ "$MODE" == analyze || $APPROVED -eq 1 ]] || die "$MODE is destructive; pass --approve after change approval"
   [[ -d "$GRID_HOME" ]] || die "local Grid home is missing"; detect_grid_owner
   detect_patch_id; read_nodes; STATE_DIR="${LOG_ROOT%/}/opu-grid-rolling-${MODE}-${PATCH_ID}"; mkdir -p "$STATE_DIR"; DONE_FILE="$STATE_DIR/completed.steps"; FAILED_FILE="$STATE_DIR/last.failure"; MAIN_LOG="$STATE_DIR/$PROGRAM.log"; touch "$DONE_FILE" "$MAIN_LOG"; write_manifest
-  exec 9>"$STATE_DIR/.lock"; flock -n 9 || die "another run owns $STATE_DIR"
+  acquire_lock "$STATE_DIR"
   log "mode=$MODE patch_id=$PATCH_ID grid_home=$GRID_HOME nodes=${NODES[*]} minimum_free_mb=$MIN_FREE_MB"
   validate_cluster_membership
   local node; for node in "${NODES[@]}"; do CURRENT_NODE=$node; preflight_node "$node"; done
