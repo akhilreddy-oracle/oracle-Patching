@@ -20,6 +20,7 @@ import evidence
 import pipeline_runner
 import pipeline_steps
 import planctl
+import recoveryctl
 import remote
 
 ROOT = Path(__file__).resolve().parent
@@ -186,6 +187,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, exc.to_json())
             return
 
+        if path == "/api/recovery":
+            self._send_json(200, {"requests": recoveryctl.list_requests()})
+            return
+
+        if path.startswith("/api/recovery/"):
+            request_id = path[len("/api/recovery/"):]
+            try:
+                self._send_json(200, recoveryctl.status(request_id))
+            except recoveryctl.RecoveryError as exc:
+                self._send_json(404, exc.to_json())
+            return
+
         if path == "/":
             self._send_static("index.html")
             return
@@ -288,6 +301,35 @@ class Handler(BaseHTTPRequestHandler):
             self._post_plan_action("create-rollback", plan_id, self._read_json_body())
             return
 
+        if path == "/api/recovery/testmode-demo":
+            self._post_recovery_action("create", None, self._read_json_body())
+            return
+
+        if path.startswith("/api/recovery/") and path.endswith("/analyze"):
+            request_id = path[len("/api/recovery/"):-len("/analyze")]
+            self._post_recovery_action("analyze", request_id, self._read_json_body())
+            return
+
+        if path.startswith("/api/recovery/") and path.endswith("/approve"):
+            request_id = path[len("/api/recovery/"):-len("/approve")]
+            self._post_recovery_action("approve", request_id, self._read_json_body())
+            return
+
+        if path.startswith("/api/recovery/") and path.endswith("/authorize"):
+            request_id = path[len("/api/recovery/"):-len("/authorize")]
+            self._post_recovery_action("authorize", request_id, self._read_json_body())
+            return
+
+        if path.startswith("/api/recovery/") and path.endswith("/execute"):
+            request_id = path[len("/api/recovery/"):-len("/execute")]
+            self._post_recovery_action("execute", request_id, self._read_json_body())
+            return
+
+        if path.startswith("/api/recovery/") and path.endswith("/reconcile"):
+            request_id = path[len("/api/recovery/"):-len("/reconcile")]
+            self._post_recovery_action("reconcile", request_id, self._read_json_body())
+            return
+
         self.send_error(404)
 
     def _post_plan_action(self, action: str, plan_id: str | None, body: dict) -> None:
@@ -332,6 +374,59 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             record = pipeline_runner.start_run("plan", key, run)
+        except pipeline_runner.RunConflict as exc:
+            self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
+            return
+        self._send_json(202, {"run_id": record.run_id})
+
+    def _post_recovery_action(self, action: str, request_id: str | None, body: dict) -> None:
+        try:
+            if action == "create":
+                request_id = body["request_id"]
+                key = f"recovery:{request_id}:create"
+
+                def run(_record, body=body):
+                    return recoveryctl.create_testmode_demo(body["request_id"], body["requester"])
+
+            elif action == "analyze":
+                key = f"recovery:{request_id}:analyze"
+
+                def run(_record, request_id=request_id):
+                    return recoveryctl.analyze(request_id)
+
+            elif action == "approve":
+                key = f"recovery:{request_id}:approve"
+
+                def run(_record, request_id=request_id, body=body):
+                    return recoveryctl.approve(request_id, body["actor"], body["approval_ticket"])
+
+            elif action == "authorize":
+                key = f"recovery:{request_id}:authorize"
+
+                def run(_record, request_id=request_id, body=body):
+                    return recoveryctl.authorize(request_id, body["actor"])
+
+            elif action == "execute":
+                key = f"recovery:{request_id}:execute"
+
+                def run(_record, request_id=request_id, body=body):
+                    return recoveryctl.execute(request_id, body["actor"])
+
+            elif action == "reconcile":
+                key = f"recovery:{request_id}:reconcile"
+
+                def run(_record, request_id=request_id, body=body):
+                    return recoveryctl.reconcile(request_id, body["actor"])
+
+            else:
+                self._send_json(404, {"error": "unknown_action", "message": action})
+                return
+        except KeyError as exc:
+            self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
+            return
+
+        try:
+            record = pipeline_runner.start_run("recovery", key, run)
         except pipeline_runner.RunConflict as exc:
             self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
             return

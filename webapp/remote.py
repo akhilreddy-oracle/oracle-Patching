@@ -29,8 +29,18 @@ def _ssh_argv(ssh_alias: str, remote_command: str, timeout: int) -> list[str]:
     return ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}", ssh_alias, remote_command]
 
 
-def run_remote(ssh_alias: str, argv: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS) -> str:
-    """Run a fixed remote command (as argv tokens) over SSH and return its stdout."""
+def run_remote(ssh_alias: str, argv: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS, sudo: bool = False) -> str:
+    """Run a fixed remote command (as argv tokens) over SSH and return its stdout.
+
+    sudo=True prepends `sudo -n` — the documented convention elsewhere in this
+    repo (docs/STANDALONE_DATABASE_PATCH.md, docs/RECOVERY_PREPARATION.md) for
+    invoking a specific opu-* binary as root over SSH from a non-root
+    automation account. Never used to run an arbitrary shell string — argv[0]
+    is always a fixed absolute binary path from trusted config, same as the
+    rest of this module.
+    """
+    if sudo:
+        argv = ["sudo", "-n", *argv]
     remote_command = " ".join(shlex.quote(a) for a in argv)
     try:
         result = subprocess.run(_ssh_argv(ssh_alias, remote_command, timeout), capture_output=True, text=True, timeout=timeout)
@@ -51,8 +61,8 @@ def run_remote(ssh_alias: str, argv: list[str], timeout: int = DEFAULT_TIMEOUT_S
     return result.stdout
 
 
-def run_remote_json(ssh_alias: str, argv: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict:
-    stdout = run_remote(ssh_alias, argv, timeout)
+def run_remote_json(ssh_alias: str, argv: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS, sudo: bool = False) -> dict:
+    stdout = run_remote(ssh_alias, argv, timeout, sudo=sudo)
     try:
         return json.loads(stdout)
     except json.JSONDecodeError as exc:

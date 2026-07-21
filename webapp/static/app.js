@@ -2,6 +2,7 @@ import { renderEstate } from "./estate.js";
 import { renderHost } from "./host.js";
 import { renderPipeline } from "./pipeline.js";
 import { renderPlanList, renderPlanNew, renderPlanDetail, renderPlanDemoNew, renderRollbackNew } from "./plan.js";
+import { renderRecoveryList, renderRecoveryNew, renderRecoveryDetail } from "./recovery.js";
 import { mountActorWidget } from "./actor.js";
 
 const app = document.getElementById("app");
@@ -18,6 +19,9 @@ function parseRoute() {
   if (parts[0] === "plans" && parts[1] === "rollback-new" && parts[2]) return { name: "rollback-new", sourceId: decodeURIComponent(parts[2]) };
   if (parts[0] === "plans" && parts[1]) return { name: "plan-detail", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "plans") return { name: "plan-list" };
+  if (parts[0] === "recovery" && parts[1] === "new") return { name: "recovery-new" };
+  if (parts[0] === "recovery" && parts[1]) return { name: "recovery-detail", id: decodeURIComponent(parts[1]) };
+  if (parts[0] === "recovery") return { name: "recovery-list" };
   return { name: "estate" };
 }
 
@@ -37,6 +41,12 @@ async function render() {
     await renderPlanDetail(app, route.id);
   } else if (route.name === "plan-list") {
     await renderPlanList(app);
+  } else if (route.name === "recovery-new") {
+    await renderRecoveryNew(app);
+  } else if (route.name === "recovery-detail") {
+    await renderRecoveryDetail(app, route.id);
+  } else if (route.name === "recovery-list") {
+    await renderRecoveryList(app);
   } else {
     await renderEstate(app);
   }
