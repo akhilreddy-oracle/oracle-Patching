@@ -3,32 +3,23 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Oracle Patching Utility — Discovery</title>
+<title>Oracle Patching Utility — Estate</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <header class="topbar">
-  <h1>Oracle Patching Utility <span class="subtitle">Discovery &amp; Inventory</span></h1>
-  <div class="controls">
-    <label for="host-select">Host</label>
-    <select id="host-select"></select>
-    <button id="refresh-btn" type="button">Refresh</button>
-    <span id="status-pill" class="pill pill-idle">idle</span>
-  </div>
+  <h1><a href="#/estate" class="brand-link">Oracle Patching Utility</a> <span class="subtitle">Estate</span></h1>
+  <nav class="topbar-nav">
+    <a href="#/estate">Estate</a>
+    <a href="#/plans">Plans</a>
+  </nav>
+  <div id="topbar-actor"></div>
 </header>
 
 <main id="app">
-  <p class="empty-state">Select a host to run discovery.</p>
+  <p class="empty-state">Loading…</p>
 </main>
 
-<template id="tpl-error">
-  <div class="error-box">
-    <h2>Discovery failed</h2>
-    <p class="error-message"></p>
-    <pre class="error-detail"></pre>
-  </div>
-</template>
-
-<script src="/app.js"></script>
+<script type="module" src="/app.js"></script>
 </body>
 </html>
