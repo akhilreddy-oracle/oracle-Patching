@@ -1,0 +1,218 @@
+:root {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --border: #dde1e6;
+  --text: #1b1f24;
+  --text-dim: #5b6470;
+  --accent: #2a5fd6;
+  --ok: #1a7f37;
+  --ok-bg: #e6f4ea;
+  --warn: #9a6700;
+  --warn-bg: #fff4e0;
+  --bad: #b3261e;
+  --bad-bg: #fbe9e7;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --surface: #1d2025;
+    --border: #2c3037;
+    --text: #e8eaed;
+    --text-dim: #9aa2ad;
+    --accent: #6f9bff;
+    --ok: #4caf6f;
+    --ok-bg: #163422;
+    --warn: #d3a336;
+    --warn-bg: #3a2f11;
+    --bad: #e5675f;
+    --bad-bg: #3a1f1d;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.topbar h1 {
+  font-size: 18px;
+  margin: 0;
+  font-weight: 600;
+}
+
+.subtitle {
+  font-weight: 400;
+  color: var(--text-dim);
+  font-size: 14px;
+  margin-left: 8px;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.controls label {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+select, button {
+  font: inherit;
+  font-size: 14px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+button {
+  cursor: pointer;
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.pill {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+.pill-idle { background: var(--border); color: var(--text-dim); }
+.pill-loading { background: var(--warn-bg); color: var(--warn); }
+.pill-ok { background: var(--ok-bg); color: var(--ok); }
+.pill-error { background: var(--bad-bg); color: var(--bad); }
+
+main {
+  padding: 24px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.empty-state {
+  color: var(--text-dim);
+  text-align: center;
+  margin-top: 60px;
+}
+
+.meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  color: var(--text-dim);
+  font-size: 13px;
+  margin-bottom: 20px;
+}
+
+.meta-row strong { color: var(--text); font-weight: 600; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 20px;
+  margin-bottom: 18px;
+  overflow-x: auto;
+}
+
+.card h2 {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin: 0 0 14px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th, td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+td.wrap { white-space: normal; }
+
+th {
+  color: var(--text-dim);
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+tr:last-child td { border-bottom: none; }
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.badge-ok { background: var(--ok-bg); color: var(--ok); }
+.badge-warn { background: var(--warn-bg); color: var(--warn); }
+.badge-bad { background: var(--bad-bg); color: var(--bad); }
+.badge-neutral { background: var(--border); color: var(--text-dim); }
+
+.mono { font-family: var(--mono); font-size: 12px; }
+
+.node-list { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.warnings {
+  border-color: var(--warn);
+}
+
+.warnings ul { margin: 0; padding-left: 18px; }
+
+.error-box {
+  border: 1px solid var(--bad);
+  background: var(--bad-bg);
+  border-radius: 10px;
+  padding: 18px 20px;
+}
+
+.error-box h2 { margin-top: 0; color: var(--bad); font-size: 15px; }
+.error-message { font-weight: 600; }
+.error-detail {
+  white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 10px;
+}

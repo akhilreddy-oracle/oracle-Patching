@@ -1,0 +1,10 @@
+{
+  "hosts": [
+    {
+      "id": "oracle-test-rac",
+      "label": "oracle-test-rac (sapproject1)",
+      "ssh_alias": "oracle-test-rac",
+      "remote_root": "/home/opc/patching-oracle"
+    }
+  ]
+}

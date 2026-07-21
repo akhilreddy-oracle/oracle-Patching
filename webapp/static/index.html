@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Oracle Patching Utility — Discovery</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>Oracle Patching Utility <span class="subtitle">Discovery &amp; Inventory</span></h1>
+  <div class="controls">
+    <label for="host-select">Host</label>
+    <select id="host-select"></select>
+    <button id="refresh-btn" type="button">Refresh</button>
+    <span id="status-pill" class="pill pill-idle">idle</span>
+  </div>
+</header>
+
+<main id="app">
+  <p class="empty-state">Select a host to run discovery.</p>
+</main>
+
+<template id="tpl-error">
+  <div class="error-box">
+    <h2>Discovery failed</h2>
+    <p class="error-message"></p>
+    <pre class="error-detail"></pre>
+  </div>
+</template>
+
+<script src="/app.js"></script>
+</body>
+</html>
