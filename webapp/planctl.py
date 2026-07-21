@@ -27,6 +27,7 @@ DEFAULT_TIMEOUT_SECONDS = 30
 # plan runnable through execute_next_task() is a synthetic demo plan.
 EXECUTOR_BY_ADAPTER = {
     "database_single_instance_opatch": REPO_ROOT / "bin" / "opu-database-single-instance-patch",
+    "database_single_instance_opatch_rollback": REPO_ROOT / "bin" / "opu-database-single-instance-rollback",
 }
 
 
@@ -170,7 +171,8 @@ def execute_next_task(plan_id: str, actor: str) -> dict | None:
     if the plan's adapter has no verified fixture wired up yet, or the
     fixture directory (created by create_testmode_demo) is missing.
     """
-    plan_state = status(plan_id).get("state")
+    plan = status(plan_id)
+    plan_state = plan.get("state")
     if plan_state == "succeeded":
         return None
     if plan_state != "running":
@@ -185,9 +187,17 @@ def execute_next_task(plan_id: str, actor: str) -> dict | None:
     if executor is None:
         raise PlanError(f"No TEST_MODE executor is wired up for adapter: {adapter}")
 
-    fixture_dir = TESTMODE_DIR / plan_id
+    # The fixture directory is derived from the plan's own sealed
+    # target.oracle_home (<fixture_dir>/oracle/dbhome_1), not from plan_id —
+    # this works uniformly for both an apply plan (its own fixture) and a
+    # rollback plan (the same fixture as its source apply plan, since
+    # rollback must act on the exact fake Oracle home the apply patched).
+    oracle_home = (plan.get("target") or {}).get("oracle_home")
+    if not oracle_home:
+        raise PlanError(f"plan {plan_id} has no target.oracle_home to locate its TEST_MODE fixture")
+    fixture_dir = Path(oracle_home).parent.parent
     if not fixture_dir.is_dir():
-        raise PlanError(f"No TEST_MODE fixture found for plan {plan_id} — was it created via the TEST_MODE demo flow?")
+        raise PlanError(f"No TEST_MODE fixture found at {fixture_dir} for plan {plan_id}")
     fx_env = testmode_fixtures.env_for(fixture_dir)
 
     exec_env = os.environ.copy()
