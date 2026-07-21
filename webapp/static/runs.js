@@ -24,7 +24,15 @@ export async function startRun(url, body) {
 export async function pollRun(runId, { onTick, intervalMs = 1200 } = {}) {
   for (;;) {
     const res = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
-    const record = await res.json();
+    let record;
+    try {
+      record = await res.json();
+    } catch (err) {
+      throw new Error(`run poll returned non-JSON for ${runId}: ${err}`);
+    }
+    if (!res.ok) {
+      throw new Error(record.message || `run poll failed (${res.status}) for ${runId}`);
+    }
     if (onTick) onTick(record);
     if (record.status === "succeeded" || record.status === "failed") return record;
     await sleep(intervalMs);

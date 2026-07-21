@@ -165,22 +165,26 @@ opu_job_ready() {
     opu_job_transition "$job_id" prechecking awaiting_approval "$actor" "precheck_evidence_sha256=$evidence"
 }
 
-opu_job_approve() {
+opu_job_approve() (
     local job_id actor requester
     job_id=$1; actor=$2
-    opu_validate_identifier "$actor" "approver" || return
-    [ -f "$(opu_job_dir "$job_id")/requester" ] || { opu_error "job does not exist: $job_id"; return 66; }
-    IFS= read -r requester <"$(opu_job_dir "$job_id")/requester" || return 74
-    [ "$actor" != "$requester" ] || { opu_error "requester cannot approve their own job"; return 77; }
+    opu_validate_identifier "$actor" "approver" || exit $?
+    opu_job_lock "$job_id" || exit $?
+    trap 'opu_job_unlock' EXIT
+    [ -f "$(opu_job_dir "$job_id")/requester" ] || { opu_error "job does not exist: $job_id"; exit 66; }
+    IFS= read -r requester <"$(opu_job_dir "$job_id")/requester" || exit 74
+    [ "$actor" != "$requester" ] || { opu_error "requester cannot approve their own job"; exit 77; }
     printf '%s\n' "$actor" >"$(opu_job_dir "$job_id")/approved_by"
     opu_job_transition "$job_id" awaiting_approval scheduled "$actor" "plan_approved"
-}
+)
 
-opu_job_start() {
+opu_job_start() (
     local job_id actor plan node index task_id task_file topology
     job_id=$1; actor=$2; plan=$(opu_job_dir "$job_id")/plan.json
-    opu_job_transition "$job_id" scheduled running "$actor" "execution_started" || return
-    topology=$(jq -r '.topology' "$plan") || return 74
+    opu_job_lock "$job_id" || exit $?
+    trap 'opu_job_unlock' EXIT
+    opu_job_transition "$job_id" scheduled running "$actor" "execution_started" || exit $?
+    topology=$(jq -r '.topology' "$plan") || exit 74
     index=0
     while IFS= read -r node; do
         for stage in apply validate; do
@@ -198,7 +202,7 @@ opu_job_start() {
             "$(opu_json_string "$task_id")" "$(opu_json_string "$job_id")" >"$task_file"
     fi
     opu_job_event "$job_id" "tasks_created" running "$actor" "count=$index"
-}
+)
 
 opu_job_next() {
     local job_id task
@@ -225,6 +229,10 @@ opu_job_claim() (
     now=$(date -u +%s); expires=$((now + lease_seconds))
     if find "$(opu_job_dir "$job_id")/tasks" -name '*.json' -exec jq -e 'select(.status == "running")' {} \; | grep -q .; then
         opu_error "a rolling task is already running; wait for its evidence or reconcile its lease"
+        exit 65
+    fi
+    if find "$(opu_job_dir "$job_id")/tasks" -name '*.json' -exec jq -e 'select(.status == "unknown")' {} \; | grep -q .; then
+        opu_error "job has an unknown task; reconcile or recover before claiming"
         exit 65
     fi
     for task_file in "$(opu_job_dir "$job_id")"/tasks/*.json; do
@@ -263,28 +271,41 @@ opu_job_reconcile() (
     exit 66
 )
 
-opu_job_complete() {
-    local job_id task_id actor status evidence task_file pending expected claimed_by expiry now
+opu_job_complete() (
+    local job_id task_id actor status evidence task_file pending unknown incomplete claimed_by expiry now
     job_id=$1; task_id=$2; actor=$3; status=$4; evidence=$5
-    opu_validate_identifier "$task_id" "task ID" || return
-    [[ $status =~ ^(succeeded|failed)$ ]] || { opu_error "task status must be succeeded or failed"; return 64; }
-    opu_job_valid_digest "$evidence" || { opu_error "evidence digest must be a SHA-256 hex value"; return 64; }
-    opu_job_read_state "$job_id" || return
-    [ "$OPU_JOB_STATE" = running ] || { opu_error "job is not running"; return 65; }
-    task_file="$(opu_job_dir "$job_id")/tasks/$task_id.json"; [ -f "$task_file" ] || { opu_error "task does not exist"; return 66; }
+    opu_validate_identifier "$task_id" "task ID" || exit $?
+    [[ $status =~ ^(succeeded|failed)$ ]] || { opu_error "task status must be succeeded or failed"; exit 64; }
+    opu_job_valid_digest "$evidence" || { opu_error "evidence digest must be a SHA-256 hex value"; exit 64; }
+    opu_job_lock "$job_id" || exit $?
+    trap 'opu_job_unlock' EXIT
+    opu_job_read_state "$job_id" || exit $?
+    [ "$OPU_JOB_STATE" = running ] || { opu_error "job is not running"; exit 65; }
+    task_file="$(opu_job_dir "$job_id")/tasks/$task_id.json"; [ -f "$task_file" ] || { opu_error "task does not exist"; exit 66; }
     claimed_by=$(jq -r '.claimed_by // empty' "$task_file")
     expiry=$(jq -r '.lease_expires_epoch // 0' "$task_file"); now=$(date -u +%s)
-    [ "$claimed_by" = "$actor" ] || { opu_error "task is not claimed by actor $actor"; return 77; }
-    [ "$expiry" -gt "$now" ] || { opu_error "task lease expired; reconcile before retrying"; return 75; }
-    jq -e '.status == "running"' "$task_file" >/dev/null 2>&1 || { opu_error "task is not running"; return 65; }
+    [ "$claimed_by" = "$actor" ] || { opu_error "task is not claimed by actor $actor"; exit 77; }
+    [ "$expiry" -gt "$now" ] || { opu_error "task lease expired; reconcile before retrying"; exit 75; }
+    jq -e '.status == "running"' "$task_file" >/dev/null 2>&1 || { opu_error "task is not running"; exit 65; }
     jq --arg status "$status" --arg evidence "$evidence" --argjson now "$now" \
         '.status=$status | .evidence_sha256=$evidence | .completed_at_epoch=$now' \
-        "$task_file" >"${task_file}.tmp" && mv "${task_file}.tmp" "$task_file" || return 74
-    if [ "$status" = failed ]; then opu_job_transition "$job_id" running paused "$actor" "task_failed=$task_id"; return; fi
-    pending=$(find "$(opu_job_dir "$job_id")/tasks" -name '*.json' -exec jq -r 'select(.status == "pending") | 1' {} \; | wc -l | tr -d ' ')
+        "$task_file" >"${task_file}.tmp" && mv "${task_file}.tmp" "$task_file" || exit 74
+    if [ "$status" = failed ]; then opu_job_transition "$job_id" running paused "$actor" "task_failed=$task_id"; exit 0; fi
     opu_job_event "$job_id" "task_completed" running "$actor" "task_id=$task_id"
-    [ "$pending" -gt 0 ] || opu_job_transition "$job_id" running succeeded "$actor" "all_tasks_succeeded"
-}
+    unknown=$(find "$(opu_job_dir "$job_id")/tasks" -name '*.json' -exec jq -r 'select(.status == "unknown") | 1' {} \; | wc -l | tr -d ' ')
+    if [ "$unknown" -gt 0 ]; then
+        opu_job_transition "$job_id" running paused "$actor" "unknown_task_blocks_success"
+        exit 0
+    fi
+    pending=$(find "$(opu_job_dir "$job_id")/tasks" -name '*.json' -exec jq -r 'select(.status == "pending") | 1' {} \; | wc -l | tr -d ' ')
+    [ "$pending" -gt 0 ] && exit 0
+    incomplete=$(find "$(opu_job_dir "$job_id")/tasks" -name '*.json' -exec jq -r 'select(.status != "succeeded") | 1' {} \; | wc -l | tr -d ' ')
+    if [ "$incomplete" -gt 0 ]; then
+        opu_job_transition "$job_id" running paused "$actor" "incomplete_tasks_block_success"
+        exit 0
+    fi
+    opu_job_transition "$job_id" running succeeded "$actor" "all_tasks_succeeded"
+)
 
 opu_job_status() {
     local job_id; job_id=$1; opu_job_read_state "$job_id" || return

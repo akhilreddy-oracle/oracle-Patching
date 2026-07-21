@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,9 @@ PLAN_STATE_DIR = Path(__file__).resolve().parent / "var" / "plans"
 TESTMODE_DIR = Path(__file__).resolve().parent / "var" / "testmode"
 DEFAULT_TIMEOUT_SECONDS = 30
 
+# Matches lib/opu/common.sh opu_validate_identifier.
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
 # Only adapters with a verified TEST_MODE fixture are wired up. Real
 # (non-fixture) execution against a live host is not implemented — every
 # plan runnable through execute_next_task() is a synthetic demo plan.
@@ -32,14 +36,24 @@ EXECUTOR_BY_ADAPTER = {
 
 
 class PlanError(Exception):
-    def __init__(self, message: str, stderr: str = ""):
+    def __init__(self, message: str, stderr: str = "", result=None):
         super().__init__(message)
         self.error = "plan_tool_failed"
         self.message = message
         self.stderr = stderr
+        self.result = result
 
     def to_json(self) -> dict:
-        return {"error": self.error, "message": self.message, "stderr": self.stderr}
+        payload = {"error": self.error, "message": self.message, "stderr": self.stderr}
+        if self.result is not None:
+            payload["result"] = self.result
+        return payload
+
+
+def validate_plan_id(plan_id: str) -> str:
+    if not plan_id or not _ID_RE.match(plan_id):
+        raise PlanError(f"plan_id contains unsupported characters: {plan_id!r}")
+    return plan_id
 
 
 def _env() -> dict:
@@ -56,24 +70,28 @@ def _run(args: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict | None
     except subprocess.TimeoutExpired:
         raise PlanError(f"opu-patch-plan timed out after {timeout}s") from None
 
-    # opu-patch-plan uses nonzero exit for real rejections (self-approval,
-    # window closed, stale readiness, etc.) but still emits structured JSON
-    # explaining why — that is the useful part, not a crash. Conversely,
-    # approve/authorize/dispatch succeed silently (exit 0, no stdout) — only
-    # create/create-rollback/status/next print a document.
+    # Failures go to stderr via opu_error; never treat nonzero exit as success
+    # even if stdout happens to contain JSON.
+    if result.returncode != 0:
+        raise PlanError(
+            f"opu-patch-plan exited {result.returncode}",
+            stderr=result.stderr.strip() or result.stdout.strip()[-2000:],
+        )
+
     if result.stdout.strip():
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as exc:
-            raise PlanError(f"opu-patch-plan produced unparsable output: {exc}", stderr=result.stdout[-2000:]) from exc
-
-    if result.returncode == 0:
-        return None
-
-    raise PlanError(f"opu-patch-plan exited {result.returncode} with no output", stderr=result.stderr.strip())
+            raise PlanError(
+                f"opu-patch-plan produced unparsable output: {exc}",
+                stderr=result.stdout[-2000:],
+            ) from exc
+    return None
 
 
 def create(plan_id: str, requester: str, host_id: str, window_start: str, window_end: str) -> dict:
+    validate_plan_id(plan_id)
+    evidence.validate_host_id(host_id)
     args = [
         "create", "--plan-id", plan_id, "--requester", requester,
         "--readiness", str(evidence.evidence_path(host_id, "readiness")),
@@ -92,6 +110,8 @@ def create(plan_id: str, requester: str, host_id: str, window_start: str, window
 
 
 def create_rollback(plan_id: str, requester: str, source_plan_id: str, window_start: str, window_end: str) -> dict:
+    validate_plan_id(plan_id)
+    validate_plan_id(source_plan_id)
     return _run([
         "create-rollback", "--plan-id", plan_id, "--requester", requester,
         "--source-plan-id", source_plan_id, "--window-start", window_start, "--window-end", window_end,
@@ -99,22 +119,26 @@ def create_rollback(plan_id: str, requester: str, source_plan_id: str, window_st
 
 
 def approve(plan_id: str, actor: str, approval_ticket: str) -> dict:
+    validate_plan_id(plan_id)
     _run(["approve", "--plan-id", plan_id, "--actor", actor, "--approval-ticket", approval_ticket])
     return status(plan_id)
 
 
 def authorize(plan_id: str, actor: str) -> dict:
+    validate_plan_id(plan_id)
     _run(["authorize", "--plan-id", plan_id, "--actor", actor])
     return status(plan_id)
 
 
 def dispatch(plan_id: str, actor: str) -> dict:
+    validate_plan_id(plan_id)
     _run(["dispatch", "--plan-id", plan_id, "--actor", actor])
     return status(plan_id)
 
 
 def next_task(plan_id: str) -> dict | None:
     """Returns the next pending task descriptor, or None when there isn't one (exit 66)."""
+    validate_plan_id(plan_id)
     argv = [str(PLAN_TOOL), "next", "--plan-id", plan_id]
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=DEFAULT_TIMEOUT_SECONDS, env=_env())
@@ -122,18 +146,28 @@ def next_task(plan_id: str) -> dict | None:
         raise PlanError(f"opu-patch-plan next timed out after {DEFAULT_TIMEOUT_SECONDS}s") from None
     if result.returncode == 66:
         return None
+    if result.returncode != 0:
+        raise PlanError(
+            f"opu-patch-plan next exited {result.returncode}",
+            stderr=result.stderr.strip(),
+        )
     if not result.stdout.strip():
         raise PlanError(f"opu-patch-plan next exited {result.returncode} with no output", stderr=result.stderr.strip())
     return json.loads(result.stdout)
 
 
 def status(plan_id: str) -> dict:
+    validate_plan_id(plan_id)
     return _run(["status", "--plan-id", plan_id])
 
 
 def list_tasks(plan_id: str) -> list[dict]:
     """Reads tasks/*.json directly — opu-patch-plan has no list-tasks subcommand."""
-    tasks_dir = PLAN_STATE_DIR / "plans" / plan_id / "tasks"
+    validate_plan_id(plan_id)
+    root = (PLAN_STATE_DIR / "plans").resolve()
+    tasks_dir = (PLAN_STATE_DIR / "plans" / plan_id / "tasks").resolve()
+    if root not in tasks_dir.parents and tasks_dir != root:
+        raise PlanError(f"plan_id escapes plan state root: {plan_id!r}")
     if not tasks_dir.is_dir():
         return []
     tasks = []
@@ -151,7 +185,11 @@ def create_testmode_demo(plan_id: str, requester: str, window_start: str, window
     plan targets the fixture's fake Oracle home, not any real host in
     hosts.json, so it can only ever run against the fixture.
     """
-    fixture_dir = TESTMODE_DIR / plan_id
+    validate_plan_id(plan_id)
+    TESTMODE_DIR.mkdir(parents=True, exist_ok=True)
+    fixture_dir = (TESTMODE_DIR / plan_id).resolve()
+    if TESTMODE_DIR.resolve() not in fixture_dir.parents and fixture_dir != TESTMODE_DIR.resolve():
+        raise PlanError(f"plan_id escapes testmode root: {plan_id!r}")
     fx = testmode_fixtures.build(fixture_dir)
     ev = fx["evidence"]
     args = [
@@ -165,12 +203,30 @@ def create_testmode_demo(plan_id: str, requester: str, window_start: str, window
     return _run(args)
 
 
+def _fixture_dir_for_plan(plan: dict, plan_id: str) -> Path:
+    """Resolve and bound the TEST_MODE fixture directory under TESTMODE_DIR."""
+    oracle_home = (plan.get("target") or {}).get("oracle_home")
+    if not oracle_home:
+        raise PlanError(f"plan {plan_id} has no target.oracle_home to locate its TEST_MODE fixture")
+    fixture_dir = Path(oracle_home).resolve().parent.parent
+    root = TESTMODE_DIR.resolve()
+    if root not in fixture_dir.parents and fixture_dir != root:
+        raise PlanError(
+            f"plan {plan_id} oracle_home is outside the TEST_MODE fixture root "
+            f"({fixture_dir} not under {root})"
+        )
+    if not fixture_dir.is_dir():
+        raise PlanError(f"No TEST_MODE fixture found at {fixture_dir} for plan {plan_id}")
+    return fixture_dir
+
+
 def execute_next_task(plan_id: str, actor: str) -> dict | None:
     """Runs the plan's next pending task through its real TEST_MODE fixture
     executor. Returns None when there is no pending task. Raises PlanError
     if the plan's adapter has no verified fixture wired up yet, or the
     fixture directory (created by create_testmode_demo) is missing.
     """
+    validate_plan_id(plan_id)
     plan = status(plan_id)
     plan_state = plan.get("state")
     if plan_state == "succeeded":
@@ -187,32 +243,49 @@ def execute_next_task(plan_id: str, actor: str) -> dict | None:
     if executor is None:
         raise PlanError(f"No TEST_MODE executor is wired up for adapter: {adapter}")
 
-    # The fixture directory is derived from the plan's own sealed
-    # target.oracle_home (<fixture_dir>/oracle/dbhome_1), not from plan_id —
-    # this works uniformly for both an apply plan (its own fixture) and a
-    # rollback plan (the same fixture as its source apply plan, since
-    # rollback must act on the exact fake Oracle home the apply patched).
-    oracle_home = (plan.get("target") or {}).get("oracle_home")
-    if not oracle_home:
-        raise PlanError(f"plan {plan_id} has no target.oracle_home to locate its TEST_MODE fixture")
-    fixture_dir = Path(oracle_home).parent.parent
-    if not fixture_dir.is_dir():
-        raise PlanError(f"No TEST_MODE fixture found at {fixture_dir} for plan {plan_id}")
+    # Fixture is derived from sealed target.oracle_home
+    # (<fixture_dir>/oracle/dbhome_1) and must stay under TESTMODE_DIR.
+    fixture_dir = _fixture_dir_for_plan(plan, plan_id)
     fx_env = testmode_fixtures.env_for(fixture_dir)
 
     exec_env = os.environ.copy()
     exec_env["OPU_PLAN_STATE_DIR"] = str(PLAN_STATE_DIR)
     exec_env.update(fx_env)
 
-    argv = [str(executor), "execute", "--plan-id", plan_id, "--task-id", task["task_id"], "--actor", actor, "--lease-seconds", "60"]
+    argv = [
+        str(executor), "execute",
+        "--plan-id", plan_id,
+        "--task-id", task["task_id"],
+        "--actor", actor,
+        "--lease-seconds", "60",
+    ]
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=exec_env)
     except subprocess.TimeoutExpired:
         raise PlanError(f"executor for task {task['task_id']} timed out") from None
 
-    if not result.stdout.strip():
-        raise PlanError(f"executor exited {result.returncode} with no output", stderr=result.stderr.strip())
-    return json.loads(result.stdout)
+    payload = None
+    if result.stdout.strip():
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise PlanError(
+                f"executor produced unparsable output: {exc}",
+                stderr=result.stdout[-2000:],
+            ) from exc
+
+    if result.returncode != 0:
+        raise PlanError(
+            f"executor for task {task['task_id']} exited {result.returncode}",
+            stderr=result.stderr.strip(),
+            result=payload,
+        )
+    if payload is None:
+        raise PlanError(
+            f"executor exited 0 with no output for task {task['task_id']}",
+            stderr=result.stderr.strip(),
+        )
+    return payload
 
 
 def list_plans() -> list[dict]:

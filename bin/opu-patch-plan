@@ -202,7 +202,29 @@ verify_task() {
 write_task() { local file=$1 task_id=$2 plan_id=$3 plan_sha=$4 stage=$5 node=$6 adapter=$7 definition hash; jq -cn --arg task "$task_id" --arg plan "$plan_id" --arg plan_sha "$plan_sha" --arg stage "$stage" --arg node "$node" --arg adapter "$adapter" --arg authorization_sha "$AUTHORIZATION_FILE_SHA" --arg authorization_record "$AUTHORIZATION_RECORD_SHA" '{schema_version:"1.0",task_id:$task,plan_id:$plan,plan_sha256:$plan_sha,stage:$stage,node:$node,adapter:$adapter,authorization_sha256:$authorization_sha,authorization_record_sha256:$authorization_record,status:"pending"}' >"$file" || return 74; definition=$(task_definition "$file") || return 74; hash=$(opu_hash_string "$definition") || return; jq --arg hash "$hash" '.task_definition_sha256=$hash' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || return 74; }
 read_state() { verify_plan "$1" || return; IFS= read -r PLAN_STATE <"$(state_file "$1")" || return 74; }
 transition() { local id=$1 expected=$2 next=$3 actor=$4 detail=$5 current; read_state "$id" || return; current=$PLAN_STATE; [ "$current" = "$expected" ] || { opu_error "plan $id is $current, expected $expected"; return 65; }; printf '%s\n' "$next" >"$(state_file "$id").tmp.$$" && mv "$(state_file "$id").tmp.$$" "$(state_file "$id")" || return 74; event "$id" state_changed "$next" "$actor" "$detail"; }
-lock() { local id=$1 tries=0 dir; dir="$(plan_dir "$id")"; [ -d "$dir" ] || { opu_error "plan does not exist or is symbolic link: $id"; return 66; }; dir="$dir/.task-lock"; while ! mkdir "$dir" 2>/dev/null; do tries=$((tries+1)); [ "$tries" -lt 50 ] || { opu_error "timed out waiting for plan task lock: $id"; return 75; }; sleep 0.1; done; PLAN_LOCK_DIR=$dir; }
+lock() {
+  local id=$1 tries=0 dir age mtime now
+  dir="$(plan_dir "$id")"
+  [ -d "$dir" ] || { opu_error "plan does not exist or is symbolic link: $id"; return 66; }
+  dir="$dir/.task-lock"
+  while ! mkdir "$dir" 2>/dev/null; do
+    tries=$((tries + 1))
+    # Control-plane locks are held only for short mutations. A crash can leave
+    # the mkdir lock forever; reclaim after 60s so the plan is not stuck.
+    if [ -d "$dir" ]; then
+      mtime=$(stat -f %m "$dir" 2>/dev/null || stat -c %Y "$dir" 2>/dev/null || echo 0)
+      now=$(date -u +%s)
+      age=$((now - mtime))
+      if [ "$age" -gt 60 ]; then
+        rmdir "$dir" 2>/dev/null || true
+        continue
+      fi
+    fi
+    [ "$tries" -lt 50 ] || { opu_error "timed out waiting for plan task lock: $id"; return 75; }
+    sleep 0.1
+  done
+  PLAN_LOCK_DIR=$dir
+}
 unlock() { rmdir "${PLAN_LOCK_DIR:-}" 2>/dev/null || true; PLAN_LOCK_DIR=""; }
 verify_inputs() {
   local readiness=$1 reconciliation=$2 artifact=$3 procedure=$4 compatibility=$5 policy=$6 recovery=${7:-} rhash ahash phash xhash yhash adapter db count canonical expected actual node normalized_total normalized_unique artifact_platform_id procedure_platform_id compatibility_platform_id readiness_platform_id
@@ -597,9 +619,10 @@ create_rollback() {
     --arg id "$id" --arg requester "$requester" --arg window_start "$start" --arg window_end "$end" \
     --arg source_plan_path "$source_plan" --arg source_plan_file_sha "$source_plan_file_sha" --arg source_plan_sha "$source_plan_sha" \
     --arg source_evidence_path "$source_evidence" --arg source_evidence_sha "$source_evidence_sha" --arg source_evidence_record "$source_evidence_record" \
+    --arg source_actor "$source_actor" \
     --arg readme_path "$ROLLBACK_README_PATH" --arg readme_sha "$ROLLBACK_README_SHA" \
     --slurpfile source "$source_plan" \
-    '{schema_version:"1.0",intent:"patch_rollback",plan_id:$id,requester:$requester,maintenance_window:{start:$window_start,end:$window_end},target:$source[0].target,patch_id:$source[0].patch_id,nodes:$source[0].nodes,artifact:$source[0].artifact,procedure:{adapter:"database_single_instance_opatch_rollback",operations:["rollback_precheck","rollback_binary","rollback_binary_validate","rollback_datapatch","rollback_final_validate"],method:"opatch",platform_id:$source[0].procedure.platform_id,required_opatch_version:$source[0].procedure.required_opatch_version,rollback:$source[0].procedure.rollback},rollback_procedure:{oracle_reference_path:$readme_path,oracle_reference_sha256:$readme_sha,expected_binary_before:"installed",expected_binary_after:"absent",expected_sql_action_before:"APPLY",expected_sql_action_after:"ROLLBACK",required_opatch_version:$source[0].procedure.required_opatch_version},source_apply:{plan_path:$source_plan_path,plan_file_sha256:$source_plan_file_sha,plan_sha256:$source_plan_sha,final_evidence_path:$source_evidence_path,final_evidence_sha256:$source_evidence_sha,final_evidence_record_sha256:$source_evidence_record},source_documents:$source[0].source_documents,snapshot_evidence:$source[0].snapshot_evidence,evidence:$source[0].evidence,recovery:$source[0].recovery}' >"$dir/plan.json.tmp" || return 74
+    '{schema_version:"1.0",intent:"patch_rollback",plan_id:$id,requester:$requester,maintenance_window:{start:$window_start,end:$window_end},target:$source[0].target,patch_id:$source[0].patch_id,nodes:$source[0].nodes,artifact:$source[0].artifact,procedure:{adapter:"database_single_instance_opatch_rollback",operations:["rollback_precheck","rollback_binary","rollback_binary_validate","rollback_datapatch","rollback_final_validate"],method:"opatch",platform_id:$source[0].procedure.platform_id,required_opatch_version:$source[0].procedure.required_opatch_version,rollback:$source[0].procedure.rollback},rollback_procedure:{oracle_reference_path:$readme_path,oracle_reference_sha256:$readme_sha,expected_binary_before:"installed",expected_binary_after:"absent",expected_sql_action_before:"APPLY",expected_sql_action_after:"ROLLBACK",required_opatch_version:$source[0].procedure.required_opatch_version},source_apply:{plan_path:$source_plan_path,plan_file_sha256:$source_plan_file_sha,plan_sha256:$source_plan_sha,final_evidence_path:$source_evidence_path,final_evidence_sha256:$source_evidence_sha,final_evidence_record_sha256:$source_evidence_record,actors:[$source_actor]},source_documents:$source[0].source_documents,snapshot_evidence:$source[0].snapshot_evidence,evidence:$source[0].evidence,recovery:$source[0].recovery}' >"$dir/plan.json.tmp" || return 74
   canonical=$(jq -cS . "$dir/plan.json.tmp") || return 74; hash=$(opu_hash_string "$canonical") || return
   jq --arg hash "$hash" '. + {plan_sha256:$hash}' "$dir/plan.json.tmp" >"$dir/plan.json" || return 74
   rm -f "$dir/plan.json.tmp"; printf 'awaiting_approval\n' >"$dir/state"
@@ -615,9 +638,9 @@ approve() (
   dir=$(plan_dir "$id"); plan="$dir/plan.json"; requester=$(jq -r '.requester' "$plan"); plan_sha=$(jq -r '.plan_sha256' "$plan")
   verify_apply_plan_readiness_current "$plan" || exit $?
   [ "$actor" != "$requester" ] || { opu_error 'requester cannot approve their own plan'; exit 77; }
-  if jq -e '.procedure.adapter == "database_rac_opatch_rollback"' "$plan" >/dev/null; then
-    jq -e --arg actor "$actor" '(.source_apply.actors | index($actor)) == null' "$plan" >/dev/null || {
-      opu_error 'RAC rollback approver must differ from every source apply worker'; exit 77;
+  if jq -e '.procedure.adapter | IN("database_rac_opatch_rollback","database_single_instance_opatch_rollback")' "$plan" >/dev/null; then
+    jq -e --arg actor "$actor" '((.source_apply.actors // []) | index($actor)) == null' "$plan" >/dev/null || {
+      opu_error 'rollback approver must differ from every source apply worker'; exit 77;
     }
   fi
   end=$(jq -r '.maintenance_window.end' "$plan"); [ "$(date -u +%s)" -lt "$(epoch "$end")" ] || { opu_error 'maintenance window has expired'; exit 65; }
@@ -640,9 +663,9 @@ authorize() (
   verify_sealed_record "$approval" approval || exit $?
   jq -e --arg plan "$id" --arg plan_sha "$plan_sha" --arg requester "$requester" '.decision == "approved" and .plan_id == $plan and .plan_sha256 == $plan_sha and .requester == $requester' "$approval" >/dev/null || { opu_error 'sealed approval does not bind this plan'; exit 74; }
   approver=$(jq -r '.actor' "$approval"); [ "$actor" != "$requester" ] && [ "$actor" != "$approver" ] || { opu_error 'operator must differ from requester and approver'; exit 77; }
-  if jq -e '.procedure.adapter == "database_rac_opatch_rollback"' "$plan" >/dev/null; then
-    jq -e --arg actor "$actor" '(.source_apply.actors | index($actor)) == null' "$plan" >/dev/null || {
-      opu_error 'RAC rollback operator must differ from every source apply worker'; exit 77;
+  if jq -e '.procedure.adapter | IN("database_rac_opatch_rollback","database_single_instance_opatch_rollback")' "$plan" >/dev/null; then
+    jq -e --arg actor "$actor" '((.source_apply.actors // []) | index($actor)) == null' "$plan" >/dev/null || {
+      opu_error 'rollback operator must differ from every source apply worker'; exit 77;
     }
   fi
   require_open_window "$id" || exit $?
@@ -734,7 +757,12 @@ claim() (
   opu_validate_identifier "$id" 'plan ID' && opu_validate_identifier "$task_id" 'task ID' && opu_validate_identifier "$actor" actor || exit $?
   [[ "$lease" =~ ^[0-9]{1,4}$ ]] && [ "$lease" -ge 30 ] && [ "$lease" -le 3600 ] || { opu_error 'lease seconds must be between 30 and 3600'; exit 64; }
   lock "$id" || exit $?; trap unlock EXIT; read_state "$id" || exit $?; [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; require_open_window "$id" || exit $?
-  for file in "$(plan_dir "$id")"/tasks/*.json; do [ -e "$file" ] || continue; verify_task "$file" || exit $?; jq -e '.status == "running"' "$file" >/dev/null 2>&1 && { opu_error 'a rolling task is already running'; exit 65; }; done
+  for file in "$(plan_dir "$id")"/tasks/*.json; do
+    [ -e "$file" ] || continue
+    verify_task "$file" || exit $?
+    jq -e '.status == "running"' "$file" >/dev/null 2>&1 && { opu_error 'a rolling task is already running'; exit 65; }
+    jq -e '.status == "unknown"' "$file" >/dev/null 2>&1 && { opu_error 'plan has an unknown task; reconcile or recover before claiming'; exit 65; }
+  done
   first=$(next --plan-id "$id") || exit $?
   [ "$(jq -r '.task_id' <<<"$first")" = "$task_id" ] || { opu_error 'only the next sealed task can be claimed'; exit 65; }
   file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || exit $?; now=$(date -u +%s); expiry=$(bounded_lease_expiry "$id" "$lease") || exit $?; jq --arg actor "$actor" --argjson now "$now" --argjson expiry "$expiry" '.status="running" | .claimed_by=$actor | .claimed_at_epoch=$now | .lease_expires_epoch=$expiry' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74
@@ -981,7 +1009,22 @@ complete() (
   seal_task_result "$file" || exit $?
   if [ "$status" = failed ]; then transition "$id" running paused "$actor" "task_failed=$task_id"; exit 0; fi
   if [ "$late" -eq 1 ]; then transition "$id" running paused "$actor" "task_completed_after_lease=$task_id"; event "$id" late_evidence_recorded paused "$actor" "task_id=$task_id"; exit 0; fi
-  event "$id" task_completed running "$actor" "task_id=$task_id"; pending=$(find "$(plan_dir "$id")/tasks" -name '*.json' -exec jq -r 'select(.status == "pending") | 1' {} \; | wc -l | tr -d ' '); [ "$pending" -gt 0 ] || transition "$id" running succeeded "$actor" 'all_tasks_succeeded'
+  event "$id" task_completed running "$actor" "task_id=$task_id"
+  # Succeed only when every task is succeeded. An unknown sibling (lease expiry
+  # crash window, or incomplete reconcile) must never be ignored as "done".
+  unknown=$(find "$(plan_dir "$id")/tasks" -name '*.json' -exec jq -r 'select(.status == "unknown") | 1' {} \; | wc -l | tr -d ' ')
+  if [ "$unknown" -gt 0 ]; then
+    transition "$id" running paused "$actor" "unknown_task_blocks_success"
+    exit 0
+  fi
+  pending=$(find "$(plan_dir "$id")/tasks" -name '*.json' -exec jq -r 'select(.status == "pending") | 1' {} \; | wc -l | tr -d ' ')
+  [ "$pending" -gt 0 ] && exit 0
+  incomplete=$(find "$(plan_dir "$id")/tasks" -name '*.json' -exec jq -r 'select(.status != "succeeded") | 1' {} \; | wc -l | tr -d ' ')
+  if [ "$incomplete" -gt 0 ]; then
+    transition "$id" running paused "$actor" "incomplete_tasks_block_success"
+    exit 0
+  fi
+  transition "$id" running succeeded "$actor" 'all_tasks_succeeded'
 )
 reconcile() (
   local id="" actor="" file expiry now task

@@ -383,6 +383,20 @@ create_rollback_plan() {
   plan dispatch --plan-id "$rollback_plan_id" --actor rollback-operator >/dev/null
 }
 
+# Source apply worker cannot approve or authorize the derived rollback plan.
+plan create-rollback --plan-id standalone-rollback-sod --requester rollback-admin \
+  --source-plan-id standalone-success --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
+plan status --plan-id standalone-rollback-sod | jq -e '.source_apply.actors == ["standalone-worker"]' >/dev/null
+if plan approve --plan-id standalone-rollback-sod --actor standalone-worker --approval-ticket TEST-ROLLBACK-SOD >/dev/null 2>&1; then
+  echo 'source apply worker was allowed to approve standalone rollback' >&2
+  exit 1
+fi
+plan approve --plan-id standalone-rollback-sod --actor rollback-approver --approval-ticket TEST-ROLLBACK-SOD >/dev/null
+if plan authorize --plan-id standalone-rollback-sod --actor standalone-worker >/dev/null 2>&1; then
+  echo 'source apply worker was allowed to authorize standalone rollback' >&2
+  exit 1
+fi
+
 # A failed OPatch rollback is an unknown binary outcome and cannot be retried.
 create_rollback_plan standalone-rollback-failure
 ROLLBACK_FAILURE_PRECHECK=$(plan next --plan-id standalone-rollback-failure | jq -r '.task_id')

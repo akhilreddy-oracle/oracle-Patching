@@ -39,10 +39,18 @@ check_recovery() {
   # Discovery v1 emits backup_age_minutes. Accept the earlier internal name
   # as a compatibility fallback so valid recovery evidence is never ignored.
   age=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | (.runtime.backup_age_minutes // .runtime.latest_backup_age_minutes // -1)' "$snapshot")
-  limit=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.fra_space_limit_bytes // -1' "$snapshot"); used=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.fra_space_used_bytes // -1' "$snapshot"); free=$((limit-used))
+  limit=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.fra_space_limit_bytes // empty' "$snapshot")
+  used=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.fra_space_used_bytes // empty' "$snapshot")
   grp=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.guaranteed_restore_points // -1' "$snapshot")
   [ "$require_backup" = false ] || { [ "$age" -ge 0 ] 2>/dev/null && [ "$age" -le "$max_age" ] || gate recovery_backup blocker "$host database $db has no backup within policy age."; }
-  [ "$free" -ge "$min_free" ] 2>/dev/null || gate recovery_fra blocker "$host database $db has insufficient FRA free capacity."
+  # Both FRA limit and used bytes must be present and non-negative. Missing used
+  # used to default to -1 and inflate free space (limit - (-1)); fail closed.
+  if [[ "$limit" =~ ^[0-9]+$ ]] && [[ "$used" =~ ^[0-9]+$ ]] && [ "$used" -le "$limit" ]; then
+    free=$((limit - used))
+    [ "$free" -ge "$min_free" ] || gate recovery_fra blocker "$host database $db has insufficient FRA free capacity."
+  else
+    gate recovery_fra blocker "$host database $db has incomplete or invalid FRA capacity evidence."
+  fi
   [ "$require_grp" = false ] || { [ "$grp" -gt 0 ] 2>/dev/null || gate recovery_restore_point blocker "$host database $db has no guaranteed restore point."; }
 }
 check_snapshots() {

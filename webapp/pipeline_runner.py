@@ -9,6 +9,7 @@ polls GET /api/runs/{run_id} for status/log/result.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
@@ -18,6 +19,7 @@ RUNS_DIR = Path(__file__).resolve().parent / "var" / "runs"
 RUNS: dict[str, "RunRecord"] = {}
 _REGISTRY_LOCK = threading.Lock()
 _ACTIVE_KEYS: set[str] = set()
+_RUN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
 
 class RunConflict(Exception):
@@ -86,18 +88,24 @@ def start_run(kind: str, key: str, fn) -> RunRecord:
     RUNS[run_id] = record
 
     def worker() -> None:
-        record.status = "running"
-        record.started_at = time.time()
+        with record._lock:
+            record.status = "running"
+            record.started_at = time.time()
         record._persist()
         try:
-            record.result = fn(record)
-            record.status = "succeeded"
+            result = fn(record)
+            with record._lock:
+                record.result = result
+                record.status = "succeeded"
         except Exception as exc:  # noqa: BLE001 - surfaced via the run record, never swallowed
             to_json = getattr(exc, "to_json", None)
-            record.error = to_json() if callable(to_json) else {"message": str(exc)}
-            record.status = "failed"
+            error = to_json() if callable(to_json) else {"message": str(exc)}
+            with record._lock:
+                record.error = error
+                record.status = "failed"
         finally:
-            record.finished_at = time.time()
+            with record._lock:
+                record.finished_at = time.time()
             record._persist()
             with _REGISTRY_LOCK:
                 _ACTIVE_KEYS.discard(key)
@@ -106,5 +114,33 @@ def start_run(kind: str, key: str, fn) -> RunRecord:
     return record
 
 
+def _load_persisted(run_id: str) -> RunRecord | None:
+    if not _RUN_ID_RE.match(run_id):
+        return None
+    path = RUNS_DIR / run_id / "run.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    record = RunRecord(run_id, data.get("kind") or "unknown", data.get("key") or "")
+    record.status = data.get("status") or "failed"
+    record.created_at = data.get("created_at") or time.time()
+    record.started_at = data.get("started_at")
+    record.finished_at = data.get("finished_at")
+    record.log_lines = list(data.get("log_tail") or [])
+    record.result = data.get("result")
+    record.error = data.get("error")
+    return record
+
+
 def get_run(run_id: str) -> RunRecord | None:
-    return RUNS.get(run_id)
+    with _REGISTRY_LOCK:
+        record = RUNS.get(run_id)
+        if record is not None:
+            return record
+        loaded = _load_persisted(run_id)
+        if loaded is not None:
+            RUNS[run_id] = loaded
+        return loaded

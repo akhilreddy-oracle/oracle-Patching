@@ -176,7 +176,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/plans/") and path.endswith("/tasks"):
             plan_id = path[len("/api/plans/"):-len("/tasks")]
-            self._send_json(200, {"tasks": planctl.list_tasks(plan_id)})
+            try:
+                self._send_json(200, {"tasks": planctl.list_tasks(plan_id)})
+            except planctl.PlanError as exc:
+                self._send_json(400, exc.to_json())
             return
 
         if path.startswith("/api/plans/"):
@@ -238,19 +241,31 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/plans":
-            self._post_plan_action("create", None, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_plan_action("create", None, body)
             return
 
         if path == "/api/plans/testmode-demo":
-            body = self._read_json_body()
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
             try:
                 plan_id = body["plan_id"]
+                requester = body["requester"]
+                window_start = body["window_start"]
+                window_end = body["window_end"]
             except KeyError as exc:
                 self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
                 return
 
-            def run(_record, body=body):
-                return planctl.create_testmode_demo(body["plan_id"], body["requester"], body["window_start"], body["window_end"])
+            def run(_record, plan_id=plan_id, requester=requester, window_start=window_start, window_end=window_end):
+                return planctl.create_testmode_demo(plan_id, requester, window_start, window_end)
 
             try:
                 record = pipeline_runner.start_run("plan", f"plan:{plan_id}:testmode-demo", run)
@@ -262,7 +277,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/plans/") and path.endswith("/execute-next"):
             plan_id = path[len("/api/plans/"):-len("/execute-next")]
-            body = self._read_json_body()
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
             try:
                 actor = body["actor"]
             except KeyError as exc:
@@ -283,51 +302,101 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/plans/") and path.endswith("/approve"):
             plan_id = path[len("/api/plans/"):-len("/approve")]
-            self._post_plan_action("approve", plan_id, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_plan_action("approve", plan_id, body)
             return
 
         if path.startswith("/api/plans/") and path.endswith("/authorize"):
             plan_id = path[len("/api/plans/"):-len("/authorize")]
-            self._post_plan_action("authorize", plan_id, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_plan_action("authorize", plan_id, body)
             return
 
         if path.startswith("/api/plans/") and path.endswith("/dispatch"):
             plan_id = path[len("/api/plans/"):-len("/dispatch")]
-            self._post_plan_action("dispatch", plan_id, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_plan_action("dispatch", plan_id, body)
             return
 
         if path.startswith("/api/plans/") and path.endswith("/create-rollback"):
             plan_id = path[len("/api/plans/"):-len("/create-rollback")]
-            self._post_plan_action("create-rollback", plan_id, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_plan_action("create-rollback", plan_id, body)
             return
 
         if path == "/api/recovery/testmode-demo":
-            self._post_recovery_action("create", None, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_recovery_action("create", None, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/analyze"):
             request_id = path[len("/api/recovery/"):-len("/analyze")]
-            self._post_recovery_action("analyze", request_id, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_recovery_action("analyze", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/approve"):
             request_id = path[len("/api/recovery/"):-len("/approve")]
-            self._post_recovery_action("approve", request_id, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_recovery_action("approve", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/authorize"):
             request_id = path[len("/api/recovery/"):-len("/authorize")]
-            self._post_recovery_action("authorize", request_id, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_recovery_action("authorize", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/execute"):
             request_id = path[len("/api/recovery/"):-len("/execute")]
-            self._post_recovery_action("execute", request_id, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_recovery_action("execute", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/reconcile"):
             request_id = path[len("/api/recovery/"):-len("/reconcile")]
-            self._post_recovery_action("reconcile", request_id, self._read_json_body())
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            self._post_recovery_action("reconcile", request_id, body)
             return
 
         self.send_error(404)
@@ -336,40 +405,66 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if action == "create":
                 plan_id = body["plan_id"]
+                requester = body["requester"]
+                host_id = body["host_id"]
+                window_start = body["window_start"]
+                window_end = body["window_end"]
+                if self._resolved_host(host_id) is None:
+                    self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
+                    return
                 key = f"plan:{plan_id}:create"
 
-                def run(_record, body=body):
-                    return planctl.create(body["plan_id"], body["requester"], body["host_id"], body["window_start"], body["window_end"])
+                def run(_record, plan_id=plan_id, requester=requester, host_id=host_id, window_start=window_start, window_end=window_end):
+                    return planctl.create(plan_id, requester, host_id, window_start, window_end)
 
             elif action == "approve":
+                actor = body["actor"]
+                approval_ticket = body["approval_ticket"]
                 key = f"plan:{plan_id}:approve"
 
-                def run(_record, plan_id=plan_id, body=body):
-                    return planctl.approve(plan_id, body["actor"], body["approval_ticket"])
+                def run(_record, plan_id=plan_id, actor=actor, approval_ticket=approval_ticket):
+                    return planctl.approve(plan_id, actor, approval_ticket)
 
             elif action == "authorize":
+                actor = body["actor"]
                 key = f"plan:{plan_id}:authorize"
 
-                def run(_record, plan_id=plan_id, body=body):
-                    return planctl.authorize(plan_id, body["actor"])
+                def run(_record, plan_id=plan_id, actor=actor):
+                    return planctl.authorize(plan_id, actor)
 
             elif action == "dispatch":
+                actor = body["actor"]
                 key = f"plan:{plan_id}:dispatch"
 
-                def run(_record, plan_id=plan_id, body=body):
-                    return planctl.dispatch(plan_id, body["actor"])
+                def run(_record, plan_id=plan_id, actor=actor):
+                    return planctl.dispatch(plan_id, actor)
 
             elif action == "create-rollback":
+                # Path plan_id is the source apply plan; body must agree when present.
+                source_plan_id = body.get("source_plan_id", plan_id)
+                if source_plan_id != plan_id:
+                    self._send_json(400, {
+                        "error": "source_plan_mismatch",
+                        "message": f"URL source plan {plan_id!r} does not match body source_plan_id {source_plan_id!r}",
+                    })
+                    return
+                new_plan_id = body["plan_id"]
+                requester = body["requester"]
+                window_start = body["window_start"]
+                window_end = body["window_end"]
                 key = f"plan:{plan_id}:create-rollback"
 
-                def run(_record, body=body):
-                    return planctl.create_rollback(body["plan_id"], body["requester"], body["source_plan_id"], body["window_start"], body["window_end"])
+                def run(_record, new_plan_id=new_plan_id, requester=requester, source_plan_id=source_plan_id, window_start=window_start, window_end=window_end):
+                    return planctl.create_rollback(new_plan_id, requester, source_plan_id, window_start, window_end)
 
             else:
                 self._send_json(404, {"error": "unknown_action", "message": action})
                 return
         except KeyError as exc:
             self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
+            return
+        except (planctl.PlanError, evidence.EvidenceError) as exc:
+            self._send_json(400, exc.to_json())
             return
 
         try:
