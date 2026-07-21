@@ -48,6 +48,19 @@ jq -n --arg r "$rhash" --arg a "$ahash" --arg p "$phash" --arg c "$chash" --arg 
 readyhash=$(sha256sum "$TMP/readiness.json" | awk '{print $1}')
 run() { OPU_PLAN_STATE_DIR="$TMP/state" "$PLAN" "$@"; }
 
+# lock() must fail fast and report a missing plan as such, not loop through
+# its full lock-contention retry window and report a misleading timeout.
+set +e
+run approve --plan-id does-not-exist --actor someone --approval-ticket CHG-X >/dev/null 2>"$TMP/nonexistent.err"
+nonexistent_status=$?
+set -e
+[ "$nonexistent_status" -eq 66 ] || { echo "approve on a nonexistent plan should exit 66, got $nonexistent_status" >&2; cat "$TMP/nonexistent.err" >&2; exit 1; }
+grep -q 'plan does not exist' "$TMP/nonexistent.err" || { echo 'nonexistent plan error message regressed' >&2; exit 1; }
+if grep -q 'timed out waiting for plan task lock' "$TMP/nonexistent.err"; then
+  echo 'nonexistent plan was misreported as a lock timeout' >&2
+  exit 1
+fi
+
 # A forged overall pass from the legacy compatibility shape must not produce a
 # plan when the independent platform-applicability evidence is absent.
 jq 'del(.checks[].applicability_check)' "$TMP/compatibility.json" >"$TMP/legacy-compatibility.json"
