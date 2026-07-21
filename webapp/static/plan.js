@@ -230,13 +230,13 @@ export async function renderPlanDetail(mount, planId) {
       renderErrorBox(body, data);
       return;
     }
-    renderPlan(body, planId, data, refresh);
+    await renderPlan(body, planId, data, refresh);
   }
 
   await refresh();
 }
 
-function renderPlan(body, planId, plan, refresh) {
+async function renderPlan(body, planId, plan, refresh) {
   body.appendChild(
     el("div", { class: "meta-row" }, [
       el("span", {}, [document.createTextNode("Intent: "), el("strong", { text: plan.intent || "—" })]),
