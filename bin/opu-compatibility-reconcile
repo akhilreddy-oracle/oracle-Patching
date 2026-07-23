@@ -16,9 +16,12 @@ expected_pairs() {
   if [ "$TARGET_FAMILY" = grid ]; then jq -r '.expected_nodes[] as $node | .cluster.grid_home as $home | [$node,$home] | @tsv' "$RECONCILIATION"; else jq -r '.expected_nodes[] as $node | [.databases[].oracle_home] | unique[] as $home | [$node,$home] | @tsv' "$RECONCILIATION"; fi
 }
 contract() {
-  jq -e '.schema_version == "1.0" and .status == "consistent" and (.expected_nodes | type == "array" and length > 0) and (.cluster.grid_home | type == "string") and (.oracle_homes | type == "array") and (.databases | type == "array")' "$RECONCILIATION" >/dev/null || { echo 'topology reconciliation is not consistent' >&2; exit 65; }
+  jq -e '.schema_version == "1.0" and .status == "consistent" and (.expected_nodes | type == "array" and length > 0) and (.oracle_homes | type == "array") and (.databases | type == "array")' "$RECONCILIATION" >/dev/null || { echo 'topology reconciliation is not consistent' >&2; exit 65; }
   jq -e '.schema_version == "1.0" and .status == "ready_for_planning" and (.procedure.patch_id | test("^[0-9]{1,20}$")) and (.procedure.artifact_sha256 | test("^[a-f0-9]{64}$")) and (.procedure.target.family | IN("grid","database")) and (.procedure.target.platform_id | test("^[0-9]+$"))' "$PROCEDURE" >/dev/null || { echo 'procedure validation is not ready or lacks a sealed platform' >&2; exit 65; }
   PATCH_ID=$(jq -r '.procedure.patch_id' "$PROCEDURE"); ARTIFACT_SHA=$(jq -r '.procedure.artifact_sha256' "$PROCEDURE"); TARGET_FAMILY=$(jq -r '.procedure.target.family' "$PROCEDURE"); TARGET_PLATFORM=$(jq -r '.procedure.target.platform_id' "$PROCEDURE")
+  if [ "$TARGET_FAMILY" = grid ]; then
+    jq -e '(.cluster.grid_home | type == "string")' "$RECONCILIATION" >/dev/null || { echo 'topology reconciliation is not consistent' >&2; exit 65; }
+  fi
 }
 collect() {
   local result node home check key seen_keys=$'\n'

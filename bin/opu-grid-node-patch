@@ -14,8 +14,8 @@ PLAN_STATE_DIR=${OPU_PLAN_STATE_DIR:-/var/lib/oracle-patching-plans}
 EXECUTION_STATE_DIR=${OPU_GRID_NODE_STATE_DIR:-/var/lib/oracle-patching-utility/grid-nodes}
 PLAN_TOOL=${OPU_GRID_NODE_PLAN_TOOL:-$ROOT/bin/opu-patch-plan}
 TEST_MODE=${OPU_GRID_NODE_TEST_MODE:-0}
+OPERATION=${OPU_GRID_NODE_OPERATION:-apply}
 EXECUTOR_LOCK_USES_FLOCK=0
-EXPECTED_OPERATIONS='["grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch"]'
 
 usage() {
   printf '%s\n' "Usage: ${0##*/} execute --plan-id ID --task-id ID --actor ID [--lease-seconds 3600]"
@@ -23,6 +23,21 @@ usage() {
 
 die() { opu_error "$*"; exit 65; }
 valid_sha() { [[ ${1:-} =~ ^[a-f0-9]{64}$ ]]; }
+case "$OPERATION" in
+  apply)
+    EXECUTOR_COLLECTOR=oracle.grid.node.executor
+    EXECUTOR_INTENT=patch_apply
+    EXPECTED_OPERATIONS='["grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch"]'
+    ;;
+  rollback)
+    EXECUTOR_COLLECTOR=oracle.grid.node.rollback.executor
+    EXECUTOR_INTENT=patch_rollback
+    EXPECTED_OPERATIONS='["grid_rootcrs_prepatch","grid_opatch_rollback","grid_rootcrs_postpatch"]'
+    ;;
+  *)
+    die 'OPU_GRID_NODE_OPERATION must be apply or rollback'
+    ;;
+esac
 require_root() { [ "${EUID:-$(id -u)}" -eq 0 ] || [ "$TEST_MODE" = 1 ] || die 'Grid node patch execution must run as root'; }
 short_host() { printf '%s\n' "${1%%.*}" | tr '[:upper:]' '[:lower:]'; }
 epoch() { date -u -d "$1" +%s 2>/dev/null || date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || return 1; }
@@ -184,6 +199,126 @@ verify_readme_procedure() {
   LC_ALL=C grep -aE 'opatch[[:space:]]+apply' "$GRID_README" >/dev/null || die 'sealed Grid README does not contain the OPatch apply step'
   LC_ALL=C grep -aE 'rootadd_rdbms\.sh' "$GRID_README" >/dev/null || die 'sealed Grid README does not contain rootadd_rdbms.sh'
   LC_ALL=C grep -aE 'rootcrs\.sh([^[:alnum:]_]|[[:space:]])+(-postpatch|[^[:cntrl:]]*[[:space:]]-postpatch)' "$GRID_README" >/dev/null || die 'sealed Grid README does not contain rootcrs.sh -postpatch'
+}
+
+verify_rollback_readme() {
+  local expected_sha actual_sha
+  ROLLBACK_README=$(jq -r '.rollback_procedure.oracle_reference_path // empty' "$PLAN_FILE")
+  expected_sha=$(jq -r '.rollback_procedure.oracle_reference_sha256 // empty' "$PLAN_FILE")
+  opu_validate_absolute_path "$ROLLBACK_README" rollback-oracle-reference >/dev/null || die 'rollback plan has no valid Oracle reference path'
+  [ -f "$ROLLBACK_README" ] && [ ! -L "$ROLLBACK_README" ] || die 'rollback Oracle reference is missing or symbolic link'
+  case "$ROLLBACK_README" in "$PATCH_DIR"/*) ;; *) die 'rollback Oracle reference is outside the sealed patch artifact' ;; esac
+  actual_sha=$(opu_hash_file "$ROLLBACK_README"); [ "$actual_sha" = "$expected_sha" ] || die 'rollback Oracle reference digest changed'
+  LC_ALL=C grep -aE 'rootcrs\.sh([^[:alnum:]_]|[[:space:]])+(-prepatch|[^[:cntrl:]]*[[:space:]]-prepatch)' "$ROLLBACK_README" >/dev/null || die 'sealed Oracle reference does not contain rootcrs.sh -prepatch'
+  LC_ALL=C grep -aE "opatch[[:space:]]+rollback[[:space:]]+-id[[:space:]]+$PATCH_ID([^0-9]|$)" "$ROLLBACK_README" >/dev/null || die 'sealed Oracle reference does not contain the fixed rollback command'
+  LC_ALL=C grep -aE 'rootcrs\.sh([^[:alnum:]_]|[[:space:]])+(-postpatch|[^[:cntrl:]]*[[:space:]]-postpatch)' "$ROLLBACK_README" >/dev/null || die 'sealed Oracle reference does not contain rootcrs.sh -postpatch'
+  jq -e --arg required "$REQUIRED_OPATCH" '
+    .intent == "patch_rollback" and
+    .rollback_procedure.expected_binary_before == "installed" and
+    .rollback_procedure.expected_binary_after == "absent" and
+    .rollback_procedure.required_opatch_version == $required
+  ' "$PLAN_FILE" >/dev/null || die 'rollback procedure is incomplete or does not match the fixed adapter'
+}
+
+verify_source_apply_lineage() {
+  local mode=${1:-metadata}
+  local source_plan_path source_plan_file_sha source_plan_sha source_plan_id source_state_path lineage canonical actual
+  local entry task_id stage_name node_name actor_name task_result_sha evidence_sha evidence_record custody_sha custody_record
+  local task_path manifest_path evidence_path manifest_parent custody_entry custody_path custody_parent expected_outcome
+  [ "$mode" = metadata ] || [ "$mode" = full ] || die 'source apply verification mode must be metadata or full'
+  source_plan_path=$(jq -r '.source_apply.plan_path' "$PLAN_FILE")
+  source_plan_file_sha=$(jq -r '.source_apply.plan_file_sha256' "$PLAN_FILE")
+  source_plan_sha=$(jq -r '.source_apply.plan_sha256' "$PLAN_FILE")
+  opu_validate_absolute_path "$source_plan_path" source-apply-plan >/dev/null || die 'rollback plan has an invalid source apply plan path'
+  [ -f "$source_plan_path" ] && [ ! -L "$source_plan_path" ] && [ "$(opu_hash_file "$source_plan_path")" = "$source_plan_file_sha" ] ||
+    die 'source apply plan is missing or changed'
+  verify_sealed_json "$source_plan_path" plan_sha256 || die 'source apply plan seal failed'
+  [ "$(jq -r '.plan_sha256' "$source_plan_path")" = "$source_plan_sha" ] || die 'source apply plan digest differs from rollback lineage'
+  source_plan_id=$(jq -r '.plan_id' "$source_plan_path")
+  source_state_path=$(dirname -- "$source_plan_path")/state
+  [ -f "$source_state_path" ] && [ "$(cat "$source_state_path")" = succeeded ] || die 'source apply plan is no longer succeeded'
+  jq -e --argjson child_nodes "$(jq -c '.nodes' "$PLAN_FILE")" '
+    .intent == "patch_apply" and .procedure.adapter == "grid_rolling_opatch" and
+    .target.family == "grid" and (.nodes | reverse) == $child_nodes
+  ' "$source_plan_path" >/dev/null || die 'source apply topology no longer matches the rollback plan'
+  lineage=$(jq -cS '.source_apply.lineage' "$PLAN_FILE")
+  canonical=$(jq -cS . <<<"$lineage"); actual=$(opu_hash_string "$canonical")
+  [ "$actual" = "$(jq -r '.source_apply.lineage_sha256' "$PLAN_FILE")" ] || die 'source apply lineage seal failed'
+  while IFS= read -r entry; do
+    task_id=$(jq -r '.task_id' <<<"$entry"); stage_name=$(jq -r '.stage' <<<"$entry"); node_name=$(jq -r '.node' <<<"$entry"); actor_name=$(jq -r '.actor' <<<"$entry")
+    task_result_sha=$(jq -r '.task_result_sha256' <<<"$entry"); evidence_sha=$(jq -r '.evidence_sha256' <<<"$entry"); evidence_record=$(jq -r '.evidence_record_sha256' <<<"$entry")
+    custody_sha=$(jq -r '.custody_manifest_sha256' <<<"$entry"); custody_record=$(jq -r '.custody_record_sha256' <<<"$entry")
+    task_path="$(dirname -- "$source_plan_path")/tasks/$task_id.json"
+    verify_task_definition "$task_path" || die "source apply task definition changed: $task_id"
+    canonical=$(jq -cS 'del(.task_result_sha256)' "$task_path"); actual=$(opu_hash_string "$canonical")
+    [ "$actual" = "$task_result_sha" ] && [ "$(jq -r '.task_result_sha256 // empty' "$task_path")" = "$task_result_sha" ] || die "source apply task result changed: $task_id"
+    jq -e --arg plan "$source_plan_id" --arg plan_sha "$source_plan_sha" --arg task "$task_id" --arg stage "$stage_name" --arg node "$node_name" --arg actor "$actor_name" \
+      --arg evidence "$evidence_sha" --arg evidence_record "$evidence_record" --arg custody "$custody_sha" --arg custody_record "$custody_record" '
+        .plan_id == $plan and .plan_sha256 == $plan_sha and .task_id == $task and .stage == $stage and .node == $node and
+        .claimed_by == $actor and .status == "succeeded" and (.evidence_sha256 == $evidence) and (.evidence_record_sha256 == $evidence_record) and
+        (.evidence_custody.manifest_sha256 == $custody) and (.evidence_custody.record_sha256 == $custody_record)
+      ' "$task_path" >/dev/null || die "source apply task custody changed: $task_id"
+    evidence_path=$(jq -r '.evidence_path' "$task_path")
+    if [ "$mode" = full ]; then
+      manifest_path=$(jq -r '.evidence_custody.manifest_path' "$task_path")
+      verify_sealed_json "$manifest_path" record_sha256 || die "source apply custody manifest changed: $task_id"
+      [ "$(opu_hash_file "$evidence_path")" = "$evidence_sha" ] || die "source apply evidence changed: $task_id"
+      manifest_parent=$(CDPATH= cd -- "$(dirname -- "$manifest_path")" && pwd -P) || die 'cannot resolve source custody directory'
+      while IFS= read -r custody_entry; do
+        custody_path=$(jq -r '.custody_path' <<<"$custody_entry")
+        custody_parent=$(CDPATH= cd -- "$(dirname -- "$custody_path")" && pwd -P) || die 'cannot resolve source custody file directory'
+        [ "$custody_parent" = "$manifest_parent" ] && [ -f "$custody_path" ] && [ ! -L "$custody_path" ] &&
+          [ "$(opu_hash_file "$custody_path")" = "$(jq -r '.sha256' <<<"$custody_entry")" ] || die "source custodied file changed: $task_id"
+      done < <(jq -c '.files[]' "$manifest_path")
+    fi
+    case "$stage_name" in
+      grid_precheck) expected_outcome=no_mutation ;;
+      grid_rootcrs_prepatch) expected_outcome=grid_quiesced_known ;;
+      grid_rootcrs_postpatch) expected_outcome=grid_stack_restored ;;
+      *) expected_outcome=binary_state_known ;;
+    esac
+    jq -e --arg plan "$source_plan_id" --arg plan_sha "$source_plan_sha" --arg task "$task_id" --arg stage "$stage_name" --arg node "$node_name" --arg outcome "$expected_outcome" '
+      .collector.name == "oracle.grid.node.executor" and .intent == "patch_apply" and
+      .plan_id == $plan and .plan_sha256 == $plan_sha and .task_id == $task and .stage == $stage and
+      .target.node == $node and .status == "succeeded" and .postcondition.status == "passed" and
+      .exit_code == 0 and .outcome_class == $outcome
+    ' "$evidence_path" >/dev/null || die "source apply evidence is not rollback-eligible: $task_id"
+  done < <(jq -c '.source_apply.lineage[]' "$PLAN_FILE")
+  SOURCE_APPLY_PLAN_SHA=$source_plan_sha
+  SOURCE_LINEAGE_SHA=$(jq -r '.source_apply.lineage_sha256' "$PLAN_FILE")
+  SOURCE_CLUSTER_FINAL_SHA=$(jq -r '.source_apply.cluster_final_evidence_sha256' "$PLAN_FILE")
+  SOURCE_CLUSTER_FINAL_RECORD=$(jq -r '.source_apply.cluster_final_evidence_record_sha256' "$PLAN_FILE")
+}
+
+verify_prior_rollback_node_validations() {
+  local expected_node match_count task_path evidence_path expected_evidence actual_evidence expected_record actual_record canonical
+  while IFS= read -r expected_node; do
+    match_count=0
+    for task_path in "$PLAN_STATE_DIR/plans/$PLAN_ID/tasks"/*.json; do
+      [ -e "$task_path" ] || continue
+      verify_task_definition "$task_path" || die 'a prior rollback task definition failed integrity verification'
+      if jq -e --arg node "$expected_node" '.stage == "grid_rollback_node_validate" and .node == $node' "$task_path" >/dev/null; then
+        match_count=$((match_count + 1))
+        verify_completed_task_result "$task_path"
+        evidence_path=$(jq -r '.evidence_path // empty' "$task_path")
+        expected_evidence=$(jq -r '.evidence_sha256 // empty' "$task_path")
+        expected_record=$(jq -r '.evidence_record_sha256 // empty' "$task_path")
+        [ -f "$evidence_path" ] && [ ! -L "$evidence_path" ] || die "rollback node validation evidence is missing for $expected_node"
+        actual_evidence=$(opu_hash_file "$evidence_path")
+        canonical=$(jq -cS 'del(.record_sha256)' "$evidence_path"); actual_record=$(opu_hash_string "$canonical")
+        [ "$actual_evidence" = "$expected_evidence" ] && [ "$actual_record" = "$expected_record" ] &&
+          [ "$(jq -r '.record_sha256' "$evidence_path")" = "$expected_record" ] ||
+          die "rollback node validation evidence changed for $expected_node"
+        jq -e --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" --arg node "$expected_node" --arg patch "$PATCH_ID" '
+          .collector.name == "oracle.grid.node.rollback.executor" and .intent == "patch_rollback" and
+          .plan_id == $plan and .plan_sha256 == $plan_sha and .stage == "grid_rollback_node_validate" and
+          .status == "succeeded" and .outcome_class == "binary_state_known" and
+          .target.node == $node and .patch.patch_id == $patch
+        ' "$evidence_path" >/dev/null || die "rollback node validation evidence does not bind $expected_node to this plan"
+      fi
+    done
+    [ "$match_count" -eq 1 ] || die "expected exactly one rollback node validation task for $expected_node, found $match_count"
+  done < <(jq -r '.nodes[]' "$PLAN_FILE")
 }
 
 verify_recovery() {
@@ -472,22 +607,141 @@ stage_grid_cluster_final_validate() {
   : >"$TASK_DIR/binary-state-known"
 }
 
+stage_grid_rollback_precheck() {
+  local actual_version
+  verify_source_apply_lineage full; verify_source_documents; verify_rollback_readme; verify_recovery full; verify_artifact; verify_live_owner
+  [ -x "$GRID_HOME_TARGET/bin/crsctl" ] && [ -x "$GRID_HOME_TARGET/bin/ocrcheck" ] && [ -x "$GRID_HOME_TARGET/bin/srvctl" ] && [ -x "$GRID_HOME_TARGET/bin/olsnodes" ] || die 'required Grid Infrastructure executables are missing'
+  [ -x "$GRID_HOME_TARGET/OPatch/opatch" ] && [ -x "$GRID_HOME_TARGET/crs/install/rootcrs.sh" ] || die 'required OPatch/root patch executables are missing'
+  collect_cluster_runtime "$TASK_DIR/rollback-precheck"
+  check_cluster_health "$TASK_DIR/rollback-precheck"
+  actual_version=$(opatch_run version 2>&1 | sed -nE 's/.*Version:[[:space:]]*([^[:space:]]+).*/\1/p' | head -n1)
+  [[ "$actual_version" =~ ^[0-9]+(\.[0-9]+){2,4}$ ]] && version_ge "$actual_version" "$REQUIRED_OPATCH" || die "OPatch $actual_version is below required $REQUIRED_OPATCH"
+  require_inventory_state installed "$TASK_DIR/rollback-precheck-lspatches.log"
+  opatch_prereq_check CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/rollback-precheck-platform-applicability.log"
+  opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/rollback-precheck-conflict.log"
+  [ ! -e "$NODE_RUN_DIR/rollback-prepatch-complete" ] && [ ! -e "$NODE_RUN_DIR/rollback-binary-removed" ] || die 'unexpected prior Grid rollback mutation marker exists for this plan/node'
+  seal_binding
+}
+
+stage_grid_rollback_rootcrs_prepatch() {
+  local rc
+  load_binding; verify_open_window; verify_source_apply_lineage metadata; verify_rollback_readme; verify_recovery full; verify_artifact
+  require_inventory_state installed "$TASK_DIR/rollback-prepatch-lspatches.log"
+  opatch_prereq_check CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/rollback-prepatch-platform-applicability.log"
+  opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/rollback-prepatch-conflict.log"
+  : >"$TASK_DIR/grid-state-unknown"
+  set +e
+  "$GRID_HOME_TARGET/crs/install/rootcrs.sh" -prepatch
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' 'rootcrs.sh -prepatch returned nonzero; automatic postpatch compensation is prohibited.' >"$TASK_DIR/prepatch-recovery-required.log"
+    : >"$TASK_DIR/recovery-required"
+    return "$rc"
+  fi
+  rm -f "$TASK_DIR/grid-state-unknown"; : >"$TASK_DIR/grid-quiesced-known"; : >"$NODE_RUN_DIR/rollback-prepatch-complete"
+}
+
+stage_grid_opatch_rollback() {
+  local rc
+  load_binding; verify_open_window; verify_source_apply_lineage metadata; verify_rollback_readme; verify_recovery full; verify_artifact
+  [ -f "$NODE_RUN_DIR/rollback-prepatch-complete" ] || die 'OPatch rollback requires a succeeded sealed rootcrs prepatch task'
+  require_inventory_state installed "$TASK_DIR/rollback-before-lspatches.log"
+  opatch_prereq_check CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/rollback-platform-applicability.log"
+  opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/rollback-conflict.log"
+  : >"$TASK_DIR/binary-state-unknown"
+  set +e
+  opatch_run rollback -id "$PATCH_ID" >"$TASK_DIR/opatch-rollback.log" 2>&1
+  rc=$?
+  set -e
+  printf '%s\n' "$rc" >"$TASK_DIR/opatch-rollback.exit-code"
+  if [ "$rc" -ne 0 ]; then
+    observe_inventory "$TASK_DIR/rollback-failure-lspatches.log" || true
+    return "$rc"
+  fi
+  require_inventory_state absent "$TASK_DIR/rollback-after-lspatches.log"
+  rm -f "$TASK_DIR/binary-state-unknown"; : >"$TASK_DIR/binary-state-known"; : >"$NODE_RUN_DIR/rollback-binary-removed"
+}
+
+stage_grid_rollback_rootcrs_postpatch() {
+  local rc
+  load_binding; verify_open_window; verify_source_apply_lineage metadata; verify_rollback_readme; verify_recovery full; verify_artifact
+  [ -f "$NODE_RUN_DIR/rollback-prepatch-complete" ] && [ -f "$NODE_RUN_DIR/rollback-binary-removed" ] || die 'rootcrs postpatch requires sealed rollback prepatch and binary removal postconditions'
+  require_inventory_state absent "$TASK_DIR/rollback-postpatch-lspatches.log"
+  : >"$TASK_DIR/grid-state-unknown"
+  set +e; "$GRID_HOME_TARGET/crs/install/rootcrs.sh" -postpatch; rc=$?; set -e
+  if [ "$rc" -ne 0 ]; then
+    set +e; check_cluster_health "$TASK_DIR/rollback-postpatch-failure-health"; set -e
+    return "$rc"
+  fi
+  collect_cluster_runtime "$TASK_DIR/rollback-postpatch"
+  check_cluster_health "$TASK_DIR/rollback-postpatch"
+  rm -f "$TASK_DIR/grid-state-unknown" "$NODE_RUN_DIR/rollback-prepatch-complete"
+  : >"$TASK_DIR/grid-stack-restored"; : >"$NODE_RUN_DIR/rollback-postpatch-complete"
+}
+
+stage_grid_rollback_node_validate() {
+  load_binding; [ -f "$NODE_RUN_DIR/rollback-postpatch-complete" ] || die 'rollback node validation requires a succeeded rootcrs postpatch task'
+  require_inventory_state absent "$TASK_DIR/rollback-node-validate-lspatches.log"
+  collect_cluster_runtime "$TASK_DIR/rollback-node-validate"
+  check_cluster_health "$TASK_DIR/rollback-node-validate"
+  : >"$TASK_DIR/binary-state-known"; : >"$NODE_RUN_DIR/rollback-node-validated"
+}
+
+stage_grid_rollback_cluster_final_validate() {
+  local inventory expected status
+  [ "$LOCAL_NODE" = "$COORDINATOR_NODE" ] || die 'rollback cluster final validation may run only on the sealed coordinator node'
+  load_binding; verify_prior_rollback_node_validations
+  collect_cluster_runtime "$TASK_DIR/rollback-cluster-final"
+  check_cluster_health "$TASK_DIR/rollback-cluster-final"
+  "$GRID_HOME_TARGET/bin/crsctl" query crs softwareversion -all >"$TASK_DIR/rollback-cluster-final-softwareversion.log" 2>&1 || die 'cannot query all-node Clusterware software versions'
+  inventory=$("$GRID_HOME_TARGET/bin/olsnodes" -s -t 2>&1) || die 'cannot query final Clusterware node membership'
+  printf '%s\n' "$inventory" >"$TASK_DIR/rollback-cluster-final-nodes.log"
+  while IFS= read -r expected; do
+    status=$(awk -v node="$(short_host "$expected")" '$1 == node {print $2; exit}' <<<"$inventory")
+    [ "$status" = Active ] || die "Grid node $expected is not Active after rolling rollback"
+    grep -F "[$(short_host "$expected")]" "$TASK_DIR/rollback-cluster-final-softwareversion.log" | grep -F "[$CLUSTER_ACTIVE_VERSION]" >/dev/null ||
+      die "Grid node $expected does not report the cluster active software version"
+  done < <(jq -r '.nodes[]' "$PLAN_FILE")
+  require_inventory_state absent "$TASK_DIR/rollback-cluster-final-lspatches.log"
+  : >"$TASK_DIR/binary-state-known"
+}
+
 load_plan() {
   PLAN_FILE="$PLAN_STATE_DIR/plans/$PLAN_ID/plan.json"
   verify_sealed_json "$PLAN_FILE" plan_sha256 || die 'immutable Grid plan is missing or its integrity check failed'
   PLAN_SHA=$(jq -r '.plan_sha256' "$PLAN_FILE")
-  jq -e --argjson operations "$EXPECTED_OPERATIONS" '
-    .schema_version == "1.0" and (.intent // "patch_apply") == "patch_apply" and
-    .target.family == "grid" and .target.method == "opatch" and (.target.platform_id | test("^[0-9]+$")) and
-    (.target.grid_home | type == "string" and startswith("/")) and
-    (.target.owner | test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")) and
-    .target.coordinator_node == .nodes[0] and (.nodes | type == "array" and length > 1 and length == (unique | length)) and
-    .procedure.adapter == "grid_rolling_opatch" and .procedure.operations == $operations and .procedure.method == "opatch" and .procedure.platform_id == .target.platform_id and
-    (.procedure.required_opatch_version | test("^[0-9]+(\\.[0-9]+){2,4}$")) and
-    (.patch_id | test("^[0-9]{1,20}$")) and (.artifact.path | type == "string" and startswith("/")) and (.artifact.sha256 | test("^[a-f0-9]{64}$")) and (.artifact.platforms | type == "array" and length == 1) and .artifact.platforms[0].id == .target.platform_id and
-    (.recovery.manifest_sha256 | test("^[a-f0-9]{64}$")) and (.recovery.record_sha256 | test("^[a-f0-9]{64}$")) and
-    (.source_documents | keys | sort) == ["artifact_manifest","compatibility","policy","procedure_validation","readiness","reconciliation"]
-  ' "$PLAN_FILE" >/dev/null || die 'plan is not a supported sealed Grid rolling OPatch procedure'
+  if [ "$OPERATION" = apply ]; then
+    jq -e --argjson operations "$EXPECTED_OPERATIONS" '
+      .schema_version == "1.0" and (.intent // "patch_apply") == "patch_apply" and
+      .target.family == "grid" and .target.method == "opatch" and (.target.platform_id | test("^[0-9]+$")) and
+      (.target.grid_home | type == "string" and startswith("/")) and
+      (.target.owner | test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")) and
+      .target.coordinator_node == .nodes[0] and (.nodes | type == "array" and length > 1 and length == (unique | length)) and
+      .procedure.adapter == "grid_rolling_opatch" and .procedure.operations == $operations and .procedure.method == "opatch" and .procedure.platform_id == .target.platform_id and
+      (.procedure.required_opatch_version | test("^[0-9]+(\\.[0-9]+){2,4}$")) and
+      (.patch_id | test("^[0-9]{1,20}$")) and (.artifact.path | type == "string" and startswith("/")) and (.artifact.sha256 | test("^[a-f0-9]{64}$")) and (.artifact.platforms | type == "array" and length == 1) and .artifact.platforms[0].id == .target.platform_id and
+      (.recovery.manifest_sha256 | test("^[a-f0-9]{64}$")) and (.recovery.record_sha256 | test("^[a-f0-9]{64}$")) and
+      (.source_documents | keys | sort) == ["artifact_manifest","compatibility","policy","procedure_validation","readiness","reconciliation"]
+    ' "$PLAN_FILE" >/dev/null || die 'plan is not a supported sealed Grid rolling OPatch procedure'
+  else
+    jq -e --argjson operations "$EXPECTED_OPERATIONS" '
+      . as $plan |
+      $plan.schema_version == "1.0" and $plan.intent == "patch_rollback" and
+      $plan.target.family == "grid" and $plan.target.method == "opatch" and ($plan.target.platform_id | test("^[0-9]+$")) and
+      ($plan.target.grid_home | type == "string" and startswith("/")) and
+      ($plan.target.owner | test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")) and
+      $plan.target.coordinator_node == $plan.nodes[-1] and ($plan.nodes | type == "array" and length > 1 and length == (unique | length)) and
+      $plan.procedure.adapter == "grid_rolling_opatch_rollback" and $plan.procedure.operations == $operations and $plan.procedure.method == "opatch" and $plan.procedure.platform_id == $plan.target.platform_id and
+      ($plan.procedure.required_opatch_version | test("^[0-9]+(\\.[0-9]+){2,4}$")) and
+      ($plan.patch_id | test("^[0-9]{1,20}$")) and ($plan.artifact.path | type == "string" and startswith("/")) and ($plan.artifact.sha256 | test("^[a-f0-9]{64}$")) and ($plan.artifact.platforms | type == "array" and length == 1) and $plan.artifact.platforms[0].id == $plan.target.platform_id and
+      ($plan.recovery.manifest_sha256 | test("^[a-f0-9]{64}$")) and ($plan.recovery.record_sha256 | test("^[a-f0-9]{64}$")) and
+      ($plan.source_apply.plan_path | type == "string" and startswith("/")) and ($plan.source_apply.plan_file_sha256 | test("^[a-f0-9]{64}$")) and ($plan.source_apply.plan_sha256 | test("^[a-f0-9]{64}$")) and
+      ($plan.source_apply.lineage | type == "array" and length == (($plan.nodes | length) * 6 + 1)) and ($plan.source_apply.lineage_sha256 | test("^[a-f0-9]{64}$")) and
+      ($plan.source_apply.cluster_final_evidence_sha256 | test("^[a-f0-9]{64}$")) and ($plan.source_apply.cluster_final_evidence_record_sha256 | test("^[a-f0-9]{64}$")) and
+      ($plan.source_documents | keys | sort) == ["artifact_manifest","compatibility","policy","procedure_validation","readiness","reconciliation"]
+    ' "$PLAN_FILE" >/dev/null || die 'plan is not a supported sealed Grid rolling OPatch rollback procedure'
+  fi
   GRID_HOME_TARGET=$(jq -r '.target.grid_home' "$PLAN_FILE"); GRID_OWNER=$(jq -r '.target.owner' "$PLAN_FILE"); COORDINATOR_NODE=$(short_host "$(jq -r '.target.coordinator_node' "$PLAN_FILE")")
   PATCH_ID=$(jq -r '.patch_id' "$PLAN_FILE"); PATCH_DIR=$(jq -r '.artifact.path' "$PLAN_FILE"); ARTIFACT_SHA=$(jq -r '.artifact.sha256' "$PLAN_FILE"); REQUIRED_OPATCH=$(jq -r '.procedure.required_opatch_version' "$PLAN_FILE"); TARGET_PLATFORM_ID=$(jq -r '.target.platform_id' "$PLAN_FILE")
   opu_validate_absolute_path "$GRID_HOME_TARGET" grid-home >/dev/null || die 'sealed Grid home path is invalid'
@@ -497,31 +751,43 @@ load_plan() {
 }
 
 load_task_after_claim() {
-  local claimed_node local_host
+  local claimed_node local_host adapter stages cluster_stage
   TASK_FILE="$PLAN_STATE_DIR/plans/$PLAN_ID/tasks/$TASK_ID.json"
   verify_task_definition "$TASK_FILE" || die 'claimed Grid task definition failed integrity verification'
   verify_task_authorization "$TASK_FILE"
-  jq -e --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg actor "$ACTOR" --arg plan_sha "$PLAN_SHA" '
+  if [ "$OPERATION" = apply ]; then
+    adapter=grid_rolling_opatch
+    stages='["grid_precheck","grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch","grid_node_validate","grid_cluster_final_validate"]'
+    cluster_stage=grid_cluster_final_validate
+  else
+    adapter=grid_rolling_opatch_rollback
+    stages='["grid_rollback_precheck","grid_rootcrs_prepatch","grid_opatch_rollback","grid_rootcrs_postpatch","grid_rollback_node_validate","grid_rollback_cluster_final_validate"]'
+    cluster_stage=grid_rollback_cluster_final_validate
+  fi
+  jq -e --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg actor "$ACTOR" --arg plan_sha "$PLAN_SHA" --arg adapter "$adapter" --argjson stages "$stages" '
     .plan_id == $plan and .task_id == $task and .claimed_by == $actor and .plan_sha256 == $plan_sha and
-    .adapter == "grid_rolling_opatch" and .status == "running" and
-    (.stage | IN("grid_precheck","grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch","grid_node_validate","grid_cluster_final_validate"))
+    .adapter == $adapter and .status == "running" and (.stage as $s | $stages | index($s) != null)
   ' "$TASK_FILE" >/dev/null || die 'claimed task does not match the Grid node executor contract'
   STAGE=$(jq -r '.stage' "$TASK_FILE"); claimed_node=$(short_host "$(jq -r '.node' "$TASK_FILE")")
   local_host=$(short_host "${OPU_GRID_NODE_TEST_HOST:-$(hostname -s 2>/dev/null || hostname)}")
   LOCAL_NODE=$local_host
   [ "$claimed_node" = "$LOCAL_NODE" ] || die "task is bound to $claimed_node, not local node $LOCAL_NODE"
-  if [ "$STAGE" = grid_cluster_final_validate ]; then [ "$LOCAL_NODE" = "$COORDINATOR_NODE" ] || die 'cluster final task is not on the sealed coordinator'; else jq -e --arg node "$LOCAL_NODE" '[.nodes[] | split(".")[0]] | index($node) != null' "$PLAN_FILE" >/dev/null || die 'local task node is absent from the sealed topology'; fi
+  if [ "$STAGE" = "$cluster_stage" ]; then [ "$LOCAL_NODE" = "$COORDINATOR_NODE" ] || die 'cluster final task is not on the sealed coordinator'; else jq -e --arg node "$LOCAL_NODE" '[.nodes[] | split(".")[0]] | index($node) != null' "$PLAN_FILE" >/dev/null || die 'local task node is absent from the sealed topology'; fi
 }
 
 run_typed_stage() {
   case "$STAGE" in
     grid_precheck) stage_grid_precheck ;;
-    grid_rootcrs_prepatch) stage_grid_rootcrs_prepatch ;;
+    grid_rootcrs_prepatch) if [ "$OPERATION" = rollback ]; then stage_grid_rollback_rootcrs_prepatch; else stage_grid_rootcrs_prepatch; fi ;;
     grid_opatch_apply) stage_grid_opatch_apply ;;
     grid_rootadd_rdbms) stage_grid_rootadd_rdbms ;;
-    grid_rootcrs_postpatch) stage_grid_rootcrs_postpatch ;;
+    grid_rootcrs_postpatch) if [ "$OPERATION" = rollback ]; then stage_grid_rollback_rootcrs_postpatch; else stage_grid_rootcrs_postpatch; fi ;;
     grid_node_validate) stage_grid_node_validate ;;
     grid_cluster_final_validate) stage_grid_cluster_final_validate ;;
+    grid_rollback_precheck) stage_grid_rollback_precheck ;;
+    grid_opatch_rollback) stage_grid_opatch_rollback ;;
+    grid_rollback_node_validate) stage_grid_rollback_node_validate ;;
+    grid_rollback_cluster_final_validate) stage_grid_rollback_cluster_final_validate ;;
     *) die "unsupported sealed Grid stage: $STAGE" ;;
   esac
 }
@@ -552,14 +818,28 @@ collect_task_artifacts() {
 emit_evidence() {
   local status=$1 postcondition=$2 exit_code=$3 detail=$4 finished=$5 outcome_class=$6 stdout_sha stderr_sha tmp canonical record_sha artifacts
   stdout_sha=$(opu_hash_file "$TASK_DIR/stdout.log"); stderr_sha=$(opu_hash_file "$TASK_DIR/stderr.log"); artifacts=$(collect_task_artifacts); tmp="$TASK_DIR/evidence.tmp"
-  jq -cn --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg plan_sha "$PLAN_SHA" --arg status "$status" --arg postcondition "$postcondition" --arg detail "$detail" --arg outcome "$outcome_class" \
-    --arg started "$STARTED_AT" --arg finished "$finished" --arg actor "$ACTOR" --arg stage "$STAGE" --arg grid_home "$GRID_HOME_TARGET" --arg owner "$GRID_OWNER" --arg coordinator "$COORDINATOR_NODE" --arg node "$LOCAL_NODE" \
-    --arg patch "$PATCH_ID" --arg artifact "$ARTIFACT_SHA" --arg readiness "$(jq -r '.source_documents.readiness.sha256' "$PLAN_FILE")" --arg reconciliation "$(jq -r '.source_documents.reconciliation.sha256' "$PLAN_FILE")" \
-    --arg artifact_manifest "$(jq -r '.source_documents.artifact_manifest.sha256' "$PLAN_FILE")" --arg procedure "$(jq -r '.source_documents.procedure_validation.sha256' "$PLAN_FILE")" --arg compatibility "$(jq -r '.source_documents.compatibility.sha256' "$PLAN_FILE")" --arg policy "$(jq -r '.source_documents.policy.sha256' "$PLAN_FILE")" \
-    --arg recovery_file "$(jq -r '.recovery.manifest_sha256' "$PLAN_FILE")" --arg recovery_record "$(jq -r '.recovery.record_sha256' "$PLAN_FILE")" \
-    --arg active_version "${CLUSTER_ACTIVE_VERSION:-unknown}" --arg upgrade_state "${CLUSTER_UPGRADE_STATE:-unknown}" --arg active_patch "${CLUSTER_ACTIVE_PATCH_LEVEL:-unknown}" --arg release_patch "${CLUSTER_RELEASE_PATCH_LEVEL:-unknown}" \
-    --arg stdout "$TASK_DIR/stdout.log" --arg stdout_sha "$stdout_sha" --arg stderr "$TASK_DIR/stderr.log" --arg stderr_sha "$stderr_sha" --argjson artifacts "$artifacts" --argjson exit_code "$exit_code" '
-    {schema_version:"1.0",collector:{name:"oracle.grid.node.executor",version:"1"},intent:"patch_apply",plan_id:$plan,task_id:$task,plan_sha256:$plan_sha,status:$status,postcondition:{status:$postcondition,detail:$detail},outcome_class:$outcome,started_at:$started,finished_at:$finished,exit_code:$exit_code,actor:$actor,stage:$stage,target:{grid_home:$grid_home,owner:$owner,coordinator_node:$coordinator,node:$node},patch:{patch_id:$patch,artifact_sha256:$artifact},source_documents:{readiness:$readiness,reconciliation:$reconciliation,artifact_manifest:$artifact_manifest,procedure_validation:$procedure,compatibility:$compatibility,policy:$policy},recovery:{manifest_sha256:$recovery_file,record_sha256:$recovery_record},cluster:{active_version:$active_version,upgrade_state:$upgrade_state,active_patch_level:$active_patch,release_patch_level:$release_patch},artifacts:$artifacts,logs:{stdout:{path:$stdout,sha256:$stdout_sha},stderr:{path:$stderr,sha256:$stderr_sha}}}' >"$tmp"
+  if [ "$OPERATION" = rollback ]; then
+    jq -cn --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg plan_sha "$PLAN_SHA" --arg status "$status" --arg postcondition "$postcondition" --arg detail "$detail" --arg outcome "$outcome_class" \
+      --arg started "$STARTED_AT" --arg finished "$finished" --arg actor "$ACTOR" --arg stage "$STAGE" --arg grid_home "$GRID_HOME_TARGET" --arg owner "$GRID_OWNER" --arg coordinator "$COORDINATOR_NODE" --arg node "$LOCAL_NODE" \
+      --arg patch "$PATCH_ID" --arg artifact "$ARTIFACT_SHA" --arg readiness "$(jq -r '.source_documents.readiness.sha256' "$PLAN_FILE")" --arg reconciliation "$(jq -r '.source_documents.reconciliation.sha256' "$PLAN_FILE")" \
+      --arg artifact_manifest "$(jq -r '.source_documents.artifact_manifest.sha256' "$PLAN_FILE")" --arg procedure "$(jq -r '.source_documents.procedure_validation.sha256' "$PLAN_FILE")" --arg compatibility "$(jq -r '.source_documents.compatibility.sha256' "$PLAN_FILE")" --arg policy "$(jq -r '.source_documents.policy.sha256' "$PLAN_FILE")" \
+      --arg recovery_file "$(jq -r '.recovery.manifest_sha256' "$PLAN_FILE")" --arg recovery_record "$(jq -r '.recovery.record_sha256' "$PLAN_FILE")" \
+      --arg source_plan_sha "$SOURCE_APPLY_PLAN_SHA" --arg source_lineage_sha "$SOURCE_LINEAGE_SHA" --arg source_cluster_final_sha "$SOURCE_CLUSTER_FINAL_SHA" --arg source_cluster_final_record "$SOURCE_CLUSTER_FINAL_RECORD" \
+      --arg active_version "${CLUSTER_ACTIVE_VERSION:-unknown}" --arg upgrade_state "${CLUSTER_UPGRADE_STATE:-unknown}" --arg active_patch "${CLUSTER_ACTIVE_PATCH_LEVEL:-unknown}" --arg release_patch "${CLUSTER_RELEASE_PATCH_LEVEL:-unknown}" \
+      --arg stdout "$TASK_DIR/stdout.log" --arg stdout_sha "$stdout_sha" --arg stderr "$TASK_DIR/stderr.log" --arg stderr_sha "$stderr_sha" --argjson artifacts "$artifacts" --argjson exit_code "$exit_code" \
+      --arg collector "$EXECUTOR_COLLECTOR" --arg intent "$EXECUTOR_INTENT" '
+      {schema_version:"1.0",collector:{name:$collector,version:"1"},intent:$intent,plan_id:$plan,task_id:$task,plan_sha256:$plan_sha,status:$status,postcondition:{status:$postcondition,detail:$detail},outcome_class:$outcome,started_at:$started,finished_at:$finished,exit_code:$exit_code,actor:$actor,stage:$stage,target:{grid_home:$grid_home,owner:$owner,coordinator_node:$coordinator,node:$node},patch:{patch_id:$patch,artifact_sha256:$artifact},source_documents:{readiness:$readiness,reconciliation:$reconciliation,artifact_manifest:$artifact_manifest,procedure_validation:$procedure,compatibility:$compatibility,policy:$policy},recovery:{manifest_sha256:$recovery_file,record_sha256:$recovery_record},source_apply:{plan_sha256:$source_plan_sha,lineage_sha256:$source_lineage_sha,cluster_final_evidence_sha256:$source_cluster_final_sha,cluster_final_evidence_record_sha256:$source_cluster_final_record},cluster:{active_version:$active_version,upgrade_state:$upgrade_state,active_patch_level:$active_patch,release_patch_level:$release_patch},artifacts:$artifacts,logs:{stdout:{path:$stdout,sha256:$stdout_sha},stderr:{path:$stderr,sha256:$stderr_sha}}}' >"$tmp"
+  else
+    jq -cn --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg plan_sha "$PLAN_SHA" --arg status "$status" --arg postcondition "$postcondition" --arg detail "$detail" --arg outcome "$outcome_class" \
+      --arg started "$STARTED_AT" --arg finished "$finished" --arg actor "$ACTOR" --arg stage "$STAGE" --arg grid_home "$GRID_HOME_TARGET" --arg owner "$GRID_OWNER" --arg coordinator "$COORDINATOR_NODE" --arg node "$LOCAL_NODE" \
+      --arg patch "$PATCH_ID" --arg artifact "$ARTIFACT_SHA" --arg readiness "$(jq -r '.source_documents.readiness.sha256' "$PLAN_FILE")" --arg reconciliation "$(jq -r '.source_documents.reconciliation.sha256' "$PLAN_FILE")" \
+      --arg artifact_manifest "$(jq -r '.source_documents.artifact_manifest.sha256' "$PLAN_FILE")" --arg procedure "$(jq -r '.source_documents.procedure_validation.sha256' "$PLAN_FILE")" --arg compatibility "$(jq -r '.source_documents.compatibility.sha256' "$PLAN_FILE")" --arg policy "$(jq -r '.source_documents.policy.sha256' "$PLAN_FILE")" \
+      --arg recovery_file "$(jq -r '.recovery.manifest_sha256' "$PLAN_FILE")" --arg recovery_record "$(jq -r '.recovery.record_sha256' "$PLAN_FILE")" \
+      --arg active_version "${CLUSTER_ACTIVE_VERSION:-unknown}" --arg upgrade_state "${CLUSTER_UPGRADE_STATE:-unknown}" --arg active_patch "${CLUSTER_ACTIVE_PATCH_LEVEL:-unknown}" --arg release_patch "${CLUSTER_RELEASE_PATCH_LEVEL:-unknown}" \
+      --arg stdout "$TASK_DIR/stdout.log" --arg stdout_sha "$stdout_sha" --arg stderr "$TASK_DIR/stderr.log" --arg stderr_sha "$stderr_sha" --argjson artifacts "$artifacts" --argjson exit_code "$exit_code" \
+      --arg collector "$EXECUTOR_COLLECTOR" --arg intent "$EXECUTOR_INTENT" '
+      {schema_version:"1.0",collector:{name:$collector,version:"1"},intent:$intent,plan_id:$plan,task_id:$task,plan_sha256:$plan_sha,status:$status,postcondition:{status:$postcondition,detail:$detail},outcome_class:$outcome,started_at:$started,finished_at:$finished,exit_code:$exit_code,actor:$actor,stage:$stage,target:{grid_home:$grid_home,owner:$owner,coordinator_node:$coordinator,node:$node},patch:{patch_id:$patch,artifact_sha256:$artifact},source_documents:{readiness:$readiness,reconciliation:$reconciliation,artifact_manifest:$artifact_manifest,procedure_validation:$procedure,compatibility:$compatibility,policy:$policy},recovery:{manifest_sha256:$recovery_file,record_sha256:$recovery_record},cluster:{active_version:$active_version,upgrade_state:$upgrade_state,active_patch_level:$active_patch,release_patch_level:$release_patch},artifacts:$artifacts,logs:{stdout:{path:$stdout,sha256:$stdout_sha},stderr:{path:$stderr,sha256:$stderr_sha}}}' >"$tmp"
+  fi
   canonical=$(jq -cS . "$tmp"); record_sha=$(opu_hash_string "$canonical"); jq --arg record_sha "$record_sha" '.record_sha256=$record_sha' "$tmp" >"$TASK_DIR/evidence.json"; rm -f "$tmp"
 }
 
@@ -587,8 +867,17 @@ execute_task() {
   elif [ -f "$TASK_DIR/binary-state-unknown" ] || [ -f "$TASK_DIR/inventory-unknown" ]; then outcome=binary_state_unknown
   elif [ -f "$TASK_DIR/grid-state-unknown" ]; then outcome=grid_state_unknown
   elif [ -f "$TASK_DIR/grid-stack-restored" ]; then outcome=grid_stack_restored
-  elif [ "$status" = succeeded ]; then case "$STAGE" in grid_precheck) outcome=no_mutation ;; grid_rootcrs_prepatch) outcome=grid_quiesced_known ;; grid_rootcrs_postpatch) outcome=grid_stack_restored ;; *) outcome=binary_state_known ;; esac
+  elif [ "$status" = succeeded ]; then
+    case "$STAGE" in
+      grid_precheck|grid_rollback_precheck) outcome=no_mutation ;;
+      grid_rootcrs_prepatch) outcome=grid_quiesced_known ;;
+      grid_rootcrs_postpatch) outcome=grid_stack_restored ;;
+      *) outcome=binary_state_known ;;
+    esac
   else outcome=no_mutation; fi
+  if [ "$OPERATION" = rollback ]; then
+    verify_source_apply_lineage metadata || die 'source apply lineage became invalid before evidence emission'
+  fi
   if [ -f "$BINDING_FILE" ] && verify_sealed_json "$BINDING_FILE" record_sha256; then
     CLUSTER_ACTIVE_VERSION=$(jq -r '.baseline.active_version' "$BINDING_FILE"); CLUSTER_UPGRADE_STATE=$(jq -r '.baseline.upgrade_state' "$BINDING_FILE"); CLUSTER_ACTIVE_PATCH_LEVEL=$(jq -r '.baseline.active_patch_level' "$BINDING_FILE"); CLUSTER_RELEASE_PATCH_LEVEL=$(jq -r '.baseline.release_patch_level' "$BINDING_FILE")
   fi

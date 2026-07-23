@@ -1,4 +1,5 @@
 import { el } from "./dom.js";
+import { getApiToken, setApiToken } from "./api.js";
 
 const ACTOR_KEY = "opu-webapp-actor";
 
@@ -7,13 +8,31 @@ export function getActor() {
 }
 
 export function mountActorWidget(container) {
-  const input = el("input", {
+  const actorInput = el("input", {
     type: "text",
     class: "actor-input",
     placeholder: "acting as…",
     value: getActor(),
-    title: "Not a security boundary — no auth system exists yet. The CLI's own separation-of-duties checks (requester/approver/operator must differ) are the real enforcement; this just fills that field.",
+    title: "Separation-of-duties identity sent to opu-patch-plan (requester/approver/operator must differ).",
   });
-  input.addEventListener("input", () => localStorage.setItem(ACTOR_KEY, input.value));
-  container.appendChild(el("div", { class: "actor-widget" }, [el("label", { text: "Acting as" }), input]));
+  actorInput.addEventListener("input", () => localStorage.setItem(ACTOR_KEY, actorInput.value));
+
+  const tokenInput = el("input", {
+    type: "password",
+    class: "actor-input",
+    placeholder: "API token",
+    value: getApiToken(),
+    title: "Bearer token from webapp/var/api-token (or OPU_WEBAPP_TOKEN). Required for every /api call.",
+    autocomplete: "off",
+  });
+  tokenInput.addEventListener("input", () => setApiToken(tokenInput.value.trim()));
+
+  container.appendChild(
+    el("div", { class: "actor-widget" }, [
+      el("label", { text: "Acting as" }),
+      actorInput,
+      el("label", { text: "API token" }),
+      tokenInput,
+    ])
+  );
 }

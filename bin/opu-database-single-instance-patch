@@ -462,7 +462,14 @@ stage_datapatch() {
   load_binding; verify_recovery; verify_open_window
   inventory_has_patch "$TASK_DIR/datapatch-lspatches.log" || die 'datapatch refused because the binary patch is absent'
   current_health "$TASK_DIR/datapatch-pre-health.log" || die 'database is not healthy for datapatch'
-  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" "PATH=$ORACLE_HOME_TARGET/bin:$ORACLE_HOME_TARGET/OPatch:/usr/bin:/bin" "$ORACLE_HOME_TARGET/OPatch/datapatch" -verbose
+  # -noqi: skip DBMS_QOPATCH's queryable-inventory cross-check. That check
+  # runs through an external-table preprocessor (qopiprep.bat) whose
+  # environment Oracle sandboxes independently of ORACLE_HOME/JAVA_HOME, so
+  # it fails outright whenever the Oracle home is reached via a symlink
+  # (e.g. /u01 -> /u02/u01) regardless of host environment configuration.
+  # It is a supplementary consistency check, not part of applying the SQL
+  # patch or updating DBA_REGISTRY_SQLPATCH.
+  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" "PATH=$ORACLE_HOME_TARGET/bin:$ORACLE_HOME_TARGET/OPatch:/usr/bin:/bin" "$ORACLE_HOME_TARGET/OPatch/datapatch" -verbose -noqi
 }
 
 stage_final_validate() {
@@ -659,7 +666,8 @@ stage_rollback_datapatch() {
   load_binding; verify_source_apply; verify_rollback_procedure; verify_recovery; verify_open_window
   if inventory_has_patch "$TASK_DIR/rollback-datapatch-lspatches.log"; then die 'rollback datapatch refused because the binary patch remains installed'; fi
   current_health "$TASK_DIR/rollback-datapatch-pre-health.log" || die 'database is not healthy for rollback datapatch'
-  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" "PATH=$ORACLE_HOME_TARGET/bin:$ORACLE_HOME_TARGET/OPatch:/usr/bin:/bin" "$ORACLE_HOME_TARGET/OPatch/datapatch" -verbose
+  # See stage_datapatch() for why -noqi is required.
+  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" "PATH=$ORACLE_HOME_TARGET/bin:$ORACLE_HOME_TARGET/OPatch:/usr/bin:/bin" "$ORACLE_HOME_TARGET/OPatch/datapatch" -verbose -noqi
 }
 
 stage_rollback_final_validate() {

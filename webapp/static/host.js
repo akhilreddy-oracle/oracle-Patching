@@ -1,4 +1,5 @@
 import { el, badge, classifyStatus, row, th, td, tdBadge, renderErrorBox } from "./dom.js";
+import { apiFetch } from "./api.js";
 
 export async function renderHost(mount, hostId) {
   mount.innerHTML = "";
@@ -22,7 +23,7 @@ export async function renderHost(mount, hostId) {
     statusPill.className = "pill pill-loading";
     refreshBtn.disabled = true;
     try {
-      const res = await fetch(`/api/hosts/${encodeURIComponent(hostId)}/discovery`);
+      const res = await apiFetch(`/api/hosts/${encodeURIComponent(hostId)}/discovery`);
       const data = await res.json();
       if (!res.ok) {
         renderErrorBox(body, data);

@@ -93,8 +93,11 @@ ticket and operator authorization; apply approval is never reused.
 RAC rollback reverses the sealed apply node order and materializes six stages
 per node (`rac_rollback_precheck` through `rac_rollback_node_validate`), then
 one coordinator `rac_rollback_datapatch` and
-`rac_rollback_final_validate`. Grid rollback is not yet an immutable-plan
-adapter.
+`rac_rollback_final_validate`. Grid rollback is now an immutable-plan
+adapter: it reverses the sealed apply node order, materializes five stages
+per node (`grid_rollback_precheck` through `grid_rollback_node_validate`, skipping
+`grid_rootadd_rdbms`), then one coordinator
+`grid_rollback_cluster_final_validate`.
 
 ## Leases and task evidence
 

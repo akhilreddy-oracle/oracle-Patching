@@ -29,6 +29,24 @@ def _ssh_argv(ssh_alias: str, remote_command: str, timeout: int) -> list[str]:
     return ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}", ssh_alias, remote_command]
 
 
+def run_remote_raw(
+    ssh_alias: str, argv: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS, sudo: bool = False
+) -> subprocess.CompletedProcess:
+    """Run a fixed remote command and return the CompletedProcess (caller checks rc)."""
+    if sudo:
+        argv = ["sudo", "-n", *argv]
+    remote_command = " ".join(shlex.quote(a) for a in argv)
+    try:
+        return subprocess.run(
+            _ssh_argv(ssh_alias, remote_command, timeout),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RemoteError("ssh_timeout", f"No response from {ssh_alias} within {timeout}s") from None
+
+
 def run_remote(ssh_alias: str, argv: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS, sudo: bool = False) -> str:
     """Run a fixed remote command (as argv tokens) over SSH and return its stdout.
 
@@ -39,13 +57,8 @@ def run_remote(ssh_alias: str, argv: list[str], timeout: int = DEFAULT_TIMEOUT_S
     is always a fixed absolute binary path from trusted config, same as the
     rest of this module.
     """
-    if sudo:
-        argv = ["sudo", "-n", *argv]
-    remote_command = " ".join(shlex.quote(a) for a in argv)
-    try:
-        result = subprocess.run(_ssh_argv(ssh_alias, remote_command, timeout), capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise RemoteError("ssh_timeout", f"No response from {ssh_alias} within {timeout}s") from None
+    result = run_remote_raw(ssh_alias, argv, timeout=timeout, sudo=sudo)
+    remote_command = " ".join(shlex.quote(a) for a in (["sudo", "-n", *argv] if sudo else argv))
 
     # Several opu-* tools exit nonzero (commonly 2) to signal a valid, fully
     # formed "blocked"/has-findings JSON result, not a crash (see

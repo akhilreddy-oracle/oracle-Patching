@@ -18,7 +18,11 @@ test:
 	./tests/single_instance_patch.sh
 	./tests/rac_database_patch.sh
 	./tests/grid_node_patch.sh
+	./tests/grid_node_rollback.sh
 	./tests/readiness.sh
+	./tests/dataguard.sh
+	./tests/live_multinode_preflight.sh
+	./tests/release_signing.sh
 	./tests/database_rolling_patch.sh
 	./tests/grid_rolling_patch.sh
 

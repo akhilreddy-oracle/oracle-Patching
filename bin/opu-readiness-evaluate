@@ -7,9 +7,9 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
 
-RECONCILIATION=""; ARTIFACT=""; PROCEDURE=""; COMPATIBILITY=""; POLICY=""; OUT=""
+RECONCILIATION=""; ARTIFACT=""; PROCEDURE=""; COMPATIBILITY=""; POLICY=""; OUT=""; DATAGUARD=""
 declare -a SNAPSHOTS=() GATES=()
-usage() { printf '%s\n' 'Usage: opu-readiness-evaluate --reconciliation ABSOLUTE_JSON --snapshot ABSOLUTE_JSON [--snapshot ABSOLUTE_JSON ...] --artifact ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON --compatibility ABSOLUTE_JSON --policy ABSOLUTE_JSON [--output ABSOLUTE_JSON]'; }
+usage() { printf '%s\n' 'Usage: opu-readiness-evaluate --reconciliation ABSOLUTE_JSON --snapshot ABSOLUTE_JSON [--snapshot ABSOLUTE_JSON ...] --artifact ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON --compatibility ABSOLUTE_JSON --policy ABSOLUTE_JSON [--dataguard ABSOLUTE_JSON] [--output ABSOLUTE_JSON]'; }
 gate() { GATES+=("$1|$2|$3"); }
 require_file() { local f=$1 label=$2; opu_validate_absolute_path "$f" "$label" || exit $?; [ -f "$f" ] && [ ! -L "$f" ] || { echo "$label is missing or symbolic link: $f" >&2; exit 66; }; }
 parse() {
@@ -17,10 +17,12 @@ parse() {
     --reconciliation) RECONCILIATION=${2:-}; shift 2;; --snapshot) SNAPSHOTS+=("${2:-}"); shift 2;;
     --artifact) ARTIFACT=${2:-}; shift 2;; --procedure-validation) PROCEDURE=${2:-}; shift 2;;
     --compatibility) COMPATIBILITY=${2:-}; shift 2;; --policy) POLICY=${2:-}; shift 2;;
+    --dataguard) DATAGUARD=${2:-}; shift 2;;
     --output) OUT=${2:-}; shift 2;; -h|--help) usage; exit 0;; *) usage >&2; exit 64;; esac; done
   [ "${#SNAPSHOTS[@]}" -gt 0 ] || { usage >&2; exit 64; }
   for pair in "$RECONCILIATION|reconciliation" "$ARTIFACT|artifact" "$PROCEDURE|procedure-validation" "$COMPATIBILITY|compatibility" "$POLICY|policy"; do require_file "${pair%%|*}" "${pair#*|}"; done
   for f in "${SNAPSHOTS[@]}"; do require_file "$f" snapshot; done
+  [ -z "$DATAGUARD" ] || require_file "$DATAGUARD" dataguard-evaluation
   [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
   command -v jq >/dev/null || { echo 'jq is required' >&2; exit 69; }
 }
@@ -54,7 +56,7 @@ check_recovery() {
   [ "$require_grp" = false ] || { [ "$grp" -gt 0 ] 2>/dev/null || gate recovery_restore_point blocker "$host database $db has no guaranteed restore point."; }
 }
 check_snapshots() {
-  local expected host collected now age max_age source grid_status upgrade target_path db runtime invalid sqlpatch pdb
+  local expected host collected now age max_age source grid_status upgrade target_path db runtime invalid sqlpatch pdb role
   local snapshot snapshot_sha supplied_evidence='[]' reconciled_evidence
   expected=$(jq -cr '.expected_nodes | sort | unique' "$RECONCILIATION")
   [ "$(jq -r '.status' "$RECONCILIATION")" = consistent ] && gate topology pass 'All supplied topology snapshots reconcile.' || gate topology blocker 'Topology reconciliation is blocked.'
@@ -82,7 +84,36 @@ check_snapshots() {
     while IFS=$'\t' read -r db runtime; do
       [ -n "$db" ] || continue
       [ "$runtime" = complete ] || { gate database_runtime blocker "$host database $db runtime is incomplete."; continue; }
-      if [ "$(jq -r '.database.require_primary_read_write' "$POLICY")" = true ]; then jq -e --arg d "$db" '.databases[] | select(.db_unique_name == $d and .runtime.database_role == "PRIMARY" and .runtime.open_mode == "READ WRITE" and .runtime.instance_state == "OPEN")' "$snapshot" >/dev/null || gate database_open blocker "$host database $db is not PRIMARY/READ WRITE/OPEN."; fi
+      role=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.database_role // "unknown"' "$snapshot")
+      case "$role" in
+        'PHYSICAL STANDBY'|'LOGICAL STANDBY'|'SNAPSHOT STANDBY')
+          if [ -n "$DATAGUARD" ] && jq -e '.status == "ready_for_standby_first"' "$DATAGUARD" >/dev/null; then
+            gate dataguard_standby_first pass "$host database $db role is $role; sealed Data Guard evaluation permits standby-first orchestration."
+          else
+            gate dataguard_unsupported blocker "$host database $db role is $role; supply a ready_for_standby_first Data Guard evaluation (--dataguard) before standby work."
+          fi
+          ;;
+        PRIMARY)
+          if [ -n "$DATAGUARD" ]; then
+            jq -e '.status == "ready_for_standby_first"' "$DATAGUARD" >/dev/null \
+              || gate dataguard_primary blocker "$host database $db is PRIMARY but Data Guard evaluation is not ready_for_standby_first."
+            gate dataguard_standby_first pass "$host PRIMARY is bound to a ready Data Guard standby-first evaluation."
+          fi
+          if [ "$(jq -r '.database.require_primary_read_write' "$POLICY")" = true ]; then
+            jq -e --arg d "$db" '.databases[] | select(.db_unique_name == $d and .runtime.database_role == "PRIMARY" and .runtime.open_mode == "READ WRITE" and .runtime.instance_state == "OPEN")' "$snapshot" >/dev/null || gate database_open blocker "$host database $db is not PRIMARY/READ WRITE/OPEN."
+          fi
+          ;;
+        *)
+          if [ "$(jq -r '.database.require_primary_read_write' "$POLICY")" = true ]; then
+            gate database_open blocker "$host database $db role is $role; expected PRIMARY/READ WRITE/OPEN."
+          fi
+          ;;
+      esac
+      # Primary-shaped SQL/FRA checks do not apply to standbys that are already
+      # approved for standby-first orchestration via sealed Data Guard evidence.
+      if [[ "$role" == *STANDBY* ]] && [ -n "$DATAGUARD" ] && jq -e '.status == "ready_for_standby_first"' "$DATAGUARD" >/dev/null; then
+        continue
+      fi
       invalid=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.invalid_objects // -1' "$snapshot"); sqlpatch=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.sqlpatch_non_success // -1' "$snapshot"); pdb=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.pdb_not_read_write // -1' "$snapshot")
       [ "$invalid" -le "$(jq -r '.database.maximum_invalid_objects' "$POLICY")" ] 2>/dev/null || gate database_invalid_objects blocker "$host database $db exceeds invalid-object policy."
       [ "$sqlpatch" = 0 ] && [ "$pdb" = 0 ] || gate database_sql_state blocker "$host database $db has failed SQL patches or non-read-write PDBs."

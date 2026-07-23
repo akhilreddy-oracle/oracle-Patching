@@ -1,4 +1,5 @@
 import { el, badge, classifyStatus } from "./dom.js";
+import { apiFetch } from "./api.js";
 
 export async function renderEstate(mount) {
   mount.innerHTML = "";
@@ -6,7 +7,7 @@ export async function renderEstate(mount) {
 
   let data;
   try {
-    const res = await fetch("/api/estate");
+    const res = await apiFetch("/api/estate");
     data = await res.json();
   } catch (err) {
     mount.innerHTML = "";

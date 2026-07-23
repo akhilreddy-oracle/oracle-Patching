@@ -1,4 +1,5 @@
 import { el, badge, classifyStatus } from "./dom.js";
+import { apiFetch } from "./api.js";
 import { runToCompletion, RunStartError } from "./runs.js";
 
 const STEP_LABELS = {
@@ -26,7 +27,7 @@ export async function renderPipeline(mount, hostId) {
   mount.appendChild(list);
 
   async function refresh() {
-    const res = await fetch(`/api/hosts/${encodeURIComponent(hostId)}/pipeline`);
+    const res = await apiFetch(`/api/hosts/${encodeURIComponent(hostId)}/pipeline`);
     const data = await res.json();
     list.innerHTML = "";
     for (const stepState of data.steps) {
@@ -113,7 +114,7 @@ function buildControls(hostId, step, controls, logBox, refresh) {
       logBox.style.display = "block";
       logBox.textContent = "discovering…";
       try {
-        const res = await fetch(`${base}/discovery`);
+        const res = await apiFetch(`${base}/discovery`);
         const data = await res.json();
         logBox.textContent = res.ok ? "succeeded" : `FAILED: ${data.message}\n${data.stderr || ""}`;
       } catch (err) {
@@ -193,7 +194,7 @@ function procedureForm(base, logBox, refresh) {
   const rollbackPrecondition = el("textarea", { rows: "2", placeholder: "exact README rollback condition" });
 
   const autofillBtn = runButton("Autofill from artifact evidence", async () => {
-    const res = await fetch(`${base}/pipeline`);
+    const res = await apiFetch(`${base}/pipeline`);
     const data = await res.json();
     const artifactStep = data.steps.find((s) => s.step === "artifact-inspect");
     const artifact = artifactStep?.evidence?.artifact;
@@ -224,7 +225,7 @@ function procedureForm(base, logBox, refresh) {
   form.appendChild(autofillBtn);
 
   const submitBtn = runButton("Validate procedure", async () => {
-    const res = await fetch(`${base}/pipeline`);
+    const res = await apiFetch(`${base}/pipeline`);
     const data = await res.json();
     const artifact = data.steps.find((s) => s.step === "artifact-inspect")?.evidence?.artifact;
     if (!artifact) {

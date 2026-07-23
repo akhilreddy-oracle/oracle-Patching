@@ -223,6 +223,62 @@ run complete --plan-id standalone-late --task-id "$late_task" --actor late-worke
 run status --plan-id standalone-late | jq -e '.state == "paused"' >/dev/null
 jq -e '.status == "succeeded" and .completed_after_lease == true' "$late_task_file" >/dev/null
 
+# retry-task: only the exact task that paused the plan may be resumed, and
+# only while the plan is paused for that reason. A successful retry resets
+# the task to pending and reopens the plan for the normal next/claim flow.
+if run retry-task --plan-id plan-001 --task-id 001-grid-precheck-node1 --actor retry-operator >/dev/null 2>&1; then
+  echo 'retry-task was accepted on a plan that is not paused' >&2
+  exit 1
+fi
+run create --plan-id standalone-retry --requester patch-admin --readiness "$TMP/standalone-readiness.json" --reconciliation "$TMP/standalone-reconciliation.json" --artifact-manifest "$TMP/standalone-artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/standalone-policy.json" --recovery-evidence "$TMP/recovery.json" --window-start "$start" --window-end "$end" >"$TMP/standalone-retry-plan.json"
+run approve --plan-id standalone-retry --actor dba-approver --approval-ticket CHG-STANDALONE-RETRY
+run authorize --plan-id standalone-retry --actor patch-operator
+run dispatch --plan-id standalone-retry --actor patch-operator
+retry_plan_sha=$(jq -r '.plan_sha256' "$TMP/standalone-retry-plan.json")
+retry_recovery_sha=$(jq -r '.recovery.manifest_sha256' "$TMP/standalone-retry-plan.json"); retry_recovery_record=$(jq -r '.recovery.record_sha256' "$TMP/standalone-retry-plan.json")
+retry_first_task=$(run next --plan-id standalone-retry | jq -r '.task_id')
+other_task=$(find "$TMP/state/plans/standalone-retry/tasks" -name '*.json' -exec basename {} \; | sed 's/\.json$//' | sort | grep -v "^${retry_first_task}\$" | head -1)
+run claim --plan-id standalone-retry --task-id "$retry_first_task" --actor retry-worker --lease-seconds 60 >/dev/null
+printf 'fail stdout\n' >"$TMP/retry-fail-stdout.log"; printf 'fail stderr\n' >"$TMP/retry-fail-stderr.log"
+retry_fail_stdout_sha=$(sha256sum "$TMP/retry-fail-stdout.log" | awk '{print $1}'); retry_fail_stderr_sha=$(sha256sum "$TMP/retry-fail-stderr.log" | awk '{print $1}')
+jq -cn --arg task "$retry_first_task" --arg plan_sha "$retry_plan_sha" --arg stdout "$TMP/retry-fail-stdout.log" --arg stderr "$TMP/retry-fail-stderr.log" --arg stdout_sha "$retry_fail_stdout_sha" --arg stderr_sha "$retry_fail_stderr_sha" --arg recovery_sha "$retry_recovery_sha" --arg recovery_record "$retry_recovery_record" --arg time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  '{schema_version:"1.0",collector:{name:"oracle.database.single_instance.executor",version:"1"},intent:"patch_apply",plan_id:"standalone-retry",task_id:$task,plan_sha256:$plan_sha,status:"failed",postcondition:{status:"failed",detail:"simulated datapatch failure"},outcome_class:"binary_state_known",started_at:$time,finished_at:$time,exit_code:1,actor:"retry-worker",stage:"precheck",target:{database_unique_name:"ORCL",oracle_home:"/opt/oracle/dbhome",owner:"oracle",oracle_sid:"ORCL"},patch:{patch_id:"12345678",artifact_sha256:"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},recovery:{manifest_sha256:$recovery_sha,record_sha256:$recovery_record},logs:{stdout:{path:$stdout,sha256:$stdout_sha},stderr:{path:$stderr,sha256:$stderr_sha}}}' >"$TMP/retry-fail-execution.tmp"
+retry_fail_record=$(jq -cS . "$TMP/retry-fail-execution.tmp" | tr -d '\n' | sha256sum | awk '{print $1}'); jq --arg record "$retry_fail_record" '.record_sha256=$record' "$TMP/retry-fail-execution.tmp" >"$TMP/retry-fail-execution.json"
+run complete --plan-id standalone-retry --task-id "$retry_first_task" --actor retry-worker --status failed --evidence "$TMP/retry-fail-execution.json"
+run status --plan-id standalone-retry | jq -e '.state == "paused"' >/dev/null
+jq -e '.status == "failed"' "$TMP/state/plans/standalone-retry/tasks/$retry_first_task.json" >/dev/null
+if run retry-task --plan-id standalone-retry --task-id "$other_task" --actor retry-operator >/dev/null 2>&1; then
+  echo 'retry-task accepted a task other than the one that failed' >&2
+  exit 1
+fi
+run status --plan-id standalone-retry | jq -e '.state == "paused"' >/dev/null
+retried=$(run retry-task --plan-id standalone-retry --task-id "$retry_first_task" --actor retry-operator)
+jq -e '.status == "pending" and (.claimed_by | not) and (.evidence_sha256 | not) and (.task_result_sha256 | not)' <<<"$retried" >/dev/null
+run status --plan-id standalone-retry | jq -e '.state == "running"' >/dev/null
+run next --plan-id standalone-retry | jq -e --arg task "$retry_first_task" '.task_id == $task' >/dev/null
+run claim --plan-id standalone-retry --task-id "$retry_first_task" --actor retry-worker-02 --lease-seconds 60 >/dev/null
+jq -cn --arg task "$retry_first_task" --arg plan_sha "$retry_plan_sha" --arg stdout "$TMP/retry-fail-stdout.log" --arg stderr "$TMP/retry-fail-stderr.log" --arg stdout_sha "$retry_fail_stdout_sha" --arg stderr_sha "$retry_fail_stderr_sha" --arg recovery_sha "$retry_recovery_sha" --arg recovery_record "$retry_recovery_record" --arg time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  '{schema_version:"1.0",collector:{name:"oracle.database.single_instance.executor",version:"1"},intent:"patch_apply",plan_id:"standalone-retry",task_id:$task,plan_sha256:$plan_sha,status:"succeeded",postcondition:{status:"passed"},outcome_class:"no_mutation",started_at:$time,finished_at:$time,exit_code:0,actor:"retry-worker-02",stage:"precheck",target:{database_unique_name:"ORCL",oracle_home:"/opt/oracle/dbhome",owner:"oracle",oracle_sid:"ORCL"},patch:{patch_id:"12345678",artifact_sha256:"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},recovery:{manifest_sha256:$recovery_sha,record_sha256:$recovery_record},logs:{stdout:{path:$stdout,sha256:$stdout_sha},stderr:{path:$stderr,sha256:$stderr_sha}}}' >"$TMP/retry-succeed-execution.tmp"
+retry_succeed_record=$(jq -cS . "$TMP/retry-succeed-execution.tmp" | tr -d '\n' | sha256sum | awk '{print $1}'); jq --arg record "$retry_succeed_record" '.record_sha256=$record' "$TMP/retry-succeed-execution.tmp" >"$TMP/retry-succeed-execution.json"
+run complete --plan-id standalone-retry --task-id "$retry_first_task" --actor retry-worker-02 --status succeeded --evidence "$TMP/retry-succeed-execution.json"
+run status --plan-id standalone-retry | jq -e '.state == "running"' >/dev/null
+run next --plan-id standalone-retry | jq -e --arg task "$retry_first_task" '.task_id != $task' >/dev/null
+if run retry-task --plan-id standalone-retry --task-id "$retry_first_task" --actor retry-operator >/dev/null 2>&1; then
+  echo 'retry-task was accepted on a running plan for an already-succeeded task' >&2
+  exit 1
+fi
+
+# Production mode refuses authorize/dispatch without a certification marker.
+run create --plan-id plan-prod-gate --requester patch-admin --readiness "$TMP/standalone-readiness.json" --reconciliation "$TMP/standalone-reconciliation.json" --artifact-manifest "$TMP/standalone-artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/standalone-policy.json" --recovery-evidence "$TMP/recovery.json" --window-start "$start" --window-end "$end" >/dev/null
+run approve --plan-id plan-prod-gate --actor dba-approver --approval-ticket CHG-PROD-GATE >/dev/null
+if OPU_PRODUCTION_MODE=1 run authorize --plan-id plan-prod-gate --actor patch-operator >/dev/null 2>&1; then
+  echo 'production mode authorized a plan without a certification marker' >&2
+  exit 1
+fi
+printf 'OPU_PRODUCTION_CERTIFIED=1\n' >"$TMP/production.cert"
+OPU_PRODUCTION_MODE=1 OPU_PRODUCTION_CERT_FILE="$TMP/production.cert" run authorize --plan-id plan-prod-gate --actor patch-operator >/dev/null
+OPU_PRODUCTION_MODE=1 OPU_PRODUCTION_CERT_FILE="$TMP/production.cert" run dispatch --plan-id plan-prod-gate --actor patch-operator >/dev/null
+
 jq '.patch_id = "tampered"' "$TMP/state/plans/plan-001/plan.json" >"$TMP/tampered.json" && mv "$TMP/tampered.json" "$TMP/state/plans/plan-001/plan.json"
 if run status --plan-id plan-001 >/dev/null 2>&1; then echo 'tampered immutable plan was accepted' >&2; exit 1; fi
 printf '%s\n' 'patch plan control test passed'

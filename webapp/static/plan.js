@@ -1,4 +1,5 @@
 import { el, badge, classifyStatus, renderErrorBox } from "./dom.js";
+import { apiFetch } from "./api.js";
 import { runToCompletion, RunStartError } from "./runs.js";
 import { getActor } from "./actor.js";
 
@@ -6,7 +7,7 @@ export async function renderPlanList(mount) {
   mount.innerHTML = "";
   mount.appendChild(el("h2", { text: "Plans" }));
 
-  const res = await fetch("/api/plans");
+  const res = await apiFetch("/api/plans");
   const data = await res.json();
 
   mount.appendChild(
@@ -224,7 +225,7 @@ export async function renderPlanDetail(mount, planId) {
 
   async function refresh() {
     body.innerHTML = "";
-    const res = await fetch(`/api/plans/${encodeURIComponent(planId)}`);
+    const res = await apiFetch(`/api/plans/${encodeURIComponent(planId)}`);
     const data = await res.json();
     if (!res.ok) {
       renderErrorBox(body, data);
@@ -310,7 +311,13 @@ async function renderPlan(body, planId, plan, refresh) {
     controls.appendChild(el("h2", { text: "Tasks" }));
     if (plan.state === "running") {
       const actor = el("input", { type: "text", value: getActor() });
-      const btn = el("button", { type: "button", text: "Execute next task (TEST_MODE)" });
+      const btn = el("button", { type: "button", text: "Execute next task" });
+      controls.appendChild(
+        el("p", {
+          class: "estate-card-error",
+          text: "TEST_MODE fixtures run locally. Live plans sync sealed state to the task node over SSH (standalone, RAC, or Grid) and pull evidence back.",
+        })
+      );
       btn.addEventListener("click", async () => {
         await runAction(logBox, btn, `/api/plans/${encodeURIComponent(planId)}/execute-next`, { actor: actor.value }, refresh);
       });
@@ -330,7 +337,7 @@ async function renderPlan(body, planId, plan, refresh) {
 }
 
 async function taskTable(planId) {
-  const res = await fetch(`/api/plans/${encodeURIComponent(planId)}/tasks`);
+  const res = await apiFetch(`/api/plans/${encodeURIComponent(planId)}/tasks`);
   const data = await res.json();
   return el("table", {}, [
     el("thead", {}, [el("tr", {}, [el("th", { text: "Task" }), el("th", { text: "Stage" }), el("th", { text: "Node" }), el("th", { text: "Status" })])]),

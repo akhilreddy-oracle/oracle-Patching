@@ -1,3 +1,5 @@
+import { apiFetch } from "./api.js";
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -11,9 +13,8 @@ export class RunStartError extends Error {
 }
 
 export async function startRun(url, body) {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "POST",
-    headers: body !== undefined ? { "Content-Type": "application/json" } : {},
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const data = await res.json();
@@ -23,7 +24,7 @@ export async function startRun(url, body) {
 
 export async function pollRun(runId, { onTick, intervalMs = 1200 } = {}) {
   for (;;) {
-    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+    const res = await apiFetch(`/api/runs/${encodeURIComponent(runId)}`);
     let record;
     try {
       record = await res.json();

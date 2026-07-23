@@ -24,10 +24,13 @@ read-only discovery, evidence reconciliation, artifact/procedure validation,
 OPatch compatibility, policy readiness, verified recovery evidence, and typed
 execution adapters for standalone Database, RAC Database, and manual rolling
 Grid Infrastructure OPatch workflows. Standalone and RAC Database apply plus
-their separately approved rollback paths, and manual Grid apply, are
-lab-capable and fail closed. Production certification, a separately approved
-Grid rollback adapter, Data Guard orchestration, and OPatchAuto execution
-remain outside the certified build.
+their separately approved rollback paths, manual Grid apply, and lab-capable
+Grid rollback are fail closed. The lab webapp now requires a Bearer API token,
+can execute sealed standalone **and** RAC/Grid tasks over SSH (per-task node
+routing with plan-state sync), and supports Data Guard observe/evaluate plus
+standby-first ordering. Production certification remains an explicit
+`OPU_PRODUCTION_MODE` gate plus lab SBOM/TLS/signing stubs; full S13 pilot
+sign-off and OPatchAuto stay outside the certified build.
 
 Implemented agent capabilities:
 
@@ -96,6 +99,8 @@ make check
 - [Program charter and accuracy gates](docs/PROGRAM_CHARTER.md)
 - [Subprojects and build order](docs/IMPLEMENTATION_PLAN.md)
 - [Complete architecture and delivery blueprint](Oracle_Patching_Utility_Blueprint.md)
+- [Data Guard observe and standby-first order](docs/DATA_GUARD.md)
+- [Production certification gate](docs/PRODUCTION_CERTIFICATION.md)
 - [High-assurance acceptance gates](docs/HIGH_ASSURANCE_ACCEPTANCE.md)
 - [Readiness pipeline](docs/READINESS_PIPELINE.md)
 - [Immutable plan control](docs/IMMUTABLE_PLAN_CONTROL.md)

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Read-only Data Guard observation. Emits broker/member/lag evidence without
+# mutating the estate. TEST_MODE loads a fixture JSON; live mode queries
+# v$database / gv$dataguard_stats / dg broker when available.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+TEST_MODE=${OPU_DATAGUARD_TEST_MODE:-0}
+FIXTURE=${OPU_DATAGUARD_TEST_FIXTURE:-}
+ORACLE_HOME=""; ORACLE_SID=""; OUT=""
+
+usage() {
+  printf '%s\n' 'Usage: opu-dataguard-observe --oracle-home PATH --oracle-sid SID [--output ABSOLUTE_JSON]'
+}
+
+die() { opu_error "$*"; exit 65; }
+
+parse() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --oracle-home) ORACLE_HOME=${2:-}; shift 2 ;;
+      --oracle-sid) ORACLE_SID=${2:-}; shift 2 ;;
+      --output) OUT=${2:-}; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; exit 64 ;;
+    esac
+  done
+  opu_validate_identifier "$ORACLE_SID" oracle-sid || exit $?
+  opu_validate_absolute_path "$ORACLE_HOME" oracle-home || exit $?
+  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  command -v jq >/dev/null || die 'jq is required'
+}
+
+emit_from_fixture() {
+  [ -n "$FIXTURE" ] && [ -f "$FIXTURE" ] && [ ! -L "$FIXTURE" ] || die 'OPU_DATAGUARD_TEST_FIXTURE must be a regular file in TEST_MODE'
+  jq -e --arg home "$ORACLE_HOME" --arg sid "$ORACLE_SID" '
+    .schema_version == "1.0" and .collector.name == "oracle.dataguard.observe" and
+    .target.oracle_home == $home and .target.oracle_sid == $sid
+  ' "$FIXTURE" >/dev/null || die 'Data Guard fixture does not bind the requested home/SID'
+  if [ -n "$OUT" ]; then cp "$FIXTURE" "$OUT"; cat "$OUT"; else cat "$FIXTURE"; fi
+}
+
+sqlplus_q() {
+  local sql=$1
+  if [ "$TEST_MODE" = 1 ]; then
+    die 'live SQL path is not used in TEST_MODE'
+  fi
+  export ORACLE_HOME ORACLE_SID
+  "$ORACLE_HOME/bin/sqlplus" -S -L "/ as sysdba" <<EOF
+set heading off feedback off pagesize 0 linesize 400 trimspool on
+$sql
+exit
+EOF
+}
+
+emit_live() {
+  local role open_mode protection broker_status collected members='[]' transport_lag=-1 apply_lag=-1 line dest status
+  collected=$(opu_now_utc)
+  role=$(sqlplus_q "select database_role from v\$database;")
+  open_mode=$(sqlplus_q "select open_mode from v\$database;")
+  protection=$(sqlplus_q "select protection_mode from v\$database;" || printf 'UNKNOWN\n')
+  role=$(printf '%s' "$role" | tr -d '\r' | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  open_mode=$(printf '%s' "$open_mode" | tr -d '\r' | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  protection=$(printf '%s' "$protection" | tr -d '\r' | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  broker_status=unavailable
+  if command -v dgmgrl >/dev/null 2>&1 || [ -x "$ORACLE_HOME/bin/dgmgrl" ]; then
+    broker_status=configured
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    dest=$(cut -d'|' -f1 <<<"$line")
+    status=$(cut -d'|' -f2 <<<"$line")
+    transport_lag=$(cut -d'|' -f3 <<<"$line")
+    apply_lag=$(cut -d'|' -f4 <<<"$line")
+    members=$(jq -cn --argjson current "$members" --arg dest "$dest" --arg status "$status" \
+      --argjson transport "$transport_lag" --argjson apply "$apply_lag" \
+      '$current + [{db_unique_name:$dest,status:$status,transport_lag_seconds:$transport,apply_lag_seconds:$apply}]')
+  done < <(sqlplus_q "select db_unique_name||'|'||status||'|'||nvl(to_char(extract(second from to_dsinterval('0 '||nvl(transport_lag,'0 0:0:0.0')))),'-1')||'|'||nvl(to_char(extract(second from to_dsinterval('0 '||nvl(apply_lag,'0 0:0:0.0')))),'-1') from v\$dataguard_stats;" 2>/dev/null || true)
+
+  local tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/opu-dg.XXXXXX")
+  jq -cn --arg collected "$collected" --arg home "$ORACLE_HOME" --arg sid "$ORACLE_SID" \
+    --arg role "$role" --arg open_mode "$open_mode" --arg protection "$protection" \
+    --arg broker "$broker_status" --argjson members "$members" \
+    '{schema_version:"1.0",collector:{name:"oracle.dataguard.observe",version:"1"},collected_at:$collected,target:{oracle_home:$home,oracle_sid:$sid},primary:{database_role:$role,open_mode:$open_mode,protection_mode:$protection},broker:{status:$broker},members:$members}' >"$tmp"
+  local canonical hash
+  canonical=$(jq -cS . "$tmp"); hash=$(opu_hash_string "$canonical")
+  jq --arg hash "$hash" '.record_sha256=$hash' "$tmp" >"${OUT:-/dev/stdout}"
+  [ -n "$OUT" ] && cat "$OUT"
+  rm -f "$tmp"
+}
+
+main() {
+  parse "$@"
+  if [ "$TEST_MODE" = 1 ]; then
+    emit_from_fixture
+  else
+    emit_live
+  fi
+}
+
+main "$@"

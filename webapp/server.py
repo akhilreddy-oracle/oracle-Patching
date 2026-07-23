@@ -15,11 +15,14 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+import os
 
+import auth
 import evidence
 import pipeline_runner
 import pipeline_steps
 import planctl
+import production
 import recoveryctl
 import remote
 
@@ -127,8 +130,25 @@ class Handler(BaseHTTPRequestHandler):
         hosts = load_hosts()
         return hosts.get(host_id)
 
+    def _require_api_auth(self) -> bool:
+        try:
+            auth.require_api_auth(self.headers.get("Authorization"))
+            return True
+        except auth.AuthError as exc:
+            self.send_response(exc.status)
+            self.send_header("WWW-Authenticate", 'Bearer realm="opu-webapp"')
+            body = json.dumps(exc.to_json()).encode("utf-8")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return False
+
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         path = urlparse(self.path).path
+
+        if path.startswith("/api/") and not self._require_api_auth():
+            return
 
         if path == "/api/hosts":
             hosts = load_hosts()
@@ -210,6 +230,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+
+        if path.startswith("/api/") and not self._require_api_auth():
+            return
 
         if path.startswith("/api/hosts/") and "/pipeline/" in path:
             host_id, _, step = path[len("/api/hosts/"):].partition("/pipeline/")
@@ -529,9 +552,32 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    port = 8765
+    port = int(os.environ.get("OPU_WEBAPP_PORT") or "8765")
+    token = auth.ensure_token()
+    production_state = production.status()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"opu webapp listening on http://127.0.0.1:{port}")
+
+    cert = (os.environ.get("OPU_WEBAPP_TLS_CERT") or "").strip()
+    key = (os.environ.get("OPU_WEBAPP_TLS_KEY") or "").strip()
+    scheme = "http"
+    if cert or key:
+        if not cert or not key:
+            raise SystemExit("OPU_WEBAPP_TLS_CERT and OPU_WEBAPP_TLS_KEY must both be set")
+        import ssl
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=cert, keyfile=key)
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+
+    print(f"opu webapp listening on {scheme}://127.0.0.1:{port}")
+    print(f"API token file: {auth.TOKEN_FILE}")
+    print(f"API token (dev): {token}")
+    print(
+        "production mode: "
+        f"{'enabled' if production_state['production_mode'] else 'disabled'}; "
+        f"certified={production_state['certified']}"
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

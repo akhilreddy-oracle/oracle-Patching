@@ -10,6 +10,16 @@
         {"name": "sapproject1", "ssh_alias": "oracle-test-rac"},
         {"name": "sapproject2", "ssh_alias": null}
       ]
+    },
+    {
+      "id": "targetdb",
+      "label": "targetdb (standalone ORCL)",
+      "ssh_alias": "targetdb",
+      "remote_root": "/home/opc/patching-oracle",
+      "sudo": true,
+      "nodes": [
+        {"name": "targetdb", "ssh_alias": "targetdb"}
+      ]
     }
   ]
 }

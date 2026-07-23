@@ -1,4 +1,5 @@
 import { el, badge, classifyStatus, renderErrorBox } from "./dom.js";
+import { apiFetch } from "./api.js";
 import { runToCompletion, RunStartError } from "./runs.js";
 import { getActor } from "./actor.js";
 
@@ -21,7 +22,7 @@ export async function renderRecoveryList(mount) {
     ])
   );
 
-  const res = await fetch("/api/recovery");
+  const res = await apiFetch("/api/recovery");
   const data = await res.json();
   if (!data.requests.length) {
     mount.appendChild(el("p", { class: "empty-state", text: "No recovery preparations yet." }));
@@ -93,7 +94,7 @@ export async function renderRecoveryDetail(mount, requestId) {
 
   async function refresh() {
     body.innerHTML = "";
-    const res = await fetch(`/api/recovery/${encodeURIComponent(requestId)}`);
+    const res = await apiFetch(`/api/recovery/${encodeURIComponent(requestId)}`);
     const data = await res.json();
     if (!res.ok) {
       renderErrorBox(body, data);

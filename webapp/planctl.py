@@ -11,27 +11,44 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
+import tarfile
+import tempfile
 from pathlib import Path
 
 import evidence
+import production
+import remote
 import testmode_fixtures
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLAN_TOOL = REPO_ROOT / "bin" / "opu-patch-plan"
 PLAN_STATE_DIR = Path(__file__).resolve().parent / "var" / "plans"
 TESTMODE_DIR = Path(__file__).resolve().parent / "var" / "testmode"
+HOSTS_FILE = Path(__file__).resolve().parent / "hosts.json"
 DEFAULT_TIMEOUT_SECONDS = 30
+LIVE_EXECUTE_TIMEOUT_SECONDS = 3600
 
 # Matches lib/opu/common.sh opu_validate_identifier.
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
-# Only adapters with a verified TEST_MODE fixture are wired up. Real
-# (non-fixture) execution against a live host is not implemented — every
-# plan runnable through execute_next_task() is a synthetic demo plan.
+# Local TEST_MODE fixture executors.
 EXECUTOR_BY_ADAPTER = {
     "database_single_instance_opatch": REPO_ROOT / "bin" / "opu-database-single-instance-patch",
     "database_single_instance_opatch_rollback": REPO_ROOT / "bin" / "opu-database-single-instance-rollback",
+}
+
+# Live SSH executors (relative to host remote_root). Plan state is synced to the
+# task's node before each execute and pulled back so multi-node RAC/Grid can
+# share controller-mediated state without NFS.
+LIVE_EXECUTOR_BY_ADAPTER = {
+    "database_single_instance_opatch": "bin/opu-database-single-instance-patch",
+    "database_single_instance_opatch_rollback": "bin/opu-database-single-instance-rollback",
+    "database_rolling_opatch": "bin/opu-database-rac-node-patch",
+    "database_rac_opatch_rollback": "bin/opu-database-rac-node-rollback",
+    "grid_rolling_opatch": "bin/opu-grid-node-patch",
+    "grid_rolling_opatch_rollback": "bin/opu-grid-node-rollback",
 }
 
 
@@ -203,29 +220,247 @@ def create_testmode_demo(plan_id: str, requester: str, window_start: str, window
     return _run(args)
 
 
-def _fixture_dir_for_plan(plan: dict, plan_id: str) -> Path:
-    """Resolve and bound the TEST_MODE fixture directory under TESTMODE_DIR."""
+def _fixture_dir_for_plan(plan: dict, plan_id: str) -> Path | None:
+    """Return TEST_MODE fixture dir when the plan targets webapp/var/testmode."""
     oracle_home = (plan.get("target") or {}).get("oracle_home")
     if not oracle_home:
-        raise PlanError(f"plan {plan_id} has no target.oracle_home to locate its TEST_MODE fixture")
+        return None
     fixture_dir = Path(oracle_home).resolve().parent.parent
     root = TESTMODE_DIR.resolve()
     if root not in fixture_dir.parents and fixture_dir != root:
-        raise PlanError(
-            f"plan {plan_id} oracle_home is outside the TEST_MODE fixture root "
-            f"({fixture_dir} not under {root})"
-        )
+        return None
     if not fixture_dir.is_dir():
-        raise PlanError(f"No TEST_MODE fixture found at {fixture_dir} for plan {plan_id}")
+        return None
     return fixture_dir
 
 
+def _short_host(name: str) -> str:
+    return str(name or "").split(".", 1)[0].lower()
+
+
+def _load_hosts() -> dict[str, dict]:
+    data = json.loads(HOSTS_FILE.read_text())
+    return {host["id"]: host for host in data["hosts"]}
+
+
+def _iter_host_nodes() -> list[tuple[dict, dict]]:
+    """Yield (host, node) pairs from hosts.json."""
+    pairs = []
+    for host in _load_hosts().values():
+        nodes = host.get("nodes") or [{"name": host.get("id"), "ssh_alias": host.get("ssh_alias")}]
+        for node in nodes:
+            pairs.append((host, node))
+    return pairs
+
+
+def _resolve_node_host(node_name: str) -> dict:
+    """Map a sealed plan/task node name to a hosts.json entry with ssh_alias."""
+    want = _short_host(node_name)
+    if not want:
+        raise PlanError("task/plan node name is empty")
+    for host, node in _iter_host_nodes():
+        name = _short_host(node.get("name") or "")
+        # Explicit null means "not wired for SSH" (fail closed). Missing key
+        # inherits the host-level ssh_alias.
+        if "ssh_alias" in node:
+            alias = node.get("ssh_alias")
+        else:
+            alias = host.get("ssh_alias")
+        if name == want:
+            if not alias:
+                raise PlanError(
+                    f"hosts.json node {node.get('name')!r} has no ssh_alias; "
+                    "multi-node live execute requires SSH to every plan node"
+                )
+            resolved = dict(host)
+            resolved["ssh_alias"] = alias
+            resolved["node_name"] = name
+            return resolved
+    # Fall back to host id match (standalone estates).
+    for host in _load_hosts().values():
+        if _short_host(host.get("id") or "") == want and host.get("ssh_alias"):
+            resolved = dict(host)
+            resolved["node_name"] = want
+            return resolved
+    raise PlanError(f"No hosts.json SSH mapping for node {node_name!r}")
+
+
+def preflight_live_plan_nodes(plan: dict) -> None:
+    """Refuse live execute unless every sealed plan node has an SSH alias."""
+    nodes = plan.get("nodes") or []
+    if not nodes:
+        raise PlanError("plan has no sealed nodes for live execute")
+    missing = []
+    for node in nodes:
+        try:
+            _resolve_node_host(str(node))
+        except PlanError as exc:
+            missing.append(f"{node}: {exc.message}")
+    if missing:
+        raise PlanError("Live execute preflight failed:\n- " + "\n- ".join(missing))
+
+
+def _task_execution_node(plan: dict, task: dict) -> str:
+    """Pick the hostname the executor must run on for this sealed task."""
+    node = task.get("node")
+    if node and _short_host(node) not in {"", "local", "cluster"}:
+        return str(node)
+    target = plan.get("target") or {}
+    coordinator = target.get("coordinator_node")
+    if coordinator:
+        return str(coordinator)
+    nodes = plan.get("nodes") or []
+    if nodes:
+        return str(nodes[0])
+    raise PlanError(f"task {task.get('task_id')} has no resolvable execution node")
+
+
+def _resolve_live_host_for_task(plan: dict, task: dict) -> dict:
+    preflight_live_plan_nodes(plan)
+    return _resolve_node_host(_task_execution_node(plan, task))
+
+
+def _remote_plan_root(host: dict) -> str:
+    return f"{host['remote_root'].rstrip('/')}/var/webapp-plans"
+
+
+def _sync_plan_to_host(host: dict, plan_id: str) -> str:
+    local_plan = PLAN_STATE_DIR / "plans" / plan_id
+    if not local_plan.is_dir():
+        raise PlanError(f"local plan directory missing for {plan_id}")
+    remote_root = _remote_plan_root(host)
+    remote.run_remote(host["ssh_alias"], ["mkdir", "-p", f"{remote_root}/plans"], timeout=60)
+    with tempfile.NamedTemporaryFile(suffix=".tar") as handle:
+        with tarfile.open(fileobj=handle, mode="w") as archive:
+            archive.add(local_plan, arcname=plan_id)
+        handle.flush()
+        handle.seek(0)
+        remote_tar = f"/tmp/opu-plan-{plan_id}.tar"
+        remote.push_file(host["ssh_alias"], remote_tar, Path(handle.name).read_bytes(), timeout=120)
+    remote.run_remote(
+        host["ssh_alias"],
+        ["tar", "-xf", remote_tar, "-C", f"{remote_root}/plans"],
+        timeout=120,
+    )
+    remote.run_remote(host["ssh_alias"], ["rm", "-f", remote_tar], timeout=30)
+    return remote_root
+
+
+def _sync_plan_from_host(host: dict, plan_id: str, remote_root: str) -> None:
+    remote_tar = f"/tmp/opu-plan-{plan_id}-back.tar"
+    remote.run_remote(
+        host["ssh_alias"],
+        ["tar", "-cf", remote_tar, "-C", f"{remote_root}/plans", plan_id],
+        timeout=120,
+    )
+    # Pull via ssh cat (push_file is upload-only).
+    argv = [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+        host["ssh_alias"], f"cat {shlex.quote(remote_tar)}",
+    ]
+    try:
+        result = subprocess.run(argv, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        raise PlanError(f"timed out pulling plan state from {host['ssh_alias']}") from exc
+    if result.returncode != 0 or not result.stdout:
+        raise PlanError(
+            f"failed to pull plan state from {host['ssh_alias']}",
+            stderr=result.stderr.decode("utf-8", errors="replace"),
+        )
+    local_plans = PLAN_STATE_DIR / "plans"
+    local_plans.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".tar") as handle:
+        handle.write(result.stdout)
+        handle.flush()
+        with tarfile.open(handle.name, mode="r") as archive:
+            archive.extractall(local_plans)
+    remote.run_remote(host["ssh_alias"], ["rm", "-f", remote_tar], timeout=30)
+
+
+def _execute_testmode(plan_id: str, task: dict, actor: str, fixture_dir: Path) -> dict:
+    adapter = task.get("adapter")
+    executor = EXECUTOR_BY_ADAPTER.get(adapter)
+    if executor is None:
+        raise PlanError(f"No TEST_MODE executor is wired up for adapter: {adapter}")
+    fx_env = testmode_fixtures.env_for(fixture_dir)
+    exec_env = os.environ.copy()
+    exec_env["OPU_PLAN_STATE_DIR"] = str(PLAN_STATE_DIR)
+    exec_env.update(fx_env)
+    argv = [
+        str(executor), "execute",
+        "--plan-id", plan_id,
+        "--task-id", task["task_id"],
+        "--actor", actor,
+        "--lease-seconds", "60",
+    ]
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=exec_env)
+    except subprocess.TimeoutExpired:
+        raise PlanError(f"executor for task {task['task_id']} timed out") from None
+    return _parse_executor_result(task["task_id"], result.returncode, result.stdout, result.stderr)
+
+
+def _execute_live(plan_id: str, plan: dict, task: dict, actor: str) -> dict:
+    production.require_live_mutation_allowed()
+    adapter = task.get("adapter")
+    rel_executor = LIVE_EXECUTOR_BY_ADAPTER.get(adapter)
+    if rel_executor is None:
+        raise PlanError(
+            f"Live execute is not wired for adapter {adapter!r}; "
+            "supported adapters: " + ", ".join(sorted(LIVE_EXECUTOR_BY_ADAPTER))
+        )
+    host = _resolve_live_host_for_task(plan, task)
+    remote_root = _sync_plan_to_host(host, plan_id)
+    remote_executor = f"{host['remote_root'].rstrip('/')}/{rel_executor}"
+    remote_argv = [
+        "env", f"OPU_PLAN_STATE_DIR={remote_root}", remote_executor,
+        "execute", "--plan-id", plan_id, "--task-id", task["task_id"],
+        "--actor", actor, "--lease-seconds", "3600",
+    ]
+    try:
+        result = remote.run_remote_raw(
+            host["ssh_alias"],
+            remote_argv,
+            timeout=LIVE_EXECUTE_TIMEOUT_SECONDS,
+            sudo=bool(host.get("sudo")),
+        )
+    except remote.RemoteError as exc:
+        try:
+            _sync_plan_from_host(host, plan_id, remote_root)
+        except Exception:  # noqa: BLE001
+            pass
+        raise PlanError(exc.message, stderr=exc.stderr) from exc
+
+    try:
+        _sync_plan_from_host(host, plan_id, remote_root)
+    except Exception as sync_exc:  # noqa: BLE001
+        raise PlanError(f"remote execute finished but plan state sync failed: {sync_exc}") from sync_exc
+
+    return _parse_executor_result(task["task_id"], result.returncode, result.stdout, result.stderr)
+
+def _parse_executor_result(task_id: str, returncode: int, stdout: str, stderr: str) -> dict:
+    payload = None
+    if stdout.strip():
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise PlanError(
+                f"executor produced unparsable output: {exc}",
+                stderr=stdout[-2000:],
+            ) from exc
+    if returncode != 0:
+        raise PlanError(
+            f"executor for task {task_id} exited {returncode}",
+            stderr=stderr.strip(),
+            result=payload,
+        )
+    if payload is None:
+        raise PlanError(f"executor exited 0 with no output for task {task_id}", stderr=stderr.strip())
+    return payload
+
+
 def execute_next_task(plan_id: str, actor: str) -> dict | None:
-    """Runs the plan's next pending task through its real TEST_MODE fixture
-    executor. Returns None when there is no pending task. Raises PlanError
-    if the plan's adapter has no verified fixture wired up yet, or the
-    fixture directory (created by create_testmode_demo) is missing.
-    """
+    """Run the next pending task via TEST_MODE fixture or live SSH executor."""
     validate_plan_id(plan_id)
     plan = status(plan_id)
     plan_state = plan.get("state")
@@ -238,54 +473,10 @@ def execute_next_task(plan_id: str, actor: str) -> dict | None:
     if task is None:
         return None
 
-    adapter = task.get("adapter")
-    executor = EXECUTOR_BY_ADAPTER.get(adapter)
-    if executor is None:
-        raise PlanError(f"No TEST_MODE executor is wired up for adapter: {adapter}")
-
-    # Fixture is derived from sealed target.oracle_home
-    # (<fixture_dir>/oracle/dbhome_1) and must stay under TESTMODE_DIR.
     fixture_dir = _fixture_dir_for_plan(plan, plan_id)
-    fx_env = testmode_fixtures.env_for(fixture_dir)
-
-    exec_env = os.environ.copy()
-    exec_env["OPU_PLAN_STATE_DIR"] = str(PLAN_STATE_DIR)
-    exec_env.update(fx_env)
-
-    argv = [
-        str(executor), "execute",
-        "--plan-id", plan_id,
-        "--task-id", task["task_id"],
-        "--actor", actor,
-        "--lease-seconds", "60",
-    ]
-    try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=exec_env)
-    except subprocess.TimeoutExpired:
-        raise PlanError(f"executor for task {task['task_id']} timed out") from None
-
-    payload = None
-    if result.stdout.strip():
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise PlanError(
-                f"executor produced unparsable output: {exc}",
-                stderr=result.stdout[-2000:],
-            ) from exc
-
-    if result.returncode != 0:
-        raise PlanError(
-            f"executor for task {task['task_id']} exited {result.returncode}",
-            stderr=result.stderr.strip(),
-            result=payload,
-        )
-    if payload is None:
-        raise PlanError(
-            f"executor exited 0 with no output for task {task['task_id']}",
-            stderr=result.stderr.strip(),
-        )
-    return payload
+    if fixture_dir is not None:
+        return _execute_testmode(plan_id, task, actor, fixture_dir)
+    return _execute_live(plan_id, plan, task, actor)
 
 
 def list_plans() -> list[dict]:

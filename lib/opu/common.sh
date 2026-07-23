@@ -222,3 +222,24 @@ opu_operation_error() {
     # shellcheck disable=SC2034 # read by bin/opu-agent after calling this function
     OPU_ERROR_RETRYABLE=${3:-false}
 }
+
+# S13 starter gate: when OPU_PRODUCTION_MODE is enabled, mutation authority
+# requires an explicit local certification marker. Lab/default builds leave
+# production mode off and are unaffected.
+opu_require_production_certified() {
+    local mode cert
+    mode=${OPU_PRODUCTION_MODE:-0}
+    case "$mode" in
+        1|true|yes|on) ;;
+        *) return 0 ;;
+    esac
+    cert=${OPU_PRODUCTION_CERT_FILE:-/etc/oracle-patching/production.cert}
+    [ -f "$cert" ] && [ ! -L "$cert" ] || {
+        opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is missing: $cert"
+        return 77
+    }
+    grep -Fq 'OPU_PRODUCTION_CERTIFIED=1' "$cert" || {
+        opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is invalid: $cert"
+        return 77
+    }
+}

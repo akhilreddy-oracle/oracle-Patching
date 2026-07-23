@@ -43,4 +43,16 @@ set -e
 [ "$missing_fra_rc" -eq 2 ]
 jq -e '.status == "blocked" and any(.gates[]; .name == "recovery_fra" and .status == "blocker")' "$TMP/standalone-missing-fra-result.json" >/dev/null
 
+# Data Guard standby roles must fail closed until S11 exists.
+jq '.databases[0].runtime.database_role = "PHYSICAL STANDBY"' "$TMP/standalone.json" >"$TMP/standalone-standby.json"
+standby_sha=$(sha256sum "$TMP/standalone-standby.json" | awk '{print $1}')
+jq -n --arg snapshot "$TMP/standalone-standby.json" --arg sha "$standby_sha" \
+  '{schema_version:"1.0",status:"consistent",expected_nodes:["standalone"],snapshot_evidence:[{path:$snapshot,sha256:$sha}]}' >"$TMP/standalone-standby-reconciliation.json"
+set +e
+"$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/standalone-standby-reconciliation.json" --snapshot "$TMP/standalone-standby.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/policy.json" --output "$TMP/standalone-standby-result.json" >/dev/null
+standby_rc=$?
+set -e
+[ "$standby_rc" -eq 2 ]
+jq -e '.status == "blocked" and any(.gates[]; .name == "dataguard_unsupported" and .status == "blocker")' "$TMP/standalone-standby-result.json" >/dev/null
+
 printf '%s\n' 'readiness evaluation test passed'
