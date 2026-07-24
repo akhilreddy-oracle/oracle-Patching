@@ -287,6 +287,7 @@ async function renderPlan(body, planId, plan, refresh) {
 
   if (plan.state === "awaiting_approval") {
     controls.appendChild(el("h2", { text: "Approve" }));
+    await appendItsmBanner(controls);
     const actor = el("input", { type: "text", value: getActor() });
     const ticket = el("input", { type: "text", placeholder: "approval ticket / change #" });
     const btn = el("button", { type: "button", text: "Approve" });
@@ -365,6 +366,24 @@ async function taskTable(planId) {
       )
     ),
   ]);
+}
+
+async function appendItsmBanner(controls) {
+  try {
+    const res = await apiFetch("/api/itsm/tickets");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.enabled) return;
+    const approved = (data.tickets || []).filter((t) => t.state === "approved").map((t) => t.ticket);
+    controls.appendChild(
+      el("p", { class: "estate-card-error" }, [
+        document.createTextNode("ITSM enforcement is ON — the ticket below must be an approved change ticket. Approved tickets: "),
+        el("strong", { text: approved.length ? approved.join(", ") : "none" }),
+      ])
+    );
+  } catch {
+    // Banner is informational only; approval is still gated server-side.
+  }
 }
 
 async function runAction(logBox, btn, url, body, refresh) {

@@ -258,15 +258,24 @@ verify_inputs() {
   rhash=$(opu_hash_file "$reconciliation"); ahash=$(opu_hash_file "$artifact"); phash=$(opu_hash_file "$procedure"); xhash=$(opu_hash_file "$compatibility"); yhash=$(opu_hash_file "$policy")
   jq -e --arg r "$rhash" --arg a "$ahash" --arg p "$phash" --arg x "$xhash" --arg y "$yhash" '.evidence.reconciliation_sha256 == $r and .evidence.artifact_manifest_sha256 == $a and .evidence.procedure_validation_sha256 == $p and .evidence.compatibility_sha256 == $x and .evidence.policy_sha256 == $y' "$readiness" >/dev/null || { opu_error 'readiness evidence hashes do not match supplied documents'; return 65; }
   verify_readiness_current "$readiness" "$reconciliation" "$policy" "$(date -u +%s)" || return
-  jq -e --arg patch "$(jq -r '.patch_id' "$readiness")" --arg artifact_sha "$(jq -r '.artifact.sha256' "$artifact")" --arg family "$(jq -r '.target.family' "$readiness")" '.procedure.patch_id == $patch and .procedure.artifact_sha256 == $artifact_sha and .procedure.target.family == $family and (.procedure.execution.adapter | IN("grid_rolling_opatch","grid_rolling_opatchauto","database_rolling_opatch","database_single_instance_opatch")) and (.procedure.execution.operations | type == "array" and length > 0)' "$procedure" >/dev/null || { opu_error 'readiness, artifact, and procedure target do not agree'; return 65; }
+  if jq -e '.procedure.target.method == "fpp"' "$procedure" >/dev/null; then
+    opu_error 'FPP (Fleet Patching and Provisioning) plans are rejected: this build has no rhpctl/FPP-server adapter. See docs/FUTURE_ADAPTERS.md'
+    return 65
+  fi
+  jq -e --arg patch "$(jq -r '.patch_id' "$readiness")" --arg artifact_sha "$(jq -r '.artifact.sha256' "$artifact")" --arg family "$(jq -r '.target.family' "$readiness")" '.procedure.patch_id == $patch and .procedure.artifact_sha256 == $artifact_sha and .procedure.target.family == $family and (.procedure.execution.adapter | IN("grid_rolling_opatch","grid_rolling_opatchauto","database_rolling_opatch","database_single_instance_opatch","database_ojvm_opatch","database_out_of_place_switch")) and (.procedure.execution.operations | type == "array" and length > 0)' "$procedure" >/dev/null || { opu_error 'readiness, artifact, and procedure target do not agree'; return 65; }
   adapter=$(jq -r '.procedure.execution.adapter' "$procedure")
   case "$adapter" in
     grid_rolling_opatch)
       jq -e '.procedure.target.method == "opatch" and .procedure.execution.operations == ["grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch"]' "$procedure" >/dev/null || { opu_error 'manual Grid rolling plans require the exact sealed rootcrs/OPatch procedure'; return 65; }
       ;;
     grid_rolling_opatchauto)
-      opu_error 'Grid OPatchAuto planning is disabled until its sealed local executor and evidence contract are implemented'
-      return 65
+      jq -e '.procedure.target.method == "opatchauto" and .procedure.execution.operations == ["grid_opatchauto_apply"]' "$procedure" >/dev/null || { opu_error 'Grid OPatchAuto rolling plans require the exact sealed opatchauto procedure'; return 65; }
+      ;;
+    database_ojvm_opatch)
+      jq -e '.procedure.target.method == "opatch" and .procedure.target.topology == "single_instance" and .procedure.execution.operations == ["database_shutdown","database_opatch_apply","database_startup_upgrade","database_datapatch_upgrade"]' "$procedure" >/dev/null || { opu_error 'OJVM database plans require the exact sealed full-shutdown upgrade-mode procedure'; return 65; }
+      ;;
+    database_out_of_place_switch)
+      jq -e '.procedure.target.method == "switch_home" and .procedure.target.topology == "single_instance" and .procedure.execution.operations == ["database_home_clone","database_opatch_apply_clone","database_home_switch","database_datapatch"]' "$procedure" >/dev/null || { opu_error 'out-of-place database plans require the exact sealed clone/switch procedure'; return 65; }
       ;;
     database_rolling_opatch)
       jq -e '.procedure.target.method == "opatch" and .procedure.target.topology == "rac" and .procedure.execution.operations == ["database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch"]' "$procedure" >/dev/null || { opu_error 'RAC database rolling procedure operations are not the fixed allowlist'; return 65; }
@@ -281,8 +290,8 @@ verify_inputs() {
   normalized_total=$(jq -r '.expected_nodes[]' "$reconciliation" | awk '{value=tolower($0); sub(/\..*/,"",value); print value}' | wc -l | tr -d ' ')
   normalized_unique=$(jq -r '.expected_nodes[]' "$reconciliation" | awk '{value=tolower($0); sub(/\..*/,"",value); print value}' | sort -u | wc -l | tr -d ' ')
   [ "$normalized_total" -eq "$normalized_unique" ] || { opu_error 'reconciliation nodes collide after local short-host normalization'; return 65; }
-  if [ "$adapter" = database_single_instance_opatch ] || [ "$adapter" = database_rolling_opatch ]; then
-    if [ "$adapter" = database_single_instance_opatch ]; then
+  if [ "$adapter" = database_single_instance_opatch ] || [ "$adapter" = database_ojvm_opatch ] || [ "$adapter" = database_out_of_place_switch ] || [ "$adapter" = database_rolling_opatch ]; then
+    if [ "$adapter" != database_rolling_opatch ]; then
       TARGET_TOPOLOGY=single_instance
       [ -n "$recovery" ] || { opu_error 'standalone database plans require --recovery-evidence'; return 65; }
     else
@@ -701,6 +710,101 @@ create_grid_rollback_plan() {
   cat "$dir/plan.json"
 }
 
+create_grid_opatchauto_rollback_plan() {
+  local id=$1 requester=$2 source_id=$3 start=$4 end=$5 source_dir=$6 source_plan=$7
+  local source_plan_sha source_plan_file_sha source_task source_task_id source_actor source_stage source_node expected_outcome
+  local lineage='[]' lineage_sha apply_nodes rollback_nodes source_actors procedure_file artifact_dir recovery_file recovery_record
+  local task_count=0 node_name stage_name count coordinator cluster_final_sha cluster_final_record dir canonical hash
+  jq -e '(.intent // "patch_apply") == "patch_apply" and .procedure.adapter == "grid_rolling_opatchauto" and
+    .target.family == "grid" and .target.method == "opatchauto" and
+    (.nodes | type == "array" and length > 1 and length == (unique | length)) and
+    .procedure.rollback.mode == "opatch_rollback" and (.recovery.manifest_path | type == "string" and startswith("/"))' \
+    "$source_plan" >/dev/null || { opu_error 'source plan is not a rollback-capable Grid OPatchAuto apply plan'; return 65; }
+  verify_bound_source_documents "$source_plan" || return
+  source_plan_sha=$(jq -r '.plan_sha256' "$source_plan")
+  source_plan_file_sha=$(opu_hash_file "$source_plan")
+  apply_nodes=$(jq -c '.nodes' "$source_plan")
+  rollback_nodes=$(jq -c '.nodes | reverse' "$source_plan")
+  coordinator=$(jq -r '.target.coordinator_node' "$source_plan")
+  while IFS= read -r source_task; do
+    [ -n "$source_task" ] || continue
+    verify_source_task_custody "$source_task" || return
+    jq -e '.adapter == "grid_rolling_opatchauto"' "$source_task" >/dev/null || {
+      opu_error "source apply task uses another adapter: $source_task"; return 65;
+    }
+    source_task_id=$(jq -r '.task_id' "$source_task")
+    source_actor=$(jq -r '.claimed_by // empty' "$source_task")
+    source_stage=$(jq -r '.stage' "$source_task")
+    source_node=$(jq -r '.node' "$source_task")
+    opu_validate_identifier "$source_actor" source-apply-actor || return
+    case "$source_stage" in
+      opatchauto_precheck) expected_outcome=no_mutation ;;
+      opatchauto_apply|opatchauto_resume_check|opatchauto_node_validate|opatchauto_cluster_final_validate) expected_outcome=binary_state_known ;;
+      *) opu_error "source Grid OPatchAuto apply contains an unsupported stage: $source_stage"; return 65 ;;
+    esac
+    jq -e --arg plan "$source_id" --arg task "$source_task_id" --arg actor "$source_actor" \
+      --arg plan_sha "$source_plan_sha" --arg stage "$source_stage" --arg node "$source_node" --arg outcome "$expected_outcome" \
+      --arg grid_target "$(jq -r '.target.grid_home' "$source_plan")" --arg owner "$(jq -r '.target.owner' "$source_plan")" \
+      --arg coordinator "$coordinator" --arg patch "$(jq -r '.patch_id' "$source_plan")" --arg artifact "$(jq -r '.artifact.sha256' "$source_plan")" \
+      --arg recovery "$(jq -r '.recovery.manifest_sha256' "$source_plan")" --arg recovery_record "$(jq -r '.recovery.record_sha256' "$source_plan")" '
+        .schema_version == "1.0" and .collector.name == "oracle.grid.opatchauto.executor" and .collector.version == "1" and
+        .intent == "patch_apply" and .plan_id == $plan and .task_id == $task and .plan_sha256 == $plan_sha and
+        .actor == $actor and .stage == $stage and .status == "succeeded" and .postcondition.status == "passed" and
+        .exit_code == 0 and .outcome_class == $outcome and .target.node == $node and
+        .target.grid_home == $grid_target and .target.owner == $owner and .target.coordinator_node == $coordinator and
+        .patch.patch_id == $patch and .patch.artifact_sha256 == $artifact and
+        .recovery.manifest_sha256 == $recovery and .recovery.record_sha256 == $recovery_record
+      ' "$SOURCE_TASK_EVIDENCE" >/dev/null || { opu_error "source Grid OPatchAuto apply evidence is not eligible for rollback: $source_task_id"; return 65; }
+    lineage=$(jq -cn --argjson current "$lineage" --arg task "$source_task_id" --arg stage "$source_stage" --arg node "$source_node" \
+      --arg actor "$source_actor" --arg result "$(jq -r '.task_result_sha256' "$source_task")" \
+      --arg evidence "$SOURCE_TASK_EVIDENCE_SHA" --arg evidence_record "$SOURCE_TASK_EVIDENCE_RECORD" \
+      --arg custody "$SOURCE_TASK_CUSTODY_SHA" --arg custody_record "$SOURCE_TASK_CUSTODY_RECORD" \
+      '$current + [{task_id:$task,stage:$stage,node:$node,actor:$actor,task_result_sha256:$result,evidence_sha256:$evidence,evidence_record_sha256:$evidence_record,custody_manifest_sha256:$custody,custody_record_sha256:$custody_record}]') || return 74
+    task_count=$((task_count + 1))
+    if [ "$source_stage" = opatchauto_cluster_final_validate ]; then cluster_final_sha=$SOURCE_TASK_EVIDENCE_SHA; cluster_final_record=$SOURCE_TASK_EVIDENCE_RECORD; fi
+  done < <(find "$source_dir/tasks" -maxdepth 1 -type f -name '*.json' -print | sort)
+  [ "$task_count" -eq "$(( $(jq -r 'length' <<<"$apply_nodes") * 4 + 1 ))" ] || {
+    opu_error 'source Grid OPatchAuto apply does not contain the exact expected task count'; return 65;
+  }
+  while IFS= read -r node_name; do
+    for stage_name in opatchauto_precheck opatchauto_apply opatchauto_resume_check opatchauto_node_validate; do
+      count=$(jq -r --arg node "$node_name" --arg stage "$stage_name" '[.[] | select(.node == $node and .stage == $stage)] | length' <<<"$lineage")
+      [ "$count" -eq 1 ] || { opu_error "source Grid OPatchAuto apply must have one $stage_name task for $node_name"; return 65; }
+    done
+  done < <(jq -r '.[]' <<<"$apply_nodes")
+  count=$(jq -r --arg node "$coordinator" --arg stage opatchauto_cluster_final_validate '[.[] | select(.node == $node and .stage == $stage)] | length' <<<"$lineage")
+  [ "$count" -eq 1 ] || { opu_error 'source Grid OPatchAuto apply must have one opatchauto_cluster_final_validate task on the coordinator'; return 65; }
+  procedure_file=$(jq -r '.source_documents.procedure_validation.path' "$source_plan")
+  artifact_dir=$(jq -r '.artifact.path' "$source_plan")
+  select_rollback_readme "$artifact_dir" "$procedure_file" || return
+  LC_ALL=C grep -aiE "opatchauto[[:space:]]+rollback[[:space:]]+[^[:cntrl:]]*$(jq -r '.patch_id' "$source_plan")([^0-9]|$)" "$ROLLBACK_README_PATH" >/dev/null || { opu_error 'sealed patch README lacks the fixed OPatchAuto rollback command'; return 65; }
+  recovery_file=$(jq -r '.recovery.manifest_path' "$source_plan"); require_file "$recovery_file" recovery-evidence || return
+  [ "$(opu_hash_file "$recovery_file")" = "$(jq -r '.recovery.manifest_sha256' "$source_plan")" ] || { opu_error 'source recovery evidence changed'; return 74; }
+  recovery_record=$(jq -r '.record_sha256 // empty' "$recovery_file"); canonical=$(jq -cS 'del(.record_sha256)' "$recovery_file")
+  [ "$recovery_record" = "$(jq -r '.recovery.record_sha256' "$source_plan")" ] && [ "$recovery_record" = "$(opu_hash_string "$canonical")" ] || { opu_error 'source recovery evidence record integrity failed'; return 74; }
+  lineage=$(jq -cS . <<<"$lineage"); lineage_sha=$(opu_hash_string "$lineage")
+  source_actors=$(jq -c '[.[].actor] | unique | sort' <<<"$lineage")
+  dir=$(plan_dir "$id"); mkdir "$dir" 2>/dev/null || { opu_error "plan already exists: $id"; return 65; }
+  jq -cn --arg id "$id" --arg requester "$requester" --arg window_start "$start" --arg window_end "$end" \
+    --arg source_plan_path "$source_plan" --arg source_plan_file_sha "$source_plan_file_sha" --arg source_plan_sha "$source_plan_sha" \
+    --arg lineage_sha "$lineage_sha" --arg cluster_final_sha "$cluster_final_sha" --arg cluster_final_record "$cluster_final_record" \
+    --arg readme_path "$ROLLBACK_README_PATH" --arg readme_sha "$ROLLBACK_README_SHA" \
+    --argjson apply_nodes "$apply_nodes" --argjson rollback_nodes "$rollback_nodes" --argjson lineage "$lineage" --argjson source_actors "$source_actors" \
+    --slurpfile source "$source_plan" '
+      {schema_version:"1.0",intent:"patch_rollback",plan_id:$id,requester:$requester,
+       maintenance_window:{start:$window_start,end:$window_end},target:$source[0].target,patch_id:$source[0].patch_id,nodes:$rollback_nodes,
+       artifact:$source[0].artifact,
+       procedure:{adapter:"grid_rolling_opatchauto_rollback",operations:["grid_opatchauto_rollback"],method:"opatchauto",platform_id:$source[0].procedure.platform_id,required_opatch_version:$source[0].procedure.required_opatch_version,rollback:$source[0].procedure.rollback},
+       rollback_procedure:{oracle_reference_path:$readme_path,oracle_reference_sha256:$readme_sha,expected_binary_before:"installed",expected_binary_after:"absent",required_opatch_version:$source[0].procedure.required_opatch_version},
+       source_apply:{plan_path:$source_plan_path,plan_file_sha256:$source_plan_file_sha,plan_sha256:$source_plan_sha,apply_nodes:$apply_nodes,actors:$source_actors,lineage:$lineage,lineage_sha256:$lineage_sha,cluster_final_evidence_sha256:$cluster_final_sha,cluster_final_evidence_record_sha256:$cluster_final_record},
+       source_documents:$source[0].source_documents,snapshot_evidence:$source[0].snapshot_evidence,evidence:$source[0].evidence,recovery:$source[0].recovery}' >"$dir/plan.json.tmp" || return 74
+  canonical=$(jq -cS . "$dir/plan.json.tmp") || return 74; hash=$(opu_hash_string "$canonical") || return
+  jq --arg hash "$hash" '. + {plan_sha256:$hash}' "$dir/plan.json.tmp" >"$dir/plan.json" || return 74
+  rm -f "$dir/plan.json.tmp"; printf 'awaiting_approval\n' >"$dir/state"
+  event "$id" rollback_plan_created awaiting_approval "$requester" "source_plan_id=$source_id adapter=grid_rolling_opatchauto_rollback plan_sha256=$hash"
+  cat "$dir/plan.json"
+}
+
 create_rollback() {
   local id="" requester="" source_id="" start="" end="" start_epoch end_epoch source_dir source_plan source_state source_plan_sha source_plan_file_sha
   local source_task="" source_task_id source_actor source_evidence source_evidence_sha source_evidence_record procedure_file artifact_dir recovery_file dir canonical hash task_count
@@ -733,15 +837,36 @@ create_rollback() {
     create_grid_rollback_plan "$id" "$requester" "$source_id" "$start" "$end" "$source_dir" "$source_plan"
     return
   fi
-  jq -e '(.intent // "patch_apply") == "patch_apply" and .procedure.adapter == "database_single_instance_opatch" and .target.family == "database" and .target.method == "opatch" and (.nodes | length == 1) and .procedure.rollback.mode == "opatch_rollback" and (.recovery.manifest_path | type == "string" and startswith("/"))' "$source_plan" >/dev/null || { opu_error 'source plan is not a rollback-capable standalone database apply plan'; return 65; }
+  if [ "$(jq -r '.procedure.adapter // empty' "$source_plan")" = grid_rolling_opatchauto ]; then
+    create_grid_opatchauto_rollback_plan "$id" "$requester" "$source_id" "$start" "$end" "$source_dir" "$source_plan"
+    return
+  fi
+  local source_adapter final_stage rollback_adapter rollback_operations rollback_method source_method rollback_mode
+  source_adapter=$(jq -r '.procedure.adapter // empty' "$source_plan")
+  case "$source_adapter" in
+    database_single_instance_opatch)
+      final_stage=final_validate; rollback_adapter=database_single_instance_opatch_rollback; source_method=opatch; rollback_method=opatch; rollback_mode=opatch_rollback
+      rollback_operations='["rollback_precheck","rollback_binary","rollback_binary_validate","rollback_datapatch","rollback_final_validate"]'
+      ;;
+    database_ojvm_opatch)
+      final_stage=ojvm_final_validate; rollback_adapter=database_ojvm_opatch_rollback; source_method=opatch; rollback_method=opatch; rollback_mode=opatch_rollback
+      rollback_operations='["ojvm_rollback_precheck","ojvm_rollback_stop_all","ojvm_rollback_binary","ojvm_rollback_start_upgrade","ojvm_rollback_datapatch","ojvm_rollback_restart_normal","ojvm_rollback_final_validate"]'
+      ;;
+    database_out_of_place_switch)
+      final_stage=oop_final_validate; rollback_adapter=database_out_of_place_switchback; source_method=switch_home; rollback_method=switch_home; rollback_mode=home_switch_back
+      rollback_operations='["oop_switchback_precheck","oop_switch_back","oop_switchback_datapatch","oop_switchback_final_validate"]'
+      ;;
+    *) opu_error 'source plan is not a rollback-capable apply plan'; return 65 ;;
+  esac
+  jq -e --arg adapter "$source_adapter" --arg method "$source_method" --arg mode "$rollback_mode" '(.intent // "patch_apply") == "patch_apply" and .procedure.adapter == $adapter and .target.family == "database" and .target.method == $method and (.nodes | length == 1) and .procedure.rollback.mode == $mode and (.recovery.manifest_path | type == "string" and startswith("/"))' "$source_plan" >/dev/null || { opu_error 'source plan is not a rollback-capable standalone database apply plan'; return 65; }
   verify_bound_source_documents "$source_plan" || return
   task_count=0
   for source_task in "$source_dir"/tasks/*.json; do
     [ -e "$source_task" ] || continue
     verify_task "$source_task" || return
-    if jq -e '.stage == "final_validate" and .status == "succeeded"' "$source_task" >/dev/null; then task_count=$((task_count + 1)); [ "$task_count" -eq 1 ] || continue; SOURCE_FINAL_TASK=$source_task; fi
+    if jq -e --arg stage "$final_stage" '.stage == $stage and .status == "succeeded"' "$source_task" >/dev/null; then task_count=$((task_count + 1)); [ "$task_count" -eq 1 ] || continue; SOURCE_FINAL_TASK=$source_task; fi
   done
-  [ "$task_count" -eq 1 ] || { opu_error "source apply plan must have exactly one succeeded final_validate task, found $task_count"; return 65; }
+  [ "$task_count" -eq 1 ] || { opu_error "source apply plan must have exactly one succeeded $final_stage task, found $task_count"; return 65; }
   source_task=$SOURCE_FINAL_TASK; source_task_id=$(jq -r '.task_id' "$source_task"); source_actor=$(jq -r '.claimed_by // empty' "$source_task"); source_evidence=$(jq -r '.evidence_path // empty' "$source_task")
   opu_validate_identifier "$source_actor" source-apply-actor || return
   require_file "$source_evidence" source-apply-final-evidence || return
@@ -751,7 +876,9 @@ create_rollback() {
   jq -e '.intent == "patch_apply" and .outcome_class == "binary_state_known"' "$source_evidence" >/dev/null || { opu_error 'source apply final evidence lacks a known binary outcome'; return 65; }
   procedure_file=$(jq -r '.source_documents.procedure_validation.path' "$source_plan"); artifact_dir=$(jq -r '.artifact.path' "$source_plan")
   select_rollback_readme "$artifact_dir" "$procedure_file" || return
-  LC_ALL=C grep -aE "opatch[[:space:]]+rollback[[:space:]]+-id[[:space:]]+$(jq -r '.patch_id' "$source_plan")([^0-9]|$)" "$ROLLBACK_README_PATH" >/dev/null || { opu_error 'sealed patch README does not contain the fixed OPatch rollback command'; return 65; }
+  if [ "$source_adapter" != database_out_of_place_switch ]; then
+    LC_ALL=C grep -aE "opatch[[:space:]]+rollback[[:space:]]+-id[[:space:]]+$(jq -r '.patch_id' "$source_plan")([^0-9]|$)" "$ROLLBACK_README_PATH" >/dev/null || { opu_error 'sealed patch README does not contain the fixed OPatch rollback command'; return 65; }
+  fi
   LC_ALL=C grep -aE 'datapatch[[:space:]]+-verbose' "$ROLLBACK_README_PATH" >/dev/null || { opu_error 'sealed patch README does not contain the rollback datapatch command'; return 65; }
   recovery_file=$(jq -r '.recovery.manifest_path' "$source_plan"); require_file "$recovery_file" recovery-evidence || return
   [ "$(opu_hash_file "$recovery_file")" = "$(jq -r '.recovery.manifest_sha256' "$source_plan")" ] || { opu_error 'source recovery evidence changed'; return 74; }
@@ -763,8 +890,9 @@ create_rollback() {
     --arg source_evidence_path "$source_evidence" --arg source_evidence_sha "$source_evidence_sha" --arg source_evidence_record "$source_evidence_record" \
     --arg source_actor "$source_actor" \
     --arg readme_path "$ROLLBACK_README_PATH" --arg readme_sha "$ROLLBACK_README_SHA" \
+    --arg rollback_adapter "$rollback_adapter" --arg rollback_method "$rollback_method" --argjson rollback_operations "$rollback_operations" \
     --slurpfile source "$source_plan" \
-    '{schema_version:"1.0",intent:"patch_rollback",plan_id:$id,requester:$requester,maintenance_window:{start:$window_start,end:$window_end},target:$source[0].target,patch_id:$source[0].patch_id,nodes:$source[0].nodes,artifact:$source[0].artifact,procedure:{adapter:"database_single_instance_opatch_rollback",operations:["rollback_precheck","rollback_binary","rollback_binary_validate","rollback_datapatch","rollback_final_validate"],method:"opatch",platform_id:$source[0].procedure.platform_id,required_opatch_version:$source[0].procedure.required_opatch_version,rollback:$source[0].procedure.rollback},rollback_procedure:{oracle_reference_path:$readme_path,oracle_reference_sha256:$readme_sha,expected_binary_before:"installed",expected_binary_after:"absent",expected_sql_action_before:"APPLY",expected_sql_action_after:"ROLLBACK",required_opatch_version:$source[0].procedure.required_opatch_version},source_apply:{plan_path:$source_plan_path,plan_file_sha256:$source_plan_file_sha,plan_sha256:$source_plan_sha,final_evidence_path:$source_evidence_path,final_evidence_sha256:$source_evidence_sha,final_evidence_record_sha256:$source_evidence_record,actors:[$source_actor]},source_documents:$source[0].source_documents,snapshot_evidence:$source[0].snapshot_evidence,evidence:$source[0].evidence,recovery:$source[0].recovery}' >"$dir/plan.json.tmp" || return 74
+    '{schema_version:"1.0",intent:"patch_rollback",plan_id:$id,requester:$requester,maintenance_window:{start:$window_start,end:$window_end},target:$source[0].target,patch_id:$source[0].patch_id,nodes:$source[0].nodes,artifact:$source[0].artifact,procedure:{adapter:$rollback_adapter,operations:$rollback_operations,method:$rollback_method,platform_id:$source[0].procedure.platform_id,required_opatch_version:$source[0].procedure.required_opatch_version,rollback:$source[0].procedure.rollback},rollback_procedure:{oracle_reference_path:$readme_path,oracle_reference_sha256:$readme_sha,expected_binary_before:"installed",expected_binary_after:"absent",expected_sql_action_before:"APPLY",expected_sql_action_after:"ROLLBACK",required_opatch_version:$source[0].procedure.required_opatch_version},source_apply:{plan_path:$source_plan_path,plan_file_sha256:$source_plan_file_sha,plan_sha256:$source_plan_sha,final_evidence_path:$source_evidence_path,final_evidence_sha256:$source_evidence_sha,final_evidence_record_sha256:$source_evidence_record,actors:[$source_actor]},source_documents:$source[0].source_documents,snapshot_evidence:$source[0].snapshot_evidence,evidence:$source[0].evidence,recovery:$source[0].recovery}' >"$dir/plan.json.tmp" || return 74
   canonical=$(jq -cS . "$dir/plan.json.tmp") || return 74; hash=$(opu_hash_string "$canonical") || return
   jq --arg hash "$hash" '. + {plan_sha256:$hash}' "$dir/plan.json.tmp" >"$dir/plan.json" || return 74
   rm -f "$dir/plan.json.tmp"; printf 'awaiting_approval\n' >"$dir/state"
@@ -780,7 +908,7 @@ approve() (
   dir=$(plan_dir "$id"); plan="$dir/plan.json"; requester=$(jq -r '.requester' "$plan"); plan_sha=$(jq -r '.plan_sha256' "$plan")
   verify_apply_plan_readiness_current "$plan" || exit $?
   [ "$actor" != "$requester" ] || { opu_error 'requester cannot approve their own plan'; exit 77; }
-  if jq -e '.procedure.adapter | IN("database_rac_opatch_rollback","database_single_instance_opatch_rollback","grid_rolling_opatch_rollback")' "$plan" >/dev/null; then
+  if jq -e '.procedure.adapter | IN("database_rac_opatch_rollback","database_single_instance_opatch_rollback","grid_rolling_opatch_rollback","grid_rolling_opatchauto_rollback","database_ojvm_opatch_rollback","database_out_of_place_switchback")' "$plan" >/dev/null; then
     jq -e --arg actor "$actor" '((.source_apply.actors // []) | index($actor)) == null' "$plan" >/dev/null || {
       opu_error 'rollback approver must differ from every source apply worker'; exit 77;
     }
@@ -806,7 +934,7 @@ authorize() (
   verify_sealed_record "$approval" approval || exit $?
   jq -e --arg plan "$id" --arg plan_sha "$plan_sha" --arg requester "$requester" '.decision == "approved" and .plan_id == $plan and .plan_sha256 == $plan_sha and .requester == $requester' "$approval" >/dev/null || { opu_error 'sealed approval does not bind this plan'; exit 74; }
   approver=$(jq -r '.actor' "$approval"); [ "$actor" != "$requester" ] && [ "$actor" != "$approver" ] || { opu_error 'operator must differ from requester and approver'; exit 77; }
-  if jq -e '.procedure.adapter | IN("database_rac_opatch_rollback","database_single_instance_opatch_rollback","grid_rolling_opatch_rollback")' "$plan" >/dev/null; then
+  if jq -e '.procedure.adapter | IN("database_rac_opatch_rollback","database_single_instance_opatch_rollback","grid_rolling_opatch_rollback","grid_rolling_opatchauto_rollback","database_ojvm_opatch_rollback","database_out_of_place_switchback")' "$plan" >/dev/null; then
     jq -e --arg actor "$actor" '((.source_apply.actors // []) | index($actor)) == null' "$plan" >/dev/null || {
       opu_error 'rollback operator must differ from every source apply worker'; exit 77;
     }
@@ -888,6 +1016,58 @@ dispatch() (
     done < <(jq -r '.nodes[]' "$plan")
     node=$(jq -r '.target.coordinator_node' "$plan")
     index=$((index+1)); task=$(printf '%03d-grid-cluster-final-validate-%s' "$index" "$node"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" grid_cluster_final_validate "$node" "$adapter" || return
+  elif [ "$adapter" = grid_rolling_opatchauto ]; then
+    while IFS= read -r node; do
+      for stage in opatchauto_precheck opatchauto_apply opatchauto_resume_check opatchauto_node_validate; do
+        index=$((index+1)); task=$(printf '%03d-%s-%s' "$index" "${stage//_/-}" "$node"); file="$tasks_tmp/$task.json"
+        write_task "$file" "$task" "$id" "$plan_sha" "$stage" "$node" "$adapter" || return
+      done
+    done < <(jq -r '.nodes[]' "$plan")
+    node=$(jq -r '.target.coordinator_node' "$plan")
+    index=$((index+1)); task=$(printf '%03d-opatchauto-cluster-final-validate-%s' "$index" "$node"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" opatchauto_cluster_final_validate "$node" "$adapter" || return
+  elif [ "$adapter" = grid_rolling_opatchauto_rollback ]; then
+    while IFS= read -r node; do
+      for stage in opatchauto_rollback_precheck opatchauto_rollback opatchauto_rollback_node_validate; do
+        index=$((index+1)); task=$(printf '%03d-%s-%s' "$index" "${stage//_/-}" "$node"); file="$tasks_tmp/$task.json"
+        write_task "$file" "$task" "$id" "$plan_sha" "$stage" "$node" "$adapter" || return
+      done
+    done < <(jq -r '.nodes[]' "$plan")
+    node=$(jq -r '.target.coordinator_node' "$plan")
+    index=$((index+1)); task=$(printf '%03d-opatchauto-rollback-cluster-final-validate-%s' "$index" "$node"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" opatchauto_rollback_cluster_final_validate "$node" "$adapter" || return
+  elif [ "$adapter" = database_ojvm_opatch ]; then
+    node=$(jq -r '.nodes[0]' "$plan")
+    for stage in ojvm_precheck ojvm_stop_all ojvm_binary_apply ojvm_start_upgrade; do
+      index=$((index+1)); task=$(printf '%03d-%s-%s' "$index" "${stage//_/-}" "$node"); file="$tasks_tmp/$task.json"
+      write_task "$file" "$task" "$id" "$plan_sha" "$stage" "$node" "$adapter" || return
+    done
+    index=$((index+1)); task=$(printf '%03d-ojvm-datapatch-upgrade-local' "$index"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" ojvm_datapatch_upgrade local "$adapter" || return
+    index=$((index+1)); task=$(printf '%03d-ojvm-restart-normal-%s' "$index" "$node"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" ojvm_restart_normal "$node" "$adapter" || return
+    index=$((index+1)); task=$(printf '%03d-ojvm-final-validate-local' "$index"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" ojvm_final_validate local "$adapter" || return
+  elif [ "$adapter" = database_ojvm_opatch_rollback ]; then
+    node=$(jq -r '.nodes[0]' "$plan")
+    for stage in ojvm_rollback_precheck ojvm_rollback_stop_all ojvm_rollback_binary ojvm_rollback_start_upgrade; do
+      index=$((index+1)); task=$(printf '%03d-%s-%s' "$index" "${stage//_/-}" "$node"); file="$tasks_tmp/$task.json"
+      write_task "$file" "$task" "$id" "$plan_sha" "$stage" "$node" "$adapter" || return
+    done
+    index=$((index+1)); task=$(printf '%03d-ojvm-rollback-datapatch-local' "$index"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" ojvm_rollback_datapatch local "$adapter" || return
+    index=$((index+1)); task=$(printf '%03d-ojvm-rollback-restart-normal-%s' "$index" "$node"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" ojvm_rollback_restart_normal "$node" "$adapter" || return
+    index=$((index+1)); task=$(printf '%03d-ojvm-rollback-final-validate-local' "$index"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" ojvm_rollback_final_validate local "$adapter" || return
+  elif [ "$adapter" = database_out_of_place_switch ]; then
+    node=$(jq -r '.nodes[0]' "$plan")
+    for stage in oop_precheck oop_clone_home oop_patch_clone oop_validate_clone oop_switch_home; do
+      index=$((index+1)); task=$(printf '%03d-%s-%s' "$index" "${stage//_/-}" "$node"); file="$tasks_tmp/$task.json"
+      write_task "$file" "$task" "$id" "$plan_sha" "$stage" "$node" "$adapter" || return
+    done
+    index=$((index+1)); task=$(printf '%03d-oop-datapatch-local' "$index"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" oop_datapatch local "$adapter" || return
+    index=$((index+1)); task=$(printf '%03d-oop-final-validate-local' "$index"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" oop_final_validate local "$adapter" || return
+  elif [ "$adapter" = database_out_of_place_switchback ]; then
+    node=$(jq -r '.nodes[0]' "$plan")
+    for stage in oop_switchback_precheck oop_switch_back; do
+      index=$((index+1)); task=$(printf '%03d-%s-%s' "$index" "${stage//_/-}" "$node"); file="$tasks_tmp/$task.json"
+      write_task "$file" "$task" "$id" "$plan_sha" "$stage" "$node" "$adapter" || return
+    done
+    index=$((index+1)); task=$(printf '%03d-oop-switchback-datapatch-local' "$index"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" oop_switchback_datapatch local "$adapter" || return
+    index=$((index+1)); task=$(printf '%03d-oop-switchback-final-validate-local' "$index"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" oop_switchback_final_validate local "$adapter" || return
   else
     while IFS= read -r node; do
       for stage in precheck apply validate; do
@@ -947,6 +1127,12 @@ verify_execution_evidence() {
     database_rac_opatch_rollback) collector=oracle.database.rac.node.rollback.executor; intent=patch_rollback ;;
     grid_rolling_opatch) collector=oracle.grid.node.executor; intent=patch_apply ;;
     grid_rolling_opatch_rollback) collector=oracle.grid.node.rollback.executor; intent=patch_rollback ;;
+    grid_rolling_opatchauto) collector=oracle.grid.opatchauto.executor; intent=patch_apply ;;
+    grid_rolling_opatchauto_rollback) collector=oracle.grid.opatchauto.rollback.executor; intent=patch_rollback ;;
+    database_ojvm_opatch) collector=oracle.database.ojvm.executor; intent=patch_apply ;;
+    database_ojvm_opatch_rollback) collector=oracle.database.ojvm.rollback.executor; intent=patch_rollback ;;
+    database_out_of_place_switch) collector=oracle.database.out_of_place.executor; intent=patch_apply ;;
+    database_out_of_place_switchback) collector=oracle.database.out_of_place.switchback.executor; intent=patch_rollback ;;
     *) opu_error 'structured execution evidence was supplied for an unsupported adapter'; return 65 ;;
   esac
   jq -e --arg id "$id" --arg task "$task_id" --arg actor "$actor" --arg plan_sha "$plan_sha" --arg status "$status" --arg stage "$stage" \
@@ -963,7 +1149,7 @@ verify_execution_evidence() {
     (.logs.stderr.path | type == "string" and startswith("/")) and (.logs.stderr.sha256 | test("^[a-f0-9]{64}$"))
   ' "$evidence_file" >/dev/null || { opu_error 'execution evidence content is malformed'; return 65; }
   case "$adapter" in
-    database_single_instance_opatch|database_single_instance_opatch_rollback)
+    database_single_instance_opatch|database_single_instance_opatch_rollback|database_ojvm_opatch|database_ojvm_opatch_rollback|database_out_of_place_switch|database_out_of_place_switchback)
       jq -e --arg database "$(jq -r '.target.database_unique_name' "$plan_file")" --arg oracle_target "$(jq -r '.target.oracle_home' "$plan_file")" --arg owner "$(jq -r '.target.owner' "$plan_file")" '
         .target.database_unique_name == $database and .target.oracle_home == $oracle_target and .target.owner == $owner and
         (.outcome_class | IN("no_mutation","binary_state_known","binary_state_unknown","database_down","recovery_required"))
@@ -978,7 +1164,7 @@ verify_execution_evidence() {
         (.outcome_class | IN("no_mutation","service_state_known","binary_state_known","binary_state_unknown","database_down","recovery_required"))
       ' "$evidence_file" >/dev/null || { opu_error 'RAC execution evidence is not bound to the sealed topology and source documents'; return 65; }
       ;;
-    grid_rolling_opatch|grid_rolling_opatch_rollback)
+    grid_rolling_opatch|grid_rolling_opatch_rollback|grid_rolling_opatchauto|grid_rolling_opatchauto_rollback)
       jq -e --arg grid_target "$(jq -r '.target.grid_home' "$plan_file")" --arg owner "$(jq -r '.target.owner' "$plan_file")" --arg coordinator "$(jq -r '.target.coordinator_node' "$plan_file")" --arg node "$(jq -r '.node' "$task_file")" \
         --arg readiness "$(jq -r '.source_documents.readiness.sha256' "$plan_file")" --arg reconciliation "$(jq -r '.source_documents.reconciliation.sha256' "$plan_file")" --arg artifact_manifest "$(jq -r '.source_documents.artifact_manifest.sha256' "$plan_file")" --arg procedure "$(jq -r '.source_documents.procedure_validation.sha256' "$plan_file")" --arg compatibility "$(jq -r '.source_documents.compatibility.sha256' "$plan_file")" --arg policy "$(jq -r '.source_documents.policy.sha256' "$plan_file")" '
         .target.grid_home == $grid_target and .target.owner == $owner and .target.coordinator_node == $coordinator and .target.node == $node and
@@ -989,10 +1175,10 @@ verify_execution_evidence() {
       ' "$evidence_file" >/dev/null || { opu_error 'Grid execution evidence is not bound to the sealed topology and source documents'; return 65; }
       ;;
   esac
-  if [ "$adapter" = database_single_instance_opatch_rollback ]; then
+  if [ "$adapter" = database_single_instance_opatch_rollback ] || [ "$adapter" = database_ojvm_opatch_rollback ] || [ "$adapter" = database_out_of_place_switchback ]; then
     jq -e --arg source_plan "$(jq -r '.source_apply.plan_sha256' "$plan_file")" --arg source_evidence "$(jq -r '.source_apply.final_evidence_sha256' "$plan_file")" --arg source_record "$(jq -r '.source_apply.final_evidence_record_sha256' "$plan_file")" '.source_apply.plan_sha256 == $source_plan and .source_apply.final_evidence_sha256 == $source_evidence and .source_apply.final_evidence_record_sha256 == $source_record' "$evidence_file" >/dev/null || { opu_error 'rollback evidence is not bound to the sealed source apply result'; return 65; }
   fi
-  if [ "$adapter" = database_rac_opatch_rollback ] || [ "$adapter" = grid_rolling_opatch_rollback ]; then
+  if [ "$adapter" = database_rac_opatch_rollback ] || [ "$adapter" = grid_rolling_opatch_rollback ] || [ "$adapter" = grid_rolling_opatchauto_rollback ]; then
     jq -e --arg source_plan "$(jq -r '.source_apply.plan_sha256' "$plan_file")" \
       --arg lineage "$(jq -r '.source_apply.lineage_sha256' "$plan_file")" \
       --arg cluster_final "$(jq -r '.source_apply.cluster_final_evidence_sha256' "$plan_file")" \
@@ -1004,7 +1190,7 @@ verify_execution_evidence() {
   fi
   expected=$(jq -r '.record_sha256' "$evidence_file"); canonical=$(jq -cS 'del(.record_sha256)' "$evidence_file"); actual=$(opu_hash_string "$canonical") || return
   [ "$actual" = "$expected" ] || { opu_error 'execution evidence record integrity verification failed'; return 74; }
-  if [ "$adapter" = database_rolling_opatch ] || [ "$adapter" = database_rac_opatch_rollback ] || [ "$adapter" = grid_rolling_opatch ] || [ "$adapter" = grid_rolling_opatch_rollback ]; then
+  if [ "$adapter" = database_rolling_opatch ] || [ "$adapter" = database_rac_opatch_rollback ] || [ "$adapter" = grid_rolling_opatch ] || [ "$adapter" = grid_rolling_opatch_rollback ] || [ "$adapter" = grid_rolling_opatchauto ] || [ "$adapter" = grid_rolling_opatchauto_rollback ]; then
     evidence_leaf=$(basename -- "$evidence_file")
     jq -e --arg evidence_leaf "$evidence_leaf" '
       (.artifacts | type) == "array" and (.artifacts | length) > 0 and
@@ -1033,9 +1219,9 @@ verify_execution_evidence() {
   if [ "$status" = succeeded ]; then
     [ "$postcondition" = passed ] && [ "$(jq -r '.exit_code' "$evidence_file")" -eq 0 ] || { opu_error 'successful task evidence requires a passed postcondition and zero exit code'; return 65; }
     case "$stage" in
-      precheck|rollback_precheck|rac_precheck|rac_rollback_precheck|grid_precheck|grid_rollback_precheck) [ "$outcome" = no_mutation ] ;;
+      precheck|rollback_precheck|rac_precheck|rac_rollback_precheck|grid_precheck|grid_rollback_precheck|opatchauto_precheck|opatchauto_rollback_precheck|ojvm_precheck|ojvm_rollback_precheck|oop_precheck|oop_switchback_precheck) [ "$outcome" = no_mutation ] ;;
       rac_drain|rac_rollback_drain) [ "$outcome" = service_state_known ] ;;
-      rac_stop|rac_rollback_stop) [ "$outcome" = database_down ] ;;
+      rac_stop|rac_rollback_stop|ojvm_stop_all|ojvm_rollback_stop_all) [ "$outcome" = database_down ] ;;
       grid_rootcrs_prepatch) [ "$outcome" = grid_quiesced_known ] ;;
       grid_rootcrs_postpatch) [ "$outcome" = grid_stack_restored ] ;;
       *) [ "$outcome" = binary_state_known ] ;;
@@ -1048,7 +1234,7 @@ verify_execution_evidence() {
     require_file "$log_path" "execution-$log_name-log" || return
     [ "$(opu_hash_file "$log_path")" = "$log_sha" ] || { opu_error "execution $log_name log digest changed"; return 74; }
   done
-  if [ "$adapter" = database_rolling_opatch ] || [ "$adapter" = database_rac_opatch_rollback ] || [ "$adapter" = grid_rolling_opatch ] || [ "$adapter" = grid_rolling_opatch_rollback ]; then
+  if [ "$adapter" = database_rolling_opatch ] || [ "$adapter" = database_rac_opatch_rollback ] || [ "$adapter" = grid_rolling_opatch ] || [ "$adapter" = grid_rolling_opatch_rollback ] || [ "$adapter" = grid_rolling_opatchauto ] || [ "$adapter" = grid_rolling_opatchauto_rollback ]; then
     for log_name in stdout stderr; do
       log_path=$(jq -r ".logs.$log_name.path" "$evidence_file")
       log_parent=$(CDPATH= cd -- "$(dirname -- "$log_path")" && pwd -P) || { opu_error "execution log directory cannot be resolved: $log_path"; return 66; }
@@ -1144,10 +1330,10 @@ complete() (
   [[ "$status" =~ ^(succeeded|failed)$ ]] || { opu_error 'status must be succeeded or failed'; exit 64; }; [ -z "$evidence" ] || [ -z "$evidence_file" ] || { opu_error 'use either --evidence or --evidence-sha256, not both'; exit 64; }
   [[ "$grace" =~ ^[0-9]{2,4}$ ]] && [ "$grace" -ge 30 ] && [ "$grace" -le 3600 ] || { opu_error 'completion grace seconds must be between 30 and 3600'; exit 64; }
   lock "$id" || exit $?; trap unlock EXIT; read_state "$id" || exit $?; [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || exit $?
-  adapter=$(jq -r '.adapter' "$file"); if [ -n "$evidence_file" ]; then verify_execution_evidence "$id" "$task_id" "$actor" "$status" "$evidence_file" || exit $?; evidence=$EXECUTION_EVIDENCE_SHA; record_sha=$EXECUTION_EVIDENCE_RECORD_SHA; structured=1; elif [[ "$adapter" =~ ^(database_single_instance_opatch(_rollback)?|database_rolling_opatch|database_rac_opatch_rollback|grid_rolling_opatch(_rollback)?)$ ]]; then opu_error 'managed execution requires structured --evidence'; exit 65; else [[ "$evidence" =~ ^[a-f0-9]{64}$ ]] || { opu_error 'evidence digest must be SHA-256 hex'; exit 64; }; fi
+  adapter=$(jq -r '.adapter' "$file"); if [ -n "$evidence_file" ]; then verify_execution_evidence "$id" "$task_id" "$actor" "$status" "$evidence_file" || exit $?; evidence=$EXECUTION_EVIDENCE_SHA; record_sha=$EXECUTION_EVIDENCE_RECORD_SHA; structured=1; elif [[ "$adapter" =~ ^(database_single_instance_opatch(_rollback)?|database_rolling_opatch|database_rac_opatch_rollback|grid_rolling_opatch(_rollback)?|grid_rolling_opatchauto(_rollback)?|database_ojvm_opatch(_rollback)?|database_out_of_place_switch(back)?)$ ]]; then opu_error 'managed execution requires structured --evidence'; exit 65; else [[ "$evidence" =~ ^[a-f0-9]{64}$ ]] || { opu_error 'evidence digest must be SHA-256 hex'; exit 64; }; fi
   claimant=$(jq -r '.claimed_by // empty' "$file"); expiry=$(jq -r '.lease_expires_epoch // 0' "$file"); now=$(date -u +%s); [ "$claimant" = "$actor" ] || { opu_error 'task is not claimed by this actor'; exit 77; }; jq -e '.status == "running"' "$file" >/dev/null || { opu_error 'task is not running'; exit 65; }
   if [ "$expiry" -le "$now" ]; then
-    [[ "$adapter" =~ ^(database_single_instance_opatch(_rollback)?|database_rolling_opatch|database_rac_opatch_rollback|grid_rolling_opatch(_rollback)?)$ ]] && [ -n "$evidence_file" ] && [ "$((now-expiry))" -le "$grace" ] || { opu_error 'task lease expired; reconcile first'; exit 75; }
+    [[ "$adapter" =~ ^(database_single_instance_opatch(_rollback)?|database_rolling_opatch|database_rac_opatch_rollback|grid_rolling_opatch(_rollback)?|grid_rolling_opatchauto(_rollback)?|database_ojvm_opatch(_rollback)?|database_out_of_place_switch(back)?)$ ]] && [ -n "$evidence_file" ] && [ "$((now-expiry))" -le "$grace" ] || { opu_error 'task lease expired; reconcile first'; exit 75; }
     late=1
   fi
   if [ "$structured" -eq 1 ]; then

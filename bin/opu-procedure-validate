@@ -26,25 +26,41 @@ validate() {
       (.path | type == "string" and length > 0) and
       (.sha256 | test("^[a-f0-9]{64}$"))))
   ' "$ARTIFACT" >/dev/null || { echo 'artifact manifest is not ready for catalog or has no hashed README' >&2; return 2; }
+  if jq -e '.target.method == "fpp"' "$PROCEDURE" >/dev/null 2>&1; then
+    echo 'FPP (Fleet Patching and Provisioning) procedures are rejected: this build has no rhpctl/FPP-server adapter. See docs/FUTURE_ADAPTERS.md.' >&2
+    return 2
+  fi
   jq -e '
     .schema_version == "1.0" and
     (.patch_id | test("^[0-9]{1,20}$")) and
     (.artifact_sha256 | test("^[a-f0-9]{64}$")) and
     (.target.family | IN("grid","database")) and
     (.target.platform_id | test("^[0-9]+$")) and
-    (.target.method | IN("opatch","opatchauto","switch_grid_home","fpp")) and
+    (.target.method | IN("opatch","opatchauto","switch_home","switch_grid_home","fpp")) and
     (.execution | type == "object" and
-      (.adapter | IN("grid_rolling_opatch","database_rolling_opatch","database_single_instance_opatch")) and
+      (.adapter | IN("grid_rolling_opatch","grid_rolling_opatchauto","database_rolling_opatch","database_single_instance_opatch","database_ojvm_opatch","database_out_of_place_switch")) and
       (.operations | type == "array" and length > 0) and
-      (all(.operations[]; IN("grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch","database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch","database_shutdown","database_startup")))) and
+      (all(.operations[]; IN("grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch","grid_opatchauto_apply","database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch","database_shutdown","database_startup","database_startup_upgrade","database_datapatch_upgrade","database_home_clone","database_opatch_apply_clone","database_home_switch")))) and
     (if .target.family == "grid" then
-       .execution.adapter == "grid_rolling_opatch" and .target.method == "opatch" and
-       (.execution.operations == ["grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch"])
+       ((.execution.adapter == "grid_rolling_opatch" and .target.method == "opatch" and
+         (.execution.operations == ["grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch"])) or
+        (.execution.adapter == "grid_rolling_opatchauto" and .target.method == "opatchauto" and
+         (.execution.operations == ["grid_opatchauto_apply"])))
      elif .execution.adapter == "database_rolling_opatch" then
        .execution.adapter == "database_rolling_opatch" and .target.method == "opatch" and
        (.target.topology == "rac") and
        (.target.database_unique_name | test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$")) and
      (.execution.operations == ["database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch"])
+     elif .execution.adapter == "database_ojvm_opatch" then
+       .target.method == "opatch" and
+       (.target.topology == "single_instance") and
+       (.target.database_unique_name | test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$")) and
+       (.execution.operations == ["database_shutdown","database_opatch_apply","database_startup_upgrade","database_datapatch_upgrade"])
+     elif .execution.adapter == "database_out_of_place_switch" then
+       .target.method == "switch_home" and
+       (.target.topology == "single_instance") and
+       (.target.database_unique_name | test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$")) and
+       (.execution.operations == ["database_home_clone","database_opatch_apply_clone","database_home_switch","database_datapatch"])
      else
        .execution.adapter == "database_single_instance_opatch" and .target.method == "opatch" and
        (.target.topology == "single_instance") and

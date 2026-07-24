@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Separate entry point for the independently approved OJVM rollback adapter.
+# All selectors still come from the sealed rollback plan.
+set -euo pipefail
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+export OPU_OJVM_OPERATION=rollback
+exec "$ROOT/bin/opu-database-ojvm-patch" "$@"

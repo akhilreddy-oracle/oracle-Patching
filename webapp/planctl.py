@@ -41,6 +41,12 @@ EXECUTOR_BY_ADAPTER = {
     "database_rac_opatch_rollback": REPO_ROOT / "bin" / "opu-database-rac-node-rollback",
     "grid_rolling_opatch": REPO_ROOT / "bin" / "opu-grid-node-patch",
     "grid_rolling_opatch_rollback": REPO_ROOT / "bin" / "opu-grid-node-rollback",
+    "grid_rolling_opatchauto": REPO_ROOT / "bin" / "opu-grid-opatchauto-patch",
+    "grid_rolling_opatchauto_rollback": REPO_ROOT / "bin" / "opu-grid-opatchauto-rollback",
+    "database_ojvm_opatch": REPO_ROOT / "bin" / "opu-database-ojvm-patch",
+    "database_ojvm_opatch_rollback": REPO_ROOT / "bin" / "opu-database-ojvm-rollback",
+    "database_out_of_place_switch": REPO_ROOT / "bin" / "opu-database-out-of-place-patch",
+    "database_out_of_place_switchback": REPO_ROOT / "bin" / "opu-database-out-of-place-switchback",
 }
 
 # The RAC and Grid executors bind each sealed task to the node it runs on; in
@@ -50,6 +56,8 @@ TESTMODE_NODE_ENV_BY_ADAPTER = {
     "database_rac_opatch_rollback": "OPU_RAC_DATABASE_TEST_HOSTNAME",
     "grid_rolling_opatch": "OPU_GRID_NODE_TEST_HOST",
     "grid_rolling_opatch_rollback": "OPU_GRID_NODE_TEST_HOST",
+    "grid_rolling_opatchauto": "OPU_GRID_OPATCHAUTO_TEST_HOST",
+    "grid_rolling_opatchauto_rollback": "OPU_GRID_OPATCHAUTO_TEST_HOST",
 }
 
 # Live SSH executors (relative to host remote_root). Plan state is synced to the
@@ -62,6 +70,12 @@ LIVE_EXECUTOR_BY_ADAPTER = {
     "database_rac_opatch_rollback": "bin/opu-database-rac-node-rollback",
     "grid_rolling_opatch": "bin/opu-grid-node-patch",
     "grid_rolling_opatch_rollback": "bin/opu-grid-node-rollback",
+    "grid_rolling_opatchauto": "bin/opu-grid-opatchauto-patch",
+    "grid_rolling_opatchauto_rollback": "bin/opu-grid-opatchauto-rollback",
+    "database_ojvm_opatch": "bin/opu-database-ojvm-patch",
+    "database_ojvm_opatch_rollback": "bin/opu-database-ojvm-rollback",
+    "database_out_of_place_switch": "bin/opu-database-out-of-place-patch",
+    "database_out_of_place_switchback": "bin/opu-database-out-of-place-switchback",
 }
 
 

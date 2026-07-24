@@ -15,6 +15,8 @@ import time
 import uuid
 from pathlib import Path
 
+import notifications
+
 RUNS_DIR = Path(__file__).resolve().parent / "var" / "runs"
 RUNS: dict[str, "RunRecord"] = {}
 _REGISTRY_LOCK = threading.Lock()
@@ -109,6 +111,15 @@ def start_run(kind: str, key: str, fn) -> RunRecord:
             record._persist()
             with _REGISTRY_LOCK:
                 _ACTIVE_KEYS.discard(key)
+            if record.status == "failed":
+                # After _persist: the failed state is durable before anything
+                # external hears about it, and emit() never raises.
+                notifications.emit("run.failed", {
+                    "run_id": run_id,
+                    "kind": kind,
+                    "key": key,
+                    "error": record.error,
+                })
 
     threading.Thread(target=worker, daemon=True).start()
     return record
@@ -133,6 +144,30 @@ def _load_persisted(run_id: str) -> RunRecord | None:
     record.result = data.get("result")
     record.error = data.get("error")
     return record
+
+
+def status_counts() -> dict[str, int]:
+    """Run counts by status across in-memory and persisted records."""
+    counts: dict[str, int] = {}
+    with _REGISTRY_LOCK:
+        records = list(RUNS.values())
+    seen = set()
+    for record in records:
+        seen.add(record.run_id)
+        counts[record.status] = counts.get(record.status, 0) + 1
+    if RUNS_DIR.is_dir():
+        for path in RUNS_DIR.glob("*/run.json"):
+            run_id = path.parent.name
+            if run_id in seen:
+                continue
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            seen.add(run_id)
+            status = str(data.get("status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+    return counts
 
 
 def get_run(run_id: str) -> RunRecord | None:

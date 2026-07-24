@@ -16,10 +16,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 import os
+import time
 
 import auth
 import agent_queue
 import evidence
+import itsm
+import notifications
 import pipeline_runner
 import pipeline_steps
 import planctl
@@ -156,6 +159,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         path = urlparse(self.path).path
 
+        if path == "/api/health":
+            # Unauthenticated liveness probe for monitoring.
+            self._send_json(200, {"status": "ok", "time": time.time()})
+            return
+
         if path.startswith("/api/") and not self._require_api_auth():
             return
 
@@ -166,6 +174,40 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/production/status":
             self._send_json(200, production.status())
+            return
+
+        if path == "/api/itsm/tickets":
+            if not self._require_role(self.headers.get("X-OPU-Actor"), "read"):
+                return
+            self._send_json(200, {
+                "enabled": itsm.itsm_enabled(),
+                "tickets_file": str(itsm.tickets_path()),
+                "tickets": itsm.list_tickets(),
+            })
+            return
+
+        if path == "/api/events":
+            if not self._require_role(self.headers.get("X-OPU-Actor"), "read"):
+                return
+            limit = 100
+            for part in urlparse(self.path).query.split("&"):
+                if part.startswith("limit="):
+                    try:
+                        limit = max(1, min(int(part.split("=", 1)[1]), 1000))
+                    except ValueError:
+                        pass
+            self._send_json(200, {"events": notifications.tail_events(limit)})
+            return
+
+        if path == "/api/metrics":
+            if not self._require_role(self.headers.get("X-OPU-Actor"), "read"):
+                return
+            self._send_json(200, {
+                "runs_by_status": pipeline_runner.status_counts(),
+                "events": notifications.event_counts(),
+                "deadletter_count": notifications.deadletter_count(),
+                "itsm_enabled": itsm.itsm_enabled(),
+            })
             return
 
         if path == "/api/agent/jobs":
@@ -359,7 +401,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             def run(_record, plan_id=plan_id, actor=actor):
-                result = planctl.execute_next_task(plan_id, actor)
+                try:
+                    result = planctl.execute_next_task(plan_id, actor)
+                except Exception:
+                    notifications.emit("plan.execute.failed", {"plan_id": plan_id, "actor": actor})
+                    raise
+                notifications.emit("plan.execute.succeeded", {"plan_id": plan_id, "actor": actor, "no_pending_task": result is None})
                 return {"task_result": result, "no_pending_task": result is None}
 
             try:
@@ -387,7 +434,13 @@ class Handler(BaseHTTPRequestHandler):
             max_tasks = int(body.get("max_tasks") or 200)
 
             def run(_record, plan_id=plan_id, actor=actor, max_tasks=max_tasks):
-                return planctl.execute_remaining_tasks(plan_id, actor, max_tasks=max_tasks)
+                try:
+                    result = planctl.execute_remaining_tasks(plan_id, actor, max_tasks=max_tasks)
+                except Exception:
+                    notifications.emit("plan.execute.failed", {"plan_id": plan_id, "actor": actor})
+                    raise
+                notifications.emit("plan.execute.succeeded", {"plan_id": plan_id, "actor": actor})
+                return result
 
             try:
                 record = pipeline_runner.start_run("plan", f"plan:{plan_id}:execute", run)
@@ -581,6 +634,14 @@ class Handler(BaseHTTPRequestHandler):
                 approval_ticket = body["approval_ticket"]
                 if not self._require_role(actor, "approve"):
                     return
+                if itsm.itsm_enabled():
+                    # Fail-closed gate: an invalid ticket or an unusable
+                    # registry rejects before any run is started.
+                    try:
+                        itsm.validate_ticket(approval_ticket)
+                    except itsm.ItsmError as exc:
+                        self._send_json(exc.status, exc.to_json())
+                        return
                 key = f"plan:{plan_id}:approve"
 
                 def run(_record, plan_id=plan_id, actor=actor, approval_ticket=approval_ticket):
@@ -634,8 +695,25 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, exc.to_json())
             return
 
+        event = {
+            "create": "plan.created",
+            "approve": "plan.approved",
+            "authorize": "plan.authorized",
+            "dispatch": "plan.dispatched",
+            "create-rollback": "plan.created",
+        }.get(action)
+        notify_plan_id = new_plan_id if action == "create-rollback" else plan_id
+
+        def notifying_run(record, inner=run, event=event, notify_plan_id=notify_plan_id, action=action):
+            result = inner(record)
+            # Emit only after the plan action has completed and persisted;
+            # emit() never raises, so it cannot fail the run.
+            if event:
+                notifications.emit(event, {"plan_id": notify_plan_id, "action": action})
+            return result
+
         try:
-            record = pipeline_runner.start_run("plan", key, run)
+            record = pipeline_runner.start_run("plan", key, notifying_run)
         except pipeline_runner.RunConflict as exc:
             self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
             return

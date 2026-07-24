@@ -10,8 +10,11 @@
     "operation": {
       "enum": [
         "grid_rootcrs_prepatch", "grid_opatch_apply", "grid_rootadd_rdbms", "grid_rootcrs_postpatch",
+        "grid_opatchauto_apply",
         "database_stop_instance", "database_opatch_apply", "database_start_instance", "database_datapatch",
-        "database_shutdown", "database_startup"
+        "database_shutdown", "database_startup",
+        "database_startup_upgrade", "database_datapatch_upgrade",
+        "database_home_clone", "database_opatch_apply_clone", "database_home_switch"
       ]
     }
   },
@@ -24,7 +27,7 @@
       "required": ["family", "method", "platform_id"],
       "properties": {
         "family": {"enum": ["grid", "database"]},
-        "method": {"enum": ["opatch", "opatchauto", "switch_grid_home", "fpp"]},
+        "method": {"enum": ["opatch", "opatchauto", "switch_home", "switch_grid_home", "fpp"]},
         "topology": {"enum": ["rac", "single_instance"]},
         "database_unique_name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$"},
         "platform_id": {"type": "string", "pattern": "^[0-9]+$"}
@@ -35,7 +38,7 @@
       "additionalProperties": false,
       "required": ["adapter", "operations"],
       "properties": {
-        "adapter": {"enum": ["grid_rolling_opatch", "database_rolling_opatch", "database_single_instance_opatch"]},
+        "adapter": {"enum": ["grid_rolling_opatch", "grid_rolling_opatchauto", "database_rolling_opatch", "database_single_instance_opatch", "database_ojvm_opatch", "database_out_of_place_switch"]},
         "operations": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/operation"}}
       }
     },

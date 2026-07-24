@@ -19,6 +19,9 @@ test:
 	./tests/rac_database_patch.sh
 	./tests/grid_node_patch.sh
 	./tests/grid_node_rollback.sh
+	./tests/grid_opatchauto_patch.sh
+	./tests/ojvm_patch.sh
+	./tests/out_of_place_patch.sh
 	./tests/readiness.sh
 	./tests/dataguard.sh
 	./tests/dataguard_switchover.sh
@@ -31,6 +34,7 @@ test:
 	./tests/production_cert.sh
 	./tests/database_rolling_patch.sh
 	./tests/grid_rolling_patch.sh
+	./tests/integrations.sh
 
 lint:
 	./scripts/lint.sh

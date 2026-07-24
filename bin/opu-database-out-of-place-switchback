@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Separate entry point for the independently approved out-of-place switchback
+# adapter. All selectors still come from the sealed switchback plan.
+set -euo pipefail
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+export OPU_OOP_OPERATION=switchback
+exec "$ROOT/bin/opu-database-out-of-place-patch" "$@"

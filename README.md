@@ -22,10 +22,13 @@ Arbitrary remote shell execution is deliberately outside the design.
 Architecture and delivery decomposition are complete. The current build has
 read-only discovery, evidence reconciliation, artifact/procedure validation,
 OPatch compatibility, policy readiness, verified recovery evidence, and typed
-execution adapters for standalone Database, RAC Database, and manual rolling
-Grid Infrastructure OPatch workflows. Standalone and RAC Database apply plus
-their separately approved rollback paths, manual Grid apply, and lab-capable
-Grid rollback are fail closed. The lab webapp now requires a Bearer API token,
+execution adapters for standalone Database, RAC Database, manual rolling
+Grid Infrastructure OPatch, rolling Grid OPatchAuto, full-shutdown OJVM, and
+out-of-place home-switch workflows. Standalone and RAC Database apply plus
+their separately approved rollback paths, manual Grid apply, lab-capable
+Grid rollback, Grid OPatchAuto apply/rollback, OJVM apply/rollback, and
+out-of-place switch/switchback are fail closed. FPP, Exadata, and Windows
+remain explicitly rejected (see docs/FUTURE_ADAPTERS.md). The lab webapp now requires a Bearer API token,
 can execute sealed standalone **and** RAC/Grid tasks over SSH (per-task node
 routing with plan-state sync), drives standalone, RAC, and Grid TEST_MODE
 fixtures end-to-end through the real executor binaries, can batch-execute
@@ -93,8 +96,18 @@ discovery operations, `host.discover@1` and `oracle_homes.discover@1` — see
   task and controller-custody record, reverse the apply node order, and require
   one coordinator rollback datapatch and final validation
 - manual Grid rolling stages for rootcrs prepatch, local OPatch, rootadd_rdbms,
-  rootcrs postpatch, node validation, and cluster final validation; OPatchAuto
-  planning is explicitly rejected
+  rootcrs postpatch, node validation, and cluster final validation
+- rolling Grid OPatchAuto stages for per-node precheck, opatchauto apply,
+  resume check, node validation, and cluster final validation, with a
+  reverse-node rollback child plan
+- full-shutdown OJVM stages for precheck, stop, binary apply, upgrade-mode
+  startup, upgrade-mode datapatch, normal restart, and final validation, with
+  a source-apply-bound rollback child plan
+- out-of-place home patching stages for precheck, home clone, offline clone
+  patch, clone validation, home switch, datapatch, and final validation, with
+  a fast switchback child plan that repoints to the untouched original home
+- FPP (Fleet Patching and Provisioning) procedures are explicitly rejected
+  fail-closed; see [docs/FUTURE_ADAPTERS.md](docs/FUTURE_ADAPTERS.md)
 - explicit mutation outcome classes that distinguish no mutation, known binary
   state, unknown binary state, and a database left down
 - executor-side applicability and conflict rechecks immediately before an

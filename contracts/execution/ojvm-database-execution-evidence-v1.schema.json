@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/oracle-patching/contracts/execution/ojvm-database-execution-evidence-v1.schema.json",
+  "title": "OJVM Database Execution Evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "collector", "intent", "plan_id", "task_id", "plan_sha256",
+    "status", "postcondition", "outcome_class", "started_at", "finished_at", "exit_code",
+    "actor", "stage", "target", "patch", "recovery", "logs",
+    "record_sha256"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "collector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "oracle.database.ojvm.executor" },
+        "version": { "const": "1" }
+      }
+    },
+    "intent": { "const": "patch_apply" },
+    "plan_id": { "$ref": "#/$defs/identifier" },
+    "task_id": { "$ref": "#/$defs/identifier" },
+    "plan_sha256": { "$ref": "#/$defs/sha256" },
+    "status": { "enum": ["succeeded", "failed"] },
+    "postcondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "detail"],
+      "properties": {
+        "status": { "enum": ["passed", "failed", "blocked", "unknown"] },
+        "detail": { "type": "string", "minLength": 1 }
+      }
+    },
+    "outcome_class": {
+      "enum": ["no_mutation", "binary_state_known", "binary_state_unknown", "database_down", "recovery_required"]
+    },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "exit_code": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "actor": { "$ref": "#/$defs/identifier" },
+    "stage": {
+      "enum": [
+        "ojvm_precheck", "ojvm_stop_all", "ojvm_binary_apply", "ojvm_start_upgrade",
+        "ojvm_datapatch_upgrade", "ojvm_restart_normal", "ojvm_final_validate"
+      ]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["database_unique_name", "oracle_home", "owner", "oracle_sid"],
+      "properties": {
+        "database_unique_name": { "$ref": "#/$defs/identifier" },
+        "oracle_home": { "$ref": "#/$defs/absolutePath" },
+        "owner": { "$ref": "#/$defs/identifier" },
+        "oracle_sid": { "anyOf": [{ "$ref": "#/$defs/identifier" }, { "type": "null" }] }
+      }
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["patch_id", "artifact_sha256"],
+      "properties": {
+        "patch_id": { "type": "string", "pattern": "^[0-9]{1,20}$" },
+        "artifact_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_sha256", "record_sha256"],
+      "properties": {
+        "manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "record_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "logs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stdout", "stderr"],
+      "properties": {
+        "stdout": { "$ref": "#/$defs/log" },
+        "stderr": { "$ref": "#/$defs/log" }
+      }
+    },
+    "record_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "absolutePath": { "type": "string", "pattern": "^/[^\\r\\n\\t]*$" },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/absolutePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

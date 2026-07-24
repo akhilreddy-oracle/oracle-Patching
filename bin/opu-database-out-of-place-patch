@@ -1,0 +1,863 @@
+#!/usr/bin/env bash
+# Executes only the sealed database_out_of_place_switch task adapter. The
+# patch is applied to an offline clone of the Oracle home; the only outage is
+# the sealed home switch. Oracle-home, database, owner, patch, and recovery
+# selectors come exclusively from the immutable plan; the clone home path is
+# derived deterministically from the sealed home and patch ID.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+PLAN_STATE_DIR=${OPU_PLAN_STATE_DIR:-/var/lib/oracle-patching-plans}
+OPERATION=${OPU_OOP_OPERATION:-apply}
+case "$OPERATION" in
+  apply)
+    EXECUTION_STATE_DIR=${OPU_OOP_STATE_DIR:-/var/lib/oracle-patching-utility/out-of-place}
+    EXECUTOR_COLLECTOR=oracle.database.out_of_place.executor
+    EXECUTOR_INTENT=patch_apply
+    ;;
+  switchback)
+    EXECUTION_STATE_DIR=${OPU_OOP_SWITCHBACK_STATE_DIR:-/var/lib/oracle-patching-utility/out-of-place-switchback}
+    EXECUTOR_COLLECTOR=oracle.database.out_of_place.switchback.executor
+    EXECUTOR_INTENT=patch_rollback
+    ;;
+  *)
+    printf '%s\n' 'OPU_OOP_OPERATION must be apply or switchback' >&2
+    exit 64
+    ;;
+esac
+TEST_MODE=${OPU_OOP_TEST_MODE:-0}
+ORATAB=${OPU_OOP_ORATAB:-/etc/oratab}
+PLAN_TOOL="$ROOT/bin/opu-patch-plan"
+EXECUTOR_LOCK_USES_FLOCK=0
+
+usage() {
+  printf '%s\n' \
+    "Usage: ${0##*/} execute --plan-id ID --task-id ID --actor ID [--lease-seconds 3600]"
+}
+
+die() { opu_error "$*"; exit 65; }
+require_root() { [ "${EUID:-$(id -u)}" -eq 0 ] || [ "$TEST_MODE" = 1 ] || die 'out-of-place database patch execution must run as root'; }
+valid_sha() { [[ ${1:-} =~ ^[a-f0-9]{64}$ ]]; }
+epoch() { date -u -d "$1" +%s 2>/dev/null || date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || return 1; }
+
+as_owner() {
+  local owner=$1
+  shift
+  if [ "$(id -un)" = "$owner" ]; then "$@"; else runuser -u "$owner" -- "$@"; fi
+}
+
+owner_for_path() {
+  stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null || true
+}
+
+acquire_executor_lock() {
+  local flock_command=flock
+  if [ "$TEST_MODE" = 1 ] && [ -n "${OPU_OOP_TEST_FLOCK:-}" ]; then
+    flock_command=$OPU_OOP_TEST_FLOCK
+    [ -x "$flock_command" ] || die 'out-of-place test flock command is not executable'
+  fi
+  if [ "$flock_command" != flock ] || command -v flock >/dev/null 2>&1; then
+    exec 8>"$RUN_DIR/executor.lock"
+    "$flock_command" -n 8 || die 'another out-of-place executor owns this plan'
+    EXECUTOR_LOCK_USES_FLOCK=1
+  elif [ "$TEST_MODE" = 1 ]; then
+    EXECUTOR_LOCK_DIR="$RUN_DIR/executor.lock.d"
+    mkdir "$EXECUTOR_LOCK_DIR" 2>/dev/null || die 'another out-of-place executor owns this plan'
+    trap 'rmdir "${EXECUTOR_LOCK_DIR:-}" 2>/dev/null || true' EXIT
+  else
+    die 'flock is required for out-of-place database patch execution'
+  fi
+}
+
+close_inherited_executor_lock() {
+  [ "$EXECUTOR_LOCK_USES_FLOCK" -eq 1 ] || return 0
+  exec 8>&-
+}
+
+directory_digest() {
+  local target_dir=$1
+  find "$target_dir" -xdev -type f -print0 | sort -z | while IFS= read -r -d '' file; do
+    printf '%s\0' "${file#"$target_dir"/}"
+    sha256sum "$file" | awk '{print $1}'
+  done | sha256sum | awk '{print $1}'
+}
+
+verify_sealed_json() {
+  local file=$1 seal_field=$2 expected canonical actual
+  [ -f "$file" ] && [ ! -L "$file" ] || return 66
+  expected=$(jq -r ".$seal_field // empty" "$file")
+  valid_sha "$expected" || return 74
+  canonical=$(jq -cS "del(.$seal_field)" "$file") || return 74
+  actual=$(opu_hash_string "$canonical") || return
+  [ "$actual" = "$expected" ]
+}
+
+task_definition() {
+  jq -cS '{schema_version,task_id,plan_id,plan_sha256,stage,node,adapter,authorization_sha256,authorization_record_sha256}' "$1"
+}
+
+verify_task_definition_and_authorization() {
+  local task_path=$1 expected actual authorization_file authorization_sha authorization_record
+  expected=$(jq -r '.task_definition_sha256 // empty' "$task_path"); valid_sha "$expected" || die 'claimed task has no valid definition digest'
+  actual=$(opu_hash_string "$(task_definition "$task_path")"); [ "$actual" = "$expected" ] || die 'claimed task definition integrity verification failed'
+  authorization_file="$PLAN_STATE_DIR/plans/$PLAN_ID/authorization.json"
+  verify_sealed_json "$authorization_file" record_sha256 || die 'sealed plan authorization is missing or changed'
+  authorization_sha=$(opu_hash_file "$authorization_file"); authorization_record=$(jq -r '.record_sha256' "$authorization_file")
+  jq -e --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" --arg authorization_sha "$authorization_sha" --arg authorization_record "$authorization_record" '
+    .plan_id == $plan and .plan_sha256 == $plan_sha and
+    .authorization_sha256 == $authorization_sha and .authorization_record_sha256 == $authorization_record
+  ' "$task_path" >/dev/null || die 'claimed task is not bound to the sealed plan authorization'
+  jq -e --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" '.decision == "execution_authorized" and .plan_id == $plan and .plan_sha256 == $plan_sha' "$authorization_file" >/dev/null || die 'sealed authorization does not bind this plan'
+}
+
+verify_open_window() {
+  local now start_epoch end_epoch
+  start_epoch=$(epoch "$(jq -r '.maintenance_window.start' "$PLAN_FILE")") || die 'plan has an invalid maintenance-window start'
+  end_epoch=$(epoch "$(jq -r '.maintenance_window.end' "$PLAN_FILE")") || die 'plan has an invalid maintenance-window end'
+  now=$(date -u +%s)
+  [ "$now" -ge "$start_epoch" ] && [ "$now" -lt "$end_epoch" ] || die 'maintenance window is not open'
+}
+
+verify_source_documents() {
+  local entry path expected actual
+  while IFS= read -r entry; do
+    path=$(jq -r '.path' <<<"$entry"); expected=$(jq -r '.sha256' <<<"$entry")
+    opu_validate_absolute_path "$path" source-document >/dev/null || die 'plan contains an invalid source-document path'
+    [ -f "$path" ] && [ ! -L "$path" ] || die "sealed source document is missing or symbolic link: $path"
+    actual=$(opu_hash_file "$path"); [ "$actual" = "$expected" ] || die "sealed source document changed: $path"
+  done < <(jq -c '.source_documents[]' "$PLAN_FILE")
+}
+
+verify_recovery() {
+  local mode=${1:-metadata}
+  local expected_file expected_record actual_file internal canonical actual_record checksum_path checksum_sha
+  RECOVERY_MANIFEST=$(jq -r '.recovery.manifest_path // empty' "$PLAN_FILE")
+  expected_file=$(jq -r '.recovery.manifest_sha256 // empty' "$PLAN_FILE"); expected_record=$(jq -r '.recovery.record_sha256 // empty' "$PLAN_FILE")
+  opu_validate_absolute_path "$RECOVERY_MANIFEST" recovery-manifest >/dev/null || die 'plan has no valid recovery manifest'
+  [ -f "$RECOVERY_MANIFEST" ] && [ ! -L "$RECOVERY_MANIFEST" ] || die 'recovery manifest is missing or symbolic link'
+  actual_file=$(opu_hash_file "$RECOVERY_MANIFEST"); [ "$actual_file" = "$expected_file" ] || die 'recovery manifest file digest changed'
+  internal=$(jq -r '.record_sha256 // empty' "$RECOVERY_MANIFEST"); canonical=$(jq -cS 'del(.record_sha256)' "$RECOVERY_MANIFEST"); actual_record=$(opu_hash_string "$canonical")
+  [ "$internal" = "$expected_record" ] && [ "$actual_record" = "$expected_record" ] || die 'recovery manifest record integrity verification failed'
+  jq -e --arg database "$DATABASE" --arg oracle_home "$ORACLE_HOME_TARGET" '.schema_version == "1.0" and .collector.name == "oracle.recovery.evidence" and .status == "passed" and .target.database_unique_name == $database and .target.oracle_home == $oracle_home and (.backup.coverage.datafiles_backed == .backup.coverage.datafiles_current) and (.backup.coverage.base_datafiles == .backup.coverage.datafiles_current) and .backup.coverage.controlfile_records > 0 and .backup.coverage.spfile_records > 0 and .backup.coverage.outside_root_pieces == 0 and .backup.coverage.unavailable_pieces == 0' "$RECOVERY_MANIFEST" >/dev/null || die 'recovery evidence does not satisfy out-of-place execution requirements'
+  checksum_path=$(jq -r '.backup.checksum_manifest.path' "$RECOVERY_MANIFEST"); checksum_sha=$(jq -r '.backup.checksum_manifest.sha256' "$RECOVERY_MANIFEST")
+  [ -f "$checksum_path" ] && [ ! -L "$checksum_path" ] && [ "$(opu_hash_file "$checksum_path")" = "$checksum_sha" ] || die 'recovery checksum manifest changed'
+  if [ "$mode" = full ]; then (cd / && sha256sum -c "$checksum_path") >"$TASK_DIR/recovery-checksums.log" 2>&1 || die 'recovery backup checksum verification failed immediately before execution'; fi
+  RECOVERY_FILE_SHA=$expected_file; RECOVERY_RECORD_SHA=$expected_record
+}
+
+verify_artifact() {
+  local artifact_actual
+  [ -d "$PATCH_DIR" ] && [ ! -L "$PATCH_DIR" ] || die 'sealed patch directory is missing or symbolic link'
+  [ -z "$(find "$PATCH_DIR" -xdev -type l -print -quit)" ] || die 'sealed patch directory contains symbolic links'
+  artifact_actual=$(directory_digest "$PATCH_DIR"); [ "$artifact_actual" = "$ARTIFACT_SHA" ] || die 'staged patch artifact digest changed'
+}
+
+verify_artifact_platform() {
+  local inventory count platform_id platform_name
+  inventory="$PATCH_DIR/etc/config/inventory.xml"
+  [ -f "$inventory" ] && [ ! -L "$inventory" ] && [ -r "$inventory" ] ||
+    die 'sealed patch artifact has no readable authoritative etc/config/inventory.xml'
+  xmllint --nonet --noout "$inventory" >/dev/null 2>&1 ||
+    die 'sealed patch artifact inventory.xml is malformed'
+  count=$(xmllint --nonet --xpath 'count(//*[local-name()="os_platforms"]/*[local-name()="platform"])' "$inventory" 2>/dev/null || true)
+  [ "$count" = 1 ] || die "sealed patch artifact must declare exactly one authoritative platform, found ${count:-unknown}"
+  platform_id=$(xmllint --nonet --xpath 'string((//*[local-name()="os_platforms"]/*[local-name()="platform"])[1]/@id)' "$inventory" 2>/dev/null || true)
+  platform_name=$(xmllint --nonet --xpath 'string((//*[local-name()="os_platforms"]/*[local-name()="platform"])[1]/@name)' "$inventory" 2>/dev/null || true)
+  [[ "$platform_id" =~ ^[0-9]+$ ]] && [ -n "$platform_name" ] ||
+    die 'sealed patch artifact platform ID or name is missing or invalid'
+  [ "$platform_id" = "$TARGET_PLATFORM_ID" ] ||
+    die "sealed patch artifact platform $platform_id ($platform_name) differs from planned platform $TARGET_PLATFORM_ID"
+}
+
+check_clone_capacity() {
+  local available_kb available_bytes home_kb artifact_kb required_bytes
+  if [ "$TEST_MODE" = 1 ] && [ -n "${OPU_OOP_TEST_CLONE_CAPACITY_BYTES:-}" ]; then
+    available_bytes=$OPU_OOP_TEST_CLONE_CAPACITY_BYTES
+  else
+    available_kb=$(df -Pk "$(dirname -- "$CLONE_HOME")" | awk 'NR==2 {print $4}')
+    [[ "$available_kb" =~ ^[0-9]+$ ]] || die 'clone home capacity cannot be determined'
+    available_bytes=$((available_kb * 1024))
+  fi
+  home_kb=$(du -sk "$ORACLE_HOME_TARGET" | awk '{print $1}')
+  artifact_kb=$(du -sk "$PATCH_DIR" | awk '{print $1}')
+  [[ "$home_kb" =~ ^[0-9]+$ ]] && [[ "$artifact_kb" =~ ^[0-9]+$ ]] || die 'clone home capacity cannot be determined'
+  # The clone needs a full home copy plus OPatch .patch_storage headroom for
+  # the patch itself (same df-based reasoning as the in-place executors).
+  required_bytes=$(((home_kb + artifact_kb * 3) * 1024))
+  [ "$available_bytes" -ge "$required_bytes" ] || die "insufficient free space to clone the Oracle home for patch $PATCH_ID: required=$required_bytes available=$available_bytes"
+}
+
+version_ge() {
+  local actual=$1 required=$2
+  awk -v actual="$actual" -v required="$required" 'BEGIN { na=split(actual,a,"."); nr=split(required,r,"."); n=(na>nr?na:nr); for(i=1;i<=n;i++){av=a[i]+0;rv=r[i]+0;if(av>rv)exit 0;if(av<rv)exit 1}exit 0 }'
+}
+
+opatch_run() {
+  local target_home=$1
+  shift
+  if [ -x "$target_home/jdk/bin/java" ]; then
+    as_owner "$ORACLE_OWNER" env -u JAVA_HOME -u OPATCH_JRE "ORACLE_HOME=$target_home" "PATH=$target_home/OPatch:$target_home/bin:/usr/bin:/bin" "$target_home/OPatch/opatch" "$@" -jdk "$target_home/jdk"
+  else
+    as_owner "$ORACLE_OWNER" env -u JAVA_HOME -u OPATCH_JRE "ORACLE_HOME=$target_home" "PATH=$target_home/OPatch:$target_home/bin:/usr/bin:/bin" "$target_home/OPatch/opatch" "$@"
+  fi
+}
+
+opatch_prereq_check() {
+  local target_home=$1 prereq=$2 output_file=$3 rc
+  set +e
+  (cd "$PATCH_DIR" && opatch_run "$target_home" prereq "$prereq" -ph "$PATCH_DIR" -oh "$target_home") >"$output_file" 2>&1
+  rc=$?
+  set -e
+  printf '%s\n' "$rc" >"$output_file.exit-code"
+  if [ "$rc" -ne 0 ] || grep -E 'Prerequisite check .* failed|Prereq .* is not executed|OPatch (failed|returns) with error code' "$output_file" >/dev/null 2>&1; then
+    cat "$output_file" >&2
+    printf 'OPatch prerequisite %s failed with exit code %s\n' "$prereq" "$rc" >&2
+    [ "$rc" -ne 0 ] || rc=65
+    return "$rc"
+  fi
+  cat "$output_file"
+}
+
+sqlplus_fixed() {
+  local target_home=$1 sid=$2
+  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$target_home" "ORACLE_SID=$sid" "PATH=$target_home/bin:/usr/bin:/bin" "$target_home/bin/sqlplus" -L -s '/ as sysdba'
+}
+
+database_probe() {
+  local target_home=$1 sid=$2 output_file=$3
+  cat <<'SQL' | sqlplus_fixed "$target_home" "$sid" >"$output_file" 2>&1
+whenever sqlerror exit failure
+set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
+select 'INSTANCE_NAME=' || instance_name from v$instance;
+select 'INSTANCE_STATUS=' || status from v$instance;
+select 'DATABASE_UNIQUE_NAME=' || db_unique_name from v$database;
+select 'DATABASE_ROLE=' || database_role from v$database;
+select 'OPEN_MODE=' || open_mode from v$database;
+select 'LOG_MODE=' || log_mode from v$database;
+select 'INVALID_OBJECTS=' || count(*) from dba_objects where status = 'INVALID';
+exit;
+SQL
+}
+
+probe_value() { sed -n "s/^$1=//p" "$2" | tail -n1 | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'; }
+
+healthy_probe() {
+  local file=$1
+  [ "$(probe_value DATABASE_UNIQUE_NAME "$file")" = "$DATABASE" ] &&
+    [ "$(probe_value INSTANCE_STATUS "$file")" = OPEN ] &&
+    [ "$(probe_value DATABASE_ROLE "$file")" = PRIMARY ] &&
+    [ "$(probe_value OPEN_MODE "$file")" = 'READ WRITE' ]
+}
+
+listener_names() {
+  local target_home=$1
+  if [ -n "${OPU_OOP_TEST_LISTENER:-}" ]; then printf '%s\n' "$OPU_OOP_TEST_LISTENER"; return; fi
+  ps -eo user=,comm=,args= 2>/dev/null | awk -v oracle_home="$target_home" -v owner="$ORACLE_OWNER" '
+    $1 == owner && $2 == "tnslsnr" && index($0, oracle_home "/") {
+      for (i = 3; i < NF; i++) if ($i ~ /\/tnslsnr$/) { print $(i + 1); break }
+    }'
+}
+
+discover_target() {
+  local target_home=$1 sid candidate_home restart_flag extra candidate_count=0 listeners listener_count probe_file instance
+  : >"$TASK_DIR/candidate-sids"
+  [ -f "$ORATAB" ] && [ ! -L "$ORATAB" ] || die 'oratab is missing or symbolic link'
+  # shellcheck disable=SC2034
+  while IFS=: read -r sid candidate_home restart_flag extra; do
+    case "$sid" in ''|'#'*) continue ;; esac
+    [ -z "${extra:-}" ] || continue
+    [ "$candidate_home" = "$target_home" ] || continue
+    opu_validate_identifier "$sid" oracle-sid >/dev/null || continue
+    printf '%s\n' "$sid" >>"$TASK_DIR/candidate-sids"
+  done <"$ORATAB"
+  sort -u "$TASK_DIR/candidate-sids" -o "$TASK_DIR/candidate-sids"
+  : >"$TASK_DIR/healthy-sids"
+  while IFS= read -r sid; do
+    [ -n "$sid" ] || continue; probe_file="$TASK_DIR/probe-$sid.log"
+    if database_probe "$target_home" "$sid" "$probe_file" && healthy_probe "$probe_file"; then
+      instance=$(probe_value INSTANCE_NAME "$probe_file"); [ "$instance" = "$sid" ] || die "instance name $instance differs from local SID $sid"
+      printf '%s\n' "$sid" >>"$TASK_DIR/healthy-sids"; candidate_count=$((candidate_count + 1))
+    fi
+  done <"$TASK_DIR/candidate-sids"
+  [ "$candidate_count" -eq 1 ] || die "expected exactly one healthy standalone instance for $DATABASE in $target_home, found $candidate_count"
+  ORACLE_SID=$(head -n1 "$TASK_DIR/healthy-sids")
+  listeners=$(listener_names "$target_home" | sort -u); listener_count=$(printf '%s\n' "$listeners" | sed '/^$/d' | wc -l | tr -d ' ')
+  [ "$listener_count" -le 1 ] || die 'multiple listeners from the target Oracle home require another adapter'
+  LISTENER_NAME=$(printf '%s\n' "$listeners" | sed '/^$/d' | head -n1)
+}
+
+oratab_home_for_sid() {
+  local sid=$1
+  awk -F: -v sid="$sid" '$1 == sid {print $2; exit}' "$ORATAB"
+}
+
+rewrite_oratab() {
+  local sid=$1 new_home=$2 tmp
+  [ -f "$ORATAB" ] && [ ! -L "$ORATAB" ] || die 'oratab is missing or symbolic link'
+  tmp="$ORATAB.tmp.$$"
+  awk -F: -v sid="$sid" -v new_home="$new_home" 'BEGIN{OFS=":"} $1 == sid {$2 = new_home} {print}' "$ORATAB" >"$tmp" || { rm -f "$tmp"; die 'oratab rewrite failed'; }
+  mv "$tmp" "$ORATAB" || die 'oratab rewrite failed'
+  [ "$(oratab_home_for_sid "$sid")" = "$new_home" ] || die 'oratab does not reflect the requested home switch'
+}
+
+seal_binding() {
+  local tmp canonical digest
+  tmp="$BINDING_FILE.tmp.$$"
+  jq -cn --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" --arg database "$DATABASE" --arg oracle_home "$ORACLE_HOME_TARGET" --arg clone_home "$CLONE_HOME" --arg owner "$ORACLE_OWNER" --arg sid "$ORACLE_SID" --arg listener "$LISTENER_NAME" \
+    '{schema_version:"1.0",plan_id:$plan,plan_sha256:$plan_sha,target:{database_unique_name:$database,oracle_home:$oracle_home,clone_home:$clone_home,owner:$owner,oracle_sid:$sid,listener:(if $listener == "" then null else $listener end)}}' >"$tmp"
+  canonical=$(jq -cS . "$tmp"); digest=$(opu_hash_string "$canonical"); jq --arg digest "$digest" '.record_sha256=$digest' "$tmp" >"$BINDING_FILE"; rm -f "$tmp"
+}
+
+load_binding() {
+  verify_sealed_json "$BINDING_FILE" record_sha256 || die 'target binding is missing or its integrity check failed'
+  jq -e --arg plan "$PLAN_ID" --arg plan_sha "$PLAN_SHA" --arg database "$DATABASE" --arg oracle_home "$ORACLE_HOME_TARGET" --arg clone_home "$CLONE_HOME" --arg owner "$ORACLE_OWNER" '.plan_id == $plan and .plan_sha256 == $plan_sha and .target.database_unique_name == $database and .target.oracle_home == $oracle_home and .target.clone_home == $clone_home and .target.owner == $owner' "$BINDING_FILE" >/dev/null || die 'target binding does not match the sealed plan'
+  ORACLE_SID=$(jq -r '.target.oracle_sid' "$BINDING_FILE"); LISTENER_NAME=$(jq -r '.target.listener // empty' "$BINDING_FILE")
+}
+
+inventory_has_patch() {
+  local target_home=$1 output_file=$2
+  opatch_run "$target_home" lspatches >"$output_file" 2>"$output_file.stderr" || die 'OPatch inventory query failed; patch state is unknown'
+  awk -F';' -v patch="$PATCH_ID" '$1 == patch {found=1} END {exit !found}' "$output_file"
+}
+
+pmon_running() {
+  if [ "$TEST_MODE" = 1 ] && [ -n "${OPU_OOP_TEST_DATABASE_STATE:-}" ]; then [ "$(cat "$OPU_OOP_TEST_DATABASE_STATE" 2>/dev/null || true)" != down ]; return; fi
+  ps -eo user=,args= 2>/dev/null | awk -v owner="$ORACLE_OWNER" -v process="ora_pmon_$ORACLE_SID" '$1 == owner && $2 == process {found=1} END {exit !found}'
+}
+
+running_from_home() {
+  local target_home=$1 proc_path executable process_id
+  if [ "$TEST_MODE" = 1 ]; then pmon_running && printf '%s\n' test-pmon || true; return; fi
+  for proc_path in /proc/[0-9]*; do
+    process_id=${proc_path##*/}; executable=$(readlink -f "$proc_path/exe" 2>/dev/null || true)
+    case "$executable" in "$target_home"/*) printf '%s\n' "$process_id" ;; esac
+  done
+  ps -eo pid=,user=,args= 2>/dev/null | awk -v owner="$ORACLE_OWNER" -v sid="ora_pmon_$ORACLE_SID" -v oracle_home="$target_home" '$2 == owner && ($3 == sid || index($0, oracle_home "/")) {print $1}'
+}
+
+wait_for_pmon_state() {
+  local wanted=$1 attempts=${OPU_OOP_WAIT_ATTEMPTS:-60}
+  while [ "$attempts" -gt 0 ]; do
+    if pmon_running; then [ "$wanted" = up ] && return 0; else [ "$wanted" = down ] && return 0; fi
+    attempts=$((attempts - 1)); sleep 2
+  done
+  return 1
+}
+
+listener_action() {
+  local target_home=$1 action=$2
+  [ -n "$LISTENER_NAME" ] || { printf '%s\n' 'No listener was bound to this plan.'; return 0; }
+  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$target_home" "PATH=$target_home/bin:/usr/bin:/bin" "$target_home/bin/lsnrctl" "$action" "$LISTENER_NAME"
+}
+
+listener_ready() {
+  local target_home=$1 output
+  [ -n "$LISTENER_NAME" ] || return 0
+  output=$(listener_action "$target_home" status 2>&1) || return
+  printf '%s\n' "$output" | grep -E "Instance \"?$ORACLE_SID\"?, status READY" >/dev/null
+}
+
+wait_for_listener_ready() {
+  local target_home=$1 attempts=${OPU_OOP_WAIT_ATTEMPTS:-60}
+  while [ "$attempts" -gt 0 ]; do
+    listener_ready "$target_home" && return 0
+    attempts=$((attempts - 1)); sleep 2
+  done
+  return 1
+}
+
+current_health() {
+  local target_home=$1 output_file=$2
+  database_probe "$target_home" "$ORACLE_SID" "$output_file" && healthy_probe "$output_file"
+}
+
+wait_for_database_health() {
+  local target_home=$1 output_file=$2 attempts=${OPU_OOP_WAIT_ATTEMPTS:-60}
+  while [ "$attempts" -gt 0 ]; do
+    current_health "$target_home" "$output_file" && return 0
+    attempts=$((attempts - 1)); sleep 2
+  done
+  return 1
+}
+
+datapatch_run() {
+  local target_home=$1
+  # See opu-database-single-instance-patch stage_datapatch() for why -noqi.
+  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$target_home" "ORACLE_SID=$ORACLE_SID" "PATH=$target_home/bin:$target_home/OPatch:/usr/bin:/bin" "$target_home/OPatch/datapatch" -verbose -noqi
+}
+
+require_marker() {
+  [ -f "$RUN_DIR/$1" ] || die "$2"
+}
+
+shutdown_database() {
+  local target_home=$1
+  cat <<'SQL' | sqlplus_fixed "$target_home" "$ORACLE_SID"
+whenever sqlerror exit failure
+shutdown immediate;
+exit;
+SQL
+  wait_for_pmon_state down || die 'database PMON did not stop after shutdown immediate'
+}
+
+startup_database() {
+  local target_home=$1
+  cat <<'SQL' | sqlplus_fixed "$target_home" "$ORACLE_SID"
+whenever sqlerror exit failure
+startup;
+exit;
+SQL
+  wait_for_pmon_state up || die 'database PMON did not return after startup'
+  listener_action "$target_home" start
+  cat <<'SQL' | sqlplus_fixed "$target_home" "$ORACLE_SID" >/dev/null
+whenever sqlerror exit failure
+alter system register;
+exit;
+SQL
+}
+
+record_clone_digest() {
+  local output_file=$1 digest
+  digest=$(directory_digest "$CLONE_HOME")
+  printf '%s\n' "$digest" >"$output_file"
+  CLONE_DIGEST=$digest
+}
+
+verify_switchback_procedure() {
+  local expected_sha actual_sha
+  ROLLBACK_README=$(jq -r '.rollback_procedure.oracle_reference_path // empty' "$PLAN_FILE")
+  expected_sha=$(jq -r '.rollback_procedure.oracle_reference_sha256 // empty' "$PLAN_FILE")
+  opu_validate_absolute_path "$ROLLBACK_README" rollback-oracle-reference >/dev/null || die 'switchback plan has no valid Oracle reference path'
+  [ -f "$ROLLBACK_README" ] && [ ! -L "$ROLLBACK_README" ] || die 'switchback Oracle reference is missing or symbolic link'
+  case "$ROLLBACK_README" in "$PATCH_DIR"/*) ;; *) die 'switchback Oracle reference is outside the sealed patch artifact' ;; esac
+  actual_sha=$(opu_hash_file "$ROLLBACK_README")
+  [ "$actual_sha" = "$expected_sha" ] || die 'switchback Oracle reference digest changed'
+  LC_ALL=C grep -aE 'datapatch[[:space:]]+-verbose' "$ROLLBACK_README" >/dev/null || die 'sealed Oracle reference does not contain the switchback datapatch command'
+  jq -e --arg patch "$PATCH_ID" --arg required "$REQUIRED_OPATCH" '
+    .intent == "patch_rollback" and
+    .rollback_procedure.expected_binary_before == "installed" and
+    .rollback_procedure.expected_binary_after == "absent" and
+    .rollback_procedure.expected_sql_action_before == "APPLY" and
+    .rollback_procedure.expected_sql_action_after == "ROLLBACK" and
+    .rollback_procedure.required_opatch_version == $required and
+    .patch_id == $patch
+  ' "$PLAN_FILE" >/dev/null || die 'switchback procedure is incomplete or does not match the fixed adapter'
+}
+
+verify_source_apply() {
+  local source_state expected_file_sha actual_file_sha expected_evidence_sha actual_evidence_sha expected_record canonical actual_record
+  SOURCE_APPLY_PLAN=$(jq -r '.source_apply.plan_path // empty' "$PLAN_FILE")
+  SOURCE_APPLY_PLAN_SHA=$(jq -r '.source_apply.plan_sha256 // empty' "$PLAN_FILE")
+  expected_file_sha=$(jq -r '.source_apply.plan_file_sha256 // empty' "$PLAN_FILE")
+  SOURCE_APPLY_EVIDENCE=$(jq -r '.source_apply.final_evidence_path // empty' "$PLAN_FILE")
+  expected_evidence_sha=$(jq -r '.source_apply.final_evidence_sha256 // empty' "$PLAN_FILE")
+  expected_record=$(jq -r '.source_apply.final_evidence_record_sha256 // empty' "$PLAN_FILE")
+  opu_validate_absolute_path "$SOURCE_APPLY_PLAN" source-apply-plan >/dev/null || die 'switchback plan has no valid source apply plan path'
+  opu_validate_absolute_path "$SOURCE_APPLY_EVIDENCE" source-apply-evidence >/dev/null || die 'switchback plan has no valid source apply evidence path'
+  [ -f "$SOURCE_APPLY_PLAN" ] && [ ! -L "$SOURCE_APPLY_PLAN" ] || die 'source apply plan is missing or symbolic link'
+  [ -f "$SOURCE_APPLY_EVIDENCE" ] && [ ! -L "$SOURCE_APPLY_EVIDENCE" ] || die 'source apply evidence is missing or symbolic link'
+  verify_sealed_json "$SOURCE_APPLY_PLAN" plan_sha256 || die 'source apply plan integrity verification failed'
+  [ "$(jq -r '.plan_sha256' "$SOURCE_APPLY_PLAN")" = "$SOURCE_APPLY_PLAN_SHA" ] || die 'source apply plan seal differs from switchback plan'
+  actual_file_sha=$(opu_hash_file "$SOURCE_APPLY_PLAN"); [ "$actual_file_sha" = "$expected_file_sha" ] || die 'source apply plan file digest changed'
+  source_state=$(dirname "$SOURCE_APPLY_PLAN")/state
+  [ -f "$source_state" ] && [ ! -L "$source_state" ] && [ "$(cat "$source_state")" = succeeded ] || die 'source apply plan is not in the succeeded state'
+  actual_evidence_sha=$(opu_hash_file "$SOURCE_APPLY_EVIDENCE"); [ "$actual_evidence_sha" = "$expected_evidence_sha" ] || die 'source apply final evidence file digest changed'
+  canonical=$(jq -cS 'del(.record_sha256)' "$SOURCE_APPLY_EVIDENCE"); actual_record=$(opu_hash_string "$canonical")
+  [ "$actual_record" = "$expected_record" ] && [ "$(jq -r '.record_sha256 // empty' "$SOURCE_APPLY_EVIDENCE")" = "$expected_record" ] || die 'source apply final evidence record integrity verification failed'
+  jq -e --arg plan_sha "$SOURCE_APPLY_PLAN_SHA" --arg database "$DATABASE" --arg oracle_home "$ORACLE_HOME_TARGET" --arg owner "$ORACLE_OWNER" --arg patch "$PATCH_ID" --arg artifact_sha "$ARTIFACT_SHA" '
+    .schema_version == "1.0" and
+    .collector.name == "oracle.database.out_of_place.executor" and
+    .intent == "patch_apply" and
+    .plan_sha256 == $plan_sha and
+    .stage == "oop_final_validate" and
+    .status == "succeeded" and
+    .postcondition.status == "passed" and
+    .outcome_class == "binary_state_known" and
+    .target.database_unique_name == $database and
+    .target.oracle_home == $oracle_home and
+    .target.owner == $owner and
+    .patch.patch_id == $patch and
+    .patch.artifact_sha256 == $artifact_sha
+  ' "$SOURCE_APPLY_EVIDENCE" >/dev/null || die 'source apply final evidence does not authorize this switchback target'
+  SOURCE_APPLY_EVIDENCE_SHA=$expected_evidence_sha
+  SOURCE_APPLY_EVIDENCE_RECORD_SHA=$expected_record
+}
+
+sqlpatch_latest() {
+  local target_home=$1 output_file=$2
+  cat <<SQL | sqlplus_fixed "$target_home" "$ORACLE_SID" >"$output_file"
+whenever sqlerror exit failure
+set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
+select 'SQLPATCH_LATEST_ACTION=' || action from (select action, row_number() over (order by action_time desc, install_id desc) as rn from dba_registry_sqlpatch where patch_id=$PATCH_ID) where rn=1;
+select 'SQLPATCH_LATEST_STATUS=' || status from (select status, row_number() over (order by action_time desc, install_id desc) as rn from dba_registry_sqlpatch where patch_id=$PATCH_ID) where rn=1;
+exit;
+SQL
+}
+
+require_latest_sqlpatch() {
+  local target_home=$1 expected_action=$2 output_file=$3 action status
+  sqlpatch_latest "$target_home" "$output_file" || die 'could not query the latest SQL patch registry action'
+  action=$(probe_value SQLPATCH_LATEST_ACTION "$output_file"); status=$(probe_value SQLPATCH_LATEST_STATUS "$output_file")
+  [ "$action" = "$expected_action" ] && [ "$status" = SUCCESS ] || die "latest SQL patch registry action is not $expected_action/SUCCESS for patch $PATCH_ID"
+}
+
+stage_oop_precheck() {
+  local actual_version
+  verify_source_documents; verify_recovery full; verify_artifact; verify_artifact_platform
+  [ "$(owner_for_path "$ORACLE_HOME_TARGET")" = "$ORACLE_OWNER" ] && { [ "$ORACLE_OWNER" != root ] || [ "$TEST_MODE" = 1 ]; } || die 'live Oracle-home owner differs from the sealed plan'
+  [ -x "$ORACLE_HOME_TARGET/bin/sqlplus" ] && [ -x "$ORACLE_HOME_TARGET/OPatch/opatch" ] && [ -x "$ORACLE_HOME_TARGET/OPatch/datapatch" ] || die 'required Oracle executables are missing'
+  [ ! -e "$CLONE_HOME" ] || die "derived clone home path already exists: $CLONE_HOME"
+  discover_target "$ORACLE_HOME_TARGET"; seal_binding
+  [ "$(oratab_home_for_sid "$ORACLE_SID")" = "$ORACLE_HOME_TARGET" ] || die 'oratab does not bind the discovered SID to the sealed Oracle home'
+  actual_version=$(opatch_run "$ORACLE_HOME_TARGET" version 2>&1 | sed -nE 's/.*Version:[[:space:]]*([^[:space:]]+).*/\1/p' | head -n1)
+  [[ "$actual_version" =~ ^[0-9]+(\.[0-9]+){2,4}$ ]] && version_ge "$actual_version" "$REQUIRED_OPATCH" || die "OPatch $actual_version is below required $REQUIRED_OPATCH"
+  if inventory_has_patch "$ORACLE_HOME_TARGET" "$TASK_DIR/precheck-lspatches.log"; then die "patch $PATCH_ID is already installed in the active home"; fi
+  opatch_prereq_check "$ORACLE_HOME_TARGET" CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/precheck-platform-applicability.log"
+  opatch_prereq_check "$ORACLE_HOME_TARGET" CheckConflictAgainstOHWithDetail "$TASK_DIR/precheck-conflict.log"
+  check_clone_capacity
+  current_health "$ORACLE_HOME_TARGET" "$TASK_DIR/precheck-health.log" || die 'database health changed before execution'
+  wait_for_listener_ready "$ORACLE_HOME_TARGET" || die 'bound listener is not ready before execution'
+  [ ! -e "$RUN_DIR/clone-complete" ] || die 'unexpected prior clone marker exists for this plan'
+}
+
+stage_oop_clone_home() {
+  local partial
+  load_binding; verify_open_window; verify_recovery full; verify_artifact
+  [ ! -e "$RUN_DIR/clone-complete" ] || die 'clone task already completed for this plan'
+  [ ! -e "$CLONE_HOME" ] || die "derived clone home path already exists: $CLONE_HOME"
+  check_clone_capacity
+  current_health "$ORACLE_HOME_TARGET" "$TASK_DIR/clone-pre-health.log" || die 'database is not healthy before the home clone'
+  partial="$CLONE_HOME.partial.$$"
+  cp -a "$ORACLE_HOME_TARGET" "$partial" || { rm -rf "$partial"; die 'Oracle home clone copy failed'; }
+  mv "$partial" "$CLONE_HOME" || { rm -rf "$partial"; die 'Oracle home clone activation failed'; }
+  [ -x "$CLONE_HOME/bin/sqlplus" ] && [ -x "$CLONE_HOME/OPatch/opatch" ] && [ -x "$CLONE_HOME/OPatch/datapatch" ] || die 'cloned Oracle home is missing required executables'
+  if inventory_has_patch "$CLONE_HOME" "$TASK_DIR/clone-lspatches.log"; then die "freshly cloned home already reports patch $PATCH_ID"; fi
+  record_clone_digest "$TASK_DIR/clone-digest"
+  cp "$TASK_DIR/clone-digest" "$RUN_DIR/clone-baseline-digest"
+  current_health "$ORACLE_HOME_TARGET" "$TASK_DIR/clone-post-health.log" || die 'database health changed while cloning the home'
+  : >"$RUN_DIR/clone-complete"
+}
+
+stage_oop_patch_clone() {
+  local opatch_rc
+  load_binding; verify_open_window; verify_artifact; verify_artifact_platform
+  require_marker clone-complete 'clone patching requires a succeeded sealed clone task'
+  [ -d "$CLONE_HOME" ] && [ ! -L "$CLONE_HOME" ] || die 'clone home is missing or symbolic link'
+  [ "$(cat "$RUN_DIR/clone-baseline-digest")" = "$(directory_digest "$CLONE_HOME")" ] || die 'clone home changed since the sealed clone task'
+  opatch_prereq_check "$CLONE_HOME" CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/patch-clone-platform-applicability.log"
+  opatch_prereq_check "$CLONE_HOME" CheckConflictAgainstOHWithDetail "$TASK_DIR/patch-clone-conflict.log"
+  if inventory_has_patch "$CLONE_HOME" "$TASK_DIR/patch-clone-before-lspatches.log"; then die "patch $PATCH_ID is already installed in the clone home"; fi
+  set +e
+  (cd "$PATCH_DIR" && opatch_run "$CLONE_HOME" apply -silent -oh "$CLONE_HOME") >"$TASK_DIR/opatch-apply.log" 2>&1
+  opatch_rc=$?
+  set -e
+  printf '%s\n' "$opatch_rc" >"$TASK_DIR/opatch-apply.exit-code"
+  cat "$TASK_DIR/opatch-apply.log"
+  if [ "$opatch_rc" -ne 0 ]; then
+    printf 'OPatch apply against the clone failed with exit code %s; the active home is untouched\n' "$opatch_rc" >&2
+    return "$opatch_rc"
+  fi
+  if grep -E 'Prerequisite check .* failed|OPatch (failed|returns) with error code' "$TASK_DIR/opatch-apply.log" >/dev/null 2>&1; then
+    printf '%s\n' 'OPatch output reported failure despite exit code 0; the clone requires reconciliation' >&2
+    return 65
+  fi
+  inventory_has_patch "$CLONE_HOME" "$TASK_DIR/patch-clone-after-lspatches.log" || die "OPatch returned success but patch $PATCH_ID is absent from the clone inventory"
+  if inventory_has_patch "$ORACLE_HOME_TARGET" "$TASK_DIR/patch-clone-active-lspatches.log"; then die 'active home inventory changed while patching the clone'; fi
+  record_clone_digest "$TASK_DIR/clone-patched-digest"
+  cp "$TASK_DIR/clone-patched-digest" "$RUN_DIR/clone-patched-digest"
+  current_health "$ORACLE_HOME_TARGET" "$TASK_DIR/patch-clone-health.log" || die 'database health changed while patching the clone'
+  : >"$RUN_DIR/patch-clone-complete"
+}
+
+stage_oop_validate_clone() {
+  load_binding
+  require_marker patch-clone-complete 'clone validation requires a succeeded sealed clone patch task'
+  inventory_has_patch "$CLONE_HOME" "$TASK_DIR/validate-clone-lspatches.log" || die "patch $PATCH_ID is absent from the clone inventory"
+  if inventory_has_patch "$ORACLE_HOME_TARGET" "$TASK_DIR/validate-clone-active-lspatches.log"; then die 'active home unexpectedly reports the patch before the switch'; fi
+  record_clone_digest "$TASK_DIR/validate-clone-digest"
+  [ "$(cat "$RUN_DIR/clone-patched-digest")" = "$CLONE_DIGEST" ] || die 'patched clone digest changed since the sealed clone patch task'
+  current_health "$ORACLE_HOME_TARGET" "$TASK_DIR/validate-clone-health.log" || die 'database health check failed during clone validation'
+  wait_for_listener_ready "$ORACLE_HOME_TARGET" || die 'bound listener is not ready during clone validation'
+  : >"$RUN_DIR/validate-clone-complete"
+}
+
+stage_oop_switch_home() {
+  local active
+  load_binding; verify_open_window; verify_recovery full
+  require_marker validate-clone-complete 'home switch requires a succeeded sealed clone validation task'
+  [ "$(cat "$RUN_DIR/clone-patched-digest")" = "$(directory_digest "$CLONE_HOME")" ] || die 'patched clone digest changed immediately before the switch'
+  inventory_has_patch "$CLONE_HOME" "$TASK_DIR/switch-clone-lspatches.log" || die "patch $PATCH_ID is absent from the clone inventory before the switch"
+  current_health "$ORACLE_HOME_TARGET" "$TASK_DIR/switch-pre-health.log" || die 'database is not healthy immediately before the home switch'
+  [ "$(oratab_home_for_sid "$ORACLE_SID")" = "$ORACLE_HOME_TARGET" ] || die 'oratab no longer binds the SID to the sealed active home'
+  shutdown_database "$ORACLE_HOME_TARGET"
+  : >"$TASK_DIR/database-down"
+  listener_action "$ORACLE_HOME_TARGET" stop
+  active=$(running_from_home "$ORACLE_HOME_TARGET" | sort -u | paste -sd, -); [ -z "$active" ] || die "active Oracle-home processes remain after shutdown: $active"
+  verify_open_window
+  : >"$TASK_DIR/binary-state-unknown"
+  rewrite_oratab "$ORACLE_SID" "$CLONE_HOME"
+  startup_database "$CLONE_HOME"
+  wait_for_database_health "$CLONE_HOME" "$TASK_DIR/switch-health.log" || die 'database did not return PRIMARY/READ WRITE/OPEN from the clone home'
+  wait_for_listener_ready "$CLONE_HOME" || die 'listener did not expose the database as READY from the clone home'
+  rm -f "$TASK_DIR/binary-state-unknown" "$TASK_DIR/database-down"
+  : >"$TASK_DIR/binary-state-known"
+  : >"$RUN_DIR/switch-complete"
+}
+
+stage_oop_datapatch() {
+  load_binding; verify_recovery; verify_open_window
+  require_marker switch-complete 'out-of-place datapatch requires a succeeded sealed home switch task'
+  [ "$(oratab_home_for_sid "$ORACLE_SID")" = "$CLONE_HOME" ] || die 'oratab does not bind the SID to the patched clone home'
+  inventory_has_patch "$CLONE_HOME" "$TASK_DIR/datapatch-lspatches.log" || die 'datapatch refused because the clone binary patch is absent'
+  current_health "$CLONE_HOME" "$TASK_DIR/datapatch-pre-health.log" || die 'database is not healthy for out-of-place datapatch'
+  datapatch_run "$CLONE_HOME"
+  : >"$TASK_DIR/binary-state-known"
+  : >"$RUN_DIR/datapatch-complete"
+}
+
+stage_oop_final_validate() {
+  local invalid maximum_invalid success non_success
+  load_binding
+  require_marker datapatch-complete 'out-of-place final validation requires a succeeded sealed datapatch task'
+  [ "$(oratab_home_for_sid "$ORACLE_SID")" = "$CLONE_HOME" ] || die 'oratab does not bind the SID to the patched clone home'
+  inventory_has_patch "$CLONE_HOME" "$TASK_DIR/final-lspatches.log" || die "patch $PATCH_ID is absent from the final clone inventory"
+  if inventory_has_patch "$ORACLE_HOME_TARGET" "$TASK_DIR/final-original-lspatches.log"; then die 'original home inventory changed during the out-of-place apply'; fi
+  current_health "$CLONE_HOME" "$TASK_DIR/final-health.log" || die 'database final health check failed'
+  wait_for_listener_ready "$CLONE_HOME" || die 'listener final validation failed'
+  invalid=$(probe_value INVALID_OBJECTS "$TASK_DIR/final-health.log"); maximum_invalid=$(jq -r '.database.maximum_invalid_objects' "$(jq -r '.source_documents.policy.path' "$PLAN_FILE")")
+  [[ "$invalid" =~ ^[0-9]+$ ]] && [ "$invalid" -le "$maximum_invalid" ] || die 'invalid-object count exceeds the sealed policy'
+  cat <<SQL | sqlplus_fixed "$CLONE_HOME" "$ORACLE_SID" >"$TASK_DIR/sqlpatch-final.log"
+whenever sqlerror exit failure
+set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
+select 'SQLPATCH_SUCCESS=' || count(*) from dba_registry_sqlpatch where patch_id=$PATCH_ID and action='APPLY' and status='SUCCESS';
+select 'SQLPATCH_NON_SUCCESS=' || count(*) from dba_registry_sqlpatch where patch_id=$PATCH_ID and status<>'SUCCESS';
+exit;
+SQL
+  success=$(probe_value SQLPATCH_SUCCESS "$TASK_DIR/sqlpatch-final.log"); non_success=$(probe_value SQLPATCH_NON_SUCCESS "$TASK_DIR/sqlpatch-final.log")
+  [[ "$success" =~ ^[0-9]+$ ]] && [ "$success" -gt 0 ] && [ "$non_success" = 0 ] || die "SQL patch registry does not show a clean SUCCESS for patch $PATCH_ID"
+  : >"$TASK_DIR/binary-state-known"
+}
+
+stage_oop_switchback_precheck() {
+  local actual_version
+  verify_source_documents; verify_source_apply; verify_switchback_procedure; verify_recovery full; verify_artifact; verify_artifact_platform
+  [ "$(owner_for_path "$ORACLE_HOME_TARGET")" = "$ORACLE_OWNER" ] && { [ "$ORACLE_OWNER" != root ] || [ "$TEST_MODE" = 1 ]; } || die 'live Oracle-home owner differs from the sealed switchback plan'
+  [ -d "$CLONE_HOME" ] && [ ! -L "$CLONE_HOME" ] || die 'patched clone home is missing or symbolic link'
+  [ -x "$ORACLE_HOME_TARGET/bin/sqlplus" ] && [ -x "$ORACLE_HOME_TARGET/OPatch/opatch" ] && [ -x "$ORACLE_HOME_TARGET/OPatch/datapatch" ] || die 'original Oracle home executables are missing'
+  [ -x "$CLONE_HOME/bin/sqlplus" ] && [ -x "$CLONE_HOME/OPatch/opatch" ] || die 'clone Oracle home executables are missing'
+  discover_target "$CLONE_HOME"; seal_binding
+  [ "$(oratab_home_for_sid "$ORACLE_SID")" = "$CLONE_HOME" ] || die 'oratab does not bind the SID to the patched clone home'
+  actual_version=$(opatch_run "$ORACLE_HOME_TARGET" version 2>&1 | sed -nE 's/.*Version:[[:space:]]*([^[:space:]]+).*/\1/p' | head -n1)
+  [[ "$actual_version" =~ ^[0-9]+(\.[0-9]+){2,4}$ ]] && version_ge "$actual_version" "$REQUIRED_OPATCH" || die "OPatch $actual_version is below required $REQUIRED_OPATCH"
+  inventory_has_patch "$CLONE_HOME" "$TASK_DIR/switchback-precheck-clone-lspatches.log" || die "patch $PATCH_ID is absent from the active clone inventory"
+  if inventory_has_patch "$ORACLE_HOME_TARGET" "$TASK_DIR/switchback-precheck-original-lspatches.log"; then die 'original home unexpectedly reports the patch; switchback target is not clean'; fi
+  current_health "$CLONE_HOME" "$TASK_DIR/switchback-precheck-health.log" || die 'database health changed before switchback'
+  wait_for_listener_ready "$CLONE_HOME" || die 'bound listener is not ready before switchback'
+  require_latest_sqlpatch "$CLONE_HOME" APPLY "$TASK_DIR/switchback-precheck-sqlpatch.log"
+  [ ! -e "$RUN_DIR/switch-back-complete" ] || die 'unexpected prior switchback marker exists for this plan'
+}
+
+stage_oop_switch_back() {
+  local active
+  load_binding; verify_open_window; verify_recovery full
+  inventory_has_patch "$CLONE_HOME" "$TASK_DIR/switch-back-clone-lspatches.log" || die "patch $PATCH_ID is absent from the active clone inventory before switchback"
+  if inventory_has_patch "$ORACLE_HOME_TARGET" "$TASK_DIR/switch-back-original-lspatches.log"; then die 'original home unexpectedly reports the patch before switchback'; fi
+  current_health "$CLONE_HOME" "$TASK_DIR/switch-back-pre-health.log" || die 'database is not healthy immediately before switchback'
+  [ "$(oratab_home_for_sid "$ORACLE_SID")" = "$CLONE_HOME" ] || die 'oratab no longer binds the SID to the patched clone home'
+  shutdown_database "$CLONE_HOME"
+  : >"$TASK_DIR/database-down"
+  listener_action "$CLONE_HOME" stop
+  active=$(running_from_home "$CLONE_HOME" | sort -u | paste -sd, -); [ -z "$active" ] || die "clone Oracle-home processes remain after shutdown: $active"
+  verify_open_window
+  : >"$TASK_DIR/binary-state-unknown"
+  rewrite_oratab "$ORACLE_SID" "$ORACLE_HOME_TARGET"
+  startup_database "$ORACLE_HOME_TARGET"
+  wait_for_database_health "$ORACLE_HOME_TARGET" "$TASK_DIR/switch-back-health.log" || die 'database did not return PRIMARY/READ WRITE/OPEN from the original home'
+  wait_for_listener_ready "$ORACLE_HOME_TARGET" || die 'listener did not expose the database as READY from the original home'
+  rm -f "$TASK_DIR/binary-state-unknown" "$TASK_DIR/database-down"
+  : >"$TASK_DIR/binary-state-known"
+  : >"$RUN_DIR/switch-back-complete"
+}
+
+stage_oop_switchback_datapatch() {
+  load_binding; verify_source_apply; verify_switchback_procedure; verify_recovery; verify_open_window
+  require_marker switch-back-complete 'switchback datapatch requires a succeeded sealed switchback task'
+  [ "$(oratab_home_for_sid "$ORACLE_SID")" = "$ORACLE_HOME_TARGET" ] || die 'oratab does not bind the SID to the original home'
+  if inventory_has_patch "$ORACLE_HOME_TARGET" "$TASK_DIR/switchback-datapatch-lspatches.log"; then die 'switchback datapatch refused because the original home reports the patch'; fi
+  current_health "$ORACLE_HOME_TARGET" "$TASK_DIR/switchback-datapatch-pre-health.log" || die 'database is not healthy for switchback datapatch'
+  datapatch_run "$ORACLE_HOME_TARGET"
+  : >"$TASK_DIR/binary-state-known"
+  : >"$RUN_DIR/switchback-datapatch-complete"
+}
+
+stage_oop_switchback_final_validate() {
+  local invalid maximum_invalid
+  load_binding; verify_source_apply; verify_switchback_procedure
+  require_marker switchback-datapatch-complete 'switchback final validation requires a succeeded sealed switchback datapatch task'
+  [ "$(oratab_home_for_sid "$ORACLE_SID")" = "$ORACLE_HOME_TARGET" ] || die 'oratab does not bind the SID to the original home'
+  if inventory_has_patch "$ORACLE_HOME_TARGET" "$TASK_DIR/switchback-final-lspatches.log"; then die "patch $PATCH_ID remains in the original home inventory"; fi
+  current_health "$ORACLE_HOME_TARGET" "$TASK_DIR/switchback-final-health.log" || die 'database switchback final health check failed'
+  wait_for_listener_ready "$ORACLE_HOME_TARGET" || die 'listener switchback final validation failed'
+  invalid=$(probe_value INVALID_OBJECTS "$TASK_DIR/switchback-final-health.log"); maximum_invalid=$(jq -r '.database.maximum_invalid_objects' "$(jq -r '.source_documents.policy.path' "$PLAN_FILE")")
+  [[ "$invalid" =~ ^[0-9]+$ ]] && [ "$invalid" -le "$maximum_invalid" ] || die 'invalid-object count exceeds the sealed policy after switchback'
+  require_latest_sqlpatch "$ORACLE_HOME_TARGET" ROLLBACK "$TASK_DIR/switchback-final-sqlpatch.log"
+  : >"$TASK_DIR/binary-state-known"
+}
+
+load_plan() {
+  PLAN_FILE="$PLAN_STATE_DIR/plans/$PLAN_ID/plan.json"
+  verify_sealed_json "$PLAN_FILE" plan_sha256 || die 'immutable plan is missing or its integrity check failed'
+  PLAN_SHA=$(jq -r '.plan_sha256' "$PLAN_FILE")
+  if [ "$OPERATION" = apply ]; then
+    jq -e '.schema_version == "1.0" and (.intent // "patch_apply") == "patch_apply" and .target.family == "database" and .target.method == "switch_home" and (.target.platform_id | test("^[0-9]+$")) and .procedure.adapter == "database_out_of_place_switch" and .procedure.operations == ["database_home_clone","database_opatch_apply_clone","database_home_switch","database_datapatch"] and .procedure.platform_id == .target.platform_id and (.nodes | length == 1) and (.patch_id | test("^[0-9]{1,20}$")) and (.artifact.sha256 | test("^[a-f0-9]{64}$")) and (.artifact.platforms | type == "array" and length == 1) and .artifact.platforms[0].id == .target.platform_id' "$PLAN_FILE" >/dev/null || die 'plan is not a supported out-of-place home switch apply procedure'
+  else
+    jq -e '.schema_version == "1.0" and .intent == "patch_rollback" and .target.family == "database" and .target.method == "switch_home" and (.target.platform_id | test("^[0-9]+$")) and .procedure.adapter == "database_out_of_place_switchback" and .procedure.operations == ["oop_switchback_precheck","oop_switch_back","oop_switchback_datapatch","oop_switchback_final_validate"] and .procedure.platform_id == .target.platform_id and (.nodes | length == 1) and (.patch_id | test("^[0-9]{1,20}$")) and (.artifact.sha256 | test("^[a-f0-9]{64}$")) and (.artifact.platforms | type == "array" and length == 1) and .artifact.platforms[0].id == .target.platform_id' "$PLAN_FILE" >/dev/null || die 'plan is not a supported out-of-place switchback procedure'
+  fi
+  DATABASE=$(jq -r '.target.database_unique_name' "$PLAN_FILE"); ORACLE_HOME_TARGET=$(jq -r '.target.oracle_home' "$PLAN_FILE"); ORACLE_OWNER=$(jq -r '.target.owner' "$PLAN_FILE")
+  PATCH_ID=$(jq -r '.patch_id' "$PLAN_FILE"); PATCH_DIR=$(jq -r '.artifact.path' "$PLAN_FILE"); ARTIFACT_SHA=$(jq -r '.artifact.sha256' "$PLAN_FILE"); REQUIRED_OPATCH=$(jq -r '.procedure.required_opatch_version' "$PLAN_FILE"); TARGET_PLATFORM_ID=$(jq -r '.target.platform_id' "$PLAN_FILE")
+  CLONE_HOME="$ORACLE_HOME_TARGET-oop-$PATCH_ID"
+  opu_validate_identifier "$DATABASE" database >/dev/null || die 'plan database name is invalid'
+  opu_validate_absolute_path "$ORACLE_HOME_TARGET" oracle-home >/dev/null || die 'plan Oracle home is invalid'
+  opu_validate_absolute_path "$CLONE_HOME" clone-home >/dev/null || die 'derived clone home path is invalid'
+  opu_validate_identifier "$ORACLE_OWNER" owner >/dev/null || die 'plan Oracle owner is invalid'
+  opu_validate_absolute_path "$PATCH_DIR" patch-directory >/dev/null || die 'plan patch directory is invalid'
+  verify_open_window
+}
+
+load_task_after_claim() {
+  local local_host
+  TASK_FILE="$PLAN_STATE_DIR/plans/$PLAN_ID/tasks/$TASK_ID.json"
+  [ -f "$TASK_FILE" ] && [ ! -L "$TASK_FILE" ] || die 'claimed task file is missing or symbolic link'
+  verify_task_definition_and_authorization "$TASK_FILE"
+  if [ "$OPERATION" = apply ]; then
+    jq -e --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg actor "$ACTOR" --arg plan_sha "$PLAN_SHA" '.plan_id == $plan and .task_id == $task and .claimed_by == $actor and .plan_sha256 == $plan_sha and .adapter == "database_out_of_place_switch" and .status == "running" and (.stage | IN("oop_precheck","oop_clone_home","oop_patch_clone","oop_validate_clone","oop_switch_home","oop_datapatch","oop_final_validate"))' "$TASK_FILE" >/dev/null || die 'claimed task does not match the out-of-place apply executor contract'
+  else
+    jq -e --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg actor "$ACTOR" --arg plan_sha "$PLAN_SHA" '.plan_id == $plan and .task_id == $task and .claimed_by == $actor and .plan_sha256 == $plan_sha and .adapter == "database_out_of_place_switchback" and .status == "running" and (.stage | IN("oop_switchback_precheck","oop_switch_back","oop_switchback_datapatch","oop_switchback_final_validate"))' "$TASK_FILE" >/dev/null || die 'claimed task does not match the out-of-place switchback executor contract'
+  fi
+  STAGE=$(jq -r '.stage' "$TASK_FILE"); TASK_NODE=$(jq -r '.node' "$TASK_FILE"); local_host=$(hostname -s 2>/dev/null || hostname)
+  case "$STAGE" in
+    oop_datapatch|oop_final_validate|oop_switchback_datapatch|oop_switchback_final_validate) [ "$TASK_NODE" = local ] || die 'database-wide task has an invalid node binding' ;;
+    *) [ "$TASK_NODE" = "$(jq -r '.nodes[0]' "$PLAN_FILE")" ] && { [ "$TASK_NODE" = "$local_host" ] || [ "$TEST_MODE" = 1 ]; } || die 'task is not bound to this host' ;;
+  esac
+}
+
+run_typed_stage() {
+  case "$STAGE" in
+    oop_precheck) stage_oop_precheck ;;
+    oop_clone_home) stage_oop_clone_home ;;
+    oop_patch_clone) stage_oop_patch_clone ;;
+    oop_validate_clone) stage_oop_validate_clone ;;
+    oop_switch_home) stage_oop_switch_home ;;
+    oop_datapatch) stage_oop_datapatch ;;
+    oop_final_validate) stage_oop_final_validate ;;
+    oop_switchback_precheck) stage_oop_switchback_precheck ;;
+    oop_switch_back) stage_oop_switch_back ;;
+    oop_switchback_datapatch) stage_oop_switchback_datapatch ;;
+    oop_switchback_final_validate) stage_oop_switchback_final_validate ;;
+    *) die "unsupported sealed stage: $STAGE" ;;
+  esac
+}
+
+heartbeat() {
+  local stage_pid=$1 interval=$((LEASE_SECONDS / 3)) elapsed=0
+  [ "$interval" -le 60 ] || interval=60; [ "$interval" -ge 10 ] || interval=10
+  while kill -0 "$stage_pid" 2>/dev/null; do
+    sleep 1; kill -0 "$stage_pid" 2>/dev/null || break
+    elapsed=$((elapsed + 1)); [ "$elapsed" -ge "$interval" ] || continue; elapsed=0
+    if ! env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" renew --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --lease-seconds "$LEASE_SECONDS" >/dev/null 2>"$TASK_DIR/heartbeat-error.log"; then
+      : >"$TASK_DIR/heartbeat-failed"; return 1
+    fi
+  done
+}
+
+emit_evidence() {
+  local status=$1 postcondition=$2 exit_code=$3 detail=$4 finished=$5 outcome_class=$6 stdout_sha stderr_sha tmp canonical record_sha clone_digest
+  if [ "$OPERATION" = switchback ]; then
+    SOURCE_APPLY_PLAN_SHA=$(jq -r '.source_apply.plan_sha256 // empty' "$PLAN_FILE")
+    SOURCE_APPLY_EVIDENCE_SHA=$(jq -r '.source_apply.final_evidence_sha256 // empty' "$PLAN_FILE")
+    SOURCE_APPLY_EVIDENCE_RECORD_SHA=$(jq -r '.source_apply.final_evidence_record_sha256 // empty' "$PLAN_FILE")
+  fi
+  clone_digest=${CLONE_DIGEST:-}
+  stdout_sha=$(opu_hash_file "$TASK_DIR/stdout.log"); stderr_sha=$(opu_hash_file "$TASK_DIR/stderr.log"); tmp="$TASK_DIR/evidence.tmp"
+  jq -cn --arg collector "$EXECUTOR_COLLECTOR" --arg intent "$EXECUTOR_INTENT" --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg plan_sha "$PLAN_SHA" --arg status "$status" --arg postcondition "$postcondition" --arg detail "$detail" --arg outcome_class "$outcome_class" --arg started "$STARTED_AT" --arg finished "$finished" --arg actor "$ACTOR" --arg stage "$STAGE" --arg database "$DATABASE" --arg oracle_home "$ORACLE_HOME_TARGET" --arg clone_home "$CLONE_HOME" --arg clone_digest "$clone_digest" --arg owner "$ORACLE_OWNER" --arg sid "${ORACLE_SID:-}" --arg patch "$PATCH_ID" --arg artifact_sha "$ARTIFACT_SHA" --arg recovery_sha "${RECOVERY_FILE_SHA:-}" --arg recovery_record "${RECOVERY_RECORD_SHA:-}" --arg source_plan_sha "${SOURCE_APPLY_PLAN_SHA:-}" --arg source_evidence_sha "${SOURCE_APPLY_EVIDENCE_SHA:-}" --arg source_evidence_record "${SOURCE_APPLY_EVIDENCE_RECORD_SHA:-}" --arg stdout "$TASK_DIR/stdout.log" --arg stdout_sha "$stdout_sha" --arg stderr "$TASK_DIR/stderr.log" --arg stderr_sha "$stderr_sha" --argjson exit_code "$exit_code" \
+    '{schema_version:"1.0",collector:{name:$collector,version:"1"},intent:$intent,plan_id:$plan,task_id:$task,plan_sha256:$plan_sha,status:$status,postcondition:{status:$postcondition,detail:$detail},outcome_class:$outcome_class,started_at:$started,finished_at:$finished,exit_code:$exit_code,actor:$actor,stage:$stage,target:{database_unique_name:$database,oracle_home:$oracle_home,clone_home:$clone_home,owner:$owner,oracle_sid:(if $sid == "" then null else $sid end)},patch:{patch_id:$patch,artifact_sha256:$artifact_sha},clone:{oracle_home:$clone_home,digest_sha256:(if $clone_digest == "" then null else $clone_digest end)},recovery:{manifest_sha256:(if $recovery_sha == "" then null else $recovery_sha end),record_sha256:(if $recovery_record == "" then null else $recovery_record end)},logs:{stdout:{path:$stdout,sha256:$stdout_sha},stderr:{path:$stderr,sha256:$stderr_sha}}} + (if $intent == "patch_rollback" then {source_apply:{plan_sha256:$source_plan_sha,final_evidence_sha256:$source_evidence_sha,final_evidence_record_sha256:$source_evidence_record}} else {} end)' >"$tmp"
+  canonical=$(jq -cS . "$tmp"); record_sha=$(opu_hash_string "$canonical"); jq --arg record_sha "$record_sha" '.record_sha256=$record_sha' "$tmp" >"$TASK_DIR/evidence.json"; rm -f "$tmp"
+}
+
+classify_outcome() {
+  local status=$1
+  if [ -f "$TASK_DIR/binary-state-unknown" ]; then
+    printf 'binary_state_unknown\n'
+  elif [ "$status" = succeeded ]; then
+    case "$STAGE" in
+      oop_precheck|oop_switchback_precheck) printf 'no_mutation\n' ;;
+      *) printf 'binary_state_known\n' ;;
+    esac
+  elif [ -f "$TASK_DIR/database-down" ]; then
+    printf 'database_down\n'
+  elif [ -f "$TASK_DIR/binary-state-known" ]; then
+    printf 'binary_state_known\n'
+  else
+    printf 'no_mutation\n'
+  fi
+}
+
+execute_task() {
+  local claim_output stage_pid heartbeat_pid stage_rc finished status postcondition detail outcome_class complete_rc
+  require_root; load_plan; verify_source_documents
+  mkdir -p "$EXECUTION_STATE_DIR/plans/$PLAN_ID"; RUN_DIR="$EXECUTION_STATE_DIR/plans/$PLAN_ID"; TASK_DIR="$RUN_DIR/tasks/$TASK_ID"; mkdir -p "$RUN_DIR/tasks"
+  [ ! -e "$TASK_DIR" ] || die "execution evidence already exists for task $TASK_ID"
+  BINDING_FILE="$RUN_DIR/target-binding.json"
+  acquire_executor_lock
+  claim_output=$(env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" claim --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --lease-seconds "$LEASE_SECONDS") || die 'could not claim the sealed task'
+  mkdir "$TASK_DIR"
+  printf '%s\n' "$claim_output" >"$TASK_DIR/claim.json"; load_task_after_claim
+  STARTED_AT=$(opu_now_utc)
+  set +e
+  (set -e; close_inherited_executor_lock; run_typed_stage) >"$TASK_DIR/stdout.log" 2>"$TASK_DIR/stderr.log" & stage_pid=$!
+  (close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
+  wait "$stage_pid"; stage_rc=$?
+  kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true
+  set -e
+  finished=$(opu_now_utc)
+  if [ -f "$TASK_DIR/heartbeat-failed" ]; then status=failed; postcondition=unknown; detail='task lease heartbeat failed; Oracle outcome requires reconciliation'; stage_rc=75
+  elif [ "$stage_rc" -eq 0 ]; then status=succeeded; postcondition=passed; detail="$STAGE postcondition passed"
+  elif [ -f "$TASK_DIR/binary-state-unknown" ]; then status=failed; postcondition=unknown; detail="$STAGE outcome is ambiguous; retry is prohibited"
+  else status=failed; postcondition=failed; detail="$STAGE failed; inspect sealed task logs"; fi
+  outcome_class=$(classify_outcome "$status")
+  [ -n "${RECOVERY_FILE_SHA:-}" ] || { RECOVERY_FILE_SHA=$(jq -r '.recovery.manifest_sha256 // empty' "$PLAN_FILE"); RECOVERY_RECORD_SHA=$(jq -r '.recovery.record_sha256 // empty' "$PLAN_FILE"); }
+  if [ -f "$BINDING_FILE" ] && verify_sealed_json "$BINDING_FILE" record_sha256; then ORACLE_SID=$(jq -r '.target.oracle_sid' "$BINDING_FILE"); fi
+  if [ -z "${CLONE_DIGEST:-}" ]; then
+    if [ -f "$TASK_DIR/validate-clone-digest" ]; then CLONE_DIGEST=$(cat "$TASK_DIR/validate-clone-digest")
+    elif [ -f "$TASK_DIR/clone-patched-digest" ]; then CLONE_DIGEST=$(cat "$TASK_DIR/clone-patched-digest")
+    elif [ -f "$TASK_DIR/clone-digest" ]; then CLONE_DIGEST=$(cat "$TASK_DIR/clone-digest")
+    fi
+  fi
+  emit_evidence "$status" "$postcondition" "$stage_rc" "$detail" "$finished" "$outcome_class"
+  set +e
+  env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" complete --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --status "$status" --evidence "$TASK_DIR/evidence.json"
+  complete_rc=$?; set -e
+  [ "$complete_rc" -eq 0 ] || die 'task evidence was written but the controller could not complete the lease; reconcile the plan'
+  cat "$TASK_DIR/evidence.json"
+  [ "$status" = succeeded ] && return 0
+  return "$stage_rc"
+}
+
+main() {
+  local command=${1:-}; [ "$#" -gt 0 ] && shift
+  [ "$command" = execute ] || { usage >&2; exit 64; }
+  PLAN_ID=""; TASK_ID=""; ACTOR=""; LEASE_SECONDS=3600
+  while [ "$#" -gt 0 ]; do case "$1" in --plan-id) PLAN_ID=${2:-}; shift 2;; --task-id) TASK_ID=${2:-}; shift 2;; --actor) ACTOR=${2:-}; shift 2;; --lease-seconds) LEASE_SECONDS=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
+  opu_validate_identifier "$PLAN_ID" plan-id >/dev/null && opu_validate_identifier "$TASK_ID" task-id >/dev/null && opu_validate_identifier "$ACTOR" actor >/dev/null || die 'plan, task, or actor identifier is invalid'
+  [[ "$LEASE_SECONDS" =~ ^[0-9]{1,4}$ ]] && [ "$LEASE_SECONDS" -ge 30 ] && [ "$LEASE_SECONDS" -le 3600 ] || die 'lease seconds must be between 30 and 3600'
+  opu_validate_absolute_path "$PLAN_STATE_DIR" plan-state-directory >/dev/null || die 'invalid plan state directory'
+  opu_validate_absolute_path "$EXECUTION_STATE_DIR" execution-state-directory >/dev/null || die 'invalid execution state directory'
+  command -v jq >/dev/null && command -v sha256sum >/dev/null && command -v xmllint >/dev/null || die 'jq, sha256sum, and xmllint are required'
+  execute_task
+}
+
+main "$@"
