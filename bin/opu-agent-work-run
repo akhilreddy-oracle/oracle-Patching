@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Lab pull-agent runner: claim one queued job for a node, execute the mapped
+# sealed plan executor (the mutation boundary), and complete the queue job
+# with the executor exit code and a stdout digest. Lab bridge only; this is
+# not an enrolled mTLS agent. OPU_AGENT_EXECUTOR_<ADAPTER> (uppercased, dots
+# and dashes as underscores) is a test-only override of the executor path.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+NODE=""; AGENT=""; LEASE=120; TOKEN=""
+QUEUE_DIR=${OPU_AGENT_QUEUE_DIR:-"$ROOT/webapp/var/agent-queue"}
+
+usage() {
+  printf '%s\n' \
+    'Usage: opu-agent-work-run --node NAME --agent-id ID [--lease-seconds N]' \
+    '           [--queue-dir DIR] [--agent-token TOKEN]' \
+    '' \
+    'Requires OPU_PLAN_STATE_DIR to point at the sealed plan state directory.'
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --node) NODE=${2:-}; shift 2 ;;
+    --agent-id) AGENT=${2:-}; shift 2 ;;
+    --lease-seconds) LEASE=${2:-}; shift 2 ;;
+    --queue-dir) QUEUE_DIR=${2:-}; shift 2 ;;
+    --agent-token) TOKEN=${2:-}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 64 ;;
+  esac
+done
+
+[ -n "$NODE" ] && [ -n "$AGENT" ] || { usage >&2; exit 64; }
+if [ -z "${OPU_PLAN_STATE_DIR:-}" ]; then
+  echo 'opu-agent-work-run: OPU_PLAN_STATE_DIR must be set to the sealed plan state directory (fail closed)' >&2
+  exit 78
+fi
+export OPU_AGENT_QUEUE_DIR="$QUEUE_DIR"
+
+OPU_WR_ROOT="$ROOT" OPU_WR_NODE="$NODE" OPU_WR_AGENT="$AGENT" \
+OPU_WR_LEASE="$LEASE" OPU_WR_TOKEN="$TOKEN" \
+python3 - <<'PY'
+import hashlib, json, os, subprocess, sys
+
+root = os.environ["OPU_WR_ROOT"]
+sys.path.insert(0, os.path.join(root, "webapp"))
+import agent_queue
+
+# Mirrors webapp/planctl.py LIVE_EXECUTOR_BY_ADAPTER exactly.
+EXECUTOR_BY_ADAPTER = {
+    "database_single_instance_opatch": "bin/opu-database-single-instance-patch",
+    "database_single_instance_opatch_rollback": "bin/opu-database-single-instance-rollback",
+    "database_rolling_opatch": "bin/opu-database-rac-node-patch",
+    "database_rac_opatch_rollback": "bin/opu-database-rac-node-rollback",
+    "grid_rolling_opatch": "bin/opu-grid-node-patch",
+    "grid_rolling_opatch_rollback": "bin/opu-grid-node-rollback",
+}
+
+node = os.environ["OPU_WR_NODE"]
+agent = os.environ["OPU_WR_AGENT"]
+lease = int(os.environ["OPU_WR_LEASE"])
+token = os.environ.get("OPU_WR_TOKEN") or None
+
+job = agent_queue.claim(node, agent, lease_seconds=lease, agent_token=token)
+if job is None:
+    print(json.dumps({"status": "idle", "message": "no queued work for node"}))
+    raise SystemExit(0)
+job_id = job["job_id"]
+
+
+def finish(result, ok):
+    done = agent_queue.complete(job_id, agent, result=result, agent_token=token)
+    print(json.dumps(done, indent=2, sort_keys=True))
+    raise SystemExit(0 if ok else 1)
+
+
+adapter = str(job.get("adapter") or "")
+rel = EXECUTOR_BY_ADAPTER.get(adapter)
+if rel is None:
+    finish({"status": "failed", "reason": f"unknown adapter: {adapter!r}"}, ok=False)
+
+override_env = "OPU_AGENT_EXECUTOR_" + adapter.replace(".", "_").replace("-", "_").upper()
+executor = (os.environ.get(override_env) or "").strip() or os.path.join(root, rel)
+if not os.access(executor, os.X_OK):
+    finish({"status": "failed", "reason": f"executor is not executable: {executor}"}, ok=False)
+
+agent_queue.extend_lease(job_id, agent, max(lease, 600))
+argv = [
+    executor, "execute",
+    "--plan-id", job["plan_id"],
+    "--task-id", job["task_id"],
+    "--actor", agent,
+    "--lease-seconds", str(lease),
+]
+proc = subprocess.run(argv, capture_output=True, text=True)
+result = {
+    "status": "success" if proc.returncode == 0 else "failed",
+    "executor": executor,
+    "exit_code": proc.returncode,
+    "stdout_sha256": hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest(),
+}
+if proc.returncode != 0:
+    result["stderr_tail"] = proc.stderr[-2000:]
+finish(result, ok=proc.returncode == 0)
+PY

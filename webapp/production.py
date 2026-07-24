@@ -34,12 +34,41 @@ def cert_file() -> Path:
     return Path(override) if override else DEFAULT_CERT_FILE
 
 
-def is_certified() -> bool:
+CHECKLIST_KEYS = (
+    "OPU_PRODUCTION_CERTIFIED=1",
+    "OPU_SBOM_VERIFIED=1",
+    "OPU_RELEASE_SIGNED=1",
+    "OPU_THREAT_MODEL_SIGNED=1",
+)
+
+
+def _cert_text() -> str | None:
     path = cert_file()
     if not path.is_file() or path.is_symlink():
+        return None
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def checklist_required() -> bool:
+    return (os.environ.get("OPU_PRODUCTION_REQUIRE_CHECKLIST") or "").strip() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def checklist_status() -> dict[str, bool]:
+    text = _cert_text() or ""
+    return {key: key in text for key in CHECKLIST_KEYS}
+
+
+def is_certified() -> bool:
+    text = _cert_text()
+    if text is None:
         return False
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return "OPU_PRODUCTION_CERTIFIED=1" in text
+    if "OPU_PRODUCTION_CERTIFIED=1" not in text:
+        return False
+    if checklist_required():
+        return all(key in text for key in CHECKLIST_KEYS)
+    return True
 
 
 def status() -> dict:
@@ -47,6 +76,8 @@ def status() -> dict:
         "production_mode": production_mode_enabled(),
         "certified": is_certified(),
         "cert_file": str(cert_file()),
+        "checklist_required": checklist_required(),
+        "checklist": checklist_status(),
     }
 
 

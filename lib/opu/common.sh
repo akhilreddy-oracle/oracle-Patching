@@ -242,4 +242,14 @@ opu_require_production_certified() {
         opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is invalid: $cert"
         return 77
     }
+    case "${OPU_PRODUCTION_REQUIRE_CHECKLIST:-0}" in
+        1|true|yes|on)
+            for key in OPU_SBOM_VERIFIED=1 OPU_RELEASE_SIGNED=1 OPU_THREAT_MODEL_SIGNED=1; do
+                grep -Fq "$key" "$cert" || {
+                    opu_error "OPU_PRODUCTION_MODE checklist incomplete; missing $key in $cert"
+                    return 77
+                }
+            done
+            ;;
+    esac
 }

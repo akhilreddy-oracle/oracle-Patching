@@ -1,18 +1,33 @@
 """Local development auth for the lab webapp control plane.
 
-S5-lite: a shared API token gates every /api request. Actor names in JSON
-bodies remain the SoD identifiers enforced by opu-patch-plan; the token is
-what proves the caller is allowed to hit the API at all.
+S5-lite Bearer token gates every /api request. Optional principals file adds
+role-based RBAC (requester/approver/operator/viewer) without replacing
+opu-patch-plan SoD: actor strings in JSON remain the SoD identities.
 """
 from __future__ import annotations
 
+import json
 import os
 import secrets
 from pathlib import Path
 
 TOKEN_ENV = "OPU_WEBAPP_TOKEN"
 TOKEN_FILE = Path(__file__).resolve().parent / "var" / "api-token"
+PRINCIPALS_ENV = "OPU_WEBAPP_PRINCIPALS_FILE"
+PRINCIPALS_FILE = Path(__file__).resolve().parent / "var" / "principals.json"
+RBAC_ENV = "OPU_WEBAPP_RBAC"
 _CACHED_TOKEN: str | None = None
+
+# Action -> required role (any one). When RBAC is off, only the Bearer token applies.
+ACTION_ROLES: dict[str, set[str]] = {
+    "read": {"viewer", "requester", "approver", "operator", "admin"},
+    "create": {"requester", "admin"},
+    "approve": {"approver", "admin"},
+    "authorize": {"operator", "admin"},
+    "dispatch": {"operator", "admin"},
+    "execute": {"operator", "admin"},
+    "agent": {"operator", "admin"},
+}
 
 
 class AuthError(Exception):
@@ -75,3 +90,67 @@ def require_api_auth(authorization_header: str | None) -> None:
     provided = extract_bearer(authorization_header)
     if not provided or not secrets.compare_digest(provided, expected):
         raise AuthError("Missing or invalid Authorization: Bearer <token>")
+
+
+def rbac_enabled() -> bool:
+    flag = (os.environ.get(RBAC_ENV) or "").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    # Auto-enable when a principals file with entries exists.
+    return bool(load_principals())
+
+
+def principals_path() -> Path:
+    override = (os.environ.get(PRINCIPALS_ENV) or "").strip()
+    return Path(override) if override else PRINCIPALS_FILE
+
+
+def load_principals() -> dict[str, set[str]]:
+    path = principals_path()
+    if not path.is_file() or path.is_symlink():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    out: dict[str, set[str]] = {}
+    for entry in data.get("principals") or []:
+        actor = str(entry.get("actor") or "").strip()
+        roles = {str(r).strip() for r in (entry.get("roles") or []) if str(r).strip()}
+        if actor and roles:
+            out[actor] = roles
+    return out
+
+
+def require_role(actor: str | None, action: str) -> None:
+    """Enforce optional RBAC for a named actor and logical action."""
+    if not rbac_enabled():
+        return
+    needed = ACTION_ROLES.get(action)
+    if not needed:
+        raise AuthError(f"unknown RBAC action: {action}", status=500)
+    if not actor or not str(actor).strip():
+        raise AuthError("actor is required when RBAC is enabled", status=403)
+    principals = load_principals()
+    roles = principals.get(str(actor).strip())
+    if not roles:
+        raise AuthError(f"actor {actor!r} is not a configured principal", status=403)
+    if roles.isdisjoint(needed):
+        raise AuthError(
+            f"actor {actor!r} lacks role for action {action} (has {sorted(roles)}, needs one of {sorted(needed)})",
+            status=403,
+        )
+
+
+def whoami(actor: str | None = None) -> dict:
+    principals = load_principals()
+    roles = sorted(principals.get(actor or "", set())) if actor else []
+    return {
+        "rbac_enabled": rbac_enabled(),
+        "actor": actor,
+        "roles": roles,
+        "principals_file": str(principals_path()),
+        "actions": {k: sorted(v) for k, v in ACTION_ROLES.items()},
+    }

@@ -15,7 +15,7 @@ export async function renderPlanList(mount) {
       el("h2", { text: "TEST_MODE demo plan" }),
       el("p", { class: "estate-card-meta" }, [
         document.createTextNode(
-          "Builds a self-contained fake Oracle home and drives a real standalone-database apply plan (precheck → apply → validate → datapatch → final_validate) through the real, unmodified executor binary. No real host is touched. "
+          "Builds a self-contained fake Oracle or Grid home (standalone, two-node RAC, or two-node Grid) and drives a real sealed apply plan through the real, unmodified executor binary. No real host is touched. "
         ),
         el("a", { href: "#/plans/demo-new", text: "Create one →" }),
       ]),
@@ -102,11 +102,16 @@ export async function renderPlanDemoNew(mount) {
   mount.innerHTML = "";
   mount.appendChild(el("h2", { text: "New TEST_MODE demo plan" }));
   mount.appendChild(
-    el("p", { class: "estate-card-meta", text: "Fresh fake Oracle home + patch directory built on the backend host, real opu-artifact-inspect run against it, then a real plan created from that evidence. Nothing here touches a configured estate host." })
+    el("p", { class: "estate-card-meta", text: "Fresh fake Oracle/Grid home + patch directory built on the backend host, real opu-artifact-inspect run against it, then a real plan created from that evidence. Nothing here touches a configured estate host." })
   );
 
   const planId = el("input", { type: "text", value: `demo-${Date.now().toString(36)}` });
   const requester = el("input", { type: "text", value: getActor() });
+  const adapter = el("select", {}, [
+    el("option", { value: "standalone", text: "Standalone database (single instance)" }),
+    el("option", { value: "rac", text: "RAC database (two-node rolling)" }),
+    el("option", { value: "grid", text: "Grid Infrastructure (two-node rolling)" }),
+  ]);
   const now = new Date();
   const start = new Date(now.getTime() - 5 * 60000);
   const end = new Date(now.getTime() + 4 * 3600000);
@@ -118,6 +123,7 @@ export async function renderPlanDemoNew(mount) {
     el("div", { class: "form-grid" }, [
       field("Plan ID", planId),
       field("Requester (actor)", requester),
+      field("Fixture adapter", adapter),
       field("Window start (UTC)", windowStart),
       field("Window end (UTC)", windowEnd),
     ]),
@@ -132,6 +138,7 @@ export async function renderPlanDemoNew(mount) {
       const record = await runToCompletion("/api/plans/testmode-demo", {
         plan_id: planId.value,
         requester: requester.value,
+        adapter: adapter.value,
         window_start: windowStart.value,
         window_end: windowEnd.value,
       });
@@ -312,16 +319,20 @@ async function renderPlan(body, planId, plan, refresh) {
     if (plan.state === "running") {
       const actor = el("input", { type: "text", value: getActor() });
       const btn = el("button", { type: "button", text: "Execute next task" });
+      const btnAll = el("button", { type: "button", text: "Execute remaining tasks" });
       controls.appendChild(
         el("p", {
           class: "estate-card-error",
-          text: "TEST_MODE fixtures run locally. Live plans sync sealed state to the task node over SSH (standalone, RAC, or Grid) and pull evidence back.",
+          text: "TEST_MODE fixtures run locally. Live plans sync sealed state to the task node over SSH (standalone, RAC, or Grid) and pull evidence back. Execute remaining runs tasks serially until idle, success, or a failed/blocked task.",
         })
       );
       btn.addEventListener("click", async () => {
         await runAction(logBox, btn, `/api/plans/${encodeURIComponent(planId)}/execute-next`, { actor: actor.value }, refresh);
       });
-      controls.appendChild(el("div", { class: "pipeline-controls" }, [field("Actor", actor), btn]));
+      btnAll.addEventListener("click", async () => {
+        await runAction(logBox, btnAll, `/api/plans/${encodeURIComponent(planId)}/execute-remaining`, { actor: actor.value }, refresh);
+      });
+      controls.appendChild(el("div", { class: "pipeline-controls" }, [field("Actor", actor), btn, btnAll]));
     }
     controls.appendChild(await taskTable(planId));
   } else {

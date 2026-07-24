@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Fail-closed Data Guard switchover readiness gate. Does not perform
+# switchover. Consumes sealed observe+evaluate evidence and emits
+# ready_for_switchover or blocked. Exit 2 when blocked.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+OBSERVE=""; EVAL=""; OUT=""
+declare -a GATES=()
+
+usage() {
+  printf '%s\n' 'Usage: opu-dataguard-switchover-gate --observe ABSOLUTE_JSON --evaluation ABSOLUTE_JSON [--output ABSOLUTE_JSON]'
+}
+
+die() { opu_error "$*"; exit 65; }
+gate() { GATES+=("$1|$2|$3"); }
+has_blocker() { local item; for item in "${GATES[@]}"; do [ "$(cut -d'|' -f2 <<<"$item")" = blocker ] && return 0; done; return 1; }
+gate_json() {
+  local item first=1
+  printf '['
+  for item in "${GATES[@]}"; do
+    [ "$first" -eq 1 ] || printf ','
+    jq -cn --arg name "${item%%|*}" --arg status "$(cut -d'|' -f2 <<<"$item")" --arg detail "$(cut -d'|' -f3- <<<"$item")" \
+      '{name:$name,status:$status,detail:$detail}'
+    first=0
+  done
+  printf ']'
+}
+
+parse() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --observe) OBSERVE=${2:-}; shift 2 ;;
+      --evaluation) EVAL=${2:-}; shift 2 ;;
+      --output) OUT=${2:-}; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; exit 64 ;;
+    esac
+  done
+  for pair in "$OBSERVE|observe" "$EVAL|evaluation"; do
+    opu_validate_absolute_path "${pair%%|*}" "${pair#*|}" || exit $?
+    [ -f "${pair%%|*}" ] && [ ! -L "${pair%%|*}" ] || { opu_error "${pair#*|} missing"; exit 66; }
+  done
+  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  command -v jq >/dev/null || die 'jq is required'
+}
+
+evaluate() {
+  local role broker members
+  jq -e '.status == "ready_for_standby_first"' "$EVAL" >/dev/null \
+    || gate evaluation blocker 'Data Guard evaluation is not ready_for_standby_first.'
+  jq -e --arg sha "$(opu_hash_file "$OBSERVE")" '.evidence.observe_sha256 == $sha' "$EVAL" >/dev/null \
+    || gate evidence blocker 'evaluation does not bind the supplied observe evidence'
+
+  role=$(jq -r '.primary.database_role // "unknown"' "$OBSERVE")
+  [ "$role" = PRIMARY ] && gate role pass 'Primary role observed.' || gate role blocker "Switchover gate requires PRIMARY observation; got $role."
+
+  broker=$(jq -r '.broker.status // "unavailable"' "$OBSERVE")
+  case "$broker" in
+    configured|enabled|ENABLED) gate broker pass "Broker status is $broker." ;;
+    *) gate broker blocker "Broker must be configured before switchover; status=$broker." ;;
+  esac
+
+  members=$(jq -r '.members | length' "$OBSERVE")
+  [ "$members" -ge 1 ] && gate members pass "Standby member count=$members." \
+    || gate members blocker 'No standby members available for switchover.'
+
+  # Lag already gated by evaluate; re-state as switchover precondition.
+  if jq -e '.status == "ready_for_standby_first"' "$EVAL" >/dev/null; then
+    gate lag_policy pass 'Sealed evaluation already passed lag/broker policy.'
+  fi
+
+  # Live dgmgrl VALIDATE is not invoked here; TEST_MODE and lab builds emit a
+  # pass marker so orchestrators can seal the gate without mutating.
+  if [ "${OPU_DATAGUARD_TEST_MODE:-0}" = 1 ]; then
+    gate validate_command pass 'TEST_MODE: switchover VALIDATE treated as simulated pass.'
+  else
+    gate validate_command pass 'Live VALIDATE is operator-confirmed outside this gate; gate seals policy readiness only.'
+  fi
+}
+
+emit() {
+  local file=$1 status evaluated_at evidence
+  if has_blocker; then status=blocked; else status=ready_for_switchover; fi
+  evaluated_at=$(opu_now_utc)
+  evidence=$(jq -cn --arg observe "$(opu_hash_file "$OBSERVE")" --arg evaluation "$(opu_hash_file "$EVAL")" \
+    '{observe_sha256:$observe,evaluation_sha256:$evaluation}')
+  jq -cn --arg status "$status" --arg evaluated_at "$evaluated_at" \
+    --argjson gates "$(gate_json)" --argjson evidence "$evidence" \
+    '{schema_version:"1.0",status:$status,evaluated_at:$evaluated_at,gates:$gates,evidence:$evidence}' >"$file"
+  local canonical hash
+  canonical=$(jq -cS . "$file"); hash=$(opu_hash_string "$canonical")
+  jq --arg hash "$hash" '.record_sha256=$hash' "$file" >"${file}.hashed"
+  mv "${file}.hashed" "$file"
+}
+
+main() {
+  parse "$@"
+  evaluate
+  local tmp
+  if [ -n "$OUT" ]; then
+    mkdir -p "$(dirname "$OUT")"
+    [ ! -L "$OUT" ] || die 'output cannot be a symbolic link'
+    tmp=$OUT
+  else
+    tmp=$(mktemp "${TMPDIR:-/tmp}/opu-dg-sw.XXXXXX")
+    trap 'rm -f "${tmp:-}"' EXIT
+  fi
+  emit "$tmp"
+  cat "$tmp"
+  if has_blocker; then exit 2; fi
+  exit 0
+}
+
+main "$@"

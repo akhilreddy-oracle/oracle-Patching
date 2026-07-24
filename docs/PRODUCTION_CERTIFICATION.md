@@ -33,6 +33,8 @@ TEST_MODE fixture demos remain available for development.
 | HTTPS for webapp | Set `OPU_WEBAPP_TLS_CERT` and `OPU_WEBAPP_TLS_KEY` before `python3 webapp/server.py` |
 | SBOM | `scripts/generate_sbom.sh [dist/sbom.json]` |
 | Detached release signing | `scripts/sign_release.sh [dist]` then `scripts/verify_release.sh dist lab-signing.pub` |
+| Cert verify | `scripts/verify_production_cert.sh` |
+| Expanded checklist | Set `OPU_PRODUCTION_REQUIRE_CHECKLIST=1` and include `OPU_SBOM_VERIFIED=1`, `OPU_RELEASE_SIGNED=1`, `OPU_THREAT_MODEL_SIGNED=1` in the marker |
 
 These are development/lab helpers. They do not replace enterprise mTLS for
 agents, HA control-plane topology, secret-manager integration, vulnerability

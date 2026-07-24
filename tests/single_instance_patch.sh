@@ -51,6 +51,7 @@ FAIL_DATAPATCH="$TMP/fail-datapatch"
 FAIL_ROLLBACK="$TMP/fail-rollback"
 SQLPATCH_ACTION_STATE="$TMP/sqlpatch-action.state"
 OPATCH_CALLS="$TMP/opatch-calls.log"
+CAPACITY_BYTES=""
 
 mkdir -p "$TEST_HOME/bin" "$TEST_HOME/OPatch" "$TEST_HOME/jdk/bin" \
   "$PATCH_DIR/etc/config" "$BACKUP_ROOT/rman" "$BACKUP_ROOT/oracle-home"
@@ -240,6 +241,7 @@ execute() {
   OPU_TEST_FAIL_DATAPATCH="$FAIL_DATAPATCH" \
   OPU_TEST_FAIL_ROLLBACK="$FAIL_ROLLBACK" \
   OPU_TEST_SQLPATCH_ACTION_STATE="$SQLPATCH_ACTION_STATE" \
+  OPU_SINGLE_INSTANCE_TEST_APPLY_CAPACITY_BYTES="$CAPACITY_BYTES" \
     "$EXECUTOR" execute --plan-id "$plan_id" --task-id "$task_id" --actor standalone-worker --lease-seconds 30
 }
 
@@ -276,6 +278,19 @@ fi
 plan status --plan-id standalone-tamper | jq -e '.state == "paused"' >/dev/null
 [ "$(cat "$DATABASE_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
 cp "$TMP/README.original" "$PATCH_DIR/README.txt"
+
+# Insufficient Oracle-home free space must block precheck before any
+# database mutation, same as the other precheck-stage guards above.
+create_plan standalone-nospace
+CAPACITY_TASK=$(plan next --plan-id standalone-nospace | jq -r '.task_id')
+CAPACITY_BYTES=1
+if execute standalone-nospace "$CAPACITY_TASK" >/dev/null 2>&1; then
+  echo 'insufficient Oracle home capacity was accepted by the standalone executor' >&2
+  exit 1
+fi
+CAPACITY_BYTES=""
+plan status --plan-id standalone-nospace | jq -e '.state == "paused"' >/dev/null
+[ "$(cat "$DATABASE_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
 
 # Platform applicability must also fail closed in the first precheck, preserve
 # OPatch's native return code, and leave all services and binaries untouched.

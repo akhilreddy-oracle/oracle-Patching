@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 import os
 
 import auth
+import agent_queue
 import evidence
 import pipeline_runner
 import pipeline_steps
@@ -144,18 +145,51 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return False
 
+    def _require_role(self, actor: str | None, action: str) -> bool:
+        try:
+            auth.require_role(actor, action)
+            return True
+        except auth.AuthError as exc:
+            self._send_json(exc.status, exc.to_json())
+            return False
+
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         path = urlparse(self.path).path
 
         if path.startswith("/api/") and not self._require_api_auth():
             return
 
+        if path == "/api/auth/whoami":
+            actor = self.headers.get("X-OPU-Actor")
+            self._send_json(200, auth.whoami(actor))
+            return
+
+        if path == "/api/production/status":
+            self._send_json(200, production.status())
+            return
+
+        if path == "/api/agent/jobs":
+            if not self._require_role(self.headers.get("X-OPU-Actor"), "agent"):
+                return
+            status_filter = None
+            query = urlparse(self.path).query
+            if "status=" in query:
+                for part in query.split("&"):
+                    if part.startswith("status="):
+                        status_filter = part.split("=", 1)[1]
+            self._send_json(200, {"jobs": agent_queue.list_jobs(status_filter)})
+            return
+
         if path == "/api/hosts":
+            if not self._require_role(self.headers.get("X-OPU-Actor"), "read"):
+                return
             hosts = load_hosts()
             self._send_json(200, {"hosts": [{"id": h["id"], "label": h["label"]} for h in hosts.values()]})
             return
 
         if path == "/api/estate":
+            if not self._require_role(self.headers.get("X-OPU-Actor"), "read"):
+                return
             self._send_json(200, {"hosts": build_estate()})
             return
 
@@ -286,9 +320,20 @@ class Handler(BaseHTTPRequestHandler):
             except KeyError as exc:
                 self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
                 return
+            adapter = str(body.get("adapter") or "standalone")
+            create_fn = {
+                "standalone": planctl.create_testmode_demo,
+                "rac": planctl.create_testmode_demo_rac,
+                "grid": planctl.create_testmode_demo_grid,
+            }.get(adapter)
+            if create_fn is None:
+                self._send_json(400, {"error": "invalid_adapter", "message": f"Unsupported demo adapter: {adapter!r} (expected standalone, rac, or grid)"})
+                return
+            if not self._require_role(requester, "create"):
+                return
 
-            def run(_record, plan_id=plan_id, requester=requester, window_start=window_start, window_end=window_end):
-                return planctl.create_testmode_demo(plan_id, requester, window_start, window_end)
+            def run(_record, create_fn=create_fn, plan_id=plan_id, requester=requester, window_start=window_start, window_end=window_end):
+                return create_fn(plan_id, requester, window_start, window_end)
 
             try:
                 record = pipeline_runner.start_run("plan", f"plan:{plan_id}:testmode-demo", run)
@@ -310,17 +355,106 @@ class Handler(BaseHTTPRequestHandler):
             except KeyError as exc:
                 self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
                 return
+            if not self._require_role(actor, "execute"):
+                return
 
             def run(_record, plan_id=plan_id, actor=actor):
                 result = planctl.execute_next_task(plan_id, actor)
                 return {"task_result": result, "no_pending_task": result is None}
 
             try:
-                record = pipeline_runner.start_run("plan", f"plan:{plan_id}:execute-next", run)
+                record = pipeline_runner.start_run("plan", f"plan:{plan_id}:execute", run)
             except pipeline_runner.RunConflict as exc:
                 self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
                 return
             self._send_json(202, {"run_id": record.run_id})
+            return
+
+        if path.startswith("/api/plans/") and path.endswith("/execute-remaining"):
+            plan_id = path[len("/api/plans/"):-len("/execute-remaining")]
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            try:
+                actor = body["actor"]
+            except KeyError as exc:
+                self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
+                return
+            if not self._require_role(actor, "execute"):
+                return
+            max_tasks = int(body.get("max_tasks") or 200)
+
+            def run(_record, plan_id=plan_id, actor=actor, max_tasks=max_tasks):
+                return planctl.execute_remaining_tasks(plan_id, actor, max_tasks=max_tasks)
+
+            try:
+                record = pipeline_runner.start_run("plan", f"plan:{plan_id}:execute", run)
+            except pipeline_runner.RunConflict as exc:
+                self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
+                return
+            self._send_json(202, {"run_id": record.run_id})
+            return
+
+        if path.startswith("/api/plans/") and path.endswith("/publish-agent-queue"):
+            plan_id = path[len("/api/plans/"):-len("/publish-agent-queue")]
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            actor = body.get("actor")
+            if not self._require_role(actor, "dispatch"):
+                return
+            try:
+                jobs = planctl.publish_agent_queue(plan_id)
+            except planctl.PlanError as exc:
+                self._send_json(400, exc.to_json())
+                return
+            self._send_json(200, {"published": len(jobs), "jobs": jobs})
+            return
+
+        if path == "/api/agent/claim":
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            agent_id = body.get("agent_id") or body.get("actor")
+            if not self._require_role(agent_id, "agent"):
+                return
+            try:
+                job = agent_queue.claim(
+                    str(body.get("node") or ""),
+                    str(agent_id or ""),
+                    lease_seconds=int(body.get("lease_seconds") or 120),
+                )
+            except agent_queue.QueueError as exc:
+                self._send_json(exc.status, exc.to_json())
+                return
+            self._send_json(200, {"job": job, "idle": job is None})
+            return
+
+        if path == "/api/agent/complete":
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            agent_id = body.get("agent_id") or body.get("actor")
+            if not self._require_role(agent_id, "agent"):
+                return
+            try:
+                job = agent_queue.complete(
+                    str(body.get("job_id") or ""),
+                    str(agent_id or ""),
+                    result=body.get("result"),
+                )
+            except agent_queue.QueueError as exc:
+                self._send_json(exc.status, exc.to_json())
+                return
+            self._send_json(200, {"job": job})
             return
 
         if path.startswith("/api/plans/") and path.endswith("/approve"):
@@ -432,6 +566,8 @@ class Handler(BaseHTTPRequestHandler):
                 host_id = body["host_id"]
                 window_start = body["window_start"]
                 window_end = body["window_end"]
+                if not self._require_role(requester, "create"):
+                    return
                 if self._resolved_host(host_id) is None:
                     self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
                     return
@@ -443,6 +579,8 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "approve":
                 actor = body["actor"]
                 approval_ticket = body["approval_ticket"]
+                if not self._require_role(actor, "approve"):
+                    return
                 key = f"plan:{plan_id}:approve"
 
                 def run(_record, plan_id=plan_id, actor=actor, approval_ticket=approval_ticket):
@@ -450,6 +588,8 @@ class Handler(BaseHTTPRequestHandler):
 
             elif action == "authorize":
                 actor = body["actor"]
+                if not self._require_role(actor, "authorize"):
+                    return
                 key = f"plan:{plan_id}:authorize"
 
                 def run(_record, plan_id=plan_id, actor=actor):
@@ -457,6 +597,8 @@ class Handler(BaseHTTPRequestHandler):
 
             elif action == "dispatch":
                 actor = body["actor"]
+                if not self._require_role(actor, "dispatch"):
+                    return
                 key = f"plan:{plan_id}:dispatch"
 
                 def run(_record, plan_id=plan_id, actor=actor):
@@ -473,6 +615,8 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 new_plan_id = body["plan_id"]
                 requester = body["requester"]
+                if not self._require_role(requester, "create"):
+                    return
                 window_start = body["window_start"]
                 window_end = body["window_end"]
                 key = f"plan:{plan_id}:create-rollback"

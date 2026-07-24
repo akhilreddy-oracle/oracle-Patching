@@ -8,7 +8,7 @@
       "sudo": false,
       "nodes": [
         {"name": "sapproject1", "ssh_alias": "oracle-test-rac"},
-        {"name": "sapproject2", "ssh_alias": null}
+        {"name": "sapproject2", "ssh_alias": "oracle-test-rac2"}
       ]
     },
     {

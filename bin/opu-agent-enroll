@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Lab agent enrollment CLI: mint, revoke, and list pull-agent identities in
+# the filesystem registry (webapp/var/agent-registry/agents.json). The agent
+# token is printed exactly once at enroll time; only its SHA-256 is stored.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+CMD=${1:-}
+[ "$#" -eq 0 ] || shift
+NODE=""; AGENT=""
+
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  opu-agent-enroll enroll --node NAME --agent-id ID' \
+    '  opu-agent-enroll revoke --agent-id ID' \
+    '  opu-agent-enroll list'
+}
+
+case "$CMD" in
+  enroll|revoke|list) ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 64 ;;
+esac
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --node) NODE=${2:-}; shift 2 ;;
+    --agent-id) AGENT=${2:-}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 64 ;;
+  esac
+done
+
+case "$CMD" in
+  enroll) [ -n "$NODE" ] && [ -n "$AGENT" ] || { usage >&2; exit 64; } ;;
+  revoke) [ -n "$AGENT" ] || { usage >&2; exit 64; } ;;
+esac
+
+OPU_ENROLL_CMD="$CMD" OPU_ENROLL_NODE="$NODE" OPU_ENROLL_AGENT="$AGENT" \
+python3 - "$ROOT" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.path.join(sys.argv[1], "webapp"))
+import agent_enroll
+
+cmd = os.environ["OPU_ENROLL_CMD"]
+try:
+    if cmd == "enroll":
+        out = agent_enroll.enroll(os.environ["OPU_ENROLL_NODE"], os.environ["OPU_ENROLL_AGENT"])
+    elif cmd == "revoke":
+        out = agent_enroll.revoke(os.environ["OPU_ENROLL_AGENT"])
+    else:
+        out = {"agents": agent_enroll.list_agents()}
+except agent_enroll.EnrollError as exc:
+    print(json.dumps(exc.to_json()), file=sys.stderr)
+    raise SystemExit(1)
+print(json.dumps(out, indent=2, sort_keys=True))
+PY

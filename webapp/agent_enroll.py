@@ -1,0 +1,124 @@
+"""Lab agent enrollment registry (filesystem, hashed tokens).
+
+Gives pull agents a verifiable identity before they may claim or complete
+queue jobs. Tokens are minted once, returned in plaintext exactly once, and
+stored only as SHA-256 digests. This is a lab-level identity layer, not mTLS.
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import time
+from pathlib import Path
+
+REGISTRY_FILE_ENV = "OPU_AGENT_REGISTRY_FILE"
+DEFAULT_REGISTRY_FILE = Path(__file__).resolve().parent / "var" / "agent-registry" / "agents.json"
+
+# Matches lib/opu/common.sh opu_validate_identifier.
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+class EnrollError(Exception):
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.error = "agent_enroll_error"
+        self.message = message
+        self.status = status
+
+    def to_json(self) -> dict:
+        return {"error": self.error, "message": self.message}
+
+
+def registry_path() -> Path:
+    override = (os.environ.get(REGISTRY_FILE_ENV) or "").strip()
+    return Path(override) if override else DEFAULT_REGISTRY_FILE
+
+
+def _validate_id(value: str, label: str) -> str:
+    value = str(value or "").strip()
+    if not _ID_RE.match(value):
+        raise EnrollError(f"invalid {label}: {value!r}")
+    return value
+
+
+def _load() -> dict:
+    path = registry_path()
+    if path.is_symlink():
+        raise EnrollError(f"registry file must not be a symlink: {path}", status=500)
+    if not path.is_file():
+        return {"schema_version": "1.0", "agents": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EnrollError(f"registry file is unreadable: {path}: {exc}", status=500)
+    if not isinstance(data.get("agents"), dict):
+        raise EnrollError(f"registry file is malformed: {path}", status=500)
+    return data
+
+
+def _save(data: dict) -> None:
+    path = registry_path()
+    if path.is_symlink():
+        raise EnrollError(f"registry file must not be a symlink: {path}", status=500)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def _public_view(entry: dict) -> dict:
+    return {k: v for k, v in entry.items() if k != "token_sha256"}
+
+
+def enroll(node: str, agent_id: str) -> dict:
+    node = _validate_id(node, "node")
+    agent_id = _validate_id(agent_id, "agent_id")
+    token = secrets.token_urlsafe(32)
+    now = int(time.time())
+    data = _load()
+    data["agents"][agent_id] = {
+        "agent_id": agent_id,
+        "node": node,
+        "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        "enrolled_at": now,
+        "revoked": False,
+    }
+    _save(data)
+    return {"agent_id": agent_id, "node": node, "agent_token": token, "enrolled_at": now}
+
+
+def verify(agent_id: str, agent_token: str) -> bool:
+    if not agent_id or not agent_token:
+        return False
+    try:
+        data = _load()
+    except EnrollError:
+        return False
+    entry = data["agents"].get(str(agent_id).strip())
+    if not entry or entry.get("revoked"):
+        return False
+    expected = str(entry.get("token_sha256") or "")
+    provided = hashlib.sha256(str(agent_token).encode("utf-8")).hexdigest()
+    return bool(expected) and hmac.compare_digest(provided, expected)
+
+
+def revoke(agent_id: str) -> dict:
+    agent_id = _validate_id(agent_id, "agent_id")
+    data = _load()
+    entry = data["agents"].get(agent_id)
+    if not entry:
+        raise EnrollError(f"unknown agent_id: {agent_id}", status=404)
+    entry["revoked"] = True
+    entry["revoked_at"] = int(time.time())
+    _save(data)
+    return _public_view(entry)
+
+
+def list_agents() -> list[dict]:
+    data = _load()
+    return [_public_view(entry) for _, entry in sorted(data["agents"].items())]

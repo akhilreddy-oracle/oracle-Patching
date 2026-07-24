@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Lab pull-agent worker: claim one queued job for a node from the webapp
+# filesystem queue. Does not mutate Oracle; prints the claim JSON for the
+# controller/agent to execute via sealed plan executors.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+NODE=""; AGENT=""; LEASE=120; TOKEN=""; QUEUE_DIR=${OPU_AGENT_QUEUE_DIR:-"$ROOT/webapp/var/agent-queue"}
+
+usage() {
+  printf '%s\n' 'Usage: opu-agent-work-pull --node NAME --agent-id ID [--lease-seconds N] [--agent-token TOKEN] [--once]'
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --node) NODE=${2:-}; shift 2 ;;
+    --agent-id) AGENT=${2:-}; shift 2 ;;
+    --lease-seconds) LEASE=${2:-}; shift 2 ;;
+    --agent-token) TOKEN=${2:-}; shift 2 ;;
+    --once) shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 64 ;;
+  esac
+done
+
+[ -n "$NODE" ] && [ -n "$AGENT" ] || { usage >&2; exit 64; }
+export OPU_AGENT_QUEUE_DIR="$QUEUE_DIR"
+OPU_WP_TOKEN="$TOKEN" python3 - <<PY
+import json, os, sys
+sys.path.insert(0, os.path.join("$ROOT", "webapp"))
+import agent_queue
+token = os.environ.get("OPU_WP_TOKEN") or None
+job = agent_queue.claim("$NODE", "$AGENT", lease_seconds=int("$LEASE"), agent_token=token)
+if job is None:
+    print(json.dumps({"status": "idle", "message": "no queued work for node"}))
+    raise SystemExit(0)
+print(json.dumps(job, indent=2, sort_keys=True))
+PY

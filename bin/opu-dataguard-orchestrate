@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Seals a Data Guard orchestration plan from observe, evaluate, plan-order,
+# and optional switchover/reinstate gates. Does not mutate the estate; emits
+# an ordered step list for controllers and operators.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+OBSERVE=""; EVAL=""; ORDER=""; SWITCHOVER=""; REINSTATE=""; OUT=""
+
+usage() {
+  printf '%s\n' 'Usage: opu-dataguard-orchestrate --observe ABSOLUTE_JSON --evaluation ABSOLUTE_JSON --order ABSOLUTE_JSON [--switchover-gate ABSOLUTE_JSON] [--reinstate-gate ABSOLUTE_JSON] [--output ABSOLUTE_JSON]'
+}
+
+die() { opu_error "$*"; exit 65; }
+
+parse() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --observe) OBSERVE=${2:-}; shift 2 ;;
+      --evaluation) EVAL=${2:-}; shift 2 ;;
+      --order) ORDER=${2:-}; shift 2 ;;
+      --switchover-gate) SWITCHOVER=${2:-}; shift 2 ;;
+      --reinstate-gate) REINSTATE=${2:-}; shift 2 ;;
+      --output) OUT=${2:-}; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; exit 64 ;;
+    esac
+  done
+  for pair in "$OBSERVE|observe" "$EVAL|evaluation" "$ORDER|order"; do
+    opu_validate_absolute_path "${pair%%|*}" "${pair#*|}" || exit $?
+    [ -f "${pair%%|*}" ] && [ ! -L "${pair%%|*}" ] || { opu_error "${pair#*|} missing"; exit 66; }
+  done
+  for pair in "$SWITCHOVER|switchover-gate" "$REINSTATE|reinstate-gate"; do
+    [ -z "${pair%%|*}" ] && continue
+    opu_validate_absolute_path "${pair%%|*}" "${pair#*|}" || exit $?
+    [ -f "${pair%%|*}" ] && [ ! -L "${pair%%|*}" ] || { opu_error "${pair#*|} missing"; exit 66; }
+  done
+  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  command -v jq >/dev/null || die 'jq is required'
+}
+
+main() {
+  local steps tmp canonical hash status
+  parse "$@"
+  jq -e '.status == "ready_for_standby_first"' "$EVAL" >/dev/null || die 'evaluation is not ready_for_standby_first'
+  jq -e --arg sha "$(opu_hash_file "$OBSERVE")" '.evidence.observe_sha256 == $sha' "$EVAL" >/dev/null \
+    || die 'evaluation does not bind observe evidence'
+  jq -e '.strategy == "standby_first"' "$ORDER" >/dev/null || die 'order is not standby_first'
+  jq -e --arg sha "$(opu_hash_file "$EVAL")" '.evidence.evaluation_sha256 == $sha' "$ORDER" >/dev/null \
+    || die 'order does not bind evaluation evidence'
+
+  if [ -n "$SWITCHOVER" ]; then
+    jq -e '.status == "ready_for_switchover"' "$SWITCHOVER" >/dev/null || die 'switchover gate is not ready_for_switchover'
+  fi
+  if [ -n "$REINSTATE" ]; then
+    jq -e '.status == "ready_for_reinstate"' "$REINSTATE" >/dev/null || die 'reinstate gate is not ready_for_reinstate'
+  fi
+
+  local switchover_step reinstate_step
+  if [ -n "$SWITCHOVER" ]; then
+    switchover_step=$(jq -cn '{step:"switchover",kind:"mutation",required:false,operator_executed:false,executor:"opu-dataguard-switchover",mode:"test_mode_or_live"}')
+  else
+    switchover_step=$(jq -cn '{step:"switchover",kind:"mutation",required:false,operator_executed:true,note:"No sealed switchover gate supplied; live switchover remains operator/broker mediated."}')
+  fi
+  if [ -n "$REINSTATE" ]; then
+    reinstate_step=$(jq -cn '{step:"reinstate_former_primary",kind:"mutation",required:false,operator_executed:false,executor:"opu-dataguard-reinstate",mode:"test_mode_or_live"}')
+  else
+    reinstate_step=$(jq -cn '{step:"reinstate_former_primary",kind:"mutation",required:false,operator_executed:true}')
+  fi
+
+  steps=$(jq -cn --slurpfile order "$ORDER" --argjson switchover_step "$switchover_step" --argjson reinstate_step "$reinstate_step" '
+    ($order[0].order // []) as $targets |
+    [
+      {step:"observe_seal",kind:"evidence",required:true},
+      {step:"evaluate_seal",kind:"gate",required:true},
+      {step:"standby_first_order",kind:"plan",required:true,targets:$targets},
+      {step:"patch_standbys",kind:"mutation",required:true,using_adapter:"database_or_grid_existing",targets:($targets|map(select(.role=="STANDBY")))},
+      {step:"switchover_gate",kind:"gate",required:false},
+      $switchover_step,
+      {step:"patch_primary",kind:"mutation",required:true,using_adapter:"database_or_grid_existing",targets:($targets|map(select(.role=="PRIMARY")))},
+      {step:"reinstate_gate",kind:"gate",required:false},
+      $reinstate_step
+    ]
+  ')
+
+  status=ready_for_orchestration
+  tmp=$(mktemp "${TMPDIR:-/tmp}/opu-dg-orch.XXXXXX")
+  jq -cn --arg status "$status" --arg evaluated_at "$(opu_now_utc)" --argjson steps "$steps" \
+    --arg observe "$(opu_hash_file "$OBSERVE")" --arg evaluation "$(opu_hash_file "$EVAL")" \
+    --arg order "$(opu_hash_file "$ORDER")" \
+    --arg switchover "$([ -n "$SWITCHOVER" ] && opu_hash_file "$SWITCHOVER" || printf '')" \
+    --arg reinstate "$([ -n "$REINSTATE" ] && opu_hash_file "$REINSTATE" || printf '')" \
+    '{
+      schema_version:"1.0",
+      status:$status,
+      evaluated_at:$evaluated_at,
+      steps:$steps,
+      evidence:{
+        observe_sha256:$observe,
+        evaluation_sha256:$evaluation,
+        order_sha256:$order,
+        switchover_gate_sha256:(if $switchover == "" then null else $switchover end),
+        reinstate_gate_sha256:(if $reinstate == "" then null else $reinstate end)
+      }
+    }' >"$tmp"
+  canonical=$(jq -cS . "$tmp"); hash=$(opu_hash_string "$canonical")
+  if [ -n "$OUT" ]; then
+    jq --arg hash "$hash" '.record_sha256=$hash' "$tmp" >"$OUT"
+    cat "$OUT"
+  else
+    jq --arg hash "$hash" '.record_sha256=$hash' "$tmp"
+  fi
+  rm -f "$tmp"
+}
+
+main "$@"

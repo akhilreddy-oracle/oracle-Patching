@@ -37,6 +37,19 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 EXECUTOR_BY_ADAPTER = {
     "database_single_instance_opatch": REPO_ROOT / "bin" / "opu-database-single-instance-patch",
     "database_single_instance_opatch_rollback": REPO_ROOT / "bin" / "opu-database-single-instance-rollback",
+    "database_rolling_opatch": REPO_ROOT / "bin" / "opu-database-rac-node-patch",
+    "database_rac_opatch_rollback": REPO_ROOT / "bin" / "opu-database-rac-node-rollback",
+    "grid_rolling_opatch": REPO_ROOT / "bin" / "opu-grid-node-patch",
+    "grid_rolling_opatch_rollback": REPO_ROOT / "bin" / "opu-grid-node-rollback",
+}
+
+# The RAC and Grid executors bind each sealed task to the node it runs on; in
+# TEST_MODE that node identity comes from an env var instead of hostname -s.
+TESTMODE_NODE_ENV_BY_ADAPTER = {
+    "database_rolling_opatch": "OPU_RAC_DATABASE_TEST_HOSTNAME",
+    "database_rac_opatch_rollback": "OPU_RAC_DATABASE_TEST_HOSTNAME",
+    "grid_rolling_opatch": "OPU_GRID_NODE_TEST_HOST",
+    "grid_rolling_opatch_rollback": "OPU_GRID_NODE_TEST_HOST",
 }
 
 # Live SSH executors (relative to host remote_root). Plan state is synced to the
@@ -123,6 +136,9 @@ def create(plan_id: str, requester: str, host_id: str, window_start: str, window
     recovery = evidence.evidence_path(host_id, "recovery")
     if recovery.is_file():
         args += ["--recovery-evidence", str(recovery)]
+    dataguard_order = evidence.evidence_path(host_id, "dataguard_order")
+    if dataguard_order.is_file():
+        args += ["--dataguard-order", str(dataguard_order)]
     return _run(args)
 
 
@@ -196,18 +212,18 @@ def list_tasks(plan_id: str) -> list[dict]:
     return tasks
 
 
-def create_testmode_demo(plan_id: str, requester: str, window_start: str, window_end: str) -> dict:
-    """Builds a fresh single-instance TEST_MODE fixture and creates a plan
-    directly from its evidence. This is a self-contained demo path — the
-    plan targets the fixture's fake Oracle home, not any real host in
-    hosts.json, so it can only ever run against the fixture.
+def _create_testmode_plan(plan_id: str, requester: str, window_start: str, window_end: str, builder) -> dict:
+    """Builds a fresh TEST_MODE fixture and creates a plan directly from its
+    evidence. This is a self-contained demo path — the plan targets the
+    fixture's fake Oracle/Grid home, not any real host in hosts.json, so it
+    can only ever run against the fixture.
     """
     validate_plan_id(plan_id)
     TESTMODE_DIR.mkdir(parents=True, exist_ok=True)
     fixture_dir = (TESTMODE_DIR / plan_id).resolve()
     if TESTMODE_DIR.resolve() not in fixture_dir.parents and fixture_dir != TESTMODE_DIR.resolve():
         raise PlanError(f"plan_id escapes testmode root: {plan_id!r}")
-    fx = testmode_fixtures.build(fixture_dir)
+    fx = builder(fixture_dir)
     ev = fx["evidence"]
     args = [
         "create", "--plan-id", plan_id, "--requester", requester,
@@ -220,12 +236,31 @@ def create_testmode_demo(plan_id: str, requester: str, window_start: str, window
     return _run(args)
 
 
+def create_testmode_demo(plan_id: str, requester: str, window_start: str, window_end: str) -> dict:
+    """Standalone single-instance database TEST_MODE demo plan."""
+    return _create_testmode_plan(plan_id, requester, window_start, window_end, testmode_fixtures.build)
+
+
+def create_testmode_demo_rac(plan_id: str, requester: str, window_start: str, window_end: str) -> dict:
+    """Two-node RAC database TEST_MODE demo plan (database_rolling_opatch)."""
+    return _create_testmode_plan(plan_id, requester, window_start, window_end, testmode_fixtures.build_rac)
+
+
+def create_testmode_demo_grid(plan_id: str, requester: str, window_start: str, window_end: str) -> dict:
+    """Two-node Grid Infrastructure TEST_MODE demo plan (grid_rolling_opatch)."""
+    return _create_testmode_plan(plan_id, requester, window_start, window_end, testmode_fixtures.build_grid)
+
+
 def _fixture_dir_for_plan(plan: dict, plan_id: str) -> Path | None:
     """Return TEST_MODE fixture dir when the plan targets webapp/var/testmode."""
-    oracle_home = (plan.get("target") or {}).get("oracle_home")
-    if not oracle_home:
+    target = plan.get("target") or {}
+    # Database plans seal oracle_home; Grid plans seal only grid_home. Both
+    # fixture layouts keep the sealed home exactly two levels below the
+    # fixture root.
+    sealed_home = target.get("oracle_home") or target.get("grid_home")
+    if not sealed_home:
         return None
-    fixture_dir = Path(oracle_home).resolve().parent.parent
+    fixture_dir = Path(sealed_home).resolve().parent.parent
     root = TESTMODE_DIR.resolve()
     if root not in fixture_dir.parents and fixture_dir != root:
         return None
@@ -386,6 +421,12 @@ def _execute_testmode(plan_id: str, task: dict, actor: str, fixture_dir: Path) -
     exec_env = os.environ.copy()
     exec_env["OPU_PLAN_STATE_DIR"] = str(PLAN_STATE_DIR)
     exec_env.update(fx_env)
+    node_env = TESTMODE_NODE_ENV_BY_ADAPTER.get(adapter)
+    if node_env is not None:
+        node = str(task.get("node") or "")
+        if not node:
+            raise PlanError(f"task {task.get('task_id')} has no sealed node for TEST_MODE execute")
+        exec_env[node_env] = node
     argv = [
         str(executor), "execute",
         "--plan-id", plan_id,
@@ -477,6 +518,52 @@ def execute_next_task(plan_id: str, actor: str) -> dict | None:
     if fixture_dir is not None:
         return _execute_testmode(plan_id, task, actor, fixture_dir)
     return _execute_live(plan_id, plan, task, actor)
+
+
+def execute_remaining_tasks(plan_id: str, actor: str, *, max_tasks: int = 200) -> dict:
+    """Execute pending tasks serially until the plan leaves running or max_tasks."""
+    validate_plan_id(plan_id)
+    if max_tasks < 1 or max_tasks > 500:
+        raise PlanError("max_tasks must be between 1 and 500")
+    results: list[dict] = []
+    stopped_reason = "succeeded_or_idle"
+    for _ in range(max_tasks):
+        plan = status(plan_id)
+        state = plan.get("state")
+        if state == "succeeded":
+            stopped_reason = "succeeded"
+            break
+        if state != "running":
+            stopped_reason = f"plan_state_{state}"
+            break
+        result = execute_next_task(plan_id, actor)
+        if result is None:
+            stopped_reason = "no_pending_task"
+            break
+        results.append(result)
+        # Stop after a failed/blocked task so operators can intervene.
+        task_status = (result.get("status") if isinstance(result, dict) else None) or ""
+        if str(task_status).lower() in {"failed", "blocked", "error"}:
+            stopped_reason = f"task_{task_status}"
+            break
+    final = status(plan_id)
+    return {
+        "plan_id": plan_id,
+        "executed_count": len(results),
+        "stopped_reason": stopped_reason,
+        "plan_state": final.get("state"),
+        "task_results": results,
+    }
+
+
+def publish_agent_queue(plan_id: str) -> list[dict]:
+    """Publish pending sealed tasks into the lab pull-agent queue."""
+    import agent_queue
+
+    validate_plan_id(plan_id)
+    plan = status(plan_id)
+    tasks = list_tasks(plan_id)
+    return agent_queue.publish_plan_tasks(plan, tasks)
 
 
 def list_plans() -> list[dict]:

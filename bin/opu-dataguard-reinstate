@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Data Guard reinstate executor. Consumes a sealed ready_for_reinstate gate
+# plus its bound observe evidence. TEST_MODE simulates the broker command;
+# the live path is fail-closed via dgmgrl and production certification.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+
+TEST_MODE=${OPU_DATAGUARD_TEST_MODE:-0}
+GATE=""; OBSERVE=""; DATABASE=""; ACTOR=""; OUT=""
+EXEC_STATUS=""; EXEC_LOG=""
+
+usage() {
+  printf '%s\n' 'Usage: opu-dataguard-reinstate execute --gate ABSOLUTE_JSON --observe ABSOLUTE_JSON --database DB_UNIQUE_NAME --actor NAME [--output ABSOLUTE_JSON]'
+}
+
+die() { opu_error "$*"; exit 65; }
+
+parse() {
+  [ "${1:-}" = execute ] || { usage >&2; exit 64; }
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --gate) GATE=${2:-}; shift 2 ;;
+      --observe) OBSERVE=${2:-}; shift 2 ;;
+      --database) DATABASE=${2:-}; shift 2 ;;
+      --actor) ACTOR=${2:-}; shift 2 ;;
+      --output) OUT=${2:-}; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; exit 64 ;;
+    esac
+  done
+  for pair in "$GATE|gate" "$OBSERVE|observe"; do
+    opu_validate_absolute_path "${pair%%|*}" "${pair#*|}" || exit $?
+    [ -f "${pair%%|*}" ] && [ ! -L "${pair%%|*}" ] || { opu_error "${pair#*|} missing"; exit 66; }
+  done
+  opu_validate_identifier "$DATABASE" database || exit $?
+  opu_validate_identifier "$ACTOR" actor || exit $?
+  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  command -v jq >/dev/null || die 'jq is required'
+}
+
+verify_gate() {
+  local sealed recomputed
+  jq -e '.status == "ready_for_reinstate"' "$GATE" >/dev/null || die 'gate is not ready_for_reinstate'
+  sealed=$(jq -r '.record_sha256 // ""' "$GATE")
+  [ -n "$sealed" ] || die 'gate is not sealed with record_sha256'
+  recomputed=$(opu_hash_string "$(jq -cS 'del(.record_sha256)' "$GATE")")
+  [ "$sealed" = "$recomputed" ] || die 'gate record_sha256 does not match sealed content'
+  jq -e --arg sha "$(opu_hash_file "$OBSERVE")" '.evidence.observe_sha256 == $sha' "$GATE" >/dev/null \
+    || die 'gate does not bind the supplied observe evidence'
+  jq -e --arg database "$DATABASE" 'any(.members[]?; .db_unique_name == $database)' "$OBSERVE" >/dev/null \
+    || die 'database is not a member in the observe evidence'
+}
+
+run_live() {
+  local dgmgrl_bin rc
+  if command -v dgmgrl >/dev/null 2>&1; then
+    dgmgrl_bin=dgmgrl
+  elif [ -n "${ORACLE_HOME:-}" ] && [ -x "$ORACLE_HOME/bin/dgmgrl" ]; then
+    dgmgrl_bin="$ORACLE_HOME/bin/dgmgrl"
+  else
+    opu_error 'live reinstate requires dgmgrl on PATH or at $ORACLE_HOME/bin/dgmgrl'
+    exit 69
+  fi
+  if [ -n "$OUT" ]; then
+    EXEC_LOG="${OUT}.dgmgrl.log"
+  else
+    EXEC_LOG=$(mktemp "${TMPDIR:-/tmp}/opu-dg-rex-log.XXXXXX")
+  fi
+  rc=0
+  "$dgmgrl_bin" -silent / "REINSTATE DATABASE '$DATABASE'" >"$EXEC_LOG" 2>&1 || rc=$?
+  EXEC_STATUS=succeeded
+  [ "$rc" -eq 0 ] || EXEC_STATUS=failed
+  if grep -Eiq 'ORA-|error' "$EXEC_LOG"; then EXEC_STATUS=failed; fi
+}
+
+emit() {
+  local file=$1 status=$2 simulated=$3 log=$4 evidence canonical hash
+  if [ -n "$log" ]; then
+    evidence=$(jq -cn --arg gate "$(opu_hash_file "$GATE")" --arg observe "$(opu_hash_file "$OBSERVE")" \
+      --arg log_path "$log" --arg log_sha "$(opu_hash_file "$log")" \
+      '{gate_sha256:$gate,observe_sha256:$observe,log_path:$log_path,log_sha256:$log_sha}')
+  else
+    evidence=$(jq -cn --arg gate "$(opu_hash_file "$GATE")" --arg observe "$(opu_hash_file "$OBSERVE")" \
+      '{gate_sha256:$gate,observe_sha256:$observe}')
+  fi
+  jq -cn --arg status "$status" --argjson simulated "$simulated" --arg database "$DATABASE" \
+    --arg actor "$ACTOR" --arg executed_at "$(opu_now_utc)" --argjson evidence "$evidence" \
+    '{schema_version:"1.0",operation:"dataguard.reinstate",status:$status,simulated:$simulated,database:$database,actor:$actor,executed_at:$executed_at,evidence:$evidence}' >"$file"
+  canonical=$(jq -cS . "$file"); hash=$(opu_hash_string "$canonical")
+  jq --arg hash "$hash" '.record_sha256=$hash' "$file" >"${file}.hashed"
+  mv "${file}.hashed" "$file"
+}
+
+main() {
+  parse "$@"
+  verify_gate
+  opu_require_production_certified || exit $?
+  local status simulated tmp
+  if [ "$TEST_MODE" = 1 ]; then
+    status=succeeded; simulated=true
+  else
+    simulated=false
+    run_live
+    status=$EXEC_STATUS
+  fi
+  if [ -n "$OUT" ]; then
+    mkdir -p "$(dirname "$OUT")"
+    [ ! -L "$OUT" ] || die 'output cannot be a symbolic link'
+    tmp=$OUT
+  else
+    tmp=$(mktemp "${TMPDIR:-/tmp}/opu-dg-rex.XXXXXX")
+    trap 'rm -f "${tmp:-}"' EXIT
+  fi
+  emit "$tmp" "$status" "$simulated" "$EXEC_LOG"
+  cat "$tmp"
+  [ "$status" = succeeded ] || exit 2
+  exit 0
+}
+
+main "$@"

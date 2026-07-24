@@ -53,13 +53,43 @@ The tests use filesystem fixtures and never require or invoke Oracle software.
 The next verification layer will run the same suite inside Oracle Linux 8 and 9
 containers with ShellCheck installed.
 
+## Discovery outside the agent registry
+
+The registry itself still exposes only the two read-only operations above.
+Richer discovery now exists as a separate read-only tool,
+`bin/opu-topology-discover`: OS and host identity, Oracle homes (oratab plus
+central inventory), Clusterware membership, registered databases and services,
+OPatch version and patch inventory (`lsinventory -xml` with an `lspatches`
+fallback), and SQL-derived database state via local `sqlplus / as sysdba`.
+That tool runs locally per host and feeds the control plane's snapshot
+reconciliation; it is not routed through the agent operation registry.
+
+## Lab pull queue, enrollment, and run bridge
+
+Separately from this registry, the lab webapp provides a filesystem pull
+queue and enrollment layer (see `docs/AGENT_PULL_QUEUE.md`):
+
+- `bin/opu-agent-enroll` mints per-agent tokens (stored hashed) in
+  `webapp/var/agent-registry/agents.json`.
+- `bin/opu-agent-work-pull` claims a queued sealed-plan task for a node.
+- `bin/opu-agent-work-run` claims a task and invokes the mapped sealed plan
+  executor, then completes the queue job with the executor outcome.
+
+`opu-agent-work-run` is a lab bridge: the sealed executors remain the only
+mutation boundary, and the enrollment tokens are a lab identity layer, not an
+enrolled mTLS agent.
+
 ## Explicitly not implemented
 
-- enrollment, mTLS, heartbeat, or remote task leasing
+- mTLS enrollment, heartbeat streams, or network task leasing (the lab queue
+  and token enrollment are filesystem-local stand-ins)
 - signed JSON task envelopes and parameter schemas
-- runtime-process, OPatch, SQL, listener, or service discovery
+- runtime-process discovery inside the agent registry (registry operations
+  remain the two read-only discovery ops; broader discovery lives in
+  `opu-topology-discover`)
 - timeouts, output-size enforcement, redaction rules, or privilege brokerage
-- patch staging, stop/start, OPatch apply, datapatch, rollback, or recovery
+- mutation operations in the agent registry: no patch staging, stop/start,
+  OPatch apply, datapatch, rollback, or recovery is registered
 
 These omissions are gates, not implicit behavior. No unregistered action can be
 requested through the current CLI.

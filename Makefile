@@ -21,8 +21,14 @@ test:
 	./tests/grid_node_rollback.sh
 	./tests/readiness.sh
 	./tests/dataguard.sh
+	./tests/dataguard_switchover.sh
+	./tests/patch_plan_dataguard.sh
+	./tests/webapp_testmode_rac_grid.sh
 	./tests/live_multinode_preflight.sh
 	./tests/release_signing.sh
+	./tests/agent_queue_rbac.sh
+	./tests/agent_work_run.sh
+	./tests/production_cert.sh
 	./tests/database_rolling_patch.sh
 	./tests/grid_rolling_patch.sh
 

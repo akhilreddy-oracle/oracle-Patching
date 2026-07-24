@@ -31,6 +31,31 @@ jq -e '.status == "ready_for_standby_first"' "$TMP/eval.json" >/dev/null
 "$ROOT/bin/opu-dataguard-plan-order" --observe "$TMP/observe.json" --evaluation "$TMP/eval.json" --output "$TMP/order.json" >/dev/null
 jq -e '.strategy == "standby_first" and .order[0].role == "STANDBY" and .order[-1].role == "PRIMARY"' "$TMP/order.json" >/dev/null
 
+OPU_DATAGUARD_TEST_MODE=1 \
+  "$ROOT/bin/opu-dataguard-switchover-gate" --observe "$TMP/observe.json" --evaluation "$TMP/eval.json" --output "$TMP/sw.json" >/dev/null
+jq -e '.status == "ready_for_switchover"' "$TMP/sw.json" >/dev/null
+
+# Reinstate gate expects standby-shaped observation.
+jq '.primary.database_role="PHYSICAL STANDBY"' "$TMP/observe.json" >"$TMP/observe-stby.raw.json"
+canonical=$(jq -cS 'del(.record_sha256)' "$TMP/observe-stby.raw.json")
+hash=$(printf '%s' "$canonical" | sha256sum | awk '{print $1}')
+jq --arg hash "$hash" 'del(.record_sha256) | .record_sha256=$hash' "$TMP/observe-stby.raw.json" >"$TMP/observe-stby.json"
+# Re-bind evaluation observe digest for reinstate evidence check.
+eval_sha_observe=$(sha256sum "$TMP/observe-stby.json" | awk '{print $1}')
+jq --arg sha "$eval_sha_observe" '.evidence.observe_sha256=$sha | del(.record_sha256)' "$TMP/eval.json" >"$TMP/eval-stby.raw.json"
+canonical=$(jq -cS . "$TMP/eval-stby.raw.json")
+hash=$(printf '%s' "$canonical" | sha256sum | awk '{print $1}')
+jq --arg hash "$hash" '.record_sha256=$hash' "$TMP/eval-stby.raw.json" >"$TMP/eval-stby.json"
+
+OPU_DATAGUARD_TEST_MODE=1 \
+  "$ROOT/bin/opu-dataguard-reinstate-gate" --observe "$TMP/observe-stby.json" --evaluation "$TMP/eval-stby.json" --output "$TMP/re.json" >/dev/null
+jq -e '.status == "ready_for_reinstate"' "$TMP/re.json" >/dev/null
+
+"$ROOT/bin/opu-dataguard-orchestrate" \
+  --observe "$TMP/observe.json" --evaluation "$TMP/eval.json" --order "$TMP/order.json" \
+  --switchover-gate "$TMP/sw.json" --output "$TMP/orch.json" >/dev/null
+jq -e '.status == "ready_for_orchestration" and any(.steps[]; .step == "patch_standbys")' "$TMP/orch.json" >/dev/null
+
 # Lagging standby must block.
 jq '.members[0].apply_lag_seconds = 9999' "$TMP/observe.json" >"$TMP/observe-lag.raw.json"
 canonical=$(jq -cS 'del(.record_sha256)' "$TMP/observe-lag.raw.json")
@@ -43,4 +68,4 @@ set -e
 [ "$lag_rc" -eq 2 ]
 jq -e '.status == "blocked" and any(.gates[]; .name == "lag" and .status == "blocker")' "$TMP/eval-lag.json" >/dev/null
 
-printf '%s\n' 'Data Guard observe/evaluate/plan-order test passed'
+printf '%s\n' 'Data Guard observe/evaluate/plan-order/gates/orchestrate test passed'

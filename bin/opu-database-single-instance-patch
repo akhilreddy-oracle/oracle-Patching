@@ -173,6 +173,28 @@ verify_artifact_platform() {
     die "sealed patch artifact platform $platform_id ($platform_name) differs from planned platform $TARGET_PLATFORM_ID"
 }
 
+check_apply_capacity() {
+  local available_kb available_bytes artifact_kb required_bytes
+  if [ "$TEST_MODE" = 1 ] && [ -n "${OPU_SINGLE_INSTANCE_TEST_APPLY_CAPACITY_BYTES:-}" ]; then
+    available_bytes=$OPU_SINGLE_INSTANCE_TEST_APPLY_CAPACITY_BYTES
+  else
+    available_kb=$(df -Pk "$ORACLE_HOME_TARGET" | awk 'NR==2 {print $4}')
+    [[ "$available_kb" =~ ^[0-9]+$ ]] || die 'Oracle home capacity cannot be determined'
+    available_bytes=$((available_kb * 1024))
+  fi
+  artifact_kb=$(du -sk "$PATCH_DIR" | awk '{print $1}')
+  [[ "$artifact_kb" =~ ^[0-9]+$ ]] || die 'Oracle home capacity cannot be determined'
+  # OPatch retains a backup copy of every file it replaces under
+  # .patch_storage for rollback, so free space must cover several times the
+  # patch's own size, not just the patch size itself. Checked here (before
+  # the outage) rather than relying on OPatch's own CheckSystemSpace prereq,
+  # which has documented reliability issues (including reports of hanging)
+  # in the field; this is the same df-based approach already used for RMAN
+  # backup capacity in opu-database-recovery-prepare.
+  required_bytes=$((artifact_kb * 1024 * 3))
+  [ "$available_bytes" -ge "$required_bytes" ] || die "insufficient Oracle home free space for patch $PATCH_ID: required=$required_bytes available=$available_bytes"
+}
+
 version_ge() {
   local actual=$1 required=$2
   awk -v actual="$actual" -v required="$required" 'BEGIN { na=split(actual,a,"."); nr=split(required,r,"."); n=(na>nr?na:nr); for(i=1;i<=n;i++){av=a[i]+0;rv=r[i]+0;if(av>rv)exit 0;if(av<rv)exit 1}exit 0 }'
@@ -390,6 +412,7 @@ stage_precheck() {
   if inventory_has_patch "$TASK_DIR/precheck-lspatches.log"; then die "patch $PATCH_ID is already installed"; fi
   opatch_prereq_check CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/precheck-platform-applicability.log"
   opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/precheck-conflict.log"
+  check_apply_capacity
   current_health "$TASK_DIR/precheck-health.log" || die 'database health changed before execution'
   wait_for_listener_ready || die 'bound listener is not ready before execution'
 }
@@ -403,6 +426,7 @@ stage_apply() {
   if inventory_has_patch "$TASK_DIR/apply-before-lspatches.log"; then die "patch $PATCH_ID became installed before the apply task"; fi
   opatch_prereq_check CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/apply-platform-applicability.log"
   opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/apply-conflict.log"
+  check_apply_capacity
   cat <<'SQL' | sqlplus_fixed "$ORACLE_SID"
 whenever sqlerror exit failure
 shutdown immediate;

@@ -27,12 +27,26 @@ Grid Infrastructure OPatch workflows. Standalone and RAC Database apply plus
 their separately approved rollback paths, manual Grid apply, and lab-capable
 Grid rollback are fail closed. The lab webapp now requires a Bearer API token,
 can execute sealed standalone **and** RAC/Grid tasks over SSH (per-task node
-routing with plan-state sync), and supports Data Guard observe/evaluate plus
-standby-first ordering. Production certification remains an explicit
-`OPU_PRODUCTION_MODE` gate plus lab SBOM/TLS/signing stubs; full S13 pilot
-sign-off and OPatchAuto stay outside the certified build.
+routing with plan-state sync), drives standalone, RAC, and Grid TEST_MODE
+fixtures end-to-end through the real executor binaries, can batch-execute
+remaining tasks, supports optional actor RBAC plus a lab pull-agent work
+queue, and includes Data Guard observe/evaluate/standby-first ordering plus
+switchover/reinstate gates and a sealed orchestration plan. A sealed
+standby-first Data Guard order can now be bound into an immutable plan at
+create and is re-verified fail-closed at dispatch. Data Guard
+switchover/reinstate executors (`opu-dataguard-switchover`,
+`opu-dataguard-reinstate`) now exist in TEST_MODE with a fail-closed live
+`dgmgrl` path that requires production certification and remains unproven
+against a real broker. Production certification
+remains an explicit
+`OPU_PRODUCTION_MODE` gate plus lab SBOM/TLS/signing/checklist stubs; full S13
+pilot sign-off, real-broker validation of live SWITCHOVER/REINSTATE,
+PostgreSQL SoR, and OPatchAuto stay outside the certified build.
 
-Implemented agent capabilities:
+Implemented utility capabilities (the `bin/opu-*` control-plane and executor
+tools; the managed-agent registry itself exposes exactly two read-only
+discovery operations, `host.discover@1` and `oracle_homes.discover@1` — see
+[docs/AGENT_MVP.md](docs/AGENT_MVP.md)):
 
 - fixed, versioned operation allowlist; no generic shell operation
 - per-task durable evidence and atomic completion publication
@@ -100,6 +114,7 @@ make check
 - [Subprojects and build order](docs/IMPLEMENTATION_PLAN.md)
 - [Complete architecture and delivery blueprint](Oracle_Patching_Utility_Blueprint.md)
 - [Data Guard observe and standby-first order](docs/DATA_GUARD.md)
+- [Lab pull-agent work queue](docs/AGENT_PULL_QUEUE.md)
 - [Production certification gate](docs/PRODUCTION_CERTIFICATION.md)
 - [High-assurance acceptance gates](docs/HIGH_ASSURANCE_ACCEPTANCE.md)
 - [Readiness pipeline](docs/READINESS_PIPELINE.md)
