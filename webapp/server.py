@@ -27,6 +27,7 @@ import pipeline_runner
 import pipeline_steps
 import planctl
 import production
+import procedure_hints
 import recoveryctl
 import remote
 
@@ -390,6 +391,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
                 return
             self._send_json(200, {"steps": pipeline_steps.pipeline_state(host_id)})
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/procedure-hints"):
+            host_id = path[len("/api/hosts/"):-len("/procedure-hints")]
+            host = self._resolved_host(host_id)
+            if host is None:
+                self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
+                return
+            identifiers = parse_qs(urlparse(self.path).query).get("readme_identifier", [""])
+            if len(identifiers) != 1:
+                self._send_json(400, {"error": "invalid_readme_selection", "message": "Select one README identifier"})
+                return
+            try:
+                self._send_json(200, procedure_hints.get_hints(host_id, host, identifiers[0]))
+            except remote.RemoteError as exc:
+                status = 504 if exc.error == "ssh_timeout" else 502 if exc.error == "pull_file_failed" else 400
+                self._send_json(status, exc.to_json())
             return
 
         if path.startswith("/api/hosts/") and path.endswith("/artifact-sources"):

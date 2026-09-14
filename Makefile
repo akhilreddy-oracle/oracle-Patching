@@ -10,7 +10,7 @@ SHELL_TESTS := python_runtime execution_lock_files execution_lifecycle run jobs 
 	dataguard dataguard_live dataguard_switchover patch_plan_dataguard discovery_phases \
 	webapp_testmode_rac_grid live_multinode_preflight release_signing agent_queue_rbac agent_work_run \
 	production_cert shell_fail_open_regressions database_rolling_patch grid_rolling_patch integrations
-PYTHON_TESTS := runtime_package agent_queue_hardening artifact_safety webapp_control
+PYTHON_TESTS := runtime_package agent_queue_hardening artifact_safety webapp_control procedure_hints
 TEST_TARGETS := $(addprefix test-shell-,$(SHELL_TESTS)) $(addprefix test-python-,$(PYTHON_TESTS)) test-frontend
 .PHONY: $(TEST_TARGETS)
 

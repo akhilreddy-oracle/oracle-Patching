@@ -61,6 +61,24 @@ record. Any absent, multiple, nonnumeric, or disagreeing platform value blocks
 planning. This binding prevents a compatibility result produced for one
 platform from authorizing another platform's artifact or home.
 
+## Procedure editor and README hints
+
+The web editor restores a saved procedure only when its artifact, patch,
+platform, and README digests match the current inspection. Edited values and
+the last failed submission are shown as unvalidated drafts. Submitting another
+validation clears the previous procedure result and dependent compatibility
+and readiness results, including when that new validation fails.
+
+Autofill preserves entered values and fills only unambiguous missing fields.
+Select an inspected README to retrieve its minimum OPatch requirement through
+`GET /api/hosts/{id}/procedure-hints?readme_identifier=README.html`. This read-only
+endpoint fetches at most 2 MiB plus one overflow-detection byte, verifies the
+README's inspected SHA-256, and recognizes explicit minimum-version statements.
+It returns the source sentence with the hint. A changed README requires fresh
+artifact inspection; missing or ambiguous wording requires manual review.
+Rollback conditions remain an explicit entry from the README. Hints neither
+validate a procedure nor authorize execution.
+
 ## Compatibility collector inputs
 
 The collector accepts a local topology snapshot, exact staged artifact,

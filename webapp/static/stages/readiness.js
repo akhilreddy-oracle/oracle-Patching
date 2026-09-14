@@ -16,7 +16,7 @@ import {
   mediaRemediation,
 } from "../ux.js";
 import { backupPolicyChooser, policyRecoveryBlock, getBackupPolicy } from "../backup_policy.js";
-import { PROCEDURE_ADAPTERS, REQUIRED_PRECHECKS, REQUIRED_POSTCHECKS, buildProcedure } from "../procedure_adapters.js";
+import { PROCEDURE_ADAPTERS, REQUIRED_PRECHECKS, REQUIRED_POSTCHECKS, buildProcedure, procedureMatchesArtifact } from "../procedure_adapters.js";
 
 const STEP_LABELS = {
   reconcile: "Topology reconciliation",
@@ -161,21 +161,21 @@ function stepCard(hostId, stepState, allSteps, refresh) {
   const status = effectiveStatus(stepState);
   const card = el("section", { class: "panel step-card" });
   const displayStatus = done ? status || "done" : "not run";
+  const statusBadge = badge(displayStatus, done ? classifyStatus(displayStatus) : "neutral");
 
   card.appendChild(
     el("div", { class: "step-card-head" }, [
       el("h3", { text: STEP_LABELS[step] || step }),
-      badge(displayStatus, done ? classifyStatus(displayStatus) : "neutral"),
+      statusBadge,
     ])
   );
 
   const explained = explainStatus(status, { done });
-  card.appendChild(
-    helperText(
-      explained.text,
-      explained.kind === "ok" ? null : explained.kind === "error" ? "error" : explained.kind === "warn" ? "warn" : null
-    )
+  const statusExplanation = helperText(
+    explained.text,
+    explained.kind === "ok" ? null : explained.kind === "error" ? "error" : explained.kind === "warn" ? "warn" : null
   );
+  card.appendChild(statusExplanation);
 
   if (step === "artifact-inspect" && done) {
     const path = evidence?.artifact?.path;
@@ -230,7 +230,7 @@ function stepCard(hostId, stepState, allSteps, refresh) {
     );
   }
 
-  buildControls(hostId, step, controls, logBox, refresh, allSteps, evidence);
+  buildControls(hostId, step, controls, logBox, refresh, allSteps, evidence, { statusBadge, statusExplanation, status });
 
   if (step === "readiness-evaluate" && status === "ready_for_approval") {
     card.appendChild(
@@ -289,7 +289,7 @@ async function executeThenRefresh(logBox, btn, runFn, refresh, opts) {
   return record;
 }
 
-function buildControls(hostId, step, controls, logBox, refresh, allSteps, evidence) {
+function buildControls(hostId, step, controls, logBox, refresh, allSteps, evidence, presentation) {
   const base = `/api/hosts/${encodeURIComponent(hostId)}`;
   const errBox = formErrorBox();
   controls.appendChild(errBox);
@@ -358,7 +358,7 @@ function buildControls(hostId, step, controls, logBox, refresh, allSteps, eviden
   }
 
   if (step === "procedure-validate") {
-    controls.appendChild(procedureForm(base, logBox, refresh, errBox, allSteps));
+    controls.appendChild(procedureForm(base, logBox, refresh, errBox, allSteps, presentation));
     return;
   }
 
@@ -520,14 +520,20 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
   return panel;
 }
 
-function extractOpatchFromEvidence(artifact) {
-  const text = String(artifact?.classification_evidence || "");
-  const match = text.match(/OPatch utility version\s+([0-9]+(?:\.[0-9]+){2,4})/i)
-    || text.match(/\b([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)\b.*OPatch/i);
-  return match?.[1] || "";
-}
-
-function procedureForm(base, logBox, refresh, errBox, allSteps) {
+function procedureForm(base, logBox, refresh, errBox, allSteps, presentation) {
+  const initialArtifact = allSteps.find((entry) => entry.step === "artifact-inspect")?.evidence?.artifact;
+  const savedStep = allSteps.find((entry) => entry.step === "procedure-validate");
+  const savedProcedure = savedStep?.evidence?.procedure;
+  const restored = procedureMatchesArtifact(savedProcedure, initialArtifact);
+  const savedInput = savedStep?.input;
+  const restoredInput = !restored && procedureMatchesArtifact(savedInput, initialArtifact);
+  const initialProcedure = restored ? savedProcedure : restoredInput ? savedInput : null;
+  // A refresh must never silently attach a draft to newly inspected media.
+  const artifactBinding = (artifact) => JSON.stringify([artifact?.sha256, artifact?.patch_ids, artifact?.platforms, artifact?.readme_files]);
+  const initialBinding = artifactBinding(initialArtifact);
+  let artifactChanged = false;
+  let validationAttempted = false;
+  let autofilledOpatch = null;
   const form = el("div", { class: "pipeline-form" });
   const patchId = el("input", { type: "text", placeholder: "e.g. 39034528" });
   const family = el("input", { type: "text", readonly: "readonly" });
@@ -543,7 +549,10 @@ function procedureForm(base, logBox, refresh, errBox, allSteps) {
     readonly: "readonly",
   });
   const requiredOpatch = el("input", { type: "text", placeholder: "e.g. 12.2.0.1.49" });
-  const readmeIdentifier = el("input", { type: "text", placeholder: "README relative path" });
+  const readmeIdentifier = el("select", {}, [
+    el("option", { value: "", text: "Choose an inspected README" }),
+    ...(initialArtifact?.readme_files || []).map((entry) => el("option", { value: entry.path, text: entry.path })),
+  ]);
   const mandatoryPre = el("input", {
     type: "text",
     value: REQUIRED_PRECHECKS.join(","),
@@ -554,6 +563,68 @@ function procedureForm(base, logBox, refresh, errBox, allSteps) {
     placeholder: "README rollback condition",
     value: "",
   });
+
+  const inputs = {
+    patch_id: patchId, platform_id: platformId, database_unique_name: dbName,
+    required_opatch_version: requiredOpatch, readme_identifier: readmeIdentifier,
+    rollback_precondition: rollbackPrecondition, prechecks: mandatoryPre, postchecks: mandatoryPost,
+  };
+  const formValues = () => Object.fromEntries(Object.entries(inputs).map(([name, input]) => [name, input.value.trim()]));
+  const draftIdentity = () => JSON.stringify([adapter.value, formValues()]);
+  if (initialProcedure) {
+    adapter.value = initialProcedure.execution.adapter;
+    const values = {
+      patch_id: initialProcedure.patch_id, platform_id: initialProcedure.target.platform_id,
+      database_unique_name: initialProcedure.target.database_unique_name || "",
+      required_opatch_version: initialProcedure.required_opatch_version || "",
+      readme_identifier: initialProcedure.oracle_references.find((entry) => entry.kind === "patch_readme").identifier,
+      rollback_precondition: initialProcedure.rollback?.precondition || "",
+      prechecks: (initialProcedure.mandatory_prechecks || []).join(","),
+      postchecks: (initialProcedure.mandatory_postchecks || []).join(","),
+    };
+    for (const [name, value] of Object.entries(values)) inputs[name].value = value;
+  }
+  const savedIdentity = restored ? draftIdentity() : null;
+  function updateDraftStatus() {
+    const unchanged = restored && draftIdentity() === savedIdentity && !artifactChanged && !validationAttempted;
+    const status = unchanged ? presentation.status || "done" : "Draft · not validated";
+    presentation.statusBadge.textContent = unchanged ? `Saved: ${status}` : status;
+    presentation.statusBadge.className = badge("", unchanged ? classifyStatus(status) : "warn").className;
+    presentation.statusExplanation.textContent = unchanged
+      ? "Loaded the saved procedure for this inspected artifact. The validation result applies to these saved values."
+      : artifactChanged || ((savedProcedure || savedInput) && !initialProcedure)
+        ? "The saved procedure belongs to different artifact evidence. Review the current artifact and validate a new procedure."
+        : restoredInput
+          ? "Loaded the last submitted draft. It has no successful validation for these values; review it and validate again."
+          : savedProcedure
+            ? "These draft values have not been validated. The previous validation applies only to the saved procedure in Evidence JSON."
+            : "Complete the draft and validate it before planning.";
+    presentation.statusExplanation.className = unchanged ? "helper-text" : "helper-text helper-warn";
+  }
+  function onEdit() {
+    updateDraftStatus();
+  }
+  for (const input of Object.values(inputs)) {
+    input.addEventListener("input", onEdit);
+    input.addEventListener("change", onEdit);
+  }
+  function requiredFieldsMissing() {
+    const labels = {
+      patch_id: "Patch ID", platform_id: "Platform ID", readme_identifier: "README identifier",
+      required_opatch_version: "Required OPatch version from the selected README",
+      rollback_precondition: "Rollback precondition from the README",
+      ...(PROCEDURE_ADAPTERS[adapter.value].family === "database" ? { database_unique_name: "Database unique name" } : {}),
+    };
+    return Object.entries(labels).filter(([name]) => !inputs[name].value.trim()).map(([name, label]) => ({ input: inputs[name], label }));
+  }
+  function checkArtifact(artifact) {
+    if (!artifact) throw new Error("Run artifact-inspect first, then reload Readiness.");
+    if (artifactBinding(artifact) !== initialBinding) {
+      artifactChanged = true;
+      updateDraftStatus();
+      throw new Error("Artifact evidence changed while this form was open. Reload Readiness to review the current artifact before validating.");
+    }
+  }
 
   const databaseField = field("Database unique name", dbName);
   function syncAdapter() {
@@ -567,43 +638,91 @@ function procedureForm(base, logBox, refresh, errBox, allSteps) {
     dbName.disabled = config.family !== "database";
     dbName.required = config.family === "database";
   }
-  adapter.addEventListener("change", syncAdapter);
+  adapter.addEventListener("change", () => { syncAdapter(); onEdit(); });
   syncAdapter();
+  updateDraftStatus();
 
   const autofillBtn = runButton("Autofill from artifact", async () => {
     clearFormError(errBox);
-    const res = await apiFetch(`${base}/pipeline`);
-    const data = await res.json();
-    const artifact = data.steps.find((s) => s.step === "artifact-inspect")?.evidence?.artifact;
-    if (!artifact) {
-      showFormError(errBox, "Run artifact-inspect first.");
-      return;
-    }
-    const discovery = data.steps.find((s) => s.step === "discovery")?.evidence;
-    const dbUnique = discovery?.databases?.[0]?.db_unique_name || "";
-
-    patchId.value = artifact.patch_ids?.[0] || "";
-    platformId.value = artifact.platforms?.[0]?.id || "";
-    if (artifact.readme_files?.[0]) readmeIdentifier.value = artifact.readme_files[0].path;
-    if (dbUnique) dbName.value = dbUnique;
-    requiredOpatch.value = extractOpatchFromEvidence(artifact) || requiredOpatch.value;
-    const missing = [];
-    if (PROCEDURE_ADAPTERS[adapter.value].family === "database" && !dbName.value.trim()) missing.push("database unique name (discovery has none)");
-    if (!requiredOpatch.value.trim()) {
-      missing.push("required OPatch version (set from patch README, e.g. 12.2.0.1.49)");
-    }
-    if (missing.length) {
-      showFormError(errBox, `Autofilled artifact/discovery fields; still need: ${missing.join("; ")}.`);
-    } else {
-      clearFormError(errBox);
+    readmeSource.textContent = "";
+    autofillBtn.disabled = true;
+    const notices = [];
+    try {
+      const res = await apiFetch(`${base}/pipeline`);
+      const data = await res.json();
+      const artifact = data.steps?.find((s) => s.step === "artifact-inspect")?.evidence?.artifact;
+      checkArtifact(artifact);
+      const discovery = data.steps?.find((s) => s.step === "discovery")?.evidence;
+      function fillUnique(input, candidates, label) {
+        if (input.value.trim()) return;
+        const values = [...new Set(candidates.filter(Boolean).map(String))];
+        if (values.length === 1) input.value = values[0];
+        else if (values.length > 1) notices.push(`Choose ${label}: ${values.join(", ")}`);
+      }
+      fillUnique(patchId, artifact.patch_ids || [], "a patch ID");
+      fillUnique(platformId, (artifact.platforms || []).map((entry) => entry.id), "a platform ID");
+      fillUnique(readmeIdentifier, (artifact.readme_files || []).map((entry) => entry.path), "a README");
+      if (PROCEDURE_ADAPTERS[adapter.value].family === "database") {
+        fillUnique(dbName, (discovery?.databases || []).map((entry) => entry.db_unique_name), "a database");
+      }
+      const selectedReadme = readmeIdentifier.value;
+      const reference = artifact.readme_files?.find((entry) => entry.path === selectedReadme);
+      if (reference) {
+        try {
+          const hintRes = await apiFetch(`${base}/procedure-hints?readme_identifier=${encodeURIComponent(selectedReadme)}`);
+          const hint = await hintRes.json();
+          if (!hintRes.ok) throw new Error(hint.message || "Could not verify the selected README.");
+          if (hint.artifact_sha256 !== artifact.sha256 || hint.readme_identifier !== reference.path || hint.readme_sha256 !== reference.sha256) {
+            throw new Error("README hints do not match the inspected artifact. Reinspect the artifact before using them.");
+          }
+          // The operator can edit the form while SSH verifies the README.
+          if (readmeIdentifier.value !== selectedReadme) {
+            notices.push("README selection changed during verification; run Autofill again for the selected README.");
+          } else {
+            if (!requiredOpatch.value.trim() && hint.required_opatch_version) {
+              requiredOpatch.value = hint.required_opatch_version;
+              autofilledOpatch = { value: hint.required_opatch_version, readme: selectedReadme };
+            }
+            readmeSource.textContent = hint.required_opatch_version
+              ? `Verified ${reference.path}: minimum OPatch ${hint.required_opatch_version}.${hint.evidence ? ` ${hint.evidence}` : ""}`
+              : `Verified ${reference.path}; no unambiguous minimum OPatch version was found. Enter it from the README.`;
+            notices.push(...(Array.isArray(hint.warnings) ? hint.warnings : []));
+          }
+        } catch (error) {
+          if (error.name === "AbortError") throw error;
+          notices.push(error.message || String(error));
+        }
+      }
+      const missing = requiredFieldsMissing();
+      if (missing.length) notices.push(`Still required: ${missing.map((entry) => entry.label).join("; ")}.`);
+      if (notices.length) showFormError(errBox, notices.join(" "));
+    } catch (error) {
+      if (error.name === "AbortError") throw error;
+      showFormError(errBox, error.message || String(error));
+    } finally {
+      autofillBtn.disabled = false;
+      updateDraftStatus();
     }
   });
 
+  const readmeSource = helperText("");
+  readmeSource.setAttribute("aria-live", "polite");
+  readmeIdentifier.addEventListener("change", () => {
+    readmeSource.textContent = "";
+    if (autofilledOpatch && readmeIdentifier.value !== autofilledOpatch.readme) {
+      if (requiredOpatch.value === autofilledOpatch.value) requiredOpatch.value = "";
+      autofilledOpatch = null;
+      updateDraftStatus();
+    }
+  });
+  requiredOpatch.addEventListener("input", () => { autofilledOpatch = null; });
+
   form.appendChild(
     helperText(
-      "Select the adapter specified by the patch README. Autofill binds patch/platform/README from artifact inspection and the database name from discovery. Enter the README minimum OPatch version and exact rollback condition. Required prechecks are always retained."
+      "Select the adapter specified by the patch README. Autofill fills empty fields from unambiguous artifact and discovery evidence, and verifies the selected README for its minimum OPatch version. Existing values are preserved. Enter the exact rollback condition from the README. Required prechecks are always retained."
     )
   );
+  form.appendChild(readmeSource);
   form.appendChild(
     el("div", { class: "form-grid" }, [
       field("Patch ID", patchId),
@@ -630,29 +749,25 @@ function procedureForm(base, logBox, refresh, errBox, allSteps) {
       showFormError(errBox, "Complete prerequisite steps.");
       return;
     }
-    if (!requireNonEmpty(patchId, errBox, "Patch ID")) return;
-    if (PROCEDURE_ADAPTERS[adapter.value].family === "database" && !requireNonEmpty(dbName, errBox, "Database unique name")) return;
-    if (!requireNonEmpty(requiredOpatch, errBox, "Required OPatch")) return;
-    if (!requireNonEmpty(readmeIdentifier, errBox, "README identifier")) return;
-    if (!requireNonEmpty(rollbackPrecondition, errBox, "Rollback precondition")) return;
-    const res = await apiFetch(`${base}/pipeline`);
-    const data = await res.json();
-    const artifact = data.steps.find((s) => s.step === "artifact-inspect")?.evidence?.artifact;
-    if (!artifact) {
-      showFormError(errBox, "Run artifact-inspect first.");
+    const missing = requiredFieldsMissing();
+    if (missing.length) {
+      showFormError(errBox, `Required: ${missing.map((entry) => entry.label).join("; ")}.`);
+      missing[0].input.focus();
       return;
     }
+    const res = await apiFetch(`${base}/pipeline`);
+    const data = await res.json();
+    const artifact = data.steps?.find((s) => s.step === "artifact-inspect")?.evidence?.artifact;
     let procedure;
     try {
-      procedure = buildProcedure(adapter.value, {
-        patch_id: patchId.value, platform_id: platformId.value, database_unique_name: dbName.value,
-        required_opatch_version: requiredOpatch.value, readme_identifier: readmeIdentifier.value,
-        rollback_precondition: rollbackPrecondition.value, prechecks: mandatoryPre.value, postchecks: mandatoryPost.value,
-      }, artifact);
+      checkArtifact(artifact);
+      procedure = buildProcedure(adapter.value, formValues(), artifact, initialProcedure);
     } catch (error) {
       showFormError(errBox, error.message);
       return;
     }
+    validationAttempted = true;
+    updateDraftStatus();
     const record = await executeThenRefresh(
       logBox,
       submitBtn,

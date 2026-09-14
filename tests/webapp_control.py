@@ -79,6 +79,47 @@ class ControlPlaneTests(unittest.TestCase):
         status, payload = self.request("/api/session", actor="approver", method="GET")
         self.assertEqual((status, payload["actor"], payload["roles"]), (200, "approver", ["approver"]))
 
+    def test_procedure_hints_route_reads_selected_readme_without_starting_work(self):
+        hint = {"required_opatch_version": "12.2.0.1.49", "readme_identifier": "README notes.html"}
+        with patch.object(server.procedure_hints, "get_hints", return_value=hint) as read, \
+             patch.object(pipeline_runner, "start_run") as start:
+            status, payload = self.request("/api/hosts/h/procedure-hints?readme_identifier=README%20notes.html", actor="viewer", method="GET")
+            self.assertEqual((status, payload), (200, hint))
+            read.assert_called_once_with("h", {"id": "h"}, "README notes.html")
+            start.assert_not_called()
+            read.reset_mock()
+            self.assertEqual(self.request("/api/hosts/h/procedure-hints?readme_identifier=a&readme_identifier=b", method="GET")[0], 400)
+            read.assert_not_called()
+        with patch.object(server.procedure_hints, "get_hints", side_effect=server.remote.RemoteError("readme_changed", "Run artifact inspection again")):
+            status, payload = self.request("/api/hosts/h/procedure-hints?readme_identifier=README.html", method="GET")
+            self.assertEqual((status, payload["error"]), (400, "readme_changed"))
+
+    def test_failed_procedure_validation_cannot_keep_older_success_or_readiness(self):
+        evidence.write_evidence("h", "artifact", {"artifact": {"status": "ready_for_catalog"}})
+        for name in ("procedure", "compatibility", "compatibility_reconciliation", "readiness"):
+            evidence.write_evidence("h", name, {"status": "ready_for_planning", "old": True})
+        draft = {"required_opatch_version": "", "patch_id": "12345678"}
+        error = server.pipeline_steps.localtools.LocalToolError("opu-procedure-validate", "Required OPatch is missing")
+        with patch.object(server.pipeline_steps.localtools, "run_tool", side_effect=error):
+            with self.assertRaises(type(error)):
+                server.pipeline_steps.step_procedure_validate("h", {}, {"procedure": draft})
+        for name in ("procedure", "compatibility", "compatibility_reconciliation", "readiness"):
+            self.assertIsNone(evidence.read_evidence("h", name), name)
+        state = next(s for s in server.pipeline_steps.pipeline_state("h") if s["step"] == "procedure-validate")
+        self.assertFalse(state["done"])
+        self.assertEqual(state["input"], draft)
+        self.assertIsNotNone(evidence.read_evidence("h", "artifact"))
+
+    def test_remote_read_limit_is_enforced_before_returning_content(self):
+        result = subprocess.CompletedProcess([], 0, b"abcd", b"")
+        with patch.object(server.remote.subprocess, "run", return_value=result) as run:
+            with self.assertRaises(server.remote.RemoteError) as failure:
+                server.remote.pull_file("fixture", "/stage/README notes.html", sudo=True, max_bytes=3)
+            self.assertEqual(failure.exception.error, "remote_file_too_large")
+            self.assertIn("sudo -n head -c 4 --", run.call_args.args[0][-1])
+        with patch.object(server.remote.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"abc", b"")):
+            self.assertEqual(server.remote.pull_file("fixture", "/stage/README.html", max_bytes=3), b"abc")
+
     def test_registry_damage_cannot_disable_rbac(self):
         os.environ.pop("OPU_WEBAPP_RBAC")
         for content in ("not-json", "[]", '{"principals":[]}', '{"principals":[null]}'):

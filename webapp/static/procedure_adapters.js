@@ -32,7 +32,20 @@ export const REQUIRED_PRECHECKS = ["artifact_integrity", "platform_applicability
 export const REQUIRED_POSTCHECKS = ["binary_inventory", "service_health"];
 const csv = (value) => String(value || "").split(",").map((part) => part.trim()).filter(Boolean);
 
-export function buildProcedure(adapter, fields, artifact) {
+/** Only restore saved inputs when every artifact and README binding still matches. */
+export function procedureMatchesArtifact(procedure, artifact) {
+  if (!procedure || !artifact?.sha256 || procedure.artifact_sha256 !== artifact.sha256) return false;
+  if (!PROCEDURE_ADAPTERS[procedure.execution?.adapter]) return false;
+  if (artifact.patch_ids?.length !== 1 || artifact.patch_ids[0] !== procedure.patch_id) return false;
+  if (artifact.platforms?.length !== 1 || artifact.platforms[0].id !== procedure.target?.platform_id) return false;
+  const references = Array.isArray(procedure.oracle_references)
+    ? procedure.oracle_references.filter((entry) => entry?.kind === "patch_readme") : [];
+  return references.length === 1 && Boolean(artifact.readme_files?.some((entry) =>
+    entry.path === references[0].identifier && entry.sha256 && entry.sha256 === references[0].sha256
+  ));
+}
+
+export function buildProcedure(adapter, fields, artifact, savedProcedure = null) {
   const config = PROCEDURE_ADAPTERS[adapter];
   if (!config) throw new Error("Choose a supported procedure adapter.");
   const required = ["patch_id", "platform_id", "required_opatch_version", "readme_identifier", "rollback_precondition"];
@@ -42,7 +55,7 @@ export function buildProcedure(adapter, fields, artifact) {
   }
   const reference = artifact?.readme_files?.find((entry) => entry.path === fields.readme_identifier);
   if (!reference?.sha256) throw new Error("README identifier must match a hashed file in the inspected artifact.");
-  return {
+  const procedure = {
     schema_version: "1.0", patch_id: fields.patch_id.trim(), artifact_sha256: artifact.sha256,
     target: {
       family: config.family, method: config.method, platform_id: fields.platform_id.trim(),
@@ -55,4 +68,15 @@ export function buildProcedure(adapter, fields, artifact) {
     mandatory_postchecks: [...new Set([...REQUIRED_POSTCHECKS, ...csv(fields.postchecks)])],
     rollback: { mode: config.rollback || "opatch_rollback", precondition: fields.rollback_precondition.trim() },
   };
+  if (savedProcedure?.execution?.adapter === adapter && procedureMatchesArtifact(savedProcedure, artifact)) {
+    // The form does not edit supporting references or the recovery mode. Retain
+    // them when editing this same workflow; a different adapter gets its own
+    // canonical operations and rollback mode.
+    procedure.oracle_references.push(...savedProcedure.oracle_references
+      .filter((entry) => entry.kind === "mos_note" || entry.kind === "oracle_doc")
+      .map((entry) => ({ ...entry })));
+    if (savedProcedure.rollback?.mode) procedure.rollback.mode = savedProcedure.rollback.mode;
+    if (config.family === "grid" && savedProcedure.target.topology) procedure.target.topology = savedProcedure.target.topology;
+  }
+  return procedure;
 }

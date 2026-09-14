@@ -212,6 +212,177 @@ test('actual readiness form can submit every adapter and does not require a data
   }
 });
 
+const procedureCard = page => page.querySelectorAll('.step-card').find(card => card.querySelector('h3')?.textContent === 'Procedure validation');
+const readinessSteps = (media = artifact, saved = null, input = null, databases = [{ db_unique_name: 'ORCL' }]) => [
+  { step: 'discovery', done: true, evidence: { databases } },
+  { step: 'artifact-inspect', done: true, status: 'ready_for_catalog', evidence: { artifact: media } },
+  { step: 'procedure-validate', done: Boolean(saved), status: saved ? 'ready_for_planning' : null, evidence: saved ? { procedure: saved } : null, input },
+];
+const readmeHint = (media = artifact, identifier = 'README.html') => ({
+  artifact_sha256: media.sha256, readme_identifier: identifier,
+  readme_sha256: media.readme_files.find(entry => entry.path === identifier).sha256,
+  required_opatch_version: '12.2.0.1.49', evidence: 'Use OPatch utility version 12.2.0.1.49 or later.', warnings: [],
+});
+
+test('procedure form restores saved validation and marks edits as an unvalidated draft', async () => {
+  const saved = buildProcedure('database_single_instance_opatch', { ...procedureFields, required_opatch_version: '12.2.0.1.51' }, artifact);
+  const steps = readinessSteps(artifact, saved, saved, [{ db_unique_name: 'OTHER' }]);
+  fetch = async url => response(url.includes('/procedure-hints?') ? readmeHint() : { steps });
+  const page = mount(); await renderReadinessStage(page, 'prod'); const card = procedureCard(page);
+  assert.equal(field(card, 'Required OPatch').value, '12.2.0.1.51');
+  assert.equal(field(card, 'Rollback precondition').value, procedureFields.rollback_precondition);
+  assert.equal(field(card, 'Adapter').value, 'database_single_instance_opatch');
+  assert.equal(field(card, 'README identifier').value, 'README.html');
+  assert.equal(card.querySelector('.badge').textContent, 'Saved: ready_for_planning');
+  const version = field(card, 'Required OPatch'); version.value = '12.2.0.1.52'; await version.fire('input');
+  assert.equal(card.querySelector('.badge').textContent, 'Draft · not validated');
+  assert.equal(card.querySelector('.badge').classList.contains('badge-ok'), false);
+  version.value = '12.2.0.1.51'; await version.fire('input');
+  assert.equal(card.querySelector('.badge').textContent, 'Saved: ready_for_planning');
+  await button(card, 'Autofill from artifact').fire('click');
+  assert.equal(version.value, '12.2.0.1.51');
+  assert.equal(field(card, 'Database unique name').value, 'ORCL');
+  assert.equal(field(card, 'Rollback precondition').value, procedureFields.rollback_precondition);
+  assert.match(card.textContent, /Verified README.html: minimum OPatch 12.2.0.1.49/);
+  assert.equal(card.querySelector('.form-error').textContent, '');
+});
+
+test('resubmitting a saved workflow retains supporting references and recovery mode', async () => {
+  const saved = buildProcedure('database_single_instance_opatch', procedureFields, artifact);
+  const supplement = { kind: 'mos_note', identifier: 'Approved change recovery instructions', sha256: 'c'.repeat(64) };
+  saved.oracle_references.push(supplement); saved.rollback.mode = 'manual_recovery';
+  const posted = [];
+  fetch = async (url, options) => {
+    if (options.method === 'POST') { posted.push(JSON.parse(options.body)); return response({ run_id: 'validation' }); }
+    return response(url.startsWith('/api/runs/') ? { status: 'succeeded' } : { steps: readinessSteps(artifact, saved) });
+  };
+  const page = mount(); await renderReadinessStage(page, 'prod');
+  await button(procedureCard(page), 'Validate procedure').fire('click');
+  assert.deepEqual(posted[0].procedure, saved);
+  const card = procedureCard(page); const adapter = field(card, 'Adapter');
+  adapter.value = 'database_out_of_place_switch'; await adapter.fire('change');
+  await button(card, 'Validate procedure').fire('click');
+  assert.equal(posted[1].procedure.rollback.mode, 'home_switch_back');
+  assert.equal(posted[1].procedure.oracle_references.length, 1);
+  assert.deepEqual(posted[1].procedure.execution.operations, PROCEDURE_ADAPTERS.database_out_of_place_switch.operations);
+});
+
+test('last submitted procedure inputs stay unvalidated and stale saved bindings are not restored', async () => {
+  const saved = buildProcedure('database_single_instance_opatch', procedureFields, artifact);
+  const variants = [
+    { steps: readinessSteps(artifact, null, saved), expected: procedureFields.required_opatch_version, text: /last submitted draft/ },
+    { steps: readinessSteps({ ...artifact, sha256: 'c'.repeat(64) }, saved, saved), expected: '', text: /different artifact evidence/ },
+    { steps: readinessSteps({ ...artifact, readme_files: [{ path: 'README.html', sha256: 'd'.repeat(64) }] }, saved), expected: '', text: /different artifact evidence/ },
+    { steps: readinessSteps({ ...artifact, readme_files: [{ path: 'other.html', sha256: 'b'.repeat(64) }] }, saved), expected: '', text: /different artifact evidence/ },
+  ];
+  for (const variant of variants) {
+    fetch = async () => response({ steps: variant.steps });
+    const page = mount(); await renderReadinessStage(page, 'prod'); const card = procedureCard(page);
+    assert.equal(field(card, 'Required OPatch').value, variant.expected);
+    assert.equal(card.querySelector('.badge').textContent, 'Draft · not validated');
+    assert.match(card.textContent, variant.text);
+  }
+});
+
+test('autofill uses verified README hints and reports every missing required field including rollback', async () => {
+  const media = { ...artifact, classification_evidence: 'OPatch utility version 99.99.99.99' };
+  let hintReads = 0;
+  fetch = async url => {
+    if (url.includes('/procedure-hints?')) { hintReads++; return response(readmeHint(media)); }
+    return response({ steps: readinessSteps(media) });
+  };
+  const page = mount(); await renderReadinessStage(page, 'prod'); const card = procedureCard(page);
+  await button(card, 'Autofill from artifact').fire('click');
+  assert.equal(hintReads, 1); assert.equal(field(card, 'Required OPatch').value, '12.2.0.1.49');
+  assert.equal(field(card, 'Rollback precondition').value, '');
+  assert.match(card.querySelector('.form-error').textContent, /Rollback precondition from the README/);
+  assert.equal(card.querySelector('.badge').textContent, 'Draft · not validated');
+
+  const empty = { ...artifact, patch_ids: [], platforms: [], readme_files: [] };
+  fetch = async () => response({ steps: readinessSteps(empty, null, null, []) });
+  const emptyPage = mount(); await renderReadinessStage(emptyPage, 'prod'); const emptyCard = procedureCard(emptyPage);
+  await button(emptyCard, 'Autofill from artifact').fire('click');
+  for (const label of ['Patch ID', 'Platform ID', 'README identifier', 'Required OPatch', 'Rollback precondition', 'Database unique name']) {
+    assert.ok(emptyCard.querySelector('.form-error').textContent.includes(label), label);
+  }
+  await button(emptyCard, 'Validate procedure').fire('click');
+  assert.match(emptyCard.querySelector('.form-error').textContent, /Platform ID.*Rollback precondition.*Database unique name/);
+});
+
+test('autofill requires explicit choices for ambiguous databases, patch media, platforms and READMEs', async () => {
+  const media = {
+    ...artifact, patch_ids: ['12345678', '23456789'], platforms: [{ id: '226' }, { id: '23' }],
+    readme_files: [...artifact.readme_files, { path: 'subpatch/README.html', sha256: 'd'.repeat(64) }],
+  };
+  let hintReads = 0;
+  fetch = async url => {
+    if (url.includes('/procedure-hints?')) { hintReads++; return response(readmeHint(media, decodeURIComponent(url.split('=')[1]))); }
+    return response({ steps: readinessSteps(media, null, null, [{ db_unique_name: 'FIRST' }, { db_unique_name: 'SECOND' }]) });
+  };
+  const page = mount(); await renderReadinessStage(page, 'prod'); const card = procedureCard(page);
+  await button(card, 'Autofill from artifact').fire('click');
+  for (const title of ['Patch ID', 'Platform ID', 'Database unique name', 'README identifier']) assert.equal(field(card, title).value, '', title);
+  assert.equal(hintReads, 0); assert.match(card.textContent, /Choose a database: FIRST, SECOND/);
+  const readme = field(card, 'README identifier'); readme.value = 'subpatch/README.html'; await readme.fire('change');
+  field(card, 'Database unique name').value = 'SECOND';
+  await button(card, 'Autofill from artifact').fire('click');
+  assert.equal(hintReads, 1); assert.equal(field(card, 'Database unique name').value, 'SECOND');
+  assert.equal(field(card, 'Required OPatch').value, '12.2.0.1.49');
+  readme.value = 'README.html'; await readme.fire('change');
+  assert.equal(field(card, 'Required OPatch').value, '', 'A hint from another README must not follow the new selection');
+});
+
+test('README verification rejects stale digest bindings and preserves edits made during a slow request', async () => {
+  let hints = { ...readmeHint(), readme_sha256: 'e'.repeat(64) }; let releaseHint;
+  fetch = async url => url.includes('/procedure-hints?')
+    ? response(hints)
+    : response({ steps: readinessSteps() });
+  const page = mount(); await renderReadinessStage(page, 'prod'); const card = procedureCard(page);
+  await button(card, 'Autofill from artifact').fire('click');
+  assert.equal(field(card, 'Required OPatch').value, '');
+  assert.match(card.querySelector('.form-error').textContent, /do not match the inspected artifact/);
+  fetch = async url => url.includes('/procedure-hints?')
+    ? new Promise(resolve => { releaseHint = () => resolve(response(readmeHint())); })
+    : response({ steps: readinessSteps() });
+  const pending = button(card, 'Autofill from artifact').fire('click');
+  while (!releaseHint) await new Promise(resolve => setImmediate(resolve));
+  const version = field(card, 'Required OPatch'); version.value = '12.2.0.1.51'; await version.fire('input');
+  releaseHint(); await pending; assert.equal(version.value, '12.2.0.1.51');
+  version.value = ''; await version.fire('input'); releaseHint = null;
+  const changed = button(card, 'Autofill from artifact').fire('click');
+  while (!releaseHint) await new Promise(resolve => setImmediate(resolve));
+  const readme = field(card, 'README identifier'); readme.value = ''; await readme.fire('change');
+  releaseHint(); await changed;
+  assert.equal(version.value, ''); assert.match(card.textContent, /README selection changed during verification/);
+});
+
+test('failed procedure validation retains entered values without restoring an earlier successful badge', async () => {
+  const saved = buildProcedure('database_single_instance_opatch', procedureFields, artifact);
+  fetch = async (url, options) => {
+    if (options.method === 'POST') return response({ run_id: 'failed-validation' });
+    if (url.startsWith('/api/runs/')) return response({ status: 'failed', error: { message: 'README validation failed' } });
+    return response({ steps: readinessSteps(artifact, saved) });
+  };
+  const page = mount(); await renderReadinessStage(page, 'prod'); const card = procedureCard(page);
+  await button(card, 'Validate procedure').fire('click');
+  assert.equal(card.querySelector('.badge').textContent, 'Draft · not validated');
+  assert.match(card.textContent, /README validation failed/);
+  const version = field(card, 'Required OPatch'); await version.fire('input');
+  assert.equal(version.value, procedureFields.required_opatch_version);
+  assert.equal(card.querySelector('.badge').classList.contains('badge-ok'), false);
+});
+
+test('an artifact change while editing cannot silently rebind a saved procedure or keep its success badge', async () => {
+  const saved = buildProcedure('database_single_instance_opatch', procedureFields, artifact);
+  let currentArtifact = artifact; let writes = 0;
+  fetch = async (_url, options) => { if (options.method === 'POST') writes++; return response({ steps: readinessSteps(currentArtifact, saved) }); };
+  const page = mount(); await renderReadinessStage(page, 'prod'); const card = procedureCard(page);
+  currentArtifact = { ...artifact, sha256: 'f'.repeat(64) };
+  await button(card, 'Validate procedure').fire('click');
+  assert.equal(writes, 0); assert.equal(card.querySelector('.badge').textContent, 'Draft · not validated');
+  assert.match(card.querySelector('.form-error').textContent, /Artifact evidence changed.*Reload Readiness/);
+});
+
 test('Execute preserves a failed operation while refreshing task and plan status', async () => {
   let state = 'execution_authorized';
   fetch = async (url, options) => {

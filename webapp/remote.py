@@ -334,9 +334,14 @@ def pull_file(
     remote_path: str,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     sudo: bool = False,
+    max_bytes: int | None = None,
 ) -> bytes:
-    """Read remote_path from the target host (optionally via sudo -n cat)."""
-    command = f"sudo -n cat {shlex.quote(remote_path)}" if sudo else f"cat {shlex.quote(remote_path)}"
+    """Read a remote file, optionally limiting transfer size before buffering it."""
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 1):
+        raise ValueError("max_bytes must be a positive integer")
+    reader = ["cat", "--"] if max_bytes is None else ["head", "-c", str(max_bytes + 1), "--"]
+    argv = (["sudo", "-n"] if sudo else []) + reader + [remote_path]
+    command = " ".join(shlex.quote(value) for value in argv)
     try:
         result = subprocess.run(_ssh_argv(ssh_alias, command, timeout), capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -347,4 +352,6 @@ def pull_file(
             f"Failed to read {remote_path} on {ssh_alias}",
             stderr=result.stderr.decode("utf-8", errors="replace").strip(),
         )
+    if max_bytes is not None and len(result.stdout) > max_bytes:
+        raise RemoteError("remote_file_too_large", f"File {remote_path} exceeds the {max_bytes}-byte read limit")
     return result.stdout

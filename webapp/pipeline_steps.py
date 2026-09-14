@@ -187,6 +187,10 @@ def step_procedure_validate(host_id: str, host: dict, body: dict) -> dict:
     artifact = evidence.evidence_path(host_id, "artifact")
     _require(artifact, "opu-procedure-validate", "artifact-inspect")
     procedure_path = evidence.write_evidence(host_id, "procedure_input", procedure_input)
+    # A submitted draft supersedes the previous validation. A failed attempt
+    # must not leave a green result (or downstream readiness) for older inputs.
+    for name in ("procedure", "compatibility", "compatibility_reconciliation", "readiness"):
+        evidence.clear_evidence(host_id, name)
     result = localtools.run_tool("opu-procedure-validate", ["--procedure", str(procedure_path), "--artifact", str(artifact)])
     evidence.write_evidence(host_id, "procedure", result)
     return result
@@ -671,6 +675,8 @@ def pipeline_state(host_id: str) -> list[dict]:
             "status": _step_status(step, payload),
             "evidence": payload,
         }
+        if step == "procedure-validate":
+            entry["input"] = evidence.read_evidence(host_id, "procedure_input")
         if step == "discovery":
             phases = discovery_phases.derive_discovery_phases(payload)
             entry["phases"] = phases
