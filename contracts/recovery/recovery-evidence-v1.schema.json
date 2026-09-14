@@ -42,7 +42,7 @@
     "backup": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["root", "checksum_manifest", "files", "oracle_home_archive", "rman_backup_set_keys", "selected_recovery_set", "coverage"],
+      "required": ["root", "checksum_manifest", "files", "oracle_home_archive", "rman_backup_set_keys", "coverage"],
       "properties": {
         "root": {"type": "string", "pattern": "^/"},
         "checksum_manifest": {"$ref": "#/$defs/path_digest"},
@@ -56,18 +56,6 @@
           "type": "array",
           "minItems": 1,
           "items": {"type": "integer", "minimum": 1}
-        },
-        "selected_recovery_set": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["observed_at", "oldest_datafile_backup_completed_at", "age_seconds_at_collection", "restore_piece_handles", "datafile_backup_sets"],
-          "properties": {
-            "observed_at": {"type": "string", "format": "date-time"},
-            "oldest_datafile_backup_completed_at": {"type": "string", "format": "date-time"},
-            "age_seconds_at_collection": {"type": "integer", "minimum": 0},
-            "restore_piece_handles": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
-            "datafile_backup_sets": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1}}
-          }
         },
         "coverage": {
           "type": "object",
@@ -117,6 +105,7 @@
         "sha256": {"$ref": "#/$defs/sha256"},
         "path": {"type": "string", "pattern": "^/"}
       }
+
     }
   }
 }

@@ -44,7 +44,23 @@ def _jq_canonical_hash(data: dict) -> str:
 def _run_tool(name: str, args: list[str], timeout: int = 30) -> None:
     result = subprocess.run([str(BIN / name), *args], capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
-        raise FixtureError(f"{name} failed while building fixture: {result.stderr.strip()}")
+        # opu-artifact-inspect reports "blocked" as JSON on stdout with rc=2;
+        # surface that reason instead of an empty stderr.
+        detail = result.stderr.strip()
+        if not detail and result.stdout.strip():
+            try:
+                detail = json.loads(result.stdout).get("artifact", {}).get("reason") or result.stdout.strip()
+            except json.JSONDecodeError:
+                detail = result.stdout.strip()
+        raise FixtureError(f"{name} failed while building fixture: {detail}")
+
+
+def _write_patch_payload(patch_dir: Path) -> None:
+    """opu-artifact-inspect fails closed on metadata/README-only stage dirs
+    (OPatch needs the files/ payload tree); give fixtures a minimal payload."""
+    payload = patch_dir / "files" / "lib"
+    payload.mkdir(parents=True, exist_ok=True)
+    (payload / "libtestpatch.so").write_bytes(b"test patch payload\n")
 
 
 def build(base_dir: Path) -> dict:
@@ -97,6 +113,7 @@ def build(base_dir: Path) -> dict:
     )
     readme = patch_dir / "README.txt"
     readme.write_text("Database Release Update test README\nopatch rollback -id 39034528\ndatapatch -verbose\n")
+    _write_patch_payload(patch_dir)
 
     artifact_json = base_dir / "artifact.json"
     _run_tool("opu-artifact-inspect", ["--artifact", str(patch_dir), "--output", str(artifact_json)])
@@ -221,8 +238,7 @@ def build(base_dir: Path) -> dict:
     policy_path = base_dir / "policy.json"
     policy_path.write_text(json.dumps(policy, indent=2))
 
-    now_epoch = int(subprocess.run(["date", "-u", "+%s"], capture_output=True, text=True, timeout=5).stdout.strip())
-    valid_until = subprocess.run(["date", "-u", "-r", str(now_epoch + 3600), "+%Y-%m-%dT%H:%M:%SZ"], capture_output=True, text=True, timeout=5).stdout.strip()
+    valid_until = _iso_from_epoch(_now_epoch() + 3600)
     readiness = {
         "schema_version": "1.0",
         "status": "ready_for_approval",
@@ -420,6 +436,7 @@ def build_rac(base_dir: Path) -> dict:
         "srvctl start instance -db ORCL -instance ORCL1\n"
         "datapatch -verbose\n"
     )
+    _write_patch_payload(patch_dir)
 
     artifact_json = base_dir / "artifact.json"
     _run_tool("opu-artifact-inspect", ["--artifact", str(patch_dir), "--output", str(artifact_json)])
@@ -582,6 +599,7 @@ def build_grid(base_dir: Path) -> dict:
         "rootcrs.sh -postpatch\n"
         "opatch rollback -id 39034528\n"
     )
+    _write_patch_payload(patch_dir)
 
     artifact_json = base_dir / "artifact.json"
     _run_tool("opu-artifact-inspect", ["--artifact", str(patch_dir), "--output", str(artifact_json)])

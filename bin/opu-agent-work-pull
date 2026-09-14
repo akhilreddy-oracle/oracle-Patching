@@ -7,6 +7,8 @@ umask 077
 export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/opu/python.sh
+. "$ROOT/lib/opu/python.sh"
 NODE=""; AGENT=""; LEASE=120; TOKEN=""; QUEUE_DIR=${OPU_AGENT_QUEUE_DIR:-"$ROOT/webapp/var/agent-queue"}
 
 usage() {
@@ -27,14 +29,16 @@ done
 
 [ -n "$NODE" ] && [ -n "$AGENT" ] || { usage >&2; exit 64; }
 export OPU_AGENT_QUEUE_DIR="$QUEUE_DIR"
-OPU_WP_TOKEN="$TOKEN" python3 - <<PY
+OPU_WP_ROOT="$ROOT" OPU_WP_NODE="$NODE" OPU_WP_AGENT="$AGENT" \
+OPU_WP_LEASE="$LEASE" OPU_WP_TOKEN="$TOKEN" opu_python - <<'PYTHON'
 import json, os, sys
-sys.path.insert(0, os.path.join("$ROOT", "webapp"))
+sys.path.insert(0, os.path.join(os.environ["OPU_WP_ROOT"], "webapp"))
 import agent_queue
 token = os.environ.get("OPU_WP_TOKEN") or None
-job = agent_queue.claim("$NODE", "$AGENT", lease_seconds=int("$LEASE"), agent_token=token)
+job = agent_queue.claim(os.environ["OPU_WP_NODE"], os.environ["OPU_WP_AGENT"],
+                        lease_seconds=int(os.environ["OPU_WP_LEASE"]), agent_token=token)
 if job is None:
     print(json.dumps({"status": "idle", "message": "no queued work for node"}))
     raise SystemExit(0)
 print(json.dumps(job, indent=2, sort_keys=True))
-PY
+PYTHON

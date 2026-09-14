@@ -10,8 +10,99 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 PROCEDURE=""; ARTIFACT=""; OUT=""
 usage() { printf '%s\n' 'Usage: opu-procedure-validate --procedure ABSOLUTE_JSON --artifact ABSOLUTE_JSON [--output ABSOLUTE_PATH]'; }
 parse() { while [ "$#" -gt 0 ]; do case "$1" in --procedure) PROCEDURE=${2:-}; shift 2;; --artifact) ARTIFACT=${2:-}; shift 2;; --output) OUT=${2:-}; shift 2;; -h|--help) usage; exit 0;; *) usage >&2; exit 64;; esac; done; for x in "$PROCEDURE" "$ARTIFACT"; do opu_validate_absolute_path "$x" input || exit $?; [ -f "$x" ] && [ ! -L "$x" ] || { echo "input is missing or symbolic link: $x" >&2; exit 66; }; done; [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?; command -v jq >/dev/null || { echo 'jq is required' >&2; exit 69; }; }
+
+# Emit concrete contract violations for the procedure document (one per line).
+# Empty stdout means the document shape/adapter binding is acceptable.
+procedure_contract_violations() {
+  jq -r '
+    def db_name_ok:
+      (.target.database_unique_name | type == "string") and
+      (.target.database_unique_name | test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$"));
+    def known_ops:
+      ["grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch","grid_opatchauto_apply",
+       "database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch",
+       "database_shutdown","database_startup","database_startup_upgrade","database_datapatch_upgrade",
+       "database_home_clone","database_opatch_apply_clone","database_home_switch"];
+    def adapter_binding_ok:
+      if .target.family == "grid" then
+        ((.execution.adapter == "grid_rolling_opatch" and .target.method == "opatch" and
+          (.execution.operations == ["grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch"])) or
+         (.execution.adapter == "grid_rolling_opatchauto" and .target.method == "opatchauto" and
+          (.execution.operations == ["grid_opatchauto_apply"])))
+      elif .execution.adapter == "database_rolling_opatch" then
+        .target.method == "opatch" and .target.topology == "rac" and db_name_ok and
+        (.execution.operations == ["database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch"])
+      elif .execution.adapter == "database_ojvm_opatch" then
+        .target.method == "opatch" and .target.topology == "single_instance" and db_name_ok and
+        (.execution.operations == ["database_shutdown","database_opatch_apply","database_startup_upgrade","database_datapatch_upgrade"])
+      elif .execution.adapter == "database_out_of_place_switch" then
+        .target.method == "switch_home" and .target.topology == "single_instance" and db_name_ok and
+        (.execution.operations == ["database_home_clone","database_opatch_apply_clone","database_home_switch","database_datapatch"])
+      elif .execution.adapter == "database_single_instance_opatch" then
+        .target.method == "opatch" and .target.topology == "single_instance" and db_name_ok and
+        (.execution.operations == ["database_shutdown","database_opatch_apply","database_startup","database_datapatch"])
+      else
+        false
+      end;
+    [
+      (if .schema_version == "1.0" then empty else "schema_version must be \"1.0\" (got \(.schema_version|tostring))" end),
+      (if (.patch_id | type == "string" and test("^[0-9]{1,20}$")) then empty else "patch_id must be a numeric patch id (got \(.patch_id|tostring))" end),
+      (if (.artifact_sha256 | type == "string" and test("^[a-f0-9]{64}$")) then empty else "artifact_sha256 must be a 64-char lowercase hex digest" end),
+      (if (.target.family | IN("grid","database")) then empty else "target.family must be grid or database (got \(.target.family|tostring))" end),
+      (if (.target.platform_id | type == "string" and test("^[0-9]+$")) then empty else "target.platform_id must be a numeric ARU platform id" end),
+      (if (.target.method | IN("opatch","opatchauto","switch_home","switch_grid_home","fpp")) then empty else "target.method is missing or unsupported (got \(.target.method|tostring))" end),
+      (if (.execution | type == "object") then empty else "execution must be an object" end),
+      (if (.execution.adapter | IN("grid_rolling_opatch","grid_rolling_opatchauto","database_rolling_opatch","database_single_instance_opatch","database_ojvm_opatch","database_out_of_place_switch"))
+         then empty
+       else "execution.adapter is missing or unsupported (got \(.execution.adapter|tostring))" end),
+      (if ((.execution.operations | type == "array") and (.execution.operations | length > 0)) then empty else "execution.operations must be a non-empty array" end),
+      (if ((.execution.operations | type == "array") and all(.execution.operations[]; . as $op | known_ops | index($op) != null))
+         then empty
+       else "execution.operations contains unknown operation names: \((.execution.operations // []) | join(","))" end),
+      (if (((.target.family == "database") or ((.execution.adapter | tostring) | startswith("database_"))) and (db_name_ok | not))
+         then "target.database_unique_name is required (non-empty Oracle db_unique_name)"
+       else empty end),
+      (if adapter_binding_ok then empty
+       else
+         "adapter/topology/method/operations binding is invalid for \(.execution.adapter|tostring) " +
+         "(topology=\(.target.topology|tostring), method=\(.target.method|tostring), " +
+         "operations=\((.execution.operations // []) | join(","))) — use contracts/procedure/examples/ for the exact sequence"
+       end),
+      (if (.required_opatch_version | type == "string" and test("^[0-9]+(\\.[0-9]+){2,4}$"))
+         then empty
+       else "required_opatch_version must be a dotted OPatch version from the patch README (e.g. 12.2.0.1.49); got \(.required_opatch_version|tostring)" end),
+      (if ((.oracle_references | type == "array") and (.oracle_references | length > 0)) then empty else "oracle_references must list at least one patch_readme/mos_note/oracle_doc" end),
+      (if ((.oracle_references | type == "array") and all(.oracle_references[];
+            (.kind | IN("patch_readme","mos_note","oracle_doc")) and
+            (.identifier | type == "string" and length > 0) and
+            (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))
+         then empty
+       else "oracle_references entries need kind, non-empty identifier, and 64-char sha256" end),
+      (if ((.mandatory_prechecks | type == "array") and
+           (.mandatory_prechecks | index("artifact_integrity") != null) and
+           (.mandatory_prechecks | index("platform_applicability") != null) and
+           (.mandatory_prechecks | index("opatch_version") != null) and
+           (.mandatory_prechecks | index("conflict_check") != null) and
+           (.mandatory_prechecks | index("backup_or_restore") != null))
+         then empty
+       else "mandatory_prechecks must include artifact_integrity, platform_applicability, opatch_version, conflict_check, backup_or_restore (got \((.mandatory_prechecks // []) | join(","))) — backup waiver is a readiness policy flag, not a procedure-contract omission" end),
+      (if ((.mandatory_postchecks | type == "array") and
+           (.mandatory_postchecks | index("binary_inventory") != null) and
+           (.mandatory_postchecks | index("service_health") != null))
+         then empty
+       else "mandatory_postchecks must include binary_inventory and service_health" end),
+      (if ((.rollback | type == "object") and (.rollback.mode | IN("opatch_rollback","home_switch_back","manual_recovery")))
+         then empty
+       else "rollback.mode must be opatch_rollback, home_switch_back, or manual_recovery" end),
+      (if ((.rollback.precondition | type == "string") and (.rollback.precondition | length > 0))
+         then empty
+       else "rollback.precondition must be a non-empty README rollback condition" end)
+    ] | .[]
+  ' "$PROCEDURE"
+}
+
 validate() {
-  local artifact_sha procedure_sha expected_patch actual_patch artifact_platform procedure_platform
+  local artifact_sha procedure_sha expected_patch actual_patch artifact_platform procedure_platform violations
   jq -e '
     .artifact.status == "ready_for_catalog" and
     (.artifact.sha256 | test("^[a-f0-9]{64}$")) and
@@ -30,50 +121,14 @@ validate() {
     echo 'FPP (Fleet Patching and Provisioning) procedures are rejected: this build has no rhpctl/FPP-server adapter. See docs/FUTURE_ADAPTERS.md.' >&2
     return 2
   fi
-  jq -e '
-    .schema_version == "1.0" and
-    (.patch_id | test("^[0-9]{1,20}$")) and
-    (.artifact_sha256 | test("^[a-f0-9]{64}$")) and
-    (.target.family | IN("grid","database")) and
-    (.target.platform_id | test("^[0-9]+$")) and
-    (.target.method | IN("opatch","opatchauto","switch_home","switch_grid_home","fpp")) and
-    (.execution | type == "object" and
-      (.adapter | IN("grid_rolling_opatch","grid_rolling_opatchauto","database_rolling_opatch","database_single_instance_opatch","database_ojvm_opatch","database_out_of_place_switch")) and
-      (.operations | type == "array" and length > 0) and
-      (all(.operations[]; IN("grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch","grid_opatchauto_apply","database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch","database_shutdown","database_startup","database_startup_upgrade","database_datapatch_upgrade","database_home_clone","database_opatch_apply_clone","database_home_switch")))) and
-    (if .target.family == "grid" then
-       ((.execution.adapter == "grid_rolling_opatch" and .target.method == "opatch" and
-         (.execution.operations == ["grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch"])) or
-        (.execution.adapter == "grid_rolling_opatchauto" and .target.method == "opatchauto" and
-         (.execution.operations == ["grid_opatchauto_apply"])))
-     elif .execution.adapter == "database_rolling_opatch" then
-       .execution.adapter == "database_rolling_opatch" and .target.method == "opatch" and
-       (.target.topology == "rac") and
-       (.target.database_unique_name | test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$")) and
-     (.execution.operations == ["database_stop_instance","database_opatch_apply","database_start_instance","database_datapatch"])
-     elif .execution.adapter == "database_ojvm_opatch" then
-       .target.method == "opatch" and
-       (.target.topology == "single_instance") and
-       (.target.database_unique_name | test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$")) and
-       (.execution.operations == ["database_shutdown","database_opatch_apply","database_startup_upgrade","database_datapatch_upgrade"])
-     elif .execution.adapter == "database_out_of_place_switch" then
-       .target.method == "switch_home" and
-       (.target.topology == "single_instance") and
-       (.target.database_unique_name | test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$")) and
-       (.execution.operations == ["database_home_clone","database_opatch_apply_clone","database_home_switch","database_datapatch"])
-     else
-       .execution.adapter == "database_single_instance_opatch" and .target.method == "opatch" and
-       (.target.topology == "single_instance") and
-       (.target.database_unique_name | test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$")) and
-       (.execution.operations == ["database_shutdown","database_opatch_apply","database_startup","database_datapatch"])
-     end) and
-    (.required_opatch_version | test("^[0-9]+(\\.[0-9]+){2,4}$")) and
-    (.oracle_references | type == "array" and length > 0) and
-    (all(.oracle_references[]; (.kind | IN("patch_readme","mos_note","oracle_doc")) and (.identifier | type == "string" and length > 0) and (.sha256 | test("^[a-f0-9]{64}$")))) and
-    (.mandatory_prechecks | type == "array" and (index("artifact_integrity") != null) and (index("platform_applicability") != null) and (index("opatch_version") != null) and (index("conflict_check") != null) and (index("backup_or_restore") != null)) and
-    (.mandatory_postchecks | type == "array" and (index("binary_inventory") != null) and (index("service_health") != null)) and
-    (.rollback | type == "object" and (.mode | IN("opatch_rollback","home_switch_back","manual_recovery")) and (.precondition | type == "string" and length > 0))
-  ' "$PROCEDURE" >/dev/null || { echo 'procedure manifest is incomplete or violates the Oracle procedure contract' >&2; return 2; }
+  violations=$(procedure_contract_violations || true)
+  if [ -n "$violations" ]; then
+    {
+      echo 'procedure manifest is incomplete or violates the Oracle procedure contract:'
+      printf '%s\n' "$violations" | sed 's/^/  - /'
+    } >&2
+    return 2
+  fi
   artifact_sha=$(jq -r '.artifact.sha256' "$ARTIFACT"); procedure_sha=$(jq -r '.artifact_sha256' "$PROCEDURE"); expected_patch=$(jq -r '.artifact.patch_ids[0]' "$ARTIFACT"); actual_patch=$(jq -r '.patch_id' "$PROCEDURE")
   [ "$artifact_sha" = "$procedure_sha" ] || { echo 'procedure artifact digest does not match inspected artifact' >&2; return 2; }
   [ "$expected_patch" = "$actual_patch" ] || { echo 'procedure patch ID does not match inspected artifact' >&2; return 2; }

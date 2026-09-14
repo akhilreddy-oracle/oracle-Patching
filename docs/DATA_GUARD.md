@@ -73,3 +73,59 @@ through to `create` whenever one is cached for the host.
 
 Real-broker validation of the live executor path and the dedicated DG adapter
 remain EXE-12 follow-on work.
+
+## Live observation and lag freshness
+
+The live collector now queries the local database role and `DB_UNIQUE_NAME`
+from `V$DATABASE`. It seals this native database identity separately from the
+instance's `ORACLE_SID`; new live patch orders cannot substitute a SID for an
+unknown database name. The existing `primary` object is retained for contract
+compatibility and describes the locally observed database, including when its
+role is standby. [Oracle 19c V$DATABASE reference](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/V-DATABASE.html).
+
+On a physical standby's applying instance, the collector reads the `transport
+lag` and `apply lag` metric rows from `V$DATAGUARD_STATS`. It retains `VALUE`,
+`UNIT`, `TIME_COMPUTED`, `DATUM_TIME`, and the originating database identity.
+Intervals are converted using days, hours, minutes and seconds; fractional
+seconds round upward. Missing values stay unavailable (`-1`), and malformed
+rows, duplicate metrics or unsupported formats fail collection. Both sample
+clocks are compared with database-local time, avoiding an assumed controller
+timezone. Supported clock formats are `MM/DD/YYYY HH24:MI:SS` and
+`YYYY-MM-DD HH24:MI:SS`; unexpected formats block collection.
+[Oracle 19c V$DATAGUARD_STATS reference](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/V-DATAGUARD_STATS.html).
+
+Physical apply state comes from the local `MRP0` process in
+`V$DATAGUARD_PROCESS`. `APPLYING_LOG` or `WAIT_FOR_LOG` can pass the process
+check only alongside acceptable lag and freshness; missing apply-process
+evidence blocks readiness. Logical or snapshot standby collection does not
+assert physical apply readiness. [Oracle 19c V$DATAGUARD_PROCESS reference](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/V-DATAGUARD_PROCESS.html).
+
+A primary scan reports standby destination health from
+`V$ARCHIVE_DEST_STATUS`. That view supplies no elapsed transport/apply lag,
+and `V$DATAGUARD_STATS` returns no primary rows. Consequently the primary
+scan explicitly reports unknown lag and cannot pass lag-based readiness.
+Passing primary-wide orchestration still requires an integration that binds
+fresh standby observations or verified broker lag samples to every member;
+this collector does not fabricate that evidence. [Oracle 19c V$ARCHIVE_DEST_STATUS reference](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/V-ARCHIVE_DEST_STATUS.html).
+
+The evaluator verifies the observation checksum and collection age. Its
+optional policy fields `dataguard.maximum_observation_age_seconds` (default
+300) and `dataguard.maximum_sample_age_seconds` (default 60) must be positive
+integers. For live collector version `2`, both computation and received-data
+ages, plus time elapsed since collection, must remain within the sample age
+limit. A stale zero-lag sample therefore blocks readiness. Legacy version `1`
+fixtures remain supported with an explicit warning that native sample clocks
+are unavailable. [Oracle's explanation of DATUM_TIME and lost transport](https://docs.oracle.com/en/database/oracle/oracle-database/19/haovw/redo-transport-troubleshooting-and-tuning.html).
+
+SQL*Plus uses SQL/OS failure exit directives; tagged output parsing also
+rejects diagnostics that return exit zero. Broker availability requires a
+successful single-command `SHOW CONFIGURATION` result without Oracle/broker
+errors, rather than merely finding a binary. [Oracle 19c broker command reference](https://docs.oracle.com/en/database/oracle/oracle-database/19/dgbkr/oracle-data-guard-broker-commands.html).
+
+Run `bash tests/dataguard_live.sh` for the real collector command path with
+temporary fake Oracle binaries. It covers native identity, primary/standby
+query separation, long/fractional lag, stale and future clocks, missing
+metrics, missing apply process, SQL and broker errors, malformed output, and
+checksum/replay checks. This proves local control flow and parsing; Oracle
+19c physical-standby, RAC applying-instance, locale, and real-broker lab
+validation remain required before production certification.

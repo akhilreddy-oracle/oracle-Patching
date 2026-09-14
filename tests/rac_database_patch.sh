@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/tests/fixtures/retire_plans.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/opu-rac-database.XXXXXX")
 cleanup() {
   local rc=$?
@@ -166,6 +167,7 @@ EOF
 cat >"$PATCH_DIR/etc/config/inventory.xml" <<'EOF'
 <patch patchID="39034528"><description>Database Release Update</description><os_platforms><platform id="226" name="Linux x86-64"/></os_platforms></patch>
 EOF
+mkdir -p "$PATCH_DIR/files/lib" && printf 'test patch payload\n' >"$PATCH_DIR/files/lib/libtestpatch.so"
 printf '%s\n' \
   'RAC Database Release Update test README' \
   'srvctl stop instance -db ORCL -instance ORCL1' \
@@ -232,6 +234,8 @@ create_plan() {
     --recovery-evidence "$TMP/recovery.json" --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
   plan approve --plan-id "$plan_id" --actor dba-approver --approval-ticket TEST-RAC-39034528 >/dev/null
   plan authorize --plan-id "$plan_id" --actor patch-operator >/dev/null
+  # Independent simulated target scenario; lifecycle tests cover retained reservations.
+  retire_fixture_plans "$PLAN_STATE"
   plan dispatch --plan-id "$plan_id" --actor patch-operator >/dev/null
 }
 
@@ -285,6 +289,8 @@ create_rollback_plan() {
     --source-plan-id rac-success --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
   plan approve --plan-id "$rollback_id" --actor rollback-approver --approval-ticket TEST-RAC-ROLLBACK-39034528 >/dev/null
   plan authorize --plan-id "$rollback_id" --actor rollback-operator >/dev/null
+  # Independent simulated target scenario; lifecycle tests cover retained reservations.
+  retire_fixture_plans "$PLAN_STATE"
   plan dispatch --plan-id "$rollback_id" --actor rollback-operator >/dev/null
 }
 
@@ -358,6 +364,8 @@ if plan approve --plan-id rac-rollback-failure --actor rac-worker --approval-tic
 fi
 plan approve --plan-id rac-rollback-failure --actor rollback-approver --approval-ticket TEST-RAC-ROLLBACK-FAILURE >/dev/null
 plan authorize --plan-id rac-rollback-failure --actor rollback-operator >/dev/null
+# Independent simulated target scenario; lifecycle tests cover retained reservations.
+retire_fixture_plans "$PLAN_STATE"
 plan dispatch --plan-id rac-rollback-failure --actor rollback-operator >/dev/null
 jq -e '.procedure.adapter == "database_rac_opatch_rollback" and .nodes == ["node2","node1"] and (.source_apply.lineage | length) == 14' \
   "$PLAN_STATE/plans/rac-rollback-failure/plan.json" >/dev/null

@@ -3,23 +3,45 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Oracle Patching Utility — Estate</title>
+<title>Oracle Patching Utility</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<header class="topbar">
-  <h1><a href="#/estate" class="brand-link">Oracle Patching Utility</a> <span class="subtitle">Estate</span></h1>
-  <nav class="topbar-nav">
-    <a href="#/estate">Estate</a>
-    <a href="#/plans">Plans</a>
-    <a href="#/recovery">Recovery</a>
-  </nav>
-  <div id="topbar-actor"></div>
-</header>
+<div class="app-shell">
+  <aside class="rail" aria-label="Navigation">
+    <a href="#/estate" class="rail-brand">
+      <span class="rail-brand-mark" aria-hidden="true"></span>
+      <span class="rail-brand-text">
+        <span class="rail-brand-oracle">Oracle</span>
+        <span class="rail-brand-product">Patching Utility</span>
+      </span>
+    </a>
 
-<main id="app">
-  <p class="empty-state">Loading…</p>
-</main>
+    <nav class="rail-section" aria-label="Estate">
+      <div class="rail-section-label">Hosts</div>
+      <div id="rail-hosts" class="rail-hosts">
+        <p class="rail-muted">Loading…</p>
+      </div>
+    </nav>
+
+    <nav class="rail-section rail-secondary" aria-label="Indexes">
+      <div class="rail-section-label">Indexes</div>
+      <a href="#/plans" class="rail-link" data-nav="plans">All plans</a>
+      <a href="#/recovery" class="rail-link" data-nav="recovery">All recovery</a>
+    </nav>
+
+    <div class="rail-session" id="rail-session"></div>
+  </aside>
+
+  <div class="workspace">
+    <main id="app" class="workspace-main">
+      <p class="empty-state">Loading…</p>
+    </main>
+  </div>
+</div>
 
 <script type="module" src="/app.js"></script>
 </body>

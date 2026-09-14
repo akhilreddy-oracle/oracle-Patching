@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/tests/fixtures/retire_plans.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/opu-ojvm.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
@@ -107,6 +108,8 @@ case "${1:-}" in
     printf '%s\n' 'OPatch succeeded.'
     ;;
   rollback)
+    # Real OPatch prompts for confirmation and exits 73 without -silent.
+    case " $* " in *' -silent '*) ;; *) printf 'Is the local system ready for patching? [y|n]\nOPatch failed with error code 73\n'; exit 73 ;; esac
     [ "$(cat "$OPU_TEST_DATABASE_STATE")" = down ] || { printf 'OJVM binary rollback attempted against a running database\n' >&2; exit 70; }
     [ ! -f "$OPU_TEST_FAIL_ROLLBACK" ] || { printf 'simulated OPatch rollback failure\n' >&2; exit 73; }
     rm -f "$OPU_TEST_PATCH_STATE"
@@ -137,6 +140,7 @@ chmod 750 "$TEST_HOME/bin/sqlplus" "$TEST_HOME/bin/lsnrctl" \
 cat >"$PATCH_DIR/etc/config/inventory.xml" <<'EOF'
 <patch patchID="39034530"><description>OJVM Release Update</description><os_platforms><platform id="226" name="Linux x86-64"/></os_platforms></patch>
 EOF
+mkdir -p "$PATCH_DIR/files/lib" && printf 'test patch payload\n' >"$PATCH_DIR/files/lib/libtestpatch.so"
 printf '%s\n' \
   'OJVM Release Update test README' \
   'Shut down all database instances before applying this patch.' \
@@ -200,6 +204,8 @@ create_plan() {
     --recovery-evidence "$TMP/recovery.json" --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
   plan approve --plan-id "$plan_id" --actor dba-approver --approval-ticket TEST-OJVM-39034530 >/dev/null
   plan authorize --plan-id "$plan_id" --actor patch-operator >/dev/null
+  # Independent simulated target scenario; lifecycle tests cover retained reservations.
+  retire_fixture_plans "$PLAN_STATE"
   plan dispatch --plan-id "$plan_id" --actor patch-operator >/dev/null
 }
 
@@ -268,6 +274,8 @@ create_rollback_plan() {
     --source-plan-id ojvm-success --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
   plan approve --plan-id "$rollback_plan_id" --actor rollback-approver --approval-ticket TEST-OJVM-ROLLBACK >/dev/null
   plan authorize --plan-id "$rollback_plan_id" --actor rollback-operator >/dev/null
+  # Independent simulated target scenario; lifecycle tests cover retained reservations.
+  retire_fixture_plans "$PLAN_STATE"
   plan dispatch --plan-id "$rollback_plan_id" --actor rollback-operator >/dev/null
 }
 

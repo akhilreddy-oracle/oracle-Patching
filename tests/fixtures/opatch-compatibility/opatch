@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 case "$1" in
   version) echo 'OPatch Version: 12.2.0.1.51' ;;
-  prereq) printf 'OPatch prereq completed successfully: %s\n' "$*" ;;
+  prereq)
+    if [ -n "${OPU_TEST_OPATCH_PREREQ_FAIL:-}" ]; then
+      # Mirrors real OPatch output when the staged directory is metadata-only.
+      printf 'Oracle Interim Patch Installer version 12.2.0.1.51\n\nPREREQ session\n\nInvoking prereq "%s"\n\nPrereq "%s" is not executed.\n\nThe details are:\n%s\n\nOPatch failed with error code 2\n' "$2" "$2" "$OPU_TEST_OPATCH_PREREQ_FAIL"
+      exit 2
+    fi
+    printf 'OPatch prereq completed successfully: %s\n' "$*"
+    ;;
   *) exit 64 ;;
 esac

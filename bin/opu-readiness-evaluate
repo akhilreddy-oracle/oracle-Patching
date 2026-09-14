@@ -38,13 +38,18 @@ target_homes() { local snapshot=$1; if [ "$TARGET_FAMILY" = grid ]; then jq -r '
 check_recovery() {
   local snapshot=$1 host=$2 db=$3 require_backup max_age min_free require_grp age limit used free grp
   require_backup=$(jq -r '.recovery.require_backup' "$POLICY"); max_age=$(jq -r '.recovery.max_backup_age_minutes' "$POLICY"); min_free=$(jq -r '.recovery.minimum_fra_free_bytes' "$POLICY"); require_grp=$(jq -r '.recovery.require_guaranteed_restore_point' "$POLICY")
+  # Customer waiver: policy.require_backup=false skips backup, FRA, and GRP gates.
+  if [ "$require_backup" = false ]; then
+    gate recovery_backup pass "$host database $db: backup not required by sealed policy (customer waiver)."
+    return 0
+  fi
   # Discovery v1 emits backup_age_minutes. Accept the earlier internal name
   # as a compatibility fallback so valid recovery evidence is never ignored.
   age=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | (.runtime.backup_age_minutes // .runtime.latest_backup_age_minutes // -1)' "$snapshot")
   limit=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.fra_space_limit_bytes // empty' "$snapshot")
   used=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.fra_space_used_bytes // empty' "$snapshot")
   grp=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.guaranteed_restore_points // -1' "$snapshot")
-  [ "$require_backup" = false ] || { [ "$age" -ge 0 ] 2>/dev/null && [ "$age" -le "$max_age" ] || gate recovery_backup blocker "$host database $db has no backup within policy age."; }
+  [ "$age" -ge 0 ] 2>/dev/null && [ "$age" -le "$max_age" ] || gate recovery_backup blocker "$host database $db has no backup within policy age."
   # Both FRA limit and used bytes must be present and non-negative. Missing used
   # used to default to -1 and inflate free space (limit - (-1)); fail closed.
   if [[ "$limit" =~ ^[0-9]+$ ]] && [[ "$used" =~ ^[0-9]+$ ]] && [ "$used" -le "$limit" ]; then
@@ -114,8 +119,8 @@ check_snapshots() {
       if [[ "$role" == *STANDBY* ]] && [ -n "$DATAGUARD" ] && jq -e '.status == "ready_for_standby_first"' "$DATAGUARD" >/dev/null; then
         continue
       fi
-      invalid=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.invalid_objects // -1' "$snapshot"); sqlpatch=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.sqlpatch_non_success // -1' "$snapshot"); pdb=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.pdb_not_read_write // -1' "$snapshot")
-      [ "$invalid" -le "$(jq -r '.database.maximum_invalid_objects' "$POLICY")" ] 2>/dev/null || gate database_invalid_objects blocker "$host database $db exceeds invalid-object policy."
+      invalid=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.invalid_objects | if type == "number" and . >= 0 and floor == . then . else -1 end' "$snapshot"); sqlpatch=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.sqlpatch_non_success // -1' "$snapshot"); pdb=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.pdb_not_read_write // -1' "$snapshot")
+      [[ "$invalid" =~ ^[0-9]+$ ]] && [ "$invalid" -le "$(jq -r '.database.maximum_invalid_objects' "$POLICY")" ] 2>/dev/null || gate database_invalid_objects blocker "$host database $db has missing, invalid, or excessive invalid-object evidence."
       [ "$sqlpatch" = 0 ] && [ "$pdb" = 0 ] || gate database_sql_state blocker "$host database $db has failed SQL patches or non-read-write PDBs."
       check_recovery "$snapshot" "$host" "$db"
     done < <(jq -r '.databases[] | [.db_unique_name, (.runtime.status // "unknown")] | @tsv' "$snapshot")
@@ -125,8 +130,19 @@ check_snapshots() {
   done < <(jq -r '.[]' <<<"$expected")
   supplied_evidence=$(jq -cS 'sort_by(.path)' <<<"$supplied_evidence")
   reconciled_evidence=$(jq -cS '(.snapshot_evidence // []) | sort_by(.path)' "$RECONCILIATION")
-  [ "$supplied_evidence" = "$reconciled_evidence" ] ||
-    gate snapshot_binding blocker 'Readiness snapshots do not exactly match the reconciled snapshot evidence.'
+  if [ "$supplied_evidence" != "$reconciled_evidence" ]; then
+    # Fail closed on any path/digest drift, and name the concrete mismatch so
+    # operators know to re-run Discover → Reconcile before Evaluate.
+    local binding_detail
+    binding_detail=$(jq -cn --argjson supplied "$supplied_evidence" --argjson reconciled "$reconciled_evidence" '
+      def short: if type == "string" and test("^[a-f0-9]{64}$") then .[0:12] + "…" else . end;
+      def row: "\(.path | split("/")[-1] // .)@\(.sha256 | short)";
+      ([$supplied[] | row] | join(", ")) as $s |
+      ([$reconciled[] | row] | join(", ")) as $r |
+      "Readiness snapshots do not exactly match reconciled snapshot_evidence (path+sha256). supplied=[\($s)] reconciled=[\($r)]. Re-run Discover then Reconcile so readiness binds the current sealed digests."
+    ')
+    gate snapshot_binding blocker "$binding_detail"
+  fi
 }
 required_checks() { local snapshot node target_path; for snapshot in "${SNAPSHOTS[@]}"; do node=$(jq -r '.host.name | split(".")[0]' "$snapshot"); while IFS=$'\t' read -r target_path _; do [ -n "$target_path" ] && printf '%s\t%s\n' "$node" "$target_path"; done < <(target_homes "$snapshot"); done | sort -u; }
 check_compatibility() {

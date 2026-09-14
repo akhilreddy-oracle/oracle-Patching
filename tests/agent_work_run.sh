@@ -8,6 +8,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/opu-agent-work-run.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
+export OPU_AGENT_TEST_MODE=1
 export OPU_AGENT_QUEUE_DIR="$TMP/queue"
 export OPU_AGENT_REGISTRY_FILE="$TMP/registry/agents.json"
 export OPU_PLAN_STATE_DIR="$TMP/plans"
@@ -34,7 +35,7 @@ publish() {
 import os
 import agent_queue
 job = agent_queue.publish_task(
-    plan_id="p1",
+    plan_id="p-" + os.environ["OPU_PUB_TASK"],
     task_id=os.environ["OPU_PUB_TASK"],
     node="node1",
     adapter="database_rolling_opatch",

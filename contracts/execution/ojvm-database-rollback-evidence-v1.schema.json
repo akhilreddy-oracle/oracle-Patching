@@ -11,6 +11,7 @@
     "source_apply", "logs", "record_sha256"
   ],
   "properties": {
+    "retry_count": { "type": "integer", "minimum": 0, "maximum": 1000000, "default": 0 },
     "schema_version": { "const": "1.0" },
     "collector": {
       "type": "object",

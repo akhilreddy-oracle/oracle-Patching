@@ -9,6 +9,7 @@ polls GET /api/runs/{run_id} for status/log/result.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -16,16 +17,25 @@ import uuid
 from pathlib import Path
 
 import notifications
+from durable import file_lock, write_json
 
 RUNS_DIR = Path(__file__).resolve().parent / "var" / "runs"
 RUNS: dict[str, "RunRecord"] = {}
 _REGISTRY_LOCK = threading.Lock()
-_ACTIVE_KEYS: set[str] = set()
+# key → active run_id (so 409 responses can hand the caller the in-flight run)
+_ACTIVE_KEYS: dict[str, str] = {}
 _RUN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+_PROCESS_ID = uuid.uuid4().hex
+_CURRENT = threading.local()
+_UNRESOLVED = {"queued", "running", "unknown", "reconciling"}
 
 
 class RunConflict(Exception):
     """Raised when a run is already active for a given dedupe key."""
+
+    def __init__(self, message: str, run_id: str | None = None):
+        super().__init__(message)
+        self.run_id = run_id
 
 
 class RunRecord:
@@ -40,7 +50,10 @@ class RunRecord:
         self.log_lines: list[str] = []
         self.result = None
         self.error = None
-        self._lock = threading.Lock()
+        self.owner = {"pid": os.getpid(), "instance": _PROCESS_ID}
+        self.context: dict = {}
+        self.reconciliation: dict | None = None
+        self._lock = threading.RLock()
 
     def log(self, line: str) -> None:
         with self._lock:
@@ -62,15 +75,44 @@ class RunRecord:
                 "log_tail": list(self.log_lines[-100:]),
                 "result": self.result,
                 "error": self.error,
+                "owner": self.owner,
+                "context": dict(self.context),
+                "reconciliation": self.reconciliation,
             }
 
     def _persist(self) -> None:
-        try:
+        with self._lock:
             run_dir = RUNS_DIR / self.run_id
             run_dir.mkdir(parents=True, exist_ok=True)
-            (run_dir / "run.json").write_text(json.dumps(self.to_json(), indent=2, default=str))
-        except OSError:
-            pass  # best-effort durability; in-memory RUNS stays authoritative
+            write_json(run_dir / "run.json", json.loads(json.dumps(self.to_json(), default=str)))
+
+
+def set_execution_context(**values) -> None:
+    """Persist detached execution coordinates before crossing the SSH boundary."""
+    record = getattr(_CURRENT, "record", None)
+    if record is not None:
+        with record._lock:
+            record.context.update(values)
+            record._persist()
+
+
+def _disk_active(key: str) -> str | None:
+    for path in sorted(RUNS_DIR.glob("*/run.json")):
+        try:
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict) or not isinstance(data.get("key"), str):
+                raise ValueError("missing run key")
+        except (OSError, ValueError) as exc:
+            raise RunConflict(f"Persisted run {path.parent.name} is unreadable; repair/reconcile its state before launching", path.parent.name) from exc
+        if data["key"] == key and data.get("status") in _UNRESOLVED:
+            return path.parent.name
+    return None
+
+
+def active_run_id(key: str) -> str | None:
+    """Return the in-flight run_id for key, if any."""
+    with _REGISTRY_LOCK:
+        return _ACTIVE_KEYS.get(key) or _disk_active(key)
 
 
 def start_run(kind: str, key: str, fn) -> RunRecord:
@@ -78,23 +120,25 @@ def start_run(kind: str, key: str, fn) -> RunRecord:
 
     key dedupes concurrent runs (e.g. "host:oracle-test-rac:pipeline:reconcile")
     so a double-click can't launch two overlapping SSH sessions for the same
-    target — raises RunConflict instead.
+    target — raises RunConflict instead (with the active run_id when known).
     """
-    with _REGISTRY_LOCK:
-        if key in _ACTIVE_KEYS:
-            raise RunConflict(f"A run is already active for {key}")
-        _ACTIVE_KEYS.add(key)
-
     run_id = uuid.uuid4().hex[:12]
     record = RunRecord(run_id, kind, key)
-    RUNS[run_id] = record
+    with file_lock(RUNS_DIR / ".registry.lock"), _REGISTRY_LOCK:
+        existing = _ACTIVE_KEYS.get(key) or _disk_active(key)
+        if existing is not None:
+            raise RunConflict(f"A run is already active for {key}", run_id=existing)
+        record._persist()  # Durable ownership must precede launching any worker.
+        _ACTIVE_KEYS[key] = run_id
+        RUNS[run_id] = record
 
     def worker() -> None:
-        with record._lock:
-            record.status = "running"
-            record.started_at = time.time()
-        record._persist()
+        _CURRENT.record = record
         try:
+            with record._lock:
+                record.status = "running"
+                record.started_at = time.time()
+            record._persist()
             result = fn(record)
             with record._lock:
                 record.result = result
@@ -104,13 +148,20 @@ def start_run(kind: str, key: str, fn) -> RunRecord:
             error = to_json() if callable(to_json) else {"message": str(exc)}
             with record._lock:
                 record.error = error
-                record.status = "failed"
+                record.status = "unknown" if record.context.get("detached_execution") and not record.context.get("detached_terminal") else "failed"
         finally:
             with record._lock:
                 record.finished_at = time.time()
-            record._persist()
+            try:
+                record._persist()
+            except OSError:
+                # Leave the durable queued/running owner in place on disk failure.
+                with record._lock:
+                    record.status = "unknown"
             with _REGISTRY_LOCK:
-                _ACTIVE_KEYS.discard(key)
+                if record.status not in _UNRESOLVED and _ACTIVE_KEYS.get(key) == run_id:
+                    _ACTIVE_KEYS.pop(key, None)
+            _CURRENT.record = None
             if record.status == "failed":
                 # After _persist: the failed state is durable before anything
                 # external hears about it, and emit() never raises.
@@ -121,7 +172,15 @@ def start_run(kind: str, key: str, fn) -> RunRecord:
                     "error": record.error,
                 })
 
-    threading.Thread(target=worker, daemon=True).start()
+    try:
+        threading.Thread(target=worker, daemon=True).start()
+    except Exception:
+        record.status = "failed"
+        record.error = {"message": "Worker thread could not be started"}
+        record._persist()
+        with _REGISTRY_LOCK:
+            _ACTIVE_KEYS.pop(key, None)
+        raise
     return record
 
 
@@ -143,7 +202,63 @@ def _load_persisted(run_id: str) -> RunRecord | None:
     record.log_lines = list(data.get("log_tail") or [])
     record.result = data.get("result")
     record.error = data.get("error")
+    record.owner = data.get("owner") or {}
+    record.context = data.get("context") or {}
+    record.reconciliation = data.get("reconciliation")
+    if record.status in _UNRESOLVED and record.owner.get("instance") != _PROCESS_ID:
+        record.status = "unknown"
+        record.error = {"message": "Controller ownership was lost; reconcile the execution before relaunching"}
     return record
+
+
+def _owner_alive(owner: dict) -> bool:
+    try:
+        pid = int(owner.get("pid") or 0)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError, TypeError):
+        return True
+
+
+def reconcile_run(run_id: str, *, actor: str | None, inspect, confirm_no_active_execution: bool = False, note: str | None = None) -> dict:
+    """Resolve an unknown result by inspecting remote evidence, never rerunning it.
+
+    Non-detached interrupted work requires an explicit operator acknowledgement
+    and audit note after its old controller has exited. Detached executions can
+    only be released by a verified terminal outcome from the managed host.
+    """
+    if not actor or not isinstance(actor, str):
+        raise ValueError("An authenticated operator actor is required")
+    with file_lock(RUNS_DIR / ".registry.lock"):
+        record = get_run(run_id)
+        if record is None:
+            raise ValueError("Unknown run_id")
+        if record.status not in {"unknown", "reconciling"}:
+            raise RunConflict("Only runs with unknown ownership/outcome can be reconciled", run_id)
+        if record.context.get("detached_execution"):
+            outcome = inspect({**record.to_json(), "reconciliation_actor": actor})
+            if outcome.get("status") not in {"succeeded", "failed", "unknown"}:
+                raise ValueError("Invalid reconciliation result")
+        else:
+            if not confirm_no_active_execution or not isinstance(note, str) or not note.strip() or _owner_alive(record.owner):
+                raise RunConflict("Verify no execution remains active after the old controller exits, then provide confirm_no_active_execution and an audit note", run_id)
+            outcome = {"status": "failed", "error": {"message": "Interrupted work closed after operator verification", "note": note.strip()}}
+        with record._lock:
+            record.status = outcome["status"]
+            record.result = outcome.get("result")
+            record.error = outcome.get("error")
+            record.finished_at = time.time() if record.status != "unknown" else None
+            record.reconciliation = {"actor": actor, "at": time.time(), "note": note, "status": record.status}
+            record._persist()
+        if record.status not in _UNRESOLVED:
+            with _REGISTRY_LOCK:
+                if _ACTIVE_KEYS.get(record.key) == run_id:
+                    _ACTIVE_KEYS.pop(record.key, None)
+        return record.to_json()
 
 
 def status_counts() -> dict[str, int]:
@@ -160,12 +275,12 @@ def status_counts() -> dict[str, int]:
             run_id = path.parent.name
             if run_id in seen:
                 continue
-            try:
-                data = json.loads(path.read_text())
-            except (OSError, json.JSONDecodeError):
+            record = _load_persisted(run_id)
+            if record is None:
+                counts["unreadable"] = counts.get("unreadable", 0) + 1
                 continue
             seen.add(run_id)
-            status = str(data.get("status") or "unknown")
+            status = record.status
             counts[status] = counts.get(status, 0) + 1
     return counts
 

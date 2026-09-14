@@ -74,12 +74,13 @@ evaluate() {
     gate lag_policy pass 'Sealed evaluation already passed lag/broker policy.'
   fi
 
-  # Live dgmgrl VALIDATE is not invoked here; TEST_MODE and lab builds emit a
-  # pass marker so orchestrators can seal the gate without mutating.
+  # Fail closed unless TEST_MODE simulates VALIDATE or an explicit override is set.
   if [ "${OPU_DATAGUARD_TEST_MODE:-0}" = 1 ]; then
     gate validate_command pass 'TEST_MODE: switchover VALIDATE treated as simulated pass.'
+  elif [ "${OPU_DATAGUARD_ALLOW_UNVALIDATED_SWITCHOVER:-0}" = 1 ]; then
+    gate validate_command pass 'Unvalidated switchover explicitly allowed by OPU_DATAGUARD_ALLOW_UNVALIDATED_SWITCHOVER=1.'
   else
-    gate validate_command pass 'Live VALIDATE is operator-confirmed outside this gate; gate seals policy readiness only.'
+    gate validate_command blocker 'Live switchover VALIDATE not executed; use TEST_MODE or OPU_DATAGUARD_ALLOW_UNVALIDATED_SWITCHOVER=1.'
   fi
 }
 

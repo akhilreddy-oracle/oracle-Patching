@@ -14,7 +14,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 import os
 import time
 
@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 HOSTS_FILE = ROOT / "hosts.json"
 SSH_TIMEOUT_SECONDS = 45
+DISCOVERY_TIMEOUT_SECONDS = pipeline_steps.DISCOVERY_TIMEOUT_SECONDS
 
 STATIC_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -49,10 +50,16 @@ def load_hosts() -> dict[str, dict]:
 
 def run_discovery(host: dict) -> dict:
     """Run opu-topology-discover on a host over SSH. Raises remote.RemoteError."""
-    argv = [f"{host['remote_root']}/bin/opu-topology-discover", "--pretty"]
-    payload = remote.run_remote_json(host["ssh_alias"], argv, timeout=SSH_TIMEOUT_SECONDS)
-    evidence.write_evidence(host["id"], "snapshot", payload)
-    return payload
+    return pipeline_steps.step_discovery(host["id"], host, {})
+
+
+def _cluster_is_standalone_no_crs(cluster: dict) -> bool:
+    """True when discovery found no Clusterware (expected for single-instance)."""
+    return (
+        str(cluster.get("status") or "").lower() == "unavailable"
+        and not (cluster.get("nodes") or [])
+        and not cluster.get("grid_home")
+    )
 
 
 def summarize_discovery(host: dict, payload: dict | None, error: remote.RemoteError | None) -> dict:
@@ -64,31 +71,84 @@ def summarize_discovery(host: dict, payload: dict | None, error: remote.RemoteEr
 
     cluster = payload.get("cluster") or {}
     runtime = cluster.get("runtime") or {}
+    databases = payload.get("databases") or []
+    if not isinstance(databases, list):
+        databases = []
+
+    # Keep raw collector value (recovery gates still expect unavailable for SI),
+    # but expose an operator-facing cluster_status that does not look like "DB down".
+    raw_cluster = cluster.get("status")
     summary["status"] = "ok"
     summary["collected_at"] = payload.get("collected_at")
     summary["host_name"] = (payload.get("host") or {}).get("name")
-    summary["cluster_status"] = cluster.get("status")
+    summary["cluster_status_raw"] = raw_cluster
+    summary["cluster_status"] = "not_applicable" if _cluster_is_standalone_no_crs(cluster) else raw_cluster
     summary["active_version"] = runtime.get("active_version")
     summary["upgrade_state"] = runtime.get("upgrade_state")
     summary["node_count"] = len(cluster.get("nodes") or [])
     summary["oracle_home_count"] = len(payload.get("oracle_homes") or [])
-    summary["database_count"] = len(payload.get("databases") or [])
+    summary["database_count"] = len(databases)
     summary["warning_count"] = len(payload.get("warnings") or [])
+
+    db_summaries = []
+    for db in databases:
+        if not isinstance(db, dict):
+            continue
+        db_runtime = db.get("runtime") or {}
+        db_summaries.append({
+            "db_unique_name": db.get("db_unique_name"),
+            "runtime_status": db_runtime.get("status"),
+            "instance_state": db_runtime.get("instance_state"),
+            "open_mode": db_runtime.get("open_mode"),
+            "database_role": db_runtime.get("database_role"),
+        })
+    summary["databases"] = db_summaries
     return summary
 
 
-def build_estate() -> list[dict]:
+def build_estate(*, live: bool = False) -> list[dict]:
+    """Estate cards from last live discovery evidence, or fresh SSH when live=True.
+
+    Cached payloads are always from a prior live SSH run (never fixtures).
+    live=True re-probes every configured host over SSH (can take minutes).
+    """
     hosts = list(load_hosts().values())
+    if not hosts:
+        return []
+
+    if not live:
+        out = []
+        for host in hosts:
+            cached = evidence.read_evidence(host["id"], "snapshot")
+            if cached is None:
+                out.append({
+                    "id": host["id"],
+                    "label": host["label"],
+                    "status": "pending",
+                    "message": "No live discovery yet — open the host to run SSH topology discovery.",
+                })
+            else:
+                summary = summarize_discovery(host, cached, None)
+                summary["evidence_source"] = "live_cache"
+                out.append(summary)
+        return out
 
     def probe(host: dict) -> dict:
         try:
             payload = run_discovery(host)
-            return summarize_discovery(host, payload, None)
+            summary = summarize_discovery(host, payload, None)
+            summary["evidence_source"] = "live_ssh"
+            return summary
         except remote.RemoteError as exc:
             return summarize_discovery(host, None, exc)
+        except Exception as exc:  # noqa: BLE001 - estate must never drop the HTTP connection
+            return {
+                "id": host["id"],
+                "label": host["label"],
+                "status": "error",
+                "error": {"error": "discovery_failed", "message": str(exc)},
+            }
 
-    if not hosts:
-        return []
     with ThreadPoolExecutor(max_workers=max(len(hosts), 1)) as pool:
         return list(pool.map(probe, hosts))
 
@@ -97,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "opu-webapp/0.1"
 
     def log_message(self, fmt, *args):  # keep default access logging, just tagged
-        print(f"[webapp] {self.address_string()} {fmt % args}")
+        print(f"[webapp] {self.address_string()} {fmt % args}", flush=True)
 
     def _send_json(self, status: int, payload) -> None:
         body = json.dumps(payload, indent=2, default=str).encode("utf-8")
@@ -107,12 +167,34 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_run_conflict(self, exc: pipeline_runner.RunConflict) -> None:
+        payload = {"error": "run_in_progress", "message": str(exc)}
+        if exc.run_id:
+            payload["run_id"] = exc.run_id
+        self._send_json(409, payload)
+
     def _read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
+        if hasattr(self, "_parsed_body"):
+            return self._parsed_body
+        if self.headers.get("Transfer-Encoding"):
+            raise ValueError("Transfer-Encoding is not supported")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("Content-Length must be a nonnegative integer") from None
+        if length < 0 or length > 1024 * 1024:
+            raise ValueError("JSON body must be at most 1 MiB")
         if length == 0:
-            return {}
+            self._parsed_body = {}
+            return self._parsed_body
         raw = self.rfile.read(length)
-        return json.loads(raw) if raw else {}
+        if len(raw) != length:
+            raise ValueError("Incomplete request body")
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            raise ValueError("JSON body must be an object")
+        self._parsed_body = body
+        return body
 
     def _send_static(self, rel_path: str) -> None:
         candidate = (STATIC_DIR / rel_path).resolve()
@@ -127,6 +209,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        # Lab UI iterates quickly; never let browsers keep stale ES modules.
+        if candidate.suffix in {".js", ".css", ".html"}:
+            self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -136,7 +221,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _require_api_auth(self) -> bool:
         try:
-            auth.require_api_auth(self.headers.get("Authorization"))
+            self._principal = auth.require_api_auth(self.headers.get("Authorization"))
+            asserted = self.headers.get("X-OPU-Actor")
+            if self._principal and asserted and asserted != self._principal:
+                raise auth.AuthError("X-OPU-Actor does not match the authenticated principal", status=403)
             return True
         except auth.AuthError as exc:
             self.send_response(exc.status)
@@ -150,11 +238,38 @@ class Handler(BaseHTTPRequestHandler):
 
     def _require_role(self, actor: str | None, action: str) -> bool:
         try:
+            principal = getattr(self, "_principal", None)
+            if principal and actor and actor != principal:
+                raise auth.AuthError("actor does not match the authenticated principal", status=403)
+            actor = principal or actor
             auth.require_role(actor, action)
             return True
         except auth.AuthError as exc:
             self._send_json(exc.status, exc.to_json())
             return False
+
+    def _authorize_path(self, method: str, path: str) -> bool:
+        """Default-deny role selection shared by every API route family."""
+        actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
+        if method == "GET":
+            action = "agent" if path == "/api/agent/jobs" else "read"
+        elif path.startswith("/api/agent/"):
+            action = "agent"
+        elif "/pipeline/" in path or path.startswith("/api/runs/"):
+            action = "execute"
+        elif path in {"/api/plans", "/api/plans/testmode-demo", "/api/recovery/testmode-demo"} or path.endswith("/create-rollback"):
+            action = "create"
+        elif path.endswith("/approve"):
+            action = "approve"
+        elif path.endswith("/authorize"):
+            action = "authorize"
+        elif path.endswith(("/dispatch", "/publish-agent-queue")):
+            action = "dispatch"
+        elif path.endswith("/analyze"):
+            action = "read"
+        else:
+            action = "execute"
+        return self._require_role(actor, action)
 
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         path = urlparse(self.path).path
@@ -167,8 +282,11 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/") and not self._require_api_auth():
             return
 
-        if path == "/api/auth/whoami":
-            actor = self.headers.get("X-OPU-Actor")
+        if path.startswith("/api/") and not self._authorize_path("GET", path):
+            return
+
+        if path in {"/api/auth/whoami", "/api/session"}:
+            actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
             self._send_json(200, auth.whoami(actor))
             return
 
@@ -232,7 +350,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/estate":
             if not self._require_role(self.headers.get("X-OPU-Actor"), "read"):
                 return
-            self._send_json(200, {"hosts": build_estate()})
+            query = urlparse(self.path).query
+            live = any(
+                part.split("=", 1)[0] == "live" and part.split("=", 1)[-1] == "1"
+                for part in query.split("&")
+                if part
+            )
+            try:
+                self._send_json(200, {"hosts": build_estate(live=live), "live": live})
+            except Exception as exc:  # noqa: BLE001 - never abort the socket mid-response
+                self._send_json(500, {"error": "estate_failed", "message": str(exc)})
             return
 
         if path.startswith("/api/hosts/") and path.endswith("/discovery"):
@@ -241,12 +368,20 @@ class Handler(BaseHTTPRequestHandler):
             if host is None:
                 self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
                 return
+            # Prefer async POST .../pipeline/discovery from the UI (long SSH).
+            # GET remains for curl/ops and always runs live SSH — never fixtures.
+            print(f"[webapp] live discovery start host={host_id} timeout={DISCOVERY_TIMEOUT_SECONDS}s", flush=True)
             try:
                 payload = run_discovery(host)
+                print(f"[webapp] live discovery ok host={host_id}", flush=True)
                 self._send_json(200, payload)
             except remote.RemoteError as exc:
+                print(f"[webapp] live discovery remote error host={host_id}: {exc.error}", flush=True)
                 status = 504 if exc.error == "ssh_timeout" else 502
                 self._send_json(status, exc.to_json())
+            except Exception as exc:  # noqa: BLE001 - uncaught errors become Failed to fetch in the browser
+                print(f"[webapp] live discovery crashed host={host_id}: {exc}", flush=True)
+                self._send_json(500, {"error": "discovery_failed", "message": str(exc)})
             return
 
         if path.startswith("/api/hosts/") and path.endswith("/pipeline"):
@@ -255,6 +390,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
                 return
             self._send_json(200, {"steps": pipeline_steps.pipeline_state(host_id)})
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/artifact-sources"):
+            host_id = path[len("/api/hosts/"):-len("/artifact-sources")]
+            hosts = load_hosts()
+            host = hosts.get(host_id)
+            if host is None:
+                self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
+                return
+            artifact_dir = ""
+            for part in urlparse(self.path).query.split("&"):
+                if part.startswith("artifact_dir="):
+                    artifact_dir = unquote(part.split("=", 1)[1])
+            try:
+                self._send_json(200, pipeline_steps.artifact_sources(host_id, host, hosts, artifact_dir))
+            except remote.RemoteError as exc:
+                self._send_json(400 if exc.error == "invalid_input" else 502, exc.to_json())
             return
 
         if path.startswith("/api/runs/"):
@@ -267,7 +419,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/plans":
-            self._send_json(200, {"plans": planctl.list_plans()})
+            host_id = parse_qs(urlparse(self.path).query).get("host_id", [None])[0]
+            plans = planctl.list_plans()
+            self._send_json(200, {"plans": [p for p in plans if host_id is None or p.get("host_id") == host_id]})
             return
 
         if path.startswith("/api/plans/") and path.endswith("/tasks"):
@@ -281,13 +435,17 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/plans/"):
             plan_id = path[len("/api/plans/"):]
             try:
-                self._send_json(200, planctl.status(plan_id))
+                plan = planctl.status(plan_id)
+                plan["sod"] = planctl.sod_summary(plan_id, plan)
+                plan["viability"] = planctl.viability(plan_id, plan)
+                self._send_json(200, plan)
             except planctl.PlanError as exc:
                 self._send_json(404, exc.to_json())
             return
 
         if path == "/api/recovery":
-            self._send_json(200, {"requests": recoveryctl.list_requests()})
+            host_id = parse_qs(urlparse(self.path).query).get("host_id", [None])[0]
+            self._send_json(200, {"requests": recoveryctl.list_requests(host_id=host_id)})
             return
 
         if path.startswith("/api/recovery/"):
@@ -306,8 +464,72 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        self.__dict__.pop("_parsed_body", None)
 
         if path.startswith("/api/") and not self._require_api_auth():
+            return
+
+        if path.startswith("/api/") and not self._authorize_path("POST", path):
+            return
+        try:
+            body = self._read_json_body()
+        except (ValueError, UnicodeError) as exc:
+            self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+            return
+        for field in ("actor", "requester", "plan_id", "request_id", "task_id", "host_id", "node", "agent_id", "approval_ticket", "source_plan_id", "window_start", "window_end", "adapter", "artifact_dir", "agent_token", "claim_token"):
+            if field in body and not isinstance(body[field], str):
+                self._send_json(400, {"error": "invalid_body", "message": f"{field} must be a string"})
+                return
+        for field in ("max_tasks", "lease_seconds", "seconds"):
+            if field in body:
+                try:
+                    value = body[field]
+                    if isinstance(value, bool) or not isinstance(value, (int, str)):
+                        raise ValueError()
+                    body[field] = int(value)
+                except ValueError:
+                    self._send_json(400, {"error": "invalid_body", "message": f"{field} must be an integer"})
+                    return
+        principal = getattr(self, "_principal", None)
+        if principal:
+            for field in ("actor", "requester"):
+                if field in body and body[field] != principal:
+                    self._send_json(403, {"error": "unauthorized", "message": f"{field} does not match the authenticated principal"})
+                    return
+            body.setdefault("actor", principal)
+            body.setdefault("requester", principal)
+
+        if path.startswith("/api/runs/") and path.endswith("/reconcile"):
+            run_id = path[len("/api/runs/"):-len("/reconcile")]
+            try:
+                result = pipeline_runner.reconcile_run(
+                    run_id,
+                    actor=principal or body.get("actor"),
+                    inspect=planctl.reconcile_detached_run,
+                    confirm_no_active_execution=body.get("confirm_no_active_execution") is True,
+                    note=body.get("note"),
+                )
+                self._send_json(200, result)
+            except (pipeline_runner.RunConflict, ValueError) as exc:
+                self._send_json(409, {"error": "reconciliation_required", "message": str(exc)})
+            return
+
+        if path in {"/api/agent/renew", "/api/agent/reconcile"}:
+            try:
+                if path.endswith("/renew"):
+                    if not self._require_role(body.get("agent_id"), "agent"):
+                        return
+                    job = agent_queue.extend_lease(
+                        str(body.get("job_id") or ""), str(body.get("agent_id") or ""),
+                        int(body.get("seconds", 120)), agent_token=body.get("agent_token"),
+                        claim_token=body.get("claim_token"),
+                    )
+                else:
+                    job = agent_queue.reconcile(str(body.get("job_id") or ""), str(principal or body.get("actor") or ""))
+            except (agent_queue.QueueError, ValueError) as exc:
+                self._send_json(getattr(exc, "status", 400), exc.to_json() if hasattr(exc, "to_json") else {"error": "invalid_body", "message": str(exc)})
+                return
+            self._send_json(200, {"job": job})
             return
 
         if path.startswith("/api/hosts/") and "/pipeline/" in path:
@@ -326,14 +548,23 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError as exc:
                 self._send_json(400, {"error": "invalid_body", "message": str(exc)})
                 return
+            # Server-side host inventory for cross-host actions; never trust the client's copy.
+            body.pop("_hosts", None)
+            body.pop("_record", None)
+            if step == "stage-artifact":
+                body["_hosts"] = load_hosts()
 
-            def run(_record, host=host, body=body, step_fn=step_fn):
+            def run(record, host=host, body=body, step_fn=step_fn):
+                if step == "readiness-chain":
+                    body["_record"] = record
                 return step_fn(host_id, host, body)
 
+            # One pipeline run per host at a time: steps share the host's SSH
+            # scratch dir and evidence files, and the chain wraps all of them.
             try:
-                record = pipeline_runner.start_run("pipeline", f"host:{host_id}:pipeline:{step}", run)
+                record = pipeline_runner.start_run("pipeline", f"host:{host_id}:pipeline", run)
             except pipeline_runner.RunConflict as exc:
-                self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
+                self._send_run_conflict(exc)
                 return
 
             self._send_json(202, {"run_id": record.run_id})
@@ -380,7 +611,34 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 record = pipeline_runner.start_run("plan", f"plan:{plan_id}:testmode-demo", run)
             except pipeline_runner.RunConflict as exc:
-                self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
+                self._send_run_conflict(exc)
+                return
+            self._send_json(202, {"run_id": record.run_id})
+            return
+
+        if path.startswith("/api/plans/") and path.endswith("/retry-task"):
+            plan_id = path[len("/api/plans/"):-len("/retry-task")]
+            try:
+                body = self._read_json_body()
+            except json.JSONDecodeError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            try:
+                actor = body["actor"]
+                task_id = body["task_id"]
+            except KeyError as exc:
+                self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
+                return
+            if not self._require_role(actor, "execute"):
+                return
+
+            def run(_record, plan_id=plan_id, task_id=task_id, actor=actor):
+                return planctl.retry_task(plan_id, task_id, actor)
+
+            try:
+                record = pipeline_runner.start_run("plan", f"plan:{plan_id}:retry-task", run)
+            except pipeline_runner.RunConflict as exc:
+                self._send_run_conflict(exc)
                 return
             self._send_json(202, {"run_id": record.run_id})
             return
@@ -412,7 +670,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 record = pipeline_runner.start_run("plan", f"plan:{plan_id}:execute", run)
             except pipeline_runner.RunConflict as exc:
-                self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
+                self._send_run_conflict(exc)
                 return
             self._send_json(202, {"run_id": record.run_id})
             return
@@ -431,7 +689,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not self._require_role(actor, "execute"):
                 return
-            max_tasks = int(body.get("max_tasks") or 200)
+            max_tasks = int(body.get("max_tasks", 200))
 
             def run(_record, plan_id=plan_id, actor=actor, max_tasks=max_tasks):
                 try:
@@ -445,7 +703,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 record = pipeline_runner.start_run("plan", f"plan:{plan_id}:execute", run)
             except pipeline_runner.RunConflict as exc:
-                self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
+                self._send_run_conflict(exc)
                 return
             self._send_json(202, {"run_id": record.run_id})
             return
@@ -481,7 +739,8 @@ class Handler(BaseHTTPRequestHandler):
                 job = agent_queue.claim(
                     str(body.get("node") or ""),
                     str(agent_id or ""),
-                    lease_seconds=int(body.get("lease_seconds") or 120),
+                    lease_seconds=int(body.get("lease_seconds", 120)),
+                    agent_token=body.get("agent_token"),
                 )
             except agent_queue.QueueError as exc:
                 self._send_json(exc.status, exc.to_json())
@@ -503,6 +762,8 @@ class Handler(BaseHTTPRequestHandler):
                     str(body.get("job_id") or ""),
                     str(agent_id or ""),
                     result=body.get("result"),
+                    agent_token=body.get("agent_token"),
+                    claim_token=body.get("claim_token"),
                 )
             except agent_queue.QueueError as exc:
                 self._send_json(exc.status, exc.to_json())
@@ -715,7 +976,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             record = pipeline_runner.start_run("plan", key, notifying_run)
         except pipeline_runner.RunConflict as exc:
-            self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
+            self._send_run_conflict(exc)
             return
         self._send_json(202, {"run_id": record.run_id})
 
@@ -726,7 +987,10 @@ class Handler(BaseHTTPRequestHandler):
                 key = f"recovery:{request_id}:create"
 
                 def run(_record, body=body):
-                    return recoveryctl.create_testmode_demo(body["request_id"], body["requester"])
+                    host_id = body.get("host_id")
+                    if host_id and self._resolved_host(host_id) is None:
+                        raise recoveryctl.RecoveryError("Unknown recovery host_id")
+                    return recoveryctl.create_testmode_demo(body["request_id"], body["requester"], host_id=host_id)
 
             elif action == "analyze":
                 key = f"recovery:{request_id}:analyze"
@@ -768,14 +1032,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             record = pipeline_runner.start_run("recovery", key, run)
         except pipeline_runner.RunConflict as exc:
-            self._send_json(409, {"error": "run_in_progress", "message": str(exc)})
+            self._send_run_conflict(exc)
             return
         self._send_json(202, {"run_id": record.run_id})
 
 
 def main() -> None:
     port = int(os.environ.get("OPU_WEBAPP_PORT") or "8765")
-    token = auth.ensure_token()
+    if auth.rbac_enabled():
+        auth.validate_configuration()
+    else:
+        auth.ensure_token()
     production_state = production.status()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
@@ -792,13 +1059,14 @@ def main() -> None:
         httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
-    print(f"opu webapp listening on {scheme}://127.0.0.1:{port}")
-    print(f"API token file: {auth.TOKEN_FILE}")
-    print(f"API token (dev): {token}")
+    print(f"opu webapp listening on {scheme}://127.0.0.1:{port}", flush=True)
+    print(f"API token file: {auth.TOKEN_FILE}", flush=True)
+    print(f"authentication mode: {'principal credentials' if auth.rbac_enabled() else 'local lab token file'}", flush=True)
     print(
         "production mode: "
         f"{'enabled' if production_state['production_mode'] else 'disabled'}; "
-        f"certified={production_state['certified']}"
+        f"certified={production_state['certified']}",
+        flush=True,
     )
     try:
         httpd.serve_forever()

@@ -111,6 +111,43 @@ next task can run. Failed work pauses the plan. `reconcile` turns an expired
 task into `unknown` and pauses the plan; it deliberately does not return the
 task to pending or invoke a retry.
 
+Dispatch now records a sealed manifest of the complete expected task set and
+atomically reserves every target host. Overlapping plans, including database
+and Grid plans, cannot dispatch concurrently. Reservations persist across
+controller restarts, failed tasks, paused plans, and expired leases. They are
+released only after every expected task and its custodied evidence verify as
+successful. An old active plan without a task manifest or target reservation
+is blocked; an operator must reconcile its actual Oracle state before creating
+fresh execution authority. There is no timeout-based reservation release.
+
+`retry-task` verifies the failed attempt's permanent controller custody first.
+It permits a failure reporting no mutation, or an explicitly repeatable
+validation/datapatch stage with a known binary state. Unknown postconditions,
+heartbeat failures, a database left down, and recovery-required outcomes remain
+blocked. Each retry receives a sealed generation and a new `TASK_ID-retryN`
+directory; generation zero retains the original `TASK_ID` directory. Previous
+task results are preserved under `attempts/`, and previous logs and evidence
+are never deleted. Evidence from an earlier generation cannot complete a new
+claim. `task-status --plan-id ID --task-id ID` returns a verified task and
+rechecks terminal controller custody for recovery and queue reconciliation.
+
+All managed mutation adapters also share a host-local kernel lock, independently
+of their plan and adapter state directories. The mutation child retains that
+lock if its supervisor dies. The production lock defaults to
+`/var/lib/oracle-patching-utility/locks/host-mutation.lock`; deployments that
+override `OPU_EXECUTION_LOCK_DIR` must use the same directory for all adapters.
+
+Remote executors receive a per-plan sealed reservation receipt alongside the
+task manifest and run with `OPU_PLAN_WORKER_SNAPSHOT=1`. That mode permits only
+existing dispatched task execution and inspection; it cannot create plans,
+approve, authorize, dispatch, or issue retries. Worker completion does not
+change the controller's global reservation registry. After importing a
+successful worker snapshot, the controller runs `reconcile --plan-id ID
+--actor ACTOR` to verify every task, mirrored custody file, and completion audit
+event before releasing the reservation. Original remote absolute paths remain
+sealed in the records; custody verification resolves their files only inside
+the corresponding mirrored plan evidence directory.
+
 `dispatch`, `claim`, and `renew` all recheck the open UTC window. The executor
 rechecks it before mutation. Once OPatch has started, service
 restoration is allowed to finish even if the window closes. The controller may

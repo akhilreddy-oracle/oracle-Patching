@@ -9,7 +9,30 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 SNAPSHOT=""; ARTIFACT=""; MANIFEST=""; PROCEDURE=""; OUT=""; EVIDENCE_DIR=""
 declare -a CHECKS=()
+declare -a FINDINGS=()
 usage() { printf '%s\n' 'Usage: opu-opatch-compatibility-collect --snapshot ABSOLUTE_JSON --artifact ABSOLUTE_DIRECTORY --artifact-manifest ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON [--evidence-dir ABSOLUTE_DIRECTORY] [--output ABSOLUTE_JSON]'; }
+artifact_payload_ok() {
+  local count
+  [ -d "$ARTIFACT/files" ] && [ ! -L "$ARTIFACT/files" ] || return 1
+  count=$(find "$ARTIFACT/files" -xdev -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "${count:-0}" -gt 0 ]
+}
+# Operator-facing reason for a failed prerequisite, taken from the OPatch log
+# so the evidence document itself explains the block without a host login.
+# Prefers OPatch's "The details are:" block; falls back to the failure line,
+# then to the last non-empty log line.
+prereq_detail() {
+  local log=$1 detail
+  [ -s "$log" ] || { printf '%s' ''; return 0; }
+  detail=$(awk '
+    /^The details are:/ { grab=1; next }
+    grab && /^OPatch (failed|returns) with error code/ { exit }
+    grab && NF { sub(/^[[:space:]]+/, ""); print }
+  ' "$log" | head -n 8 | paste -sd ' ' -)
+  [ -n "$detail" ] || detail=$(grep -E 'Prerequisite check .* failed|Prereq .* is not executed|OPatch (failed|returns) with error code|not readable|Permission denied|No such file' "$log" | head -n 3 | paste -sd ' ' -)
+  [ -n "$detail" ] || detail=$(grep -v '^[[:space:]]*$' "$log" | tail -n 1)
+  printf '%s' "${detail:0:1200}"
+}
 require_file() { local file=$1 label=$2; opu_validate_absolute_path "$file" "$label" || exit $?; [ -f "$file" ] && [ ! -L "$file" ] || { echo "$label is missing or symbolic link: $file" >&2; exit 66; }; }
 parse() {
   while [ "$#" -gt 0 ]; do case "$1" in
@@ -54,15 +77,16 @@ contract() {
   case "$TARGET_FAMILY" in grid|database) ;; *) echo 'unsupported target family' >&2; exit 65;; esac
 }
 check_home() {
-  local home=$1 owner=$2 host_platform=$3 host_platform_name=$4 host actual status version_status platform_status applicability_status conflict_status applicability_log applicability_rc applicability_sha conflict_log conflict_rc conflict_sha message
+  local home=$1 owner=$2 host_platform=$3 host_platform_name=$4 host actual status version_status platform_status applicability_status conflict_status applicability_log applicability_rc applicability_sha conflict_log conflict_rc conflict_sha message applicability_detail conflict_detail
   host=$(jq -r '.host.name | split(".")[0]' "$SNAPSHOT")
-  status=passed; version_status=passed; platform_status=passed; applicability_status=passed; conflict_status=passed
+  status=passed; version_status=passed; platform_status=passed; applicability_status=passed; conflict_status=passed; message=""
   applicability_log="$EVIDENCE_DIR/${host}-$(basename "$home")-opatch-platform-${PATCH_ID}.log"
   conflict_log="$EVIDENCE_DIR/${host}-$(basename "$home")-opatch-conflict-${PATCH_ID}.log"
   applicability_rc=126; conflict_rc=126
   [ "$host_platform" = "$ARTIFACT_PLATFORM" ] && [ "$host_platform" = "$PROCEDURE_PLATFORM" ] || { platform_status=failed; status=blocked; }
   if [ -z "$owner" ] || [ "$owner" = unknown ] || [ ! -x "$home/OPatch/opatch" ]; then
-    status=blocked; applicability_status=unknown; conflict_status=unknown; version_status=unknown; actual=""; message='OPatch executable or Oracle home owner is unavailable.'
+    status=blocked; applicability_status=unknown; conflict_status=unknown; version_status=unknown; actual=""; message="OPatch executable or Oracle home owner is unavailable for $home (owner '${owner:-unknown}')."
+    FINDINGS+=("$message")
     printf '%s\n' "$message" >"$applicability_log"; printf '%s\n' "$message" >"$conflict_log"
   else
     actual=$(opatch_as_owner "$owner" "$home" version 2>&1 | sed -nE 's/.*Version:[[:space:]]*([^[:space:]]+).*/\1/p' | head -n1 || true)
@@ -71,10 +95,16 @@ check_home() {
     # the Oracle Home owner.  Verify that owner can traverse and read the
     # immutable metadata before invoking OPatch; otherwise its Java error
     # misleadingly reports the files as missing.
-    if ! as_owner "$owner" test -r "$ARTIFACT/etc/config/actions.xml" ||
+    if ! artifact_payload_ok; then
+      applicability_rc=66; conflict_rc=66; applicability_status=failed; conflict_status=failed; status=blocked
+      message="Incomplete patch media: missing files/ payload under $ARTIFACT (metadata/README only; OPatch cannot create a Patch Object)."
+      FINDINGS+=("$message")
+      printf '%s\n' "$message" >"$applicability_log"; printf '%s\n' "$message" >"$conflict_log"
+    elif ! as_owner "$owner" test -r "$ARTIFACT/etc/config/actions.xml" ||
        ! as_owner "$owner" test -r "$ARTIFACT/etc/config/inventory.xml"; then
       applicability_rc=126; conflict_rc=126; applicability_status=failed; conflict_status=failed; status=blocked
       message="Verified artifact metadata is not readable by Oracle Home owner '$owner': $ARTIFACT/etc/config/actions.xml or $ARTIFACT/etc/config/inventory.xml"
+      FINDINGS+=("$message")
       printf '%s\n' "$message" >"$applicability_log"; printf '%s\n' "$message" >"$conflict_log"
     else
       set +e
@@ -87,12 +117,31 @@ check_home() {
       if [ "$conflict_rc" -ne 0 ] || grep -E 'Prerequisite check .* failed|Prereq .* is not executed|OPatch (failed|returns) with error code' "$conflict_log" >/dev/null 2>&1; then conflict_status=failed; status=blocked; fi
     fi
   fi
+  if [ "$version_status" = failed ]; then
+    FINDINGS+=("OPatch on $home is ${actual:-unknown}; procedure requires $REQUIRED_OPATCH or newer.")
+  fi
+  if [ "$platform_status" = failed ]; then
+    FINDINGS+=("Platform mismatch for $home: host platform $host_platform ($host_platform_name) vs artifact $ARTIFACT_PLATFORM / procedure $PROCEDURE_PLATFORM.")
+  fi
+  applicability_detail=""; conflict_detail=""
+  if [ "$applicability_status" != passed ]; then
+    applicability_detail=$(prereq_detail "$applicability_log")
+    [ -n "$message" ] || FINDINGS+=("CheckPatchApplicableOnCurrentPlatform failed on $home (exit $applicability_rc): ${applicability_detail:-see $applicability_log}")
+  fi
+  if [ "$conflict_status" != passed ]; then
+    conflict_detail=$(prereq_detail "$conflict_log")
+    [ -n "$message" ] || FINDINGS+=("CheckConflictAgainstOHWithDetail failed on $home (exit $conflict_rc): ${conflict_detail:-see $conflict_log}")
+  fi
   applicability_sha=$(opu_hash_file "$applicability_log"); conflict_sha=$(opu_hash_file "$conflict_log")
-  CHECKS+=("$(jq -cn --arg node "$host" --arg home "$home" --arg owner "$owner" --arg actual "$actual" --arg required "$REQUIRED_OPATCH" --arg host_platform "$host_platform" --arg host_platform_name "$host_platform_name" --arg artifact_platform "$ARTIFACT_PLATFORM" --arg procedure_platform "$PROCEDURE_PLATFORM" --arg ps "$platform_status" --arg vs "$version_status" --arg aps "$applicability_status" --arg cs "$conflict_status" --arg patch_source "$ARTIFACT" --arg applicability_log "$applicability_log" --arg applicability_sha "$applicability_sha" --arg conflict_log "$conflict_log" --arg conflict_sha "$conflict_sha" --argjson applicability_rc "$applicability_rc" --argjson conflict_rc "$conflict_rc" '{node:$node,home:$home,owner:$owner,status:(if $ps == "passed" and $vs == "passed" and $aps == "passed" and $cs == "passed" then "passed" else "blocked" end),platform:{host_id:$host_platform,host_name:$host_platform_name,artifact_ids:[$artifact_platform],procedure_id:$procedure_platform,status:$ps},opatch:{actual_version:($actual|select(length>0)),required_version:$required,status:$vs},applicability_check:{name:"CheckPatchApplicableOnCurrentPlatform",status:$aps,exit_code:$applicability_rc,patch_option:"-ph",patch_source:$patch_source,evidence_path:$applicability_log,evidence_sha256:$applicability_sha},conflict_check:{name:"CheckConflictAgainstOHWithDetail",status:$cs,exit_code:$conflict_rc,patch_option:"-ph",patch_source:$patch_source,evidence_path:$conflict_log,evidence_sha256:$conflict_sha}}')")
+  CHECKS+=("$(jq -cn --arg node "$host" --arg home "$home" --arg owner "$owner" --arg actual "$actual" --arg required "$REQUIRED_OPATCH" --arg host_platform "$host_platform" --arg host_platform_name "$host_platform_name" --arg artifact_platform "$ARTIFACT_PLATFORM" --arg procedure_platform "$PROCEDURE_PLATFORM" --arg ps "$platform_status" --arg vs "$version_status" --arg aps "$applicability_status" --arg cs "$conflict_status" --arg patch_source "$ARTIFACT" --arg applicability_log "$applicability_log" --arg applicability_sha "$applicability_sha" --arg conflict_log "$conflict_log" --arg conflict_sha "$conflict_sha" --argjson applicability_rc "$applicability_rc" --argjson conflict_rc "$conflict_rc" --arg applicability_detail "$applicability_detail" --arg conflict_detail "$conflict_detail" '{node:$node,home:$home,owner:$owner,status:(if $ps == "passed" and $vs == "passed" and $aps == "passed" and $cs == "passed" then "passed" else "blocked" end),platform:{host_id:$host_platform,host_name:$host_platform_name,artifact_ids:[$artifact_platform],procedure_id:$procedure_platform,status:$ps},opatch:{actual_version:($actual|select(length>0)),required_version:$required,status:$vs},applicability_check:({name:"CheckPatchApplicableOnCurrentPlatform",status:$aps,exit_code:$applicability_rc,patch_option:"-ph",patch_source:$patch_source,evidence_path:$applicability_log,evidence_sha256:$applicability_sha} + (if ($applicability_detail|length) > 0 then {detail:$applicability_detail} else {} end)),conflict_check:({name:"CheckConflictAgainstOHWithDetail",status:$cs,exit_code:$conflict_rc,patch_option:"-ph",patch_source:$patch_source,evidence_path:$conflict_log,evidence_sha256:$conflict_sha} + (if ($conflict_detail|length) > 0 then {detail:$conflict_detail} else {} end))}')")
 }
 emit() {
-  local file=$1 first=1 item status=passed; for item in "${CHECKS[@]}"; do [ "$(jq -r '.status' <<<"$item")" = passed ] || status=blocked; done
-  printf '{"schema_version":"1.0","status":%s,"patch_id":%s,"artifact_sha256":%s,"target":{"family":%s,"platform_id":%s},"checks":[' "$(opu_json_string "$status")" "$(opu_json_string "$PATCH_ID")" "$(opu_json_string "$ARTIFACT_SHA")" "$(opu_json_string "$TARGET_FAMILY")" "$(opu_json_string "$ARTIFACT_PLATFORM")" >"$file"
+  local file=$1 first=1 item status=passed findings_json='[]'
+  for item in "${CHECKS[@]}"; do [ "$(jq -r '.status' <<<"$item")" = passed ] || status=blocked; done
+  if [ "${#FINDINGS[@]}" -gt 0 ]; then
+    findings_json=$(jq -n --args '$ARGS.positional' -- "${FINDINGS[@]}")
+  fi
+  printf '{"schema_version":"1.0","status":%s,"patch_id":%s,"artifact_sha256":%s,"target":{"family":%s,"platform_id":%s},"findings":%s,"checks":[' "$(opu_json_string "$status")" "$(opu_json_string "$PATCH_ID")" "$(opu_json_string "$ARTIFACT_SHA")" "$(opu_json_string "$TARGET_FAMILY")" "$(opu_json_string "$ARTIFACT_PLATFORM")" "$findings_json" >"$file"
   for item in "${CHECKS[@]}"; do [ "$first" -eq 1 ] || printf ',' >>"$file"; printf '%s' "$item" >>"$file"; first=0; done; printf ']}\n' >>"$file"
 }
 main() {

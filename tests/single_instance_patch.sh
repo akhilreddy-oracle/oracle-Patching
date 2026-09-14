@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/tests/fixtures/retire_plans.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/opu-single-instance.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
@@ -130,6 +131,9 @@ case "${1:-}" in
     printf '%s\n' 'OPatch succeeded.'
     ;;
   rollback)
+    # Real OPatch prompts "Is the local system ready for patching? [y|n]" and
+    # exits 73 under non-interactive automation unless -silent is passed.
+    case " $* " in *' -silent '*) ;; *) printf 'Is the local system ready for patching? [y|n]\nOPatch failed with error code 73\n'; exit 73 ;; esac
     [ ! -f "$OPU_TEST_FAIL_ROLLBACK" ] || { printf 'simulated OPatch rollback failure\n' >&2; exit 73; }
     rm -f "$OPU_TEST_PATCH_STATE"
     printf '%s\n' 'OPatch rollback succeeded.'
@@ -158,6 +162,8 @@ chmod 750 "$TEST_HOME/bin/sqlplus" "$TEST_HOME/bin/lsnrctl" \
 cat >"$PATCH_DIR/etc/config/inventory.xml" <<'EOF'
 <patch patchID="39034528"><description>Database Release Update</description><os_platforms><platform id="226" name="Linux x86-64"/></os_platforms></patch>
 EOF
+# artifact-inspect fails closed on metadata-only stage dirs; give OPatch a payload tree.
+mkdir -p "$PATCH_DIR/files/lib" && printf 'test patch payload\n' >"$PATCH_DIR/files/lib/libtestpatch.so"
 printf '%s\n' \
   'Database Release Update test README' \
   'opatch rollback -id 39034528' \
@@ -220,6 +226,8 @@ create_plan() {
     --recovery-evidence "$TMP/recovery.json" --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
   plan approve --plan-id "$plan_id" --actor dba-approver --approval-ticket TEST-39034528 >/dev/null
   plan authorize --plan-id "$plan_id" --actor patch-operator >/dev/null
+  # Independent simulated target scenario; lifecycle tests cover retained reservations.
+  retire_fixture_plans "$PLAN_STATE"
   plan dispatch --plan-id "$plan_id" --actor patch-operator >/dev/null
 }
 
@@ -309,6 +317,16 @@ jq -e '.exit_code == 73 and .outcome_class == "no_mutation"' \
 [ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
 rm -f "$FAIL_APPLICABILITY"
 
+# Retry the actual executor without deleting its first evidence directory.
+FIRST_ATTEMPT_SHA=$(sha256sum "$EXECUTION_STATE/plans/standalone-platform-precheck-failure/tasks/$PLATFORM_INITIAL_PRECHECK/evidence.json" | awk '{print $1}')
+plan retry-task --plan-id standalone-platform-precheck-failure --task-id "$PLATFORM_INITIAL_PRECHECK" --actor patch-operator >/dev/null
+execute standalone-platform-precheck-failure "$PLATFORM_INITIAL_PRECHECK" >"$TMP/precheck-retry-result.json"
+jq -e '.status == "succeeded" and .retry_count == 1' "$TMP/precheck-retry-result.json" >/dev/null
+[ -f "$EXECUTION_STATE/plans/standalone-platform-precheck-failure/tasks/$PLATFORM_INITIAL_PRECHECK-retry1/evidence.json" ]
+[ "$(sha256sum "$EXECUTION_STATE/plans/standalone-platform-precheck-failure/tasks/$PLATFORM_INITIAL_PRECHECK/evidence.json" | awk '{print $1}')" = "$FIRST_ATTEMPT_SHA" ]
+jq -e '.status == "failed"' "$PLAN_STATE/plans/standalone-platform-precheck-failure/attempts/$PLATFORM_INITIAL_PRECHECK/attempt-0.json" >/dev/null
+plan task-status --plan-id standalone-platform-precheck-failure --task-id "$PLATFORM_INITIAL_PRECHECK" | jq -e '.status == "succeeded" and .retry_count == 1' >/dev/null
+
 # The apply task must repeat platform applicability before any outage. If the
 # runtime prerequisite changes after precheck, the plan pauses without
 # stopping the database or listener and without touching binary inventory.
@@ -356,6 +374,10 @@ jq -e '.exit_code == 73 and .outcome_class == "binary_state_unknown"' \
   "$EXECUTION_STATE/plans/standalone-opatch-failure/tasks/$FAILURE_APPLY/evidence.json" >/dev/null
 [ "$(cat "$EXECUTION_STATE/plans/standalone-opatch-failure/tasks/$FAILURE_APPLY/opatch-apply.exit-code")" -eq 73 ]
 [ "$(cat "$DATABASE_STATE")" = down ] && [ "$(cat "$LISTENER_STATE")" = down ] && [ ! -f "$PATCH_STATE" ]
+if plan retry-task --plan-id standalone-opatch-failure --task-id "$FAILURE_APPLY" --actor patch-operator >/dev/null 2>&1; then
+  echo 'unknown binary outcome was made retryable' >&2
+  exit 1
+fi
 
 # A paused mutation task is immutable: replay and deriving a rollback plan from
 # the incomplete source plan are both refused.
@@ -395,6 +417,8 @@ create_rollback_plan() {
     --source-plan-id standalone-success --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
   plan approve --plan-id "$rollback_plan_id" --actor rollback-approver --approval-ticket TEST-ROLLBACK-39034528 >/dev/null
   plan authorize --plan-id "$rollback_plan_id" --actor rollback-operator >/dev/null
+  # Independent simulated target scenario; lifecycle tests cover retained reservations.
+  retire_fixture_plans "$PLAN_STATE"
   plan dispatch --plan-id "$rollback_plan_id" --actor rollback-operator >/dev/null
 }
 
@@ -439,6 +463,51 @@ for expected_stage in rollback_precheck rollback_binary rollback_binary_validate
 done
 
 plan status --plan-id standalone-rollback-success | jq -e '.intent == "patch_rollback" and .state == "succeeded"' >/dev/null
+[ ! -f "$PATCH_STATE" ] && [ "$(cat "$SQLPATCH_ACTION_STATE")" = ROLLBACK ]
+[ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ]
+grep -E '^rollback -id 39034528 -silent( |$)' "$OPATCH_CALLS" >/dev/null
+
+# Backup waiver (policy require_backup=false): the apply plan seals
+# recovery.waived with no manifest, and create-rollback must still derive a
+# rollback plan from its succeeded final_validate evidence.
+jq '.recovery.require_backup = false | .recovery.max_backup_age_minutes = 0' "$TMP/policy.json" >"$TMP/waived-policy.json"
+WAIVED_POLICY_SHA=$(sha256sum "$TMP/waived-policy.json" | awk '{print $1}')
+jq --arg policy "$WAIVED_POLICY_SHA" '.evidence.policy_sha256 = $policy' "$TMP/readiness.json" >"$TMP/waived-readiness.json"
+plan create --plan-id standalone-waived-apply --requester patch-admin \
+  --readiness "$TMP/waived-readiness.json" --reconciliation "$TMP/reconciliation.json" \
+  --artifact-manifest "$TMP/artifact.json" --procedure-validation "$TMP/procedure.json" \
+  --compatibility "$TMP/compatibility.json" --policy "$TMP/waived-policy.json" \
+  --window-start "$WINDOW_START" --window-end "$WINDOW_END" \
+  | jq -e '.recovery.waived == true and .recovery.require_backup == false and (.recovery.manifest_path | not)' >/dev/null
+plan approve --plan-id standalone-waived-apply --actor dba-approver --approval-ticket TEST-WAIVED >/dev/null
+plan authorize --plan-id standalone-waived-apply --actor patch-operator >/dev/null
+# Independent simulated target scenario; lifecycle tests cover retained reservations.
+retire_fixture_plans "$PLAN_STATE"
+plan dispatch --plan-id standalone-waived-apply --actor patch-operator >/dev/null
+for expected_stage in precheck apply validate datapatch final_validate; do
+  TASK_ID=$(plan next --plan-id standalone-waived-apply | jq -r '.task_id')
+  execute standalone-waived-apply "$TASK_ID" >"$TMP/waived-$expected_stage-result.json"
+  jq -e '.status == "succeeded" and .recovery.manifest_sha256 == null and .recovery.record_sha256 == null' "$TMP/waived-$expected_stage-result.json" >/dev/null
+done
+plan status --plan-id standalone-waived-apply | jq -e '.state == "succeeded"' >/dev/null
+[ -f "$PATCH_STATE" ] && [ "$(cat "$SQLPATCH_ACTION_STATE")" = APPLY ]
+
+plan create-rollback --plan-id standalone-waived-rollback --requester rollback-admin \
+  --source-plan-id standalone-waived-apply --window-start "$WINDOW_START" --window-end "$WINDOW_END" \
+  | jq -e '.intent == "patch_rollback" and .recovery.waived == true and (.recovery.manifest_path | not)' >/dev/null
+plan approve --plan-id standalone-waived-rollback --actor rollback-approver --approval-ticket TEST-WAIVED-ROLLBACK >/dev/null
+plan authorize --plan-id standalone-waived-rollback --actor rollback-operator >/dev/null
+# Independent simulated target scenario; lifecycle tests cover retained reservations.
+retire_fixture_plans "$PLAN_STATE"
+plan dispatch --plan-id standalone-waived-rollback --actor rollback-operator >/dev/null
+for expected_stage in rollback_precheck rollback_binary rollback_binary_validate rollback_datapatch rollback_final_validate; do
+  TASK_JSON=$(plan next --plan-id standalone-waived-rollback)
+  TASK_ID=$(jq -r '.task_id' <<<"$TASK_JSON")
+  [ "$(jq -r '.stage' <<<"$TASK_JSON")" = "$expected_stage" ]
+  execute_rollback standalone-waived-rollback "$TASK_ID" >"$TMP/waived-$expected_stage-result.json"
+  jq -e '.intent == "patch_rollback" and .status == "succeeded"' "$TMP/waived-$expected_stage-result.json" >/dev/null
+done
+plan status --plan-id standalone-waived-rollback | jq -e '.state == "succeeded"' >/dev/null
 [ ! -f "$PATCH_STATE" ] && [ "$(cat "$SQLPATCH_ACTION_STATE")" = ROLLBACK ]
 [ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ]
 

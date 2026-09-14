@@ -50,22 +50,73 @@ parse() {
 }
 
 check_contracts() {
+  local canonical expected
   jq -e '
-    .schema_version == "1.0" and
-    .collector.name == "oracle.dataguard.observe" and
+    def valid_name: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$");
+    .schema_version == "1.0" and .collector.name == "oracle.dataguard.observe" and
     (.primary.database_role | type == "string" and length > 0) and
-    (.members | type == "array")
+    (.collected_at | type == "string" and length > 0) and
+    (.members | type == "array") and
+    all(.members[]; (.db_unique_name | valid_name) and (.status | type == "string") and
+      (.transport_lag_seconds == null or (.transport_lag_seconds | type == "number" and . == floor)) and
+      (.apply_lag_seconds == null or (.apply_lag_seconds | type == "number" and . == floor))) and
+    ((.members | map(.db_unique_name) | length) == (.members | map(.db_unique_name) | unique | length)) and
+    (if .collector.version == "2" then
+      (.target.db_unique_name | valid_name) and .target.db_unique_name == .primary.db_unique_name and
+      .sampling.source == "live_sql" and all(.members[]; (.lag_samples | type == "object") and
+        .lag_samples.transport.seconds == .transport_lag_seconds and .lag_samples.apply.seconds == .apply_lag_seconds)
+     else true end)
   ' "$OBSERVE" >/dev/null || die 'observe evidence violates the Data Guard v1 contract'
+  expected=$(jq -r '.record_sha256 // ""' "$OBSERVE")
+  canonical=$(jq -cS 'del(.record_sha256)' "$OBSERVE")
+  [ "$expected" = "$(opu_hash_string "$canonical")" ] || die 'observe record checksum does not match its content'
   jq -e '
+    def nonnegative_integer: type == "number" and . >= 0 and . == floor;
     .schema_version == "1.0" and
-    (.dataguard.max_transport_lag_seconds | type == "number" and . >= 0) and
-    (.dataguard.max_apply_lag_seconds | type == "number" and . >= 0) and
-    (.dataguard.require_broker | type == "boolean")
+    (.dataguard.max_transport_lag_seconds | nonnegative_integer) and
+    (.dataguard.max_apply_lag_seconds | nonnegative_integer) and
+    (.dataguard.require_broker | type == "boolean") and
+    ((.dataguard.maximum_observation_age_seconds // 300) | nonnegative_integer and . > 0) and
+    ((.dataguard.maximum_sample_age_seconds // 60) | nonnegative_integer and . > 0)
   ' "$POLICY" >/dev/null || die 'Data Guard policy violates the v1 contract'
 }
 
+check_freshness() {
+  local age maximum sample_max samples name kind computed datum status
+  maximum=$(jq -r '.dataguard.maximum_observation_age_seconds // 300' "$POLICY")
+  sample_max=$(jq -r '.dataguard.maximum_sample_age_seconds // 60' "$POLICY")
+  age=$(jq -er '(now - (.collected_at | fromdateiso8601)) | floor' "$OBSERVE") \
+    || die 'invalid Data Guard observation collection timestamp'
+  if [ "$age" -ge 0 ] && [ "$age" -le "$maximum" ]; then
+    gate observation_freshness pass "Observation is ${age}s old (maximum ${maximum}s)."
+  else
+    gate observation_freshness blocker "Observation age ${age}s is outside 0..${maximum}s."
+  fi
+  if jq -e '.collector.version == "2" or .sampling.source == "live_sql"' "$OBSERVE" >/dev/null; then
+    samples=$(jq -r '.members[] | .db_unique_name as $name |
+      ["transport","apply"][] as $kind | (.lag_samples[$kind] // {}) as $sample |
+      [$name,$kind,($sample.status // "unavailable"),($sample.time_computed_age_seconds // -1),($sample.datum_age_seconds // -1)] | @tsv' "$OBSERVE") \
+      || die 'could not inspect Data Guard sample clocks'
+    while IFS=$'\t' read -r name kind status computed datum; do
+      [ -n "$name" ] || continue
+      if [ "$status" = collected ] && [[ "$computed" =~ ^[0-9]+$ ]] && [[ "$datum" =~ ^[0-9]+$ ]] &&
+        jq -en --argjson computed "$computed" --argjson datum "$datum" --argjson age "$age" --argjson maximum "$sample_max" \
+          '$age >= 0 and ($computed + $age) <= $maximum and ($datum + $age) <= $maximum' >/dev/null; then
+        gate sample_freshness pass "$name $kind computation/data ages at collection ${computed}/${datum}s plus observation age ${age}s are within ${sample_max}s."
+      else
+        gate sample_freshness blocker "$name $kind metric has missing, future or stale TIME_COMPUTED/DATUM_TIME (status=$status; computed=$computed; datum=$datum; max=${sample_max}s)."
+      fi
+    done <<<"$samples"
+  else
+    # Preserve the original fixture contract; live version 2 may never omit its
+    # sample clocks. Legacy data remains explicitly distinguishable in gates.
+    gate sample_freshness warning 'Legacy v1 evidence has no native sample clocks; only collection freshness can be checked.'
+  fi
+}
+
 evaluate() {
-  local role broker require_broker max_transport max_apply member_count transport apply status name
+  local role broker require_broker max_transport max_apply member_count transport apply status name member_rows
+  check_freshness
   role=$(jq -r '.primary.database_role' "$OBSERVE")
   case "$role" in
     PRIMARY) gate role pass 'Observed role is PRIMARY; standby-first order is applicable.' ;;
@@ -85,18 +136,22 @@ evaluate() {
   fi
 
   member_count=$(jq -r '.members | length' "$OBSERVE")
-  if [ "$role" = PRIMARY ] && [ "$member_count" -lt 1 ]; then
-    gate members blocker 'PRIMARY observation has no standby members.'
+  # Standby-first readiness always needs at least one member lag sample.
+  # Empty members used to pass for *STANDBY* roles and fail open.
+  if [ "$member_count" -lt 1 ]; then
+    gate members blocker 'Data Guard observation has no members; cannot evaluate lag or standby-first readiness.'
   else
     gate members pass "Observed $member_count Data Guard member(s)."
   fi
 
   max_transport=$(jq -r '.dataguard.max_transport_lag_seconds' "$POLICY")
   max_apply=$(jq -r '.dataguard.max_apply_lag_seconds' "$POLICY")
+  member_rows=$(jq -r '.members[] | [.db_unique_name, .status, (.transport_lag_seconds // -1 | tostring), (.apply_lag_seconds // -1 | tostring)] | @tsv' "$OBSERVE") \
+    || die 'could not inspect Data Guard members'
   while IFS=$'\t' read -r name status transport apply; do
     [ -n "$name" ] || continue
     case "$status" in
-      APPLYING_LOG|applying_log|ENABLED|enabled|VALID|valid)
+      APPLYING_LOG|applying_log|WAIT_FOR_LOG|wait_for_log|ENABLED|enabled|VALID|valid)
         gate member_status pass "$name status is $status."
         ;;
       *)
@@ -106,14 +161,14 @@ evaluate() {
     if [[ "$transport" =~ ^-?[0-9]+$ ]] && [ "$transport" -ge 0 ] && [ "$transport" -le "$max_transport" ]; then
       gate lag pass "$name transport lag ${transport}s within ${max_transport}s."
     else
-      gate lag blocker "$name transport lag ${transport}s exceeds policy ${max_transport}s."
+      gate lag blocker "$name transport lag ${transport}s is unknown or exceeds policy ${max_transport}s."
     fi
     if [[ "$apply" =~ ^-?[0-9]+$ ]] && [ "$apply" -ge 0 ] && [ "$apply" -le "$max_apply" ]; then
       gate lag pass "$name apply lag ${apply}s within ${max_apply}s."
     else
-      gate lag blocker "$name apply lag ${apply}s exceeds policy ${max_apply}s."
+      gate lag blocker "$name apply lag ${apply}s is unknown or exceeds policy ${max_apply}s."
     fi
-  done < <(jq -r '.members[] | [.db_unique_name // "", .status // "unknown", (.transport_lag_seconds // -1 | tostring), (.apply_lag_seconds // -1 | tostring)] | @tsv' "$OBSERVE")
+  done <<<"$member_rows"
 }
 
 emit() {

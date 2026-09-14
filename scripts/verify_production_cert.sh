@@ -21,14 +21,14 @@ esac
   opu_error "certification marker missing: $CERT"
   exit 2
 }
-grep -Fq 'OPU_PRODUCTION_CERTIFIED=1' "$CERT" || {
+opu_cert_marker_line "$CERT" 'OPU_PRODUCTION_CERTIFIED=1' || {
   opu_error "certification marker invalid: $CERT"
   exit 2
 }
 
 if [ "$REQUIRE_CHECKLIST" = 1 ]; then
   for key in OPU_SBOM_VERIFIED=1 OPU_RELEASE_SIGNED=1 OPU_THREAT_MODEL_SIGNED=1; do
-    grep -Fq "$key" "$CERT" || {
+    opu_cert_marker_line "$CERT" "$key" || {
       opu_error "checklist incomplete: missing $key in $CERT"
       exit 2
     }

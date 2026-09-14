@@ -41,7 +41,15 @@ main() {
   jq -e --arg sha "$(opu_hash_file "$OBSERVE")" '.evidence.observe_sha256 == $sha' "$EVAL" >/dev/null \
     || die 'evaluation does not bind the supplied observe evidence'
 
+  # Live observations seal DB_UNIQUE_NAME from V$DATABASE; SID is an instance
+  # name and is not an acceptable database identity for new live collections.
+  jq -e 'if .collector.version == "2" or .sampling.source == "live_sql" then
+    (.target.db_unique_name | type == "string" and length > 0) and
+    .target.db_unique_name == .primary.db_unique_name else true end' "$OBSERVE" >/dev/null \
+    || die 'live Data Guard observation lacks a consistent native database identity'
   order=$(jq -c '
+    (.target.db_unique_name // .primary.db_unique_name // .target.oracle_sid) as $local_name |
+    if ($local_name | type != "string" or length == 0) then error("database identity is missing") else . end |
     (.primary.database_role) as $role |
     if $role == "PRIMARY" then
       ((.members // []) | map(select(.db_unique_name != null)) | sort_by(.apply_lag_seconds // 0)) as $standbys |
@@ -50,14 +58,14 @@ main() {
         strategy:"standby_first",
         order: (
           ($standbys | map({db_unique_name,role:"STANDBY",apply_lag_seconds:(.apply_lag_seconds // 0)}))
-          + [{db_unique_name:(.target.oracle_sid // "PRIMARY"),role:"PRIMARY",apply_lag_seconds:0}]
+          + [{db_unique_name:$local_name,role:"PRIMARY",apply_lag_seconds:0}]
         )
       }
     elif ($role | test("STANDBY$")) then
       {
         schema_version:"1.0",
         strategy:"standby_first",
-        order: [{db_unique_name:(.target.oracle_sid // "STANDBY"),role:$role,apply_lag_seconds:0}]
+        order: [{db_unique_name:$local_name,role:$role,apply_lag_seconds:0}]
       }
     else
       error("unsupported role for plan order")

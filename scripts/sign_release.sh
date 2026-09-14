@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 # Lab release signing stub (S13). Not a substitute for production provenance.
 set -euo pipefail
+# Do not add macOS AppleDouble sidecar entries to portable Oracle media.
+export COPYFILE_DISABLE=1
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 DIST=${1:-"$ROOT/dist"}
 mkdir -p "$DIST"
 
-"$ROOT/scripts/generate_sbom.sh" "$DIST/sbom.json"
 (
   cd "$ROOT"
   tar -czf "$DIST/opu-source.tgz" \
     --exclude .git --exclude .venv --exclude webapp/var --exclude dist \
-    bin lib webapp contracts scripts docs tests Makefile README.md
+    --exclude __pycache__ --exclude "*.pyc" \
+    bin lib operations webapp contracts scripts docs tests Makefile README.md
 )
+
+# Inventory the captured archive so source edits cannot desynchronize its SBOM.
+"$ROOT/scripts/generate_sbom.sh" "$DIST/sbom.json" "$DIST/opu-source.tgz"
 
 (
   cd "$DIST"

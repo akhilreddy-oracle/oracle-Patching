@@ -43,8 +43,35 @@ def drive(plan_id: str, create_fn, worker: str, expected_tasks: int, expected_ad
     assert plan["procedure"]["adapter"] == expected_adapter, plan["procedure"]
     assert plan["nodes"] == ["node1", "node2"], plan["nodes"]
 
+    sod = planctl.sod_summary(plan_id)
+    assert sod["requester"] == "patch-admin" and sod["approver"] is None, sod
+    assert sod["barred"]["approve"] == ["patch-admin"], sod
+    # A freshly sealed plan is viable: window open, readiness unexpired, all sealed docs intact.
+    via = planctl.viability(plan_id)
+    assert via["actionable"] is True and via["blockers"] == [] and via["window"]["state"] == "open", via
+    assert via["pre_execution"] is True and all(d["status"] == "ok" for d in via["documents"]), via
+    # The same plan evaluated after its window closed / readiness expired / a sealed
+    # document changed is reported dead, with every reason, instead of exit 66 later.
+    import copy, datetime as _dt
+    plan_doc = planctl.status(plan_id)
+    late = _dt.datetime.fromisoformat(plan_doc["maintenance_window"]["end"].replace("Z", "+00:00")) + _dt.timedelta(hours=1)
+    stale = planctl.viability(plan_id, plan_doc, now=late)
+    assert stale["actionable"] is False and stale["window"]["state"] == "closed", stale
+    assert any("window closed" in b for b in stale["blockers"]), stale["blockers"]
+    tampered = copy.deepcopy(plan_doc)
+    tampered["source_documents"]["readiness"]["path"] = "/nonexistent/readiness.json"
+    tampered["source_documents"]["policy"]["sha256"] = "0" * 64
+    dead = planctl.viability(plan_id, tampered)
+    statuses = {d["name"]: d["status"] for d in dead["documents"]}
+    assert statuses["readiness"] == "missing" and statuses["policy"] == "changed", statuses
+    assert dead["actionable"] is False and any("no longer matches" in b for b in dead["blockers"]), dead
     planctl.approve(plan_id, "dba-approver", f"TEST-WEBAPP-{plan_id}")
+    sod = planctl.sod_summary(plan_id)
+    assert sod["approver"] == "dba-approver", sod
+    assert sod["barred"]["authorize"] == ["dba-approver", "patch-admin"], sod
     planctl.authorize(plan_id, "patch-operator")
+    sod = planctl.sod_summary(plan_id)
+    assert sod["operator"] == "patch-operator" and sod["allowed"]["dispatch"] == ["patch-operator"], sod
     dispatched = planctl.dispatch(plan_id, "patch-operator")
     assert dispatched["state"] == "running", dispatched["state"]
 

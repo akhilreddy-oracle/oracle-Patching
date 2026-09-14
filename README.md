@@ -199,5 +199,6 @@ derived from a fully succeeded source apply. See
 [RAC Database rollback](docs/RAC_DATABASE_ROLLBACK.md).
 
 The earlier `opu-database-rolling-patch` helper is retained for analysis and
-compatibility, but its command-line approval flag is not equivalent to the
-immutable-plan approval and evidence-custody workflow.
+fixtures. Its live apply/rollback modes are disabled; use the immutable-plan
+approval and evidence-custody workflow for mutation. The legacy Grid rolling
+helper follows the same restriction.

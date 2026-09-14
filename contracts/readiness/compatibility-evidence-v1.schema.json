@@ -18,7 +18,8 @@
         "patch_option": {"const": "-ph"},
         "patch_source": {"type": "string", "pattern": "^/"},
         "evidence_path": {"type": "string", "pattern": "^/"},
-        "evidence_sha256": {"$ref": "#/$defs/sha256"}
+        "evidence_sha256": {"$ref": "#/$defs/sha256"},
+        "detail": {"type": "string", "minLength": 1, "maxLength": 1200, "description": "Operator-facing failure reason extracted from the OPatch log (absent when the check passed)."}
       }
     }
   },
@@ -27,6 +28,7 @@
     "status": {"enum": ["passed", "blocked"]},
     "patch_id": {"type": "string", "pattern": "^[0-9]{1,20}$"},
     "artifact_sha256": {"$ref": "#/$defs/sha256"},
+    "findings": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Human-readable reasons for every blocked condition; empty when status is passed."},
     "target": {
       "type": "object",
       "additionalProperties": false,

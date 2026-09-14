@@ -15,8 +15,10 @@ opu-recovery-evidence-collect invocation, no real Oracle software involved.
 from __future__ import annotations
 
 import json
+import os
+import pwd
 import shutil
-import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -34,9 +36,11 @@ def build(base_dir: Path, request_id: str) -> dict:
     Returns {"snapshot": path, "policy": path, "backup_parent": path,
     "window_start": iso, "window_end": iso, "env": {...}}.
     """
-    if base_dir.exists():
-        shutil.rmtree(base_dir)
-    base_dir.mkdir(parents=True)
+    # Never replace an existing request: it may contain the only recovery
+    # evidence. mkdir(exist_ok=False) also makes concurrent creates exclusive.
+    if base_dir.exists() or base_dir.is_symlink():
+        raise FixtureError(f"Recovery fixture already exists: {base_dir}")
+    base_dir.mkdir(parents=True, exist_ok=False)
 
     oracle_home = base_dir / "oracle" / "dbhome_1"
     inventory = base_dir / "oraInventory"
@@ -47,7 +51,7 @@ def build(base_dir: Path, request_id: str) -> dict:
         d.mkdir(parents=True, exist_ok=True)
     backup_parent_canonical = backup_parent.resolve()
 
-    owner = subprocess.run(["id", "-un"], capture_output=True, text=True, timeout=5).stdout.strip()
+    owner = pwd.getpwuid(os.getuid()).pw_name
 
     (runtime / "database.state").write_text("OPEN\n")
     (oracle_home / "oraInst.loc").write_text(f"inventory_loc={inventory}\ninst_group=oinstall\n")
@@ -66,10 +70,11 @@ def build(base_dir: Path, request_id: str) -> dict:
     shutil.copy(SHIMS_DIR / "fake-topology.sh", fake_topology)
     fake_topology.chmod(0o750)
 
-    now_iso = subprocess.run(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], capture_output=True, text=True, timeout=5).stdout.strip()
-    now_epoch = int(subprocess.run(["date", "-u", "+%s"], capture_output=True, text=True, timeout=5).stdout.strip())
-    window_start = subprocess.run(["date", "-u", "-r", str(now_epoch - 60), "+%Y-%m-%dT%H:%M:%SZ"], capture_output=True, text=True, timeout=5).stdout.strip()
-    window_end = subprocess.run(["date", "-u", "-r", str(now_epoch + 1800), "+%Y-%m-%dT%H:%M:%SZ"], capture_output=True, text=True, timeout=5).stdout.strip()
+    now = datetime.now(timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    now_iso = now.strftime(fmt)
+    window_start = (now - timedelta(seconds=60)).strftime(fmt)
+    window_end = (now + timedelta(seconds=1800)).strftime(fmt)
 
     snapshot = {
         "schema_version": "1.0",

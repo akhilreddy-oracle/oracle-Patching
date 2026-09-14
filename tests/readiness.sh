@@ -30,12 +30,24 @@ jq -n --arg digest "$digest" '{schema_version:"1.0",status:"passed",patch_id:"12
 "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/standalone-reconciliation.json" --snapshot "$TMP/standalone.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/policy.json" --output "$TMP/standalone-result.json" >/dev/null
 jq -e '.status == "ready_for_approval" and .target.platform_id == "226"' "$TMP/standalone-result.json" >/dev/null
 
+# Absent, null, negative and fractional invalid-object counts are unknown, never zero.
+for invalid_expr in 'del(.databases[0].runtime.invalid_objects)' '.databases[0].runtime.invalid_objects = null' '.databases[0].runtime.invalid_objects = -1' '.databases[0].runtime.invalid_objects = 0.5' '.databases[0].runtime.invalid_objects = "0"'; do
+  jq "$invalid_expr" "$TMP/standalone.json" >"$TMP/invalid-count.json"
+  count_sha=$(sha256sum "$TMP/invalid-count.json" | awk '{print $1}')
+  jq -n --arg snapshot "$TMP/invalid-count.json" --arg sha "$count_sha" '{schema_version:"1.0",status:"consistent",expected_nodes:["standalone"],snapshot_evidence:[{path:$snapshot,sha256:$sha}]}' >"$TMP/count-reconciliation.json"
+  if "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/count-reconciliation.json" --snapshot "$TMP/invalid-count.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/policy.json" --output "$TMP/count-result.json" >/dev/null; then
+    echo 'unknown or invalid invalid-object count was accepted' >&2; exit 1
+  fi
+  jq -e '.status == "blocked" and any(.gates[]; .name == "database_invalid_objects" and .status == "blocker")' "$TMP/count-result.json" >/dev/null
+done
+
 # Missing FRA used bytes must fail closed (never inflate free = limit - (-1)).
 jq '.databases[0].runtime |= del(.fra_space_used_bytes)' "$TMP/standalone.json" >"$TMP/standalone-missing-fra-used.json"
 missing_fra_sha=$(sha256sum "$TMP/standalone-missing-fra-used.json" | awk '{print $1}')
 jq -n --arg snapshot "$TMP/standalone-missing-fra-used.json" --arg sha "$missing_fra_sha" \
   '{schema_version:"1.0",status:"consistent",expected_nodes:["standalone"],snapshot_evidence:[{path:$snapshot,sha256:$sha}]}' >"$TMP/standalone-missing-fra-reconciliation.json"
-jq '.recovery.minimum_fra_free_bytes = 1' "$TMP/policy.json" >"$TMP/fra-policy.json"
+# FRA fail-closed applies only when backup is required. Waiver (require_backup=false) skips recovery gates.
+jq '.recovery.require_backup = true | .recovery.minimum_fra_free_bytes = 1' "$TMP/policy.json" >"$TMP/fra-policy.json"
 set +e
 "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/standalone-missing-fra-reconciliation.json" --snapshot "$TMP/standalone-missing-fra-used.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/fra-policy.json" --output "$TMP/standalone-missing-fra-result.json" >/dev/null
 missing_fra_rc=$?
@@ -54,5 +66,20 @@ standby_rc=$?
 set -e
 [ "$standby_rc" -eq 2 ]
 jq -e '.status == "blocked" and any(.gates[]; .name == "dataguard_unsupported" and .status == "blocker")' "$TMP/standalone-standby-result.json" >/dev/null
+
+# Stale reconciliation digests must fail closed with an actionable binding detail.
+jq '.oracle_homes[0].patches += ["99999999"]' "$TMP/standalone.json" >"$TMP/standalone-drift.json"
+set +e
+"$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/standalone-reconciliation.json" --snapshot "$TMP/standalone-drift.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/policy.json" --output "$TMP/standalone-drift-result.json" >/dev/null
+drift_rc=$?
+set -e
+[ "$drift_rc" -eq 2 ]
+jq -e '
+  .status == "blocked" and
+  any(.gates[];
+    .name == "snapshot_binding" and .status == "blocker" and
+    (.detail | test("supplied=\\[") and test("reconciled=\\[") and test("Re-run Discover then Reconcile"))
+  )
+' "$TMP/standalone-drift-result.json" >/dev/null
 
 printf '%s\n' 'readiness evaluation test passed'

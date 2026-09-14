@@ -6,8 +6,9 @@ umask 077
 export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/execution.sh"
 STATE_DIR=${OPU_PLAN_STATE_DIR:-/var/lib/oracle-patching-plans}
-usage() { printf '%s\n' 'Usage:' '  opu-patch-plan create --plan-id ID --requester ID --readiness ABSOLUTE_JSON --reconciliation ABSOLUTE_JSON --artifact-manifest ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON --compatibility ABSOLUTE_JSON --policy ABSOLUTE_JSON [--recovery-evidence ABSOLUTE_JSON] [--dataguard-order ABSOLUTE_JSON] --window-start UTC_ISO8601 --window-end UTC_ISO8601' '  opu-patch-plan create-rollback --plan-id ID --requester ID --source-plan-id ID --window-start UTC_ISO8601 --window-end UTC_ISO8601' '  opu-patch-plan approve --plan-id ID --actor ID --approval-ticket ID' '  opu-patch-plan authorize --plan-id ID --actor ID' '  opu-patch-plan dispatch --plan-id ID --actor ID' '  opu-patch-plan next --plan-id ID' '  opu-patch-plan claim --plan-id ID --task-id ID --actor ID [--lease-seconds 300]' '  opu-patch-plan renew --plan-id ID --task-id ID --actor ID [--lease-seconds 300]' '  opu-patch-plan complete --plan-id ID --task-id ID --actor ID --status succeeded|failed (--evidence ABSOLUTE_JSON | --evidence-sha256 SHA256)' '  opu-patch-plan reconcile --plan-id ID --actor ID' '  opu-patch-plan retry-task --plan-id ID --task-id ID --actor ID' '  opu-patch-plan status --plan-id ID'; }
+usage() { printf '%s\n' 'Usage:' '  opu-patch-plan create --plan-id ID --requester ID --readiness ABSOLUTE_JSON --reconciliation ABSOLUTE_JSON --artifact-manifest ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON --compatibility ABSOLUTE_JSON --policy ABSOLUTE_JSON [--recovery-evidence ABSOLUTE_JSON] [--dataguard-order ABSOLUTE_JSON] --window-start UTC_ISO8601 --window-end UTC_ISO8601' '  opu-patch-plan create-rollback --plan-id ID --requester ID --source-plan-id ID --window-start UTC_ISO8601 --window-end UTC_ISO8601' '  opu-patch-plan approve --plan-id ID --actor ID --approval-ticket ID' '  opu-patch-plan authorize --plan-id ID --actor ID' '  opu-patch-plan dispatch --plan-id ID --actor ID' '  opu-patch-plan next --plan-id ID' '  opu-patch-plan claim --plan-id ID --task-id ID --actor ID [--lease-seconds 300]' '  opu-patch-plan renew --plan-id ID --task-id ID --actor ID [--lease-seconds 300]' '  opu-patch-plan complete --plan-id ID --task-id ID --actor ID --status succeeded|failed (--evidence ABSOLUTE_JSON | --evidence-sha256 SHA256)' '  opu-patch-plan reconcile --plan-id ID --actor ID' '  opu-patch-plan retry-task --plan-id ID --task-id ID --actor ID' '  opu-patch-plan task-status --plan-id ID --task-id ID' '  opu-patch-plan status --plan-id ID'; }
 plan_dir() { printf '%s/plans/%s' "$STATE_DIR" "$1"; }
 state_file() { printf '%s/state' "$(plan_dir "$1")"; }
 events_file() { printf '%s/events.jsonl' "$(plan_dir "$1")"; }
@@ -150,14 +151,20 @@ verify_apply_plan_readiness_current() {
     opu_error 'plan readiness expiry differs from its sealed evidence'; return 74;
   }
   if [ "$(jq -r '.target.family' "$plan_file")" = database ]; then
-    recovery_file=$(jq -r '.recovery.manifest_path // empty' "$plan_file")
-    verify_database_recovery_current "$recovery_file" "$plan_file" "$policy_file" "$reference_epoch" \
-      "$(jq -r '.recovery.manifest_sha256 // empty' "$plan_file")" \
-      "$(jq -r '.recovery.record_sha256 // empty' "$plan_file")" || return
-    [ "$(jq -r '.recovery.selected_datafile_backup_completed_at // empty' "$plan_file")" = "$RECOVERY_COMPLETED_AT" ] &&
-      [ "$(jq -r '.recovery.valid_until // empty' "$plan_file")" = "$RECOVERY_VALID_UNTIL" ] || {
-        opu_error 'plan recovery freshness differs from its sealed evidence'; return 74;
-      }
+    # Backup waiver sealed at create (require_backup=false) has no recovery
+    # manifest; approve/authorize/dispatch must not demand one.
+    if jq -e '.recovery.waived == true and .recovery.require_backup == false' "$plan_file" >/dev/null; then
+      :
+    else
+      recovery_file=$(jq -r '.recovery.manifest_path // empty' "$plan_file")
+      verify_database_recovery_current "$recovery_file" "$plan_file" "$policy_file" "$reference_epoch" \
+        "$(jq -r '.recovery.manifest_sha256 // empty' "$plan_file")" \
+        "$(jq -r '.recovery.record_sha256 // empty' "$plan_file")" || return
+      [ "$(jq -r '.recovery.selected_datafile_backup_completed_at // empty' "$plan_file")" = "$RECOVERY_COMPLETED_AT" ] &&
+        [ "$(jq -r '.recovery.valid_until // empty' "$plan_file")" = "$RECOVERY_VALID_UNTIL" ] || {
+          opu_error 'plan recovery freshness differs from its sealed evidence'; return 74;
+        }
+    fi
   fi
 }
 window_bounds() { WINDOW_START_EPOCH=$(epoch "$(jq -r '.maintenance_window.start' "$(plan_dir "$1")/plan.json")") || return 74; WINDOW_END_EPOCH=$(epoch "$(jq -r '.maintenance_window.end' "$(plan_dir "$1")/plan.json")") || return 74; }
@@ -176,6 +183,13 @@ verify_sealed_record() {
   [ "$actual" = "$expected" ] || { opu_error "$label record integrity verification failed"; return 74; }
 }
 task_definition() { jq -cS '{schema_version,task_id,plan_id,plan_sha256,stage,node,adapter,authorization_sha256,authorization_record_sha256}' "$1"; }
+task_attempt_definition() { jq -cS '{task_definition_sha256,retry_count:(.retry_count // 0),previous_attempt_result_sha256:(.previous_attempt_result_sha256 // null)}' "$1"; }
+seal_task_attempt() {
+  local file=$1 canonical digest
+  canonical=$(task_attempt_definition "$file") || return 74
+  digest=$(opu_hash_string "$canonical") || return
+  jq --arg digest "$digest" '.attempt_definition_sha256=$digest' "$file" >"$file.tmp.attempt" && mv "$file.tmp.attempt" "$file" || return 74
+}
 task_result() { jq -cS 'del(.task_result_sha256)' "$1"; }
 seal_task_result() {
   local file=$1 canonical digest
@@ -191,6 +205,15 @@ verify_task() {
   plan_sha=$(jq -r '.plan_sha256' "$(dirname "$(dirname "$file")")/plan.json")
   [ -n "$expected" ] && [ "$expected" = "$actual" ] && [ "$(jq -r '.plan_sha256' "$file")" = "$plan_sha" ] || { opu_error "task definition integrity verification failed: $file"; return 74; }
   status=$(jq -r '.status // empty' "$file")
+  jq -e '(.status | IN("pending","running","succeeded","failed","unknown")) and
+    ((.retry_count // 0) | type == "number" and . >= 0 and . <= 1000000 and floor == .)' "$file" >/dev/null || {
+    opu_error "task state or generation is invalid: $file"; return 74;
+  }
+  if jq -e '(.retry_count // 0) > 0 or has("attempt_definition_sha256")' "$file" >/dev/null; then
+    [ "$(jq -r '.attempt_definition_sha256 // empty' "$file")" = "$(opu_hash_string "$(task_attempt_definition "$file")")" ] || {
+      opu_error "task attempt definition changed: $file"; return 74;
+    }
+  fi
   case "$status" in
     succeeded|failed|unknown)
       result_expected=$(jq -r '.task_result_sha256 // empty' "$file")
@@ -199,33 +222,40 @@ verify_task() {
       ;;
   esac
 }
-write_task() { local file=$1 task_id=$2 plan_id=$3 plan_sha=$4 stage=$5 node=$6 adapter=$7 definition hash; jq -cn --arg task "$task_id" --arg plan "$plan_id" --arg plan_sha "$plan_sha" --arg stage "$stage" --arg node "$node" --arg adapter "$adapter" --arg authorization_sha "$AUTHORIZATION_FILE_SHA" --arg authorization_record "$AUTHORIZATION_RECORD_SHA" '{schema_version:"1.0",task_id:$task,plan_id:$plan,plan_sha256:$plan_sha,stage:$stage,node:$node,adapter:$adapter,authorization_sha256:$authorization_sha,authorization_record_sha256:$authorization_record,status:"pending"}' >"$file" || return 74; definition=$(task_definition "$file") || return 74; hash=$(opu_hash_string "$definition") || return; jq --arg hash "$hash" '.task_definition_sha256=$hash' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || return 74; }
+write_task() { local file=$1 task_id=$2 plan_id=$3 plan_sha=$4 stage=$5 node=$6 adapter=$7 definition hash; jq -cn --arg task "$task_id" --arg plan "$plan_id" --arg plan_sha "$plan_sha" --arg stage "$stage" --arg node "$node" --arg adapter "$adapter" --arg authorization_sha "$AUTHORIZATION_FILE_SHA" --arg authorization_record "$AUTHORIZATION_RECORD_SHA" '{schema_version:"1.0",task_id:$task,plan_id:$plan,plan_sha256:$plan_sha,stage:$stage,node:$node,adapter:$adapter,authorization_sha256:$authorization_sha,authorization_record_sha256:$authorization_record,status:"pending"}' >"$file" || return 74; definition=$(task_definition "$file") || return 74; hash=$(opu_hash_string "$definition") || return; jq --arg hash "$hash" '.task_definition_sha256=$hash' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || return 74; seal_task_attempt "$file"; }
 read_state() { verify_plan "$1" || return; IFS= read -r PLAN_STATE <"$(state_file "$1")" || return 74; }
 transition() { local id=$1 expected=$2 next=$3 actor=$4 detail=$5 current; read_state "$id" || return; current=$PLAN_STATE; [ "$current" = "$expected" ] || { opu_error "plan $id is $current, expected $expected"; return 65; }; printf '%s\n' "$next" >"$(state_file "$id").tmp.$$" && mv "$(state_file "$id").tmp.$$" "$(state_file "$id")" || return 74; event "$id" state_changed "$next" "$actor" "$detail"; }
 lock() {
-  local id=$1 tries=0 dir age mtime now
+  local id=$1 tries=0 dir age mtime now holder
   dir="$(plan_dir "$id")"
   [ -d "$dir" ] || { opu_error "plan does not exist or is symbolic link: $id"; return 66; }
   dir="$dir/.task-lock"
   while ! mkdir "$dir" 2>/dev/null; do
     tries=$((tries + 1))
-    # Control-plane locks are held only for short mutations. A crash can leave
-    # the mkdir lock forever; reclaim after 60s so the plan is not stuck.
+    # Reclaim only when the holder PID is dead (or never recorded). Never steal
+    # from a live complete()/claim() holder — age alone used to fail open after 60s.
     if [ -d "$dir" ]; then
-      mtime=$(stat -f %m "$dir" 2>/dev/null || stat -c %Y "$dir" 2>/dev/null || echo 0)
-      now=$(date -u +%s)
-      age=$((now - mtime))
-      if [ "$age" -gt 60 ]; then
-        rmdir "$dir" 2>/dev/null || true
-        continue
+      holder=$(cat "$dir/pid" 2>/dev/null || true)
+      if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+        :
+      else
+        mtime=$(stat -f %m "$dir" 2>/dev/null || stat -c %Y "$dir" 2>/dev/null || echo 0)
+        now=$(date -u +%s)
+        age=$((now - mtime))
+        if [ "$age" -gt 60 ] || [ -z "$holder" ]; then
+          rm -f "$dir/pid" 2>/dev/null || true
+          rmdir "$dir" 2>/dev/null || true
+          continue
+        fi
       fi
     fi
     [ "$tries" -lt 50 ] || { opu_error "timed out waiting for plan task lock: $id"; return 75; }
     sleep 0.1
   done
+  printf '%s\n' "$$" >"$dir/pid" || true
   PLAN_LOCK_DIR=$dir
 }
-unlock() { rmdir "${PLAN_LOCK_DIR:-}" 2>/dev/null || true; PLAN_LOCK_DIR=""; }
+unlock() { rm -f "${PLAN_LOCK_DIR:-}/pid" 2>/dev/null || true; rmdir "${PLAN_LOCK_DIR:-}" 2>/dev/null || true; PLAN_LOCK_DIR=""; }
 verify_inputs() {
   local readiness=$1 reconciliation=$2 artifact=$3 procedure=$4 compatibility=$5 policy=$6 recovery=${7:-} rhash ahash phash xhash yhash adapter db count canonical expected actual node normalized_total normalized_unique artifact_platform_id procedure_platform_id compatibility_platform_id readiness_platform_id
   for pair in "$readiness|readiness" "$reconciliation|reconciliation" "$artifact|artifact-manifest" "$procedure|procedure-validation" "$compatibility|compatibility" "$policy|policy"; do require_file "${pair%%|*}" "${pair#*|}" || return; done
@@ -290,20 +320,28 @@ verify_inputs() {
   normalized_total=$(jq -r '.expected_nodes[]' "$reconciliation" | awk '{value=tolower($0); sub(/\..*/,"",value); print value}' | wc -l | tr -d ' ')
   normalized_unique=$(jq -r '.expected_nodes[]' "$reconciliation" | awk '{value=tolower($0); sub(/\..*/,"",value); print value}' | sort -u | wc -l | tr -d ' ')
   [ "$normalized_total" -eq "$normalized_unique" ] || { opu_error 'reconciliation nodes collide after local short-host normalization'; return 65; }
+  RECOVERY_WAIVED=false
   if [ "$adapter" = database_single_instance_opatch ] || [ "$adapter" = database_ojvm_opatch ] || [ "$adapter" = database_out_of_place_switch ] || [ "$adapter" = database_rolling_opatch ]; then
     if [ "$adapter" != database_rolling_opatch ]; then
       TARGET_TOPOLOGY=single_instance
-      [ -n "$recovery" ] || { opu_error 'standalone database plans require --recovery-evidence'; return 65; }
     else
       TARGET_TOPOLOGY=rac
       jq -e '.procedure.target.topology == "rac"' "$procedure" >/dev/null || { opu_error 'database rolling procedure must target RAC'; return 65; }
-      [ -n "$recovery" ] || { opu_error 'RAC database plans require --recovery-evidence'; return 65; }
       TARGET_GRID_HOME=$(jq -r '.cluster.grid_home // empty' "$reconciliation")
       opu_validate_absolute_path "$TARGET_GRID_HOME" 'reconciled Grid home' || return
       count=$(jq -r --arg grid_home "$TARGET_GRID_HOME" '[.oracle_homes[] | select(.path == $grid_home)] | length' "$reconciliation")
       [ "$count" -eq 1 ] || { opu_error 'reconciliation must map the RAC Grid home exactly once'; return 65; }
     fi
-    require_file "$recovery" recovery-evidence || return
+    if [ -z "$recovery" ]; then
+      if [ "$(jq -r '.recovery.require_backup' "$policy")" = false ]; then
+        RECOVERY_WAIVED=true
+      else
+        opu_error 'database plans require --recovery-evidence unless policy.recovery.require_backup is false'
+        return 65
+      fi
+    else
+      require_file "$recovery" recovery-evidence || return
+    fi
     db=$(jq -r '.procedure.target.database_unique_name // empty' "$procedure"); opu_validate_identifier "$db" database || return
     count=$(jq -r --arg db "$db" '[.databases[] | select(.db_unique_name == $db)] | length' "$reconciliation")
     [ "$count" -eq 1 ] || { opu_error 'reconciliation must map the target database exactly once'; return 65; }
@@ -318,12 +356,21 @@ verify_inputs() {
       count=$(jq -r --arg node "$node" --arg home "$TARGET_ORACLE_HOME" '[.checks[] | select(.node == $node and .home == $home)] | length' "$compatibility")
       [ "$count" -eq 1 ] || { opu_error "compatibility must contain exactly one sealed result for $node:$TARGET_ORACLE_HOME"; return 65; }
     done < <(jq -r '.expected_nodes[]' "$reconciliation")
-    jq -e --arg db "$TARGET_DB" --arg oracle_home "$TARGET_ORACLE_HOME" '.schema_version == "1.0" and .collector.name == "oracle.recovery.evidence" and .status == "passed" and .target.database_unique_name == $db and .target.oracle_home == $oracle_home and (.record_sha256 | test("^[a-f0-9]{64}$")) and (.backup.checksum_manifest.sha256 | test("^[a-f0-9]{64}$")) and (.verification.rman_log.sha256 | test("^[a-f0-9]{64}$"))' "$recovery" >/dev/null || { opu_error 'recovery evidence is invalid or targets another database home'; return 65; }
-    jq -e --arg owner "$TARGET_OWNER" '.target.owner == $owner' "$recovery" >/dev/null || { opu_error 'recovery evidence owner does not match the reconciled database home'; return 65; }
-    verify_database_recovery_current "$recovery" "$reconciliation" "$policy" "$(date -u +%s)" || return
-    RECOVERY_FILE_SHA=$(opu_hash_file "$recovery"); RECOVERY_RECORD_SHA=$(jq -r '.record_sha256' "$recovery")
+    if [ "$RECOVERY_WAIVED" = false ]; then
+      jq -e --arg db "$TARGET_DB" --arg oracle_home "$TARGET_ORACLE_HOME" '.schema_version == "1.0" and .collector.name == "oracle.recovery.evidence" and .status == "passed" and .target.database_unique_name == $db and .target.oracle_home == $oracle_home and (.record_sha256 | test("^[a-f0-9]{64}$")) and (.backup.checksum_manifest.sha256 | test("^[a-f0-9]{64}$")) and (.verification.rman_log.sha256 | test("^[a-f0-9]{64}$"))' "$recovery" >/dev/null || { opu_error 'recovery evidence is invalid or targets another database home'; return 65; }
+      jq -e --arg owner "$TARGET_OWNER" '.target.owner == $owner' "$recovery" >/dev/null || { opu_error 'recovery evidence owner does not match the reconciled database home'; return 65; }
+      verify_database_recovery_current "$recovery" "$reconciliation" "$policy" "$(date -u +%s)" || return
+      RECOVERY_FILE_SHA=$(opu_hash_file "$recovery"); RECOVERY_RECORD_SHA=$(jq -r '.record_sha256' "$recovery")
+    fi
   elif [ "$adapter" = grid_rolling_opatch ] || [ "$adapter" = grid_rolling_opatchauto ]; then
-    [ -n "$recovery" ] || { opu_error 'Grid rolling plans require --recovery-evidence'; return 65; }
+    if [ -z "$recovery" ]; then
+      if [ "$(jq -r '.recovery.require_backup' "$policy")" = false ]; then
+        RECOVERY_WAIVED=true
+      else
+        opu_error 'Grid rolling plans require --recovery-evidence unless policy.recovery.require_backup is false'
+        return 65
+      fi
+    fi
     TARGET_GRID_HOME=$(jq -r '.cluster.grid_home // empty' "$reconciliation")
     opu_validate_absolute_path "$TARGET_GRID_HOME" 'reconciled Grid home' || return
     count=$(jq -r --arg grid_home "$TARGET_GRID_HOME" '[.oracle_homes[] | select(.path == $grid_home and (.owner | type == "string" and length > 0))] | length' "$reconciliation")
@@ -335,6 +382,7 @@ verify_inputs() {
       count=$(jq -r --arg node "$node" --arg home "$TARGET_GRID_HOME" '[.checks[] | select(.node == $node and .home == $home)] | length' "$compatibility")
       [ "$count" -eq 1 ] || { opu_error "compatibility must contain exactly one sealed result for $node:$TARGET_GRID_HOME"; return 65; }
     done < <(jq -r '.expected_nodes[]' "$reconciliation")
+    if [ "$RECOVERY_WAIVED" = false ]; then
     require_file "$recovery" recovery-evidence || return
     jq -e --arg grid_home "$TARGET_GRID_HOME" --arg owner "$TARGET_OWNER" --slurpfile reconciliation "$reconciliation" '
       .schema_version == "1.0" and .collector.name == "oracle.grid.recovery.evidence" and .collector.version == "1" and
@@ -364,6 +412,7 @@ verify_inputs() {
     expected=$(jq -r '.record_sha256' "$recovery"); canonical=$(jq -cS 'del(.record_sha256)' "$recovery"); actual=$(opu_hash_string "$canonical")
     [ "$expected" = "$actual" ] || { opu_error 'Grid recovery evidence record integrity verification failed'; return 74; }
     RECOVERY_FILE_SHA=$(opu_hash_file "$recovery"); RECOVERY_RECORD_SHA=$expected
+    fi
   fi
 }
 verify_dataguard_order_input() {
@@ -418,9 +467,10 @@ create() {
     --arg readiness_path "$readiness" --arg reconciliation_path "$reconciliation" --arg artifact_path "$artifact" --arg procedure_path "$procedure" --arg compatibility_path "$compatibility" --arg policy_path "$policy" \
     --arg readiness_sha "$(opu_hash_file "$readiness")" --arg reconciliation_sha "$(opu_hash_file "$reconciliation")" --arg artifact_sha "$(opu_hash_file "$artifact")" --arg procedure_sha "$(opu_hash_file "$procedure")" --arg compatibility_sha "$(opu_hash_file "$compatibility")" --arg policy_sha "$(opu_hash_file "$policy")" \
     --arg recovery_path "$recovery" --arg recovery_sha "$RECOVERY_FILE_SHA" --arg recovery_record_sha "$RECOVERY_RECORD_SHA" --arg recovery_completed_at "$RECOVERY_COMPLETED_AT" --arg recovery_valid_until "$RECOVERY_VALID_UNTIL" \
+    --argjson recovery_waived "$([ "${RECOVERY_WAIVED:-false}" = true ] && echo true || echo false)" \
     --arg dataguard_order_path "$dataguard_order" --arg dataguard_order_file_sha "$DATAGUARD_ORDER_FILE_SHA" --arg dataguard_order_record_sha "$DATAGUARD_ORDER_RECORD_SHA" --arg dataguard_strategy "$DATAGUARD_STRATEGY" \
     --arg readiness_evaluated_at "$(jq -r '.evaluated_at' "$readiness")" --arg readiness_valid_until "$READINESS_VALID_UNTIL" \
-    '{schema_version:"1.0",intent:"patch_apply",plan_id:$id,requester:$requester,maintenance_window:{start:$window_start,end:$window_end},planning_evidence:{readiness_evaluated_at:$readiness_evaluated_at,readiness_valid_until:$readiness_valid_until},target:(if $adapter == "database_rolling_opatch" then {family:"database",method:$procedure[0].procedure.target.method,topology:$target_topology,database_unique_name:$target_db,oracle_home:$target_home,owner:$target_owner,grid_home:$target_grid_home,coordinator_node:$coordinator,platform_id:$target_platform_id,platform_name:$target_platform_name} elif ($adapter == "grid_rolling_opatch" or $adapter == "grid_rolling_opatchauto") then {family:"grid",method:$procedure[0].procedure.target.method,grid_home:$target_grid_home,owner:$target_owner,coordinator_node:$coordinator,platform_id:$target_platform_id,platform_name:$target_platform_name} else (($readiness[0].target) + {database_unique_name:$target_db,oracle_home:$target_home,owner:$target_owner,platform_id:$target_platform_id,platform_name:$target_platform_name}) end),patch_id:$readiness[0].patch_id,nodes:$reconciliation[0].expected_nodes,artifact:{path:$artifact[0].artifact.path,patch_id:$artifact[0].artifact.patch_ids[0],sha256:$artifact[0].artifact.sha256,platforms:$artifact[0].artifact.platforms},procedure:{adapter:$procedure[0].procedure.execution.adapter,operations:$procedure[0].procedure.execution.operations,method:$procedure[0].procedure.target.method,platform_id:$procedure[0].procedure.target.platform_id,required_opatch_version:$procedure[0].procedure.required_opatch_version,rollback:$procedure[0].procedure.rollback},source_documents:{readiness:{path:$readiness_path,sha256:$readiness_sha},reconciliation:{path:$reconciliation_path,sha256:$reconciliation_sha},artifact_manifest:{path:$artifact_path,sha256:$artifact_sha},procedure_validation:{path:$procedure_path,sha256:$procedure_sha},compatibility:{path:$compatibility_path,sha256:$compatibility_sha},policy:{path:$policy_path,sha256:$policy_sha}},snapshot_evidence:($reconciliation[0].snapshot_evidence // []),evidence:{readiness_sha256:$readiness_sha,reconciliation_sha256:$reconciliation_sha,artifact_manifest_sha256:$artifact_sha,procedure_validation_sha256:$procedure_sha,compatibility_sha256:$compatibility_sha,policy_sha256:$policy_sha}} + (if $recovery_path != "" then {recovery:{manifest_path:$recovery_path,manifest_sha256:$recovery_sha,record_sha256:$recovery_record_sha,selected_datafile_backup_completed_at:$recovery_completed_at,valid_until:$recovery_valid_until}} else {} end) + (if $dataguard_order_path != "" then {dataguard:{order_path:$dataguard_order_path,order_file_sha256:$dataguard_order_file_sha,order_sha256:$dataguard_order_record_sha,strategy:$dataguard_strategy}} else {} end)' >"$dir/plan.json.tmp" || return 74
+    '{schema_version:"1.0",intent:"patch_apply",plan_id:$id,requester:$requester,maintenance_window:{start:$window_start,end:$window_end},planning_evidence:{readiness_evaluated_at:$readiness_evaluated_at,readiness_valid_until:$readiness_valid_until},target:(if $adapter == "database_rolling_opatch" then {family:"database",method:$procedure[0].procedure.target.method,topology:$target_topology,database_unique_name:$target_db,oracle_home:$target_home,owner:$target_owner,grid_home:$target_grid_home,coordinator_node:$coordinator,platform_id:$target_platform_id,platform_name:$target_platform_name} elif ($adapter == "grid_rolling_opatch" or $adapter == "grid_rolling_opatchauto") then {family:"grid",method:$procedure[0].procedure.target.method,grid_home:$target_grid_home,owner:$target_owner,coordinator_node:$coordinator,platform_id:$target_platform_id,platform_name:$target_platform_name} else (($readiness[0].target) + {database_unique_name:$target_db,oracle_home:$target_home,owner:$target_owner,platform_id:$target_platform_id,platform_name:$target_platform_name}) end),patch_id:$readiness[0].patch_id,nodes:$reconciliation[0].expected_nodes,artifact:{path:$artifact[0].artifact.path,patch_id:$artifact[0].artifact.patch_ids[0],sha256:$artifact[0].artifact.sha256,platforms:$artifact[0].artifact.platforms},procedure:{adapter:$procedure[0].procedure.execution.adapter,operations:$procedure[0].procedure.execution.operations,method:$procedure[0].procedure.target.method,platform_id:$procedure[0].procedure.target.platform_id,required_opatch_version:$procedure[0].procedure.required_opatch_version,rollback:$procedure[0].procedure.rollback},source_documents:{readiness:{path:$readiness_path,sha256:$readiness_sha},reconciliation:{path:$reconciliation_path,sha256:$reconciliation_sha},artifact_manifest:{path:$artifact_path,sha256:$artifact_sha},procedure_validation:{path:$procedure_path,sha256:$procedure_sha},compatibility:{path:$compatibility_path,sha256:$compatibility_sha},policy:{path:$policy_path,sha256:$policy_sha}},snapshot_evidence:($reconciliation[0].snapshot_evidence // []),evidence:{readiness_sha256:$readiness_sha,reconciliation_sha256:$reconciliation_sha,artifact_manifest_sha256:$artifact_sha,procedure_validation_sha256:$procedure_sha,compatibility_sha256:$compatibility_sha,policy_sha256:$policy_sha}} + (if $recovery_waived then {recovery:{waived:true,require_backup:false}} elif $recovery_path != "" then {recovery:{manifest_path:$recovery_path,manifest_sha256:$recovery_sha,record_sha256:$recovery_record_sha,selected_datafile_backup_completed_at:$recovery_completed_at,valid_until:$recovery_valid_until}} else {} end) + (if $dataguard_order_path != "" then {dataguard:{order_path:$dataguard_order_path,order_file_sha256:$dataguard_order_file_sha,order_sha256:$dataguard_order_record_sha,strategy:$dataguard_strategy}} else {} end)' >"$dir/plan.json.tmp" || return 74
   canonical=$(jq -cS . "$dir/plan.json.tmp") || return 74; hash=$(opu_hash_string "$canonical") || return; jq --arg hash "$hash" '. + {plan_sha256:$hash}' "$dir/plan.json.tmp" >"$dir/plan.json" || return 74; rm -f "$dir/plan.json.tmp"; printf 'awaiting_approval\n' >"$dir/state"; event "$id" plan_created awaiting_approval "$requester" "plan_sha256=$hash"; cat "$dir/plan.json"
 }
 
@@ -435,12 +485,12 @@ verify_bound_source_documents() {
 }
 
 verify_source_task_custody() {
-  local task_path=$1 expected_stage=${2:-} expected_node=${3:-}
+  local task_path=$1 expected_stage=${2:-} expected_node=${3:-} expected_status=${4:-succeeded}
   local manifest_path manifest_sha manifest_record canonical actual custody_dir entry custody_path custody_parent
-  local evidence_path evidence_sha evidence_record
+  local evidence_path evidence_sha evidence_record recorded_evidence recorded_directory recorded_manifest custody_leaf
   verify_task "$task_path" || return
-  jq -e '.status == "succeeded" and (.task_result_sha256 | test("^[a-f0-9]{64}$"))' "$task_path" >/dev/null || {
-    opu_error "source apply task is not successfully sealed: $task_path"; return 65;
+  jq -e --arg status "$expected_status" '.status == $status and (.task_result_sha256 | test("^[a-f0-9]{64}$"))' "$task_path" >/dev/null || {
+    opu_error "source task is not sealed with expected status $expected_status: $task_path"; return 65;
   }
   [ -z "$expected_stage" ] || [ "$(jq -r '.stage' "$task_path")" = "$expected_stage" ] || {
     opu_error "source apply task has an unexpected stage: $task_path"; return 65;
@@ -449,6 +499,20 @@ verify_source_task_custody() {
     opu_error "source apply task has an unexpected node: $task_path"; return 65;
   }
   manifest_path=$(jq -r '.evidence_custody.manifest_path // empty' "$task_path")
+  recorded_manifest=$manifest_path
+  recorded_evidence=$(jq -r '.evidence_path // empty' "$task_path")
+  opu_validate_absolute_path "$recorded_manifest" custody-manifest-path && opu_validate_absolute_path "$recorded_evidence" custody-evidence-path || return
+  recorded_directory=$(dirname -- "$recorded_evidence")
+  [ "$(dirname -- "$recorded_manifest")" = "$recorded_directory" ] &&
+    [ "$(basename -- "$recorded_manifest")" = custody.json ] && [ "$(basename -- "$recorded_evidence")" = evidence.json ] || {
+    opu_error 'custody metadata paths do not share the expected directory'; return 74;
+  }
+  custody_leaf=$(jq -r '.task_id + (if (.retry_count // 0) == 0 then "" else "-retry" + (.retry_count | tostring) end)' "$task_path")
+  custody_dir="$(dirname -- "$(dirname -- "$task_path")")/evidence/$custody_leaf"
+  [ -d "$custody_dir" ] && [ ! -L "$custody_dir" ] || { opu_error 'controller custody directory is missing or symbolic link'; return 74; }
+  # A synced plan retains the original sealed remote path strings. Resolve
+  # only inside this plan's mirrored custody directory; never rewrite seals.
+  manifest_path="$custody_dir/custody.json"
   manifest_sha=$(jq -r '.evidence_custody.manifest_sha256 // empty' "$task_path")
   manifest_record=$(jq -r '.evidence_custody.record_sha256 // empty' "$task_path")
   require_file "$manifest_path" source-controller-custody-manifest || return
@@ -460,12 +524,12 @@ verify_source_task_custody() {
   [ "$actual" = "$manifest_record" ] && [ "$(jq -r '.record_sha256 // empty' "$manifest_path")" = "$manifest_record" ] || {
     opu_error "source task custody record integrity failed: $manifest_path"; return 74;
   }
-  evidence_path=$(jq -r '.evidence_path // empty' "$task_path")
+  evidence_path="$custody_dir/evidence.json"
   evidence_sha=$(jq -r '.evidence_sha256 // empty' "$task_path")
   evidence_record=$(jq -r '.evidence_record_sha256 // empty' "$task_path")
   require_file "$evidence_path" source-controller-custodied-evidence || return
   jq -e --arg plan "$(jq -r '.plan_id' "$task_path")" --arg task "$(jq -r '.task_id' "$task_path")" \
-    --arg evidence "$evidence_path" --arg evidence_sha "$evidence_sha" --arg evidence_record "$evidence_record" '
+    --arg evidence "$recorded_evidence" --arg evidence_sha "$evidence_sha" --arg evidence_record "$evidence_record" '
       .collector.name == "oracle.patch.controller.evidence_custody" and .collector.version == "1" and
       .plan_id == $plan and .task_id == $task and .evidence.custody_path == $evidence and
       .evidence.sha256 == $evidence_sha and .evidence.record_sha256 == $evidence_record
@@ -476,11 +540,18 @@ verify_source_task_custody() {
   [ "$actual" = "$evidence_record" ] && [ "$(jq -r '.record_sha256 // empty' "$evidence_path")" = "$evidence_record" ] || {
     opu_error "source task evidence record integrity failed: $evidence_path"; return 74;
   }
-  custody_dir=$(CDPATH= cd -- "$(dirname -- "$manifest_path")" && pwd -P) || return 66
+  jq -e --slurpfile task "$task_path" '
+    .plan_id == $task[0].plan_id and .task_id == $task[0].task_id and
+    .plan_sha256 == $task[0].plan_sha256 and .stage == $task[0].stage and
+    .actor == $task[0].claimed_by and .status == $task[0].status and
+    (.retry_count // 0) == ($task[0].retry_count // 0)
+  ' "$evidence_path" >/dev/null || { opu_error 'custodied evidence does not bind this task attempt'; return 74; }
   while IFS= read -r entry; do
     custody_path=$(jq -r '.custody_path' <<<"$entry")
-    custody_parent=$(CDPATH= cd -- "$(dirname -- "$custody_path")" && pwd -P) || return 66
-    [ "$custody_parent" = "$custody_dir" ] || { opu_error "source custodied file escapes its task directory: $custody_path"; return 65; }
+    opu_validate_absolute_path "$custody_path" custodied-file-path || return
+    custody_parent=$(dirname -- "$custody_path")
+    [ "$custody_parent" = "$recorded_directory" ] || { opu_error "source custodied file escapes its task directory: $custody_path"; return 65; }
+    custody_path="$custody_dir/$(basename -- "$custody_path")"
     require_file "$custody_path" source-custodied-file || return
     [ "$(opu_hash_file "$custody_path")" = "$(jq -r '.sha256' <<<"$entry")" ] || {
       opu_error "source custodied file changed: $custody_path"; return 74;
@@ -858,7 +929,16 @@ create_rollback() {
       ;;
     *) opu_error 'source plan is not a rollback-capable apply plan'; return 65 ;;
   esac
-  jq -e --arg adapter "$source_adapter" --arg method "$source_method" --arg mode "$rollback_mode" '(.intent // "patch_apply") == "patch_apply" and .procedure.adapter == $adapter and .target.family == "database" and .target.method == $method and (.nodes | length == 1) and .procedure.rollback.mode == $mode and (.recovery.manifest_path | type == "string" and startswith("/"))' "$source_plan" >/dev/null || { opu_error 'source plan is not a rollback-capable standalone database apply plan'; return 65; }
+  # Waived backup policy (require_backup=false) seals recovery.waived with no
+  # manifest_path; rollback still derives from the apply plan + final evidence.
+  jq -e --arg adapter "$source_adapter" --arg method "$source_method" --arg mode "$rollback_mode" '
+    (.intent // "patch_apply") == "patch_apply" and .procedure.adapter == $adapter and
+    .target.family == "database" and .target.method == $method and (.nodes | length == 1) and
+    .procedure.rollback.mode == $mode and (
+      (.recovery.manifest_path | type == "string" and startswith("/")) or
+      (.recovery.waived == true and .recovery.require_backup == false)
+    )
+  ' "$source_plan" >/dev/null || { opu_error 'source plan is not a rollback-capable standalone database apply plan'; return 65; }
   verify_bound_source_documents "$source_plan" || return
   task_count=0
   for source_task in "$source_dir"/tasks/*.json; do
@@ -880,8 +960,12 @@ create_rollback() {
     LC_ALL=C grep -aE "opatch[[:space:]]+rollback[[:space:]]+-id[[:space:]]+$(jq -r '.patch_id' "$source_plan")([^0-9]|$)" "$ROLLBACK_README_PATH" >/dev/null || { opu_error 'sealed patch README does not contain the fixed OPatch rollback command'; return 65; }
   fi
   LC_ALL=C grep -aE 'datapatch[[:space:]]+-verbose' "$ROLLBACK_README_PATH" >/dev/null || { opu_error 'sealed patch README does not contain the rollback datapatch command'; return 65; }
-  recovery_file=$(jq -r '.recovery.manifest_path' "$source_plan"); require_file "$recovery_file" recovery-evidence || return
-  [ "$(opu_hash_file "$recovery_file")" = "$(jq -r '.recovery.manifest_sha256' "$source_plan")" ] || { opu_error 'source recovery evidence changed'; return 74; }
+  if jq -e '.recovery.waived == true and .recovery.require_backup == false' "$source_plan" >/dev/null; then
+    :
+  else
+    recovery_file=$(jq -r '.recovery.manifest_path' "$source_plan"); require_file "$recovery_file" recovery-evidence || return
+    [ "$(opu_hash_file "$recovery_file")" = "$(jq -r '.recovery.manifest_sha256' "$source_plan")" ] || { opu_error 'source recovery evidence changed'; return 74; }
+  fi
   source_plan_sha=$(jq -r '.plan_sha256' "$source_plan"); source_plan_file_sha=$(opu_hash_file "$source_plan")
   dir=$(plan_dir "$id"); mkdir "$dir" 2>/dev/null || { opu_error "plan already exists: $id"; return 65; }
   jq -cn \
@@ -948,6 +1032,126 @@ authorize() (
   jq --arg record "$record_sha" '.record_sha256=$record' "$tmp" >"$dir/authorization.json" || exit 74; rm -f "$tmp"
   transition "$id" approved execution_authorized "$actor" 'window_open_and_approval_verified'
 )
+write_task_manifest() {
+  local id=$1 tasks=$2 temporary canonical digest
+  temporary="$(plan_dir "$id")/task-manifest.tmp.$$"
+  jq -s --arg plan "$id" --arg sha "$(jq -r '.plan_sha256' "$(plan_dir "$id")/plan.json")" '
+    {schema_version:"1.0",plan_id:$plan,plan_sha256:$sha,
+     tasks:(map({task_id,task_definition_sha256}) | sort_by(.task_id))}
+  ' "$tasks"/*.json >"$temporary" || return 74
+  canonical=$(jq -cS . "$temporary") || return 74
+  digest=$(opu_hash_string "$canonical") || return
+  jq --arg digest "$digest" '.record_sha256=$digest' "$temporary" >"$temporary.sealed" &&
+    mv "$temporary.sealed" "$(plan_dir "$id")/task-manifest.json" || return 74
+  rm -f "$temporary"
+}
+
+verify_task_manifest() {
+  local id=$1 dir manifest file
+  dir=$(plan_dir "$id"); manifest="$dir/task-manifest.json"
+  verify_sealed_record "$manifest" task-manifest || return
+  jq -e --arg id "$id" --arg sha "$(jq -r '.plan_sha256' "$dir/plan.json")" '
+    .plan_id == $id and .plan_sha256 == $sha and
+    (.tasks | type == "array" and length > 0 and length == (map(.task_id) | unique | length))
+  ' "$manifest" >/dev/null || { opu_error 'task manifest does not bind this plan'; return 74; }
+  jq -e -s --slurpfile manifest "$manifest" '
+    (map({task_id,task_definition_sha256}) | sort_by(.task_id)) == $manifest[0].tasks
+  ' "$dir/tasks"/*.json >/dev/null || { opu_error 'plan task set is missing, malformed, or differs from its sealed manifest'; return 74; }
+  for file in "$dir/tasks"/*.json; do
+    verify_task "$file" || return
+    [ "$(basename -- "$file")" = "$(jq -r '.task_id' "$file").json" ] || {
+      opu_error 'task filename differs from its sealed task ID'; return 74;
+    }
+  done
+}
+
+# One atomically replaced registry reserves every affected host together. Host
+# keys deliberately serialize Oracle mutation across database and Grid adapters.
+# Paused/unknown plans retain their reservation without an expiry; elapsed time
+# is never evidence that an Oracle process has stopped or a target is healthy.
+target_reservation() (
+  local id=$1 action=$2 registry temporary canonical digest plan sha nodes other_state other_id other_nodes state_path receipt
+  plan="$(plan_dir "$id")/plan.json"; verify_plan "$id" || return
+  sha=$(jq -r '.plan_sha256' "$plan")
+  nodes=$(jq -ec '[.nodes[] | ascii_downcase | split(".")[0]] | unique | select(length > 0 and all(.[]; test("^[a-z0-9][a-z0-9_-]*$")))' "$plan") || return 65
+  receipt="$(plan_dir "$id")/target-reservation.json"
+  if [ "${OPU_PLAN_WORKER_SNAPSHOT:-0}" = 1 ]; then
+    [ "$action" != release ] || return 0
+    [ "$action" = verify ] || { opu_error 'worker snapshots cannot grant target reservations'; return 77; }
+    verify_sealed_record "$receipt" worker-target-reservation || return
+    jq -e --arg id "$id" --arg sha "$sha" --argjson nodes "$nodes" --arg manifest "$(opu_hash_file "$(plan_dir "$id")/task-manifest.json")" '
+      .schema_version == "1.0" and .plan_id == $id and .plan_sha256 == $sha and
+      .nodes == $nodes and .task_manifest_sha256 == $manifest
+    ' "$receipt" >/dev/null || { opu_error 'worker reservation receipt does not bind this dispatched plan'; return 74; }
+    return 0
+  fi
+  registry="$STATE_DIR/target-reservations.json"; temporary="$registry.tmp.$$"
+  prepare || return
+  opu_execution_lock_file "$STATE_DIR/target-reservations.lock" 6 5 || { opu_error 'target reservation registry is busy or its lock file is unsafe'; return 75; }
+  trap 'rm -f "$temporary" "$temporary.sealed" "$temporary.receipt"' EXIT
+  if [ -e "$registry" ] || [ -L "$registry" ]; then
+    verify_sealed_record "$registry" target-reservations || return
+    jq -e '.schema_version == "1.0" and (.reservations | type == "object")' "$registry" >/dev/null || return 74
+    cp "$registry" "$temporary" || return 74
+  else
+    printf '%s\n' '{"schema_version":"1.0","reservations":{}}' >"$temporary"
+  fi
+  case "$action" in
+    reserve)
+      # A pre-upgrade running/paused plan may predate this registry. Its
+      # missing reservation is not permission to overlap its unfinished work.
+      for state_path in "$STATE_DIR"/plans/*/state; do
+        [ -e "$state_path" ] || continue
+        other_id=$(basename -- "$(dirname -- "$state_path")")
+        [ "$other_id" != "$id" ] || continue
+        require_file "$state_path" historical-plan-state || return
+        IFS= read -r other_state <"$state_path" || return 74
+        case "$other_state" in
+          running|paused)
+            verify_plan "$other_id" || return
+            other_nodes=$(jq -ec '[.nodes[] | ascii_downcase | split(".")[0]] | unique | select(length > 0)' "$(plan_dir "$other_id")/plan.json") || return 74
+            jq -ne --argjson current "$nodes" --argjson other "$other_nodes" 'all($current[]; . as $node | ($other | index($node)) == null)' >/dev/null || {
+              opu_error "unfinished historical plan $other_id overlaps this target; reconcile its Oracle state before dispatch"; return 75;
+            }
+            ;;
+          awaiting_approval|approved|execution_authorized|succeeded) ;;
+          *) opu_error "historical plan has an unrecognized state: $other_id"; return 74 ;;
+        esac
+      done
+      jq -e --arg id "$id" --arg sha "$sha" --argjson nodes "$nodes" '
+        .reservations as $r | all($nodes[]; $r[.] == null or $r[.] == {plan_id:$id,plan_sha256:$sha})
+      ' "$temporary" >/dev/null || { opu_error 'another plan reserves an overlapping Oracle target; reconcile that plan before dispatch'; return 75; }
+      jq --arg id "$id" --arg sha "$sha" --argjson nodes "$nodes" '
+        del(.record_sha256) | reduce $nodes[] as $node (. ; .reservations[$node]={plan_id:$id,plan_sha256:$sha})
+      ' "$temporary" >"$temporary.sealed" || return 74
+      ;;
+    verify)
+      jq -e --arg id "$id" --arg sha "$sha" --argjson nodes "$nodes" '
+        .reservations as $r | all($nodes[]; $r[.] == {plan_id:$id,plan_sha256:$sha})
+      ' "$temporary" >/dev/null || { opu_error 'plan does not own every target reservation'; return 75; }
+      return 0
+      ;;
+    release)
+      jq --arg id "$id" --arg sha "$sha" '
+        del(.record_sha256) | .reservations |= with_entries(select(.value != {plan_id:$id,plan_sha256:$sha}))
+      ' "$temporary" >"$temporary.sealed" || return 74
+      ;;
+    *) return 64 ;;
+  esac
+  mv "$temporary.sealed" "$temporary" || return 74
+  canonical=$(jq -cS . "$temporary") || return 74
+  digest=$(opu_hash_string "$canonical") || return
+  jq --arg digest "$digest" '.record_sha256=$digest' "$temporary" >"$temporary.sealed" &&
+    mv "$temporary.sealed" "$registry" || return 74
+  if [ "$action" = reserve ]; then
+    jq -cn --arg id "$id" --arg sha "$sha" --argjson nodes "$nodes" --arg manifest "$(opu_hash_file "$(plan_dir "$id")/task-manifest.json")" '
+      {schema_version:"1.0",plan_id:$id,plan_sha256:$sha,nodes:$nodes,task_manifest_sha256:$manifest}
+    ' >"$temporary.receipt" || return 74
+    canonical=$(jq -cS . "$temporary.receipt") || return 74; digest=$(opu_hash_string "$canonical") || return
+    jq --arg digest "$digest" '.record_sha256=$digest' "$temporary.receipt" >"$temporary.sealed" && mv "$temporary.sealed" "$receipt" || return 74
+  fi
+)
+
 dispatch() (
   local id="" actor="" authorized_by plan adapter plan_sha index=0 node stage task file tasks_tmp tasks_dir authorization approval
   while [ "$#" -gt 0 ]; do case "$1" in --plan-id) id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) opu_error "unknown dispatch option: $1"; return 64;; esac; done
@@ -1080,7 +1284,9 @@ dispatch() (
     index=$((index+1)); task=$(printf '%03d-datapatch-local' "$index"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" datapatch local "$adapter" || return
     index=$((index+1)); task=$(printf '%03d-final-validate-local' "$index"); write_task "$tasks_tmp/$task.json" "$task" "$id" "$plan_sha" final_validate local "$adapter" || return
   fi
-  mv "$tasks_tmp" "$tasks_dir" || return 74; tasks_tmp=""
+  write_task_manifest "$id" "$tasks_tmp" || return
+  target_reservation "$id" reserve || return
+  mv "$tasks_tmp" "$tasks_dir" || { target_reservation "$id" release; return 74; }; tasks_tmp=""
   transition "$id" execution_authorized running "$actor" 'typed_tasks_materialized' || return
   event "$id" tasks_materialized running "$actor" "count=$index adapter=$adapter"
 )
@@ -1097,6 +1303,8 @@ claim() (
     jq -e '.status == "running"' "$file" >/dev/null 2>&1 && { opu_error 'a rolling task is already running'; exit 65; }
     jq -e '.status == "unknown"' "$file" >/dev/null 2>&1 && { opu_error 'plan has an unknown task; reconcile or recover before claiming'; exit 65; }
   done
+  verify_task_manifest "$id" || exit $?
+  target_reservation "$id" verify || exit $?
   first=$(next --plan-id "$id") || exit $?
   [ "$(jq -r '.task_id' <<<"$first")" = "$task_id" ] || { opu_error 'only the next sealed task can be claimed'; exit 65; }
   file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || exit $?; now=$(date -u +%s); expiry=$(bounded_lease_expiry "$id" "$lease") || exit $?; jq --arg actor "$actor" --argjson now "$now" --argjson expiry "$expiry" '.status="running" | .claimed_by=$actor | .claimed_at_epoch=$now | .lease_expires_epoch=$expiry' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74
@@ -1108,6 +1316,7 @@ renew() (
   opu_validate_identifier "$id" 'plan ID' && opu_validate_identifier "$task_id" 'task ID' && opu_validate_identifier "$actor" actor || exit $?
   [[ "$lease" =~ ^[0-9]{1,4}$ ]] && [ "$lease" -ge 30 ] && [ "$lease" -le 3600 ] || { opu_error 'lease seconds must be between 30 and 3600'; exit 64; }
   lock "$id" || exit $?; trap unlock EXIT; read_state "$id" || exit $?; [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; require_open_window "$id" || exit $?
+  target_reservation "$id" verify || exit $?
   file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || exit $?; claimant=$(jq -r '.claimed_by // empty' "$file"); current_expiry=$(jq -r '.lease_expires_epoch // 0' "$file"); now=$(date -u +%s)
   [ "$claimant" = "$actor" ] || { opu_error 'task is not claimed by this actor'; exit 77; }; [ "$current_expiry" -gt "$now" ] || { opu_error 'task lease already expired; reconcile first'; exit 75; }; jq -e '.status == "running"' "$file" >/dev/null || { opu_error 'task is not running'; exit 65; }
   expiry=$(bounded_lease_expiry "$id" "$lease") || exit $?; jq --argjson expiry "$expiry" --argjson now "$now" '.lease_expires_epoch=$expiry | .lease_renewed_at_epoch=$now' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74
@@ -1140,9 +1349,14 @@ verify_execution_evidence() {
     '.schema_version == "1.0" and .collector.name == $collector and .collector.version == "1" and
      .intent == $intent and .plan_id == $id and .task_id == $task and .plan_sha256 == $plan_sha and
      .actor == $actor and .stage == $stage and .status == $status' "$evidence_file" >/dev/null || { opu_error 'execution evidence identity is malformed or not bound to this task'; return 65; }
+  jq -e --argjson generation "$(jq -r '.retry_count // 0' "$task_file")" '
+    (.retry_count // 0) == $generation
+  ' "$evidence_file" >/dev/null || { opu_error 'execution evidence belongs to a different task attempt'; return 65; }
+  # Waived recovery omits manifest digests on the plan; executors emit JSON null.
+  # Treat null and empty as equivalent so require_backup=false plans can complete.
   jq -e --arg patch "$(jq -r '.patch_id' "$plan_file")" --arg artifact_sha "$(jq -r '.artifact.sha256' "$plan_file")" --arg recovery_sha "$(jq -r '.recovery.manifest_sha256 // empty' "$plan_file")" --arg recovery_record "$(jq -r '.recovery.record_sha256 // empty' "$plan_file")" '
     .patch.patch_id == $patch and .patch.artifact_sha256 == $artifact_sha and
-    .recovery.manifest_sha256 == $recovery_sha and .recovery.record_sha256 == $recovery_record and
+    ((.recovery.manifest_sha256 // "") == $recovery_sha) and ((.recovery.record_sha256 // "") == $recovery_record) and
     (.record_sha256 | test("^[a-f0-9]{64}$")) and (.postcondition.status | type == "string") and
     (.started_at | type == "string") and (.finished_at | type == "string") and (.exit_code | type == "number") and
     (.logs.stdout.path | type == "string" and startswith("/")) and (.logs.stdout.sha256 | test("^[a-f0-9]{64}$")) and
@@ -1330,6 +1544,7 @@ complete() (
   [[ "$status" =~ ^(succeeded|failed)$ ]] || { opu_error 'status must be succeeded or failed'; exit 64; }; [ -z "$evidence" ] || [ -z "$evidence_file" ] || { opu_error 'use either --evidence or --evidence-sha256, not both'; exit 64; }
   [[ "$grace" =~ ^[0-9]{2,4}$ ]] && [ "$grace" -ge 30 ] && [ "$grace" -le 3600 ] || { opu_error 'completion grace seconds must be between 30 and 3600'; exit 64; }
   lock "$id" || exit $?; trap unlock EXIT; read_state "$id" || exit $?; [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || exit $?
+  target_reservation "$id" verify || exit $?
   adapter=$(jq -r '.adapter' "$file"); if [ -n "$evidence_file" ]; then verify_execution_evidence "$id" "$task_id" "$actor" "$status" "$evidence_file" || exit $?; evidence=$EXECUTION_EVIDENCE_SHA; record_sha=$EXECUTION_EVIDENCE_RECORD_SHA; structured=1; elif [[ "$adapter" =~ ^(database_single_instance_opatch(_rollback)?|database_rolling_opatch|database_rac_opatch_rollback|grid_rolling_opatch(_rollback)?|grid_rolling_opatchauto(_rollback)?|database_ojvm_opatch(_rollback)?|database_out_of_place_switch(back)?)$ ]]; then opu_error 'managed execution requires structured --evidence'; exit 65; else [[ "$evidence" =~ ^[a-f0-9]{64}$ ]] || { opu_error 'evidence digest must be SHA-256 hex'; exit 64; }; fi
   claimant=$(jq -r '.claimed_by // empty' "$file"); expiry=$(jq -r '.lease_expires_epoch // 0' "$file"); now=$(date -u +%s); [ "$claimant" = "$actor" ] || { opu_error 'task is not claimed by this actor'; exit 77; }; jq -e '.status == "running"' "$file" >/dev/null || { opu_error 'task is not running'; exit 65; }
   if [ "$expiry" -le "$now" ]; then
@@ -1357,30 +1572,59 @@ complete() (
   if [ "$status" = failed ]; then transition "$id" running paused "$actor" "task_failed=$task_id"; exit 0; fi
   if [ "$late" -eq 1 ]; then transition "$id" running paused "$actor" "task_completed_after_lease=$task_id"; event "$id" late_evidence_recorded paused "$actor" "task_id=$task_id"; exit 0; fi
   event "$id" task_completed running "$actor" "task_id=$task_id"
-  # Succeed only when every task is succeeded. An unknown sibling (lease expiry
-  # crash window, or incomplete reconcile) must never be ignored as "done".
-  unknown=$(find "$(plan_dir "$id")/tasks" -name '*.json' -exec jq -r 'select(.status == "unknown") | 1' {} \; | wc -l | tr -d ' ')
-  if [ "$unknown" -gt 0 ]; then
+  if ! verify_task_manifest "$id"; then
+    transition "$id" running paused "$actor" 'task_integrity_blocks_success' || exit $?
+    exit 74
+  fi
+  # Succeed only when every task is succeeded. Single jq -s scan keeps the
+  # lock hold short (per-file find|jq previously amplified the reclaim race).
+  local counts unknown pending incomplete
+  counts=$(jq -s -r '
+    [(map(select(.status == "unknown")) | length),
+     (map(select(.status == "pending")) | length),
+     (map(select(.status != "succeeded")) | length)] | @tsv
+  ' "$(plan_dir "$id")/tasks"/*.json) || {
+    transition "$id" running paused "$actor" 'task_scan_failed' || exit $?
+    exit 74
+  }
+  unknown=$(cut -f1 <<<"$counts"); pending=$(cut -f2 <<<"$counts"); incomplete=$(cut -f3 <<<"$counts")
+  if [ "${unknown:-0}" -gt 0 ]; then
     transition "$id" running paused "$actor" "unknown_task_blocks_success"
     exit 0
   fi
-  pending=$(find "$(plan_dir "$id")/tasks" -name '*.json' -exec jq -r 'select(.status == "pending") | 1' {} \; | wc -l | tr -d ' ')
-  [ "$pending" -gt 0 ] && exit 0
-  incomplete=$(find "$(plan_dir "$id")/tasks" -name '*.json' -exec jq -r 'select(.status != "succeeded") | 1' {} \; | wc -l | tr -d ' ')
-  if [ "$incomplete" -gt 0 ]; then
+  [ "${pending:-0}" -gt 0 ] && exit 0
+  if [ "${incomplete:-0}" -gt 0 ]; then
     transition "$id" running paused "$actor" "incomplete_tasks_block_success"
     exit 0
   fi
-  transition "$id" running succeeded "$actor" 'all_tasks_succeeded'
+  for file in "$(plan_dir "$id")/tasks"/*.json; do
+    if ! verify_source_task_custody "$file"; then
+      transition "$id" running paused "$actor" 'task_custody_blocks_success' || exit $?
+      exit 74
+    fi
+  done
+  transition "$id" running succeeded "$actor" 'all_tasks_succeeded' || exit $?
+  target_reservation "$id" release || exit $?
 )
 reconcile() (
   local id="" actor="" file expiry now task
   while [ "$#" -gt 0 ]; do case "$1" in --plan-id) id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) opu_error "unknown reconcile option: $1"; exit 64;; esac; done; opu_validate_identifier "$id" 'plan ID' && opu_validate_identifier "$actor" actor || exit $?
-  lock "$id" || exit $?; trap unlock EXIT; read_state "$id" || exit $?; [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; now=$(date -u +%s)
+  lock "$id" || exit $?; trap unlock EXIT; read_state "$id" || exit $?
+  if [ "$PLAN_STATE" = succeeded ]; then
+    # Importing a worker snapshot never imports or replaces the authoritative
+    # registry. Release its reservation only after local custody verification.
+    verify_task_manifest "$id" || exit $?
+    for file in "$(plan_dir "$id")/tasks"/*.json; do verify_source_task_custody "$file" || exit $?; done
+    jq -e -s --arg id "$id" 'any(.[]; .plan_id == $id and .event == "state_changed" and .state == "succeeded" and .detail == "all_tasks_succeeded")' "$(events_file "$id")" >/dev/null || { opu_error 'plan has no verified completion audit event'; exit 74; }
+    event "$id" successful_plan_reconciled succeeded "$actor" 'custody_verified_before_reservation_release' || exit $?
+    target_reservation "$id" release || exit $?
+    exit 0
+  fi
+  [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; now=$(date -u +%s)
   for file in "$(plan_dir "$id")"/tasks/*.json; do verify_task "$file" || exit $?; jq -e '.status == "running"' "$file" >/dev/null 2>&1 || continue; expiry=$(jq -r '.lease_expires_epoch // 0' "$file"); [ "$expiry" -le "$now" ] || continue; task=$(jq -r '.task_id' "$file"); jq --argjson now "$now" '.status="unknown" | .reconciled_at_epoch=$now' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74; seal_task_result "$file" || exit $?; transition "$id" running paused "$actor" "lease_expired_task=$task"; event "$id" task_outcome_unknown paused "$actor" "task_id=$task"; exit 0; done; exit 66
 )
 retry_task() (
-  local id="" task_id="" actor="" file last_paused_detail
+  local id="" task_id="" actor="" file last_paused_detail attempt_archive
   while [ "$#" -gt 0 ]; do case "$1" in --plan-id) id=${2:-}; shift 2;; --task-id) task_id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) opu_error "unknown retry-task option: $1"; exit 64;; esac; done
   opu_validate_identifier "$id" 'plan ID' && opu_validate_identifier "$task_id" 'task ID' && opu_validate_identifier "$actor" actor || exit $?
   lock "$id" || exit $?; trap unlock EXIT; read_state "$id" || exit $?
@@ -1394,14 +1638,56 @@ retry_task() (
   [ "$last_paused_detail" = "task_failed=$task_id" ] || { opu_error "plan was not paused by a failure of task $task_id"; exit 65; }
   file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || exit $?
   jq -e '.status == "failed"' "$file" >/dev/null || { opu_error 'task is not in a failed state'; exit 65; }
+  verify_source_task_custody "$file" '' '' failed || exit $?
+  # Only failure before mutation, or a repeatable validation/datapatch stage
+  # with a known binary state, can start another attempt. Heartbeat loss,
+  # database-down, recovery-required, and unknown outcomes require recovery.
+  jq -e '
+    .postcondition.status == "failed" and .exit_code != 0 and
+    (.outcome_class == "no_mutation" or
+     (.outcome_class == "binary_state_known" and
+      (.stage | IN("validate","datapatch","final_validate","rollback_binary_validate","rollback_datapatch","rollback_final_validate",
+        "rac_node_validate","cluster_datapatch","cluster_final_validate","rac_rollback_node_validate","cluster_rollback_datapatch","cluster_rollback_final_validate",
+        "grid_node_validate","grid_cluster_final_validate","grid_rollback_node_validate","grid_rollback_cluster_final_validate",
+        "opatchauto_node_validate","opatchauto_cluster_final_validate","opatchauto_rollback_node_validate","opatchauto_rollback_cluster_final_validate",
+        "ojvm_datapatch","ojvm_final_validate","ojvm_rollback_datapatch","ojvm_rollback_final_validate",
+        "oop_validate","oop_datapatch","oop_final_validate","oop_switchback_validate","oop_switchback_datapatch","oop_switchback_final_validate"))))
+  ' "$SOURCE_TASK_EVIDENCE" >/dev/null || { opu_error 'task outcome is not safe for retry; reconcile and recover before further mutation'; exit 65; }
+  verify_task_manifest "$id" || exit $?
+  target_reservation "$id" verify || exit $?
+  attempt_archive="$(plan_dir "$id")/attempts/$task_id/attempt-$(jq -r '.retry_count // 0' "$file").json"
+  mkdir -p "$(dirname -- "$attempt_archive")" || exit 73
+  # Link the sealed result before replacing the current task file. The prior
+  # attempt keeps its exact original bytes and custody pointers permanently.
+  ln "$file" "$attempt_archive" 2>/dev/null || cmp -s "$file" "$attempt_archive" || { opu_error 'failed task attempt archive differs or cannot be preserved'; exit 74; }
   # The failed attempt's evidence custody directory is permanent (see
   # custody_execution_evidence): bump retry_count so the next completion of
   # this task_id is custodied under a fresh, never-before-used path instead
   # of colliding with the preserved record of this failure.
-  jq 'del(.claimed_by, .claimed_at_epoch, .lease_expires_epoch, .evidence_sha256, .evidence_path, .evidence_source_path, .evidence_record_sha256, .evidence_custody, .completed_at_epoch, .completed_after_lease, .reconciled_at_epoch, .task_result_sha256) | .status = "pending" | .retry_count = ((.retry_count // 0) + 1)' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74
+  jq '.previous_attempt_result_sha256=.task_result_sha256 | del(.claimed_by, .claimed_at_epoch, .lease_expires_epoch, .evidence_sha256, .evidence_path, .evidence_source_path, .evidence_record_sha256, .evidence_custody, .completed_at_epoch, .completed_after_lease, .reconciled_at_epoch, .task_result_sha256) | .status = "pending" | .retry_count = ((.retry_count // 0) + 1)' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74
+  seal_task_attempt "$file" || exit $?
   transition "$id" paused running "$actor" "task_retried=$task_id"
   cat "$file"
 )
 status() { [ "${1:-}" = --plan-id ] && [ "$#" -eq 2 ] || { usage >&2; return 64; }; read_state "$2" || return; jq --arg state "$PLAN_STATE" '. + {state:$state}' "$(plan_dir "$2")/plan.json"; }
-main() { local command=${1:-help}; [ "$#" -gt 0 ] && shift; case "$command" in create) create "$@";; create-rollback) create_rollback "$@";; approve) approve "$@";; authorize) authorize "$@";; dispatch) dispatch "$@";; next) next "$@";; claim) claim "$@";; renew) renew "$@";; complete) complete "$@";; reconcile) reconcile "$@";; retry-task) retry_task "$@";; status) status "$@";; help|-h|--help) usage;; *) opu_error "unknown command: $command"; usage >&2; return 64;; esac; }
+task_status() (
+  local id="" task_id="" file status
+  while [ "$#" -gt 0 ]; do case "$1" in --plan-id) id=${2:-}; shift 2;; --task-id) task_id=${2:-}; shift 2;; *) return 64;; esac; done
+  opu_validate_identifier "$id" plan-id && opu_validate_identifier "$task_id" task-id || return
+  lock "$id" || return; trap unlock EXIT
+  read_state "$id" || return
+  file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || return
+  status=$(jq -r '.status' "$file")
+  case "$status" in succeeded|failed) verify_source_task_custody "$file" '' '' "$status" || return;; esac
+  cat "$file"
+)
+main() {
+  local command=${1:-help}; [ "$#" -gt 0 ] && shift
+  case "${OPU_PLAN_WORKER_SNAPSHOT:-0}" in
+    0) ;;
+    1) case "$command" in claim|renew|complete|next|status|task-status|reconcile|help|-h|--help) ;; *) opu_error 'worker snapshots cannot create authority, dispatch plans, or issue retries'; return 77;; esac ;;
+    *) opu_error 'OPU_PLAN_WORKER_SNAPSHOT must be 0 or 1'; return 64 ;;
+  esac
+  case "$command" in create) create "$@";; create-rollback) create_rollback "$@";; approve) approve "$@";; authorize) authorize "$@";; dispatch) dispatch "$@";; next) next "$@";; claim) claim "$@";; renew) renew "$@";; complete) complete "$@";; reconcile) reconcile "$@";; retry-task) retry_task "$@";; status) status "$@";; task-status) task_status "$@";; help|-h|--help) usage;; *) opu_error "unknown command: $command"; usage >&2; return 64;; esac
+}
 main "$@"

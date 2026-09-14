@@ -14,6 +14,8 @@ import re
 import secrets
 import time
 from pathlib import Path
+from functools import wraps
+from durable import file_lock, write_json
 
 REGISTRY_FILE_ENV = "OPU_AGENT_REGISTRY_FILE"
 DEFAULT_REGISTRY_FILE = Path(__file__).resolve().parent / "var" / "agent-registry" / "agents.json"
@@ -55,7 +57,7 @@ def _load() -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise EnrollError(f"registry file is unreadable: {path}: {exc}", status=500)
-    if not isinstance(data.get("agents"), dict):
+    if not isinstance(data, dict) or not isinstance(data.get("agents"), dict):
         raise EnrollError(f"registry file is malformed: {path}", status=500)
     return data
 
@@ -65,16 +67,22 @@ def _save(data: dict) -> None:
     if path.is_symlink():
         raise EnrollError(f"registry file must not be a symlink: {path}", status=500)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    write_json(path, data)
 
 
 def _public_view(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if k != "token_sha256"}
 
 
+def _locked(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with file_lock(registry_path().with_suffix(".lock")):
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+@_locked
 def enroll(node: str, agent_id: str) -> dict:
     node = _validate_id(node, "node")
     agent_id = _validate_id(agent_id, "agent_id")
@@ -92,7 +100,7 @@ def enroll(node: str, agent_id: str) -> dict:
     return {"agent_id": agent_id, "node": node, "agent_token": token, "enrolled_at": now}
 
 
-def verify(agent_id: str, agent_token: str) -> bool:
+def verify(agent_id: str, agent_token: str, node: str | None = None) -> bool:
     if not agent_id or not agent_token:
         return False
     try:
@@ -102,11 +110,14 @@ def verify(agent_id: str, agent_token: str) -> bool:
     entry = data["agents"].get(str(agent_id).strip())
     if not entry or entry.get("revoked"):
         return False
+    if node is not None and entry.get("node") != node:
+        return False
     expected = str(entry.get("token_sha256") or "")
     provided = hashlib.sha256(str(agent_token).encode("utf-8")).hexdigest()
     return bool(expected) and hmac.compare_digest(provided, expected)
 
 
+@_locked
 def revoke(agent_id: str) -> dict:
     agent_id = _validate_id(agent_id, "agent_id")
     data = _load()

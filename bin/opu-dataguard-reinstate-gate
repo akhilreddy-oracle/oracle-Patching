@@ -66,18 +66,19 @@ evaluate() {
       ;;
   esac
 
-  # Reinstate is only allowed after an explicit ready or blocked-with-intent
-  # evaluation digest is present; fail closed if evaluation is missing status.
-  if jq -e '.status == "ready_for_standby_first" or .status == "blocked"' "$EVAL" >/dev/null; then
-    gate evaluation pass 'Sealed evaluation digest present for reinstate planning.'
+  # Reinstate requires a ready standby-first evaluation — blocked must not unlock mutation.
+  if jq -e '.status == "ready_for_standby_first"' "$EVAL" >/dev/null; then
+    gate evaluation pass 'Sealed evaluation is ready_for_standby_first.'
   else
-    gate evaluation blocker 'evaluation status is not usable for reinstate planning.'
+    gate evaluation blocker 'evaluation is not ready_for_standby_first; reinstate gate refuses blocked or unknown status.'
   fi
 
   if [ "${OPU_DATAGUARD_TEST_MODE:-0}" = 1 ]; then
     gate reinstate_command pass 'TEST_MODE: reinstate command treated as simulated pass.'
+  elif [ "${OPU_DATAGUARD_ALLOW_UNVALIDATED_REINSTATE:-0}" = 1 ]; then
+    gate reinstate_command pass 'Unvalidated reinstate explicitly allowed by OPU_DATAGUARD_ALLOW_UNVALIDATED_REINSTATE=1.'
   else
-    gate reinstate_command pass 'Live reinstate remains operator-executed; this gate seals readiness only.'
+    gate reinstate_command blocker 'Live reinstate VALIDATE not executed; use TEST_MODE or OPU_DATAGUARD_ALLOW_UNVALIDATED_REINSTATE=1.'
   fi
 }
 

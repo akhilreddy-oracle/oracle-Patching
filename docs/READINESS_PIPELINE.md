@@ -5,7 +5,18 @@ only `ready_for_approval`; it never performs a patch operation.
 
 ## Evidence sequence
 
-1. `opu-topology-discover` runs locally on each active node.
+1. `opu-topology-discover` runs locally on each active node (the webapp SSHes
+   every `hosts.json` node alias for a cluster). It stores one sealed
+   `snapshot_<node>` document per node plus a primary `snapshot` view for
+   estate/UI discovery phases operators can audit before later gates:
+   - **A Host identity & OS** — hostname/OS/kernel (always required)
+   - **B Oracle homes & OPatch** — home paths, owners, versions, OPatch tooling
+   - **C Cluster / RAC / CRS** — membership + Grid runtime (required for
+     RAC/Grid; `not_applicable` on single-instance when Clusterware is absent)
+   - **D Databases & instances** — DB→home mapping + runtime (required for
+     database-family; `not_applicable` on Grid-only hosts)
+   - **E Patch inventory & platform** — OPatch XML platform ID/name/digest and
+     installed patches (**required before reconcile / compatibility / readiness**)
 2. `opu-snapshot-reconcile` rejects differing cluster membership, Grid state,
    Oracle-home inventory, or database-to-home mappings.
 3. `opu-artifact-inspect` produces a deterministic artifact manifest. The
@@ -31,8 +42,12 @@ only `ready_for_approval`; it never performs a patch operation.
    `evaluated_at`, the earliest `valid_until`, and one path/digest/host/time
    record for every supplied snapshot.
 
-For RAC, step 5 runs once on each node and step 6 combines the local documents.
-A result for one node never stands in for another node.
+(Discovery phases above are a UI/API view of the primary-node snapshot; reconcile
+and readiness consume every per-node `oracle.topology.discover` document.)
+
+For RAC, step 2 requires one snapshot per active node, step 5 runs once on each
+node, and step 6 combines the local documents. A result for one node never
+stands in for another node.
 
 The reconciled `snapshot_evidence` set must exactly equal the snapshots passed
 to readiness evaluation. `opu-patch-plan` independently re-hashes those files
@@ -68,6 +83,42 @@ from the signed discovery evidence and verifies:
 Each prerequisite retains its own native exit code and content-addressed log.
 Any unavailable `OPatch`, owner, version, platform evidence, command error, or
 failed prerequisite is recorded as `blocked`. The collector is read-only.
+
+A blocked result must be explainable without a host login. Every failed
+prerequisite therefore also carries `detail` — OPatch's own "The details are:"
+text (or the failure line) taken from the sealed log — and the document lists
+one human-readable entry in `findings` per blocked condition (incomplete media,
+unreadable metadata, OPatch version, platform mismatch, or a failed check).
+Metadata-only stage directories (no `files/` payload) are diagnosed before
+OPatch runs; otherwise OPatch reports them as the opaque "one-level down" /
+"No patch location specified" errors.
+
+## Fixing blocked media from the control plane
+
+`stage-artifact` is a remediation action of the webapp pipeline (not part of
+the evidence chain). It stages complete media at the same absolute path on
+every node of a host via `bin/opu-artifact-stage`, either by replicating from
+another managed host that already holds complete media, or by unpacking a
+patch zip already on the node. `GET /api/hosts/<id>/artifact-sources` probes
+where complete media exists. The tool is fail-closed: it extracts into a
+private work directory, requires `etc/config/{inventory,actions}.xml` plus a
+non-empty `files/` payload, requires the inventory patch ID to equal the
+directory name, sets ownership to the Oracle Home owner, moves a metadata-only
+stage aside (never deletes it), and refuses to overwrite complete media
+without `replace`.
+
+Replication prefers the hosts' own network: a throwaway ed25519 key is
+authorised on the destination for the duration of one transfer, restricted to
+`from=<source IPs>` with a forced `command=` pinned to the exact staging
+invocation and `no-pty,no-port-forwarding,no-agent-forwarding`, then removed.
+When the destination is unreachable from the source the stream is relayed
+through the control plane instead. Staging clears every artifact-bound
+evidence document (artifact, procedure, compatibility, reconciliation,
+readiness) so the chain must be re-run from Artifact inspection.
+
+Before any remote tool runs, the webapp compares a content fingerprint of
+`bin/` + `lib/` with a stamp on the host and pushes the current tree when they
+differ, so a host can never run a stale executor or collector.
 
 Passing readiness is not a one-time permission to mutate. The execution
 adapter re-runs both applicability and conflict checks immediately before the

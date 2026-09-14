@@ -9,8 +9,23 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 ARTIFACT=""; OUT=""; PRETTY=0
 usage() { printf '%s\n' 'Usage: opu-artifact-inspect --artifact ABSOLUTE_DIRECTORY [--output ABSOLUTE_PATH] [--pretty]'; }
-parse() { while [ "$#" -gt 0 ]; do case "$1" in --artifact) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; ARTIFACT=$2; shift 2;; --output) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; OUT=$2; shift 2;; --pretty) PRETTY=1; shift;; -h|--help) usage; exit 0;; *) usage >&2; exit 64;; esac; done; opu_validate_absolute_path "$ARTIFACT" artifact || exit $?; [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?; [ -d "$ARTIFACT" ] && [ ! -L "$ARTIFACT" ] || { echo 'artifact must be a non-symbolic-link directory' >&2; exit 66; }; command -v xmllint >/dev/null || { echo 'xmllint is required for authoritative Oracle platform metadata' >&2; exit 69; }; }
-artifact_digest() { find "$ARTIFACT" -xdev -type f -print0 | sort -z | while IFS= read -r -d '' file; do printf '%s\0' "${file#"$ARTIFACT"/}"; sha256sum "$file" | awk '{print $1}'; done | sha256sum | awk '{print $1}'; }
+parse() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --artifact) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; ARTIFACT=$2; shift 2;;
+      --output) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; OUT=$2; shift 2;;
+      --pretty) PRETTY=1; shift;;
+      -h|--help) usage; exit 0;;
+      *) usage >&2; exit 64;;
+    esac
+  done
+  opu_validate_absolute_path "$ARTIFACT" artifact || exit $?
+  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  # Adopt canonical directory (resolves symlink-to-dir; rejects missing/file).
+  ARTIFACT=$(opu_resolve_directory "$ARTIFACT" artifact) || exit $?
+  command -v xmllint >/dev/null || { echo 'xmllint is required for authoritative Oracle platform metadata' >&2; exit 69; }
+}
+artifact_digest() { opu_python "$ROOT/lib/opu/artifact_media.py" validate-tree "$ARTIFACT" || return; find "$ARTIFACT" -xdev -type f -print0 | sort -z | while IFS= read -r -d '' file; do printf '%s\0' "${file#"$ARTIFACT"/}"; sha256sum "$file" | awk '{print $1}'; done | sha256sum | awk '{print $1}'; }
 json_files() {
   local kind=$1 file first=1
   printf '['
@@ -37,6 +52,17 @@ emit() {
   [ "$file_count" -gt 0 ] || { status=blocked; reason='artifact directory contains no regular files'; }
   [ "$patch_count" -gt 0 ] || { status=blocked; reason='artifact metadata exposes no patch ID'; }
   [ "$patch_count" -le 1 ] || { status=blocked; reason='artifact contains multiple patch IDs and requires explicit decomposition'; }
+  # OPatch PatchObject requires the payload tree. Metadata/README-only stage
+  # dirs pass inventory parsing but fail prereqs with opaque "No patch location
+  # specified" / "one-level down" errors.
+  payload_count=0
+  if [ -d "$ARTIFACT/files" ] && [ ! -L "$ARTIFACT/files" ]; then
+    payload_count=$(find "$ARTIFACT/files" -xdev -type f | wc -l | tr -d ' ')
+  fi
+  if [ "${payload_count:-0}" -eq 0 ]; then
+    status=blocked
+    reason='artifact is incomplete: missing files/ payload (metadata/README only; cannot be applied by OPatch)'
+  fi
   inventory="$ARTIFACT/etc/config/inventory.xml"; platforms_json='[]'
   if [ ! -f "$inventory" ] || [ -L "$inventory" ] || [ ! -r "$inventory" ]; then
     status=blocked; reason='artifact has no readable authoritative etc/config/inventory.xml'

@@ -10,6 +10,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/execution.sh"
 
 PLAN_STATE_DIR=${OPU_PLAN_STATE_DIR:-/var/lib/oracle-patching-plans}
 EXECUTION_STATE_DIR=${OPU_RAC_DATABASE_STATE_DIR:-/var/lib/oracle-patching-utility/database-rac}
@@ -158,6 +159,10 @@ verify_source_documents() {
 verify_recovery() {
   local mode=${1:-metadata} manifest_path expected_file expected_record actual_file internal canonical actual_record
   local checksum_path checksum_sha
+  if jq -e '.recovery.waived == true and .recovery.require_backup == false' "$PLAN_FILE" >/dev/null 2>&1; then
+    RECOVERY_FILE_SHA=""; RECOVERY_RECORD_SHA=""
+    return 0
+  fi
   manifest_path=$(jq -r '.recovery.manifest_path // empty' "$PLAN_FILE")
   expected_file=$(jq -r '.recovery.manifest_sha256 // empty' "$PLAN_FILE")
   expected_record=$(jq -r '.recovery.record_sha256 // empty' "$PLAN_FILE")
@@ -205,6 +210,7 @@ artifact_digest() {
 }
 
 verify_artifact() {
+  opu_python "$ROOT/lib/opu/artifact_media.py" validate-tree "$PATCH_DIR" || die 'sealed patch media tree is unsafe'
   local actual inventory platform_count platform_id platform_name
   [ -d "$PATCH_DIR" ] && [ ! -L "$PATCH_DIR" ] ||
     die 'sealed patch directory is missing or symbolic link'
@@ -1037,6 +1043,7 @@ emit_evidence() {
        recovery:{manifest_sha256:$recovery_sha,record_sha256:$recovery_record},artifacts:$artifacts,
        logs:{stdout:{path:$stdout_path,sha256:$stdout_sha},stderr:{path:$stderr_path,sha256:$stderr_sha}}}
     ' >"$tmp"
+  opu_execution_seal_attempt "$tmp" || return $?
   canonical=$(jq -cS . "$tmp")
   record_sha=$(opu_hash_string "$canonical")
   jq --arg record_sha "$record_sha" '.record_sha256=$record_sha' "$tmp" >"$TASK_DIR/evidence.json"
@@ -1046,13 +1053,14 @@ emit_evidence() {
 execute_task() {
   local claim_output stage_pid heartbeat_pid stage_rc finished_at status postcondition detail outcome_class complete_rc
   require_root
+  opu_execution_host_lock || return $?
   load_plan
   verify_source_documents
   verify_recovery
   mkdir -p "$EXECUTION_STATE_DIR/plans/$PLAN_ID/nodes"
   NODE_RUN_DIR="$EXECUTION_STATE_DIR/plans/$PLAN_ID/nodes/$(node_key "${OPU_RAC_DATABASE_TEST_HOSTNAME:-$(current_short_host)}")"
   mkdir -p "$NODE_RUN_DIR/tasks"
-  TASK_DIR="$NODE_RUN_DIR/tasks/$TASK_ID"
+  opu_execution_prepare_attempt "$NODE_RUN_DIR/tasks" "$PLAN_STATE_DIR/plans/$PLAN_ID/tasks/$TASK_ID.json" "$TASK_ID" || return $?
   [ ! -e "$TASK_DIR" ] || die "execution evidence already exists for task $TASK_ID"
   BINDING_FILE="$NODE_RUN_DIR/target-binding.json"
   DRAIN_FILE="$NODE_RUN_DIR/drain-state.json"
@@ -1063,6 +1071,7 @@ execute_task() {
   mkdir "$TASK_DIR"
   printf '%s\n' "$claim_output" >"$TASK_DIR/claim.json"
   load_task_after_claim
+  opu_execution_verify_attempt "$TASK_FILE" || return $?
   # Re-key the run directory from the sealed task node, not an untrusted environment value.
   local sealed_node_dir
   sealed_node_dir="$EXECUTION_STATE_DIR/plans/$PLAN_ID/nodes/$(node_key "$LOCAL_NODE")"
@@ -1073,7 +1082,7 @@ execute_task() {
   set +e
   (set -e; close_inherited_executor_lock; run_typed_stage) >"$TASK_DIR/stdout.log" 2>"$TASK_DIR/stderr.log" &
   stage_pid=$!
-  (close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
+  (exec 7>&-; close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
   wait "$stage_pid"; stage_rc=$?
   kill "$heartbeat_pid" 2>/dev/null || true
   wait "$heartbeat_pid" 2>/dev/null || true

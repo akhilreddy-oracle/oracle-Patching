@@ -29,7 +29,7 @@ emit() {
     "$(opu_json_string "$status")" "$expected_json" "$captured_json" "$grid_json" "$homes_json" "$db_json" "$hashes_json" "$findings_json" >"$file"
 }
 main() {
-  local snapshot host expected grid homes dbs warnings hash baseline_expected baseline_grid baseline_homes baseline_dbs node
+  local snapshot host expected grid homes homes_compare dbs warnings hash baseline_expected baseline_grid baseline_homes baseline_dbs node
   declare -a EXPECTED=() CAPTURED=() HASHES=()
   parse "$@"; baseline_expected=""; baseline_grid=""; baseline_homes=""; baseline_dbs=""
   for snapshot in "${SNAPSHOTS[@]}"; do
@@ -42,14 +42,18 @@ main() {
     # complete target membership and must not be rejected as "not active".
     [ "$expected" != '[]' ] || expected=$(jq -cn --arg host "$host" '[$host]')
     grid=$(jq -c '.cluster | {grid_home, runtime: {status: .runtime.status, active_version: .runtime.active_version, upgrade_state: .runtime.upgrade_state, active_patch_level: .runtime.active_patch_level}}' "$snapshot")
+    # Keep per-node source_sha256 in emitted homes (integrity evidence). Do not
+    # compare it across RAC nodes: OPatch XML embeds hostName/home UId, so
+    # digests differ even when owner/version/OPatch/platform/patches match.
     homes=$(jq -c '.oracle_homes | sort_by(.path) | map({path,owner,version,opatch_version,platform:{status:.platform.status,id:.platform.id,name:.platform.name,source:.platform.source,source_sha256:.platform.source_sha256},patches:(.patches|sort)})' "$snapshot")
+    homes_compare=$(jq -c 'map({path,owner,version,opatch_version,platform:{status:.platform.status,id:.platform.id,name:.platform.name,source:.platform.source},patches})' <<<"$homes")
     dbs=$(jq -c '.databases | sort_by(.db_unique_name) | map({db_unique_name,oracle_home})' "$snapshot")
     warnings=$(jq -r '.warnings[]?' "$snapshot")
-    if [ -z "$baseline_expected" ]; then baseline_expected=$expected; baseline_grid=$grid; baseline_homes=$homes; baseline_dbs=$dbs; GRID_JSON=$grid; HOMES_JSON=$homes; DATABASES_JSON=$dbs
+    if [ -z "$baseline_expected" ]; then baseline_expected=$expected; baseline_grid=$grid; baseline_homes=$homes_compare; baseline_dbs=$dbs; GRID_JSON=$grid; HOMES_JSON=$homes; DATABASES_JSON=$dbs
     else
       [ "$baseline_expected" = "$expected" ] || add_finding CLUSTER_MEMBERSHIP_MISMATCH blocker "Cluster node membership differs between snapshots."
       [ "$baseline_grid" = "$grid" ] || add_finding GRID_INVENTORY_MISMATCH blocker "Grid home, active version, patch level, or upgrade state differs between snapshots."
-      [ "$baseline_homes" = "$homes" ] || add_finding ORACLE_HOME_INVENTORY_MISMATCH blocker "Oracle home owner, version, OPatch level, or patch inventory differs between snapshots."
+      [ "$baseline_homes" = "$homes_compare" ] || add_finding ORACLE_HOME_INVENTORY_MISMATCH blocker "Oracle home owner, version, OPatch level, or patch inventory differs between snapshots."
       [ "$baseline_dbs" = "$dbs" ] || add_finding DATABASE_CONFIGURATION_MISMATCH blocker "Registered database names or Oracle homes differ between snapshots."
     fi
     if jq -e '.cluster.nodes | length > 0' "$snapshot" >/dev/null 2>&1; then

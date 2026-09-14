@@ -192,7 +192,10 @@ parse() {
     --grid-home) GRID_HOME=${2:-}; shift 2;; --patch-dir) PATCH_DIR=${2:-}; shift 2;; --patch-id) PATCH_ID=${2:-}; shift 2;; --mode) MODE=${2:-}; shift 2;; --nodes) NODE_FILE=${2:-}; shift 2;; --log-root) LOG_ROOT=${2:-}; shift 2;; --remote-user) REMOTE_USER=${2:-}; shift 2;; --min-free-mb) MIN_FREE_MB=${2:-}; shift 2;; --approve) APPROVED=1; shift;; -h|--help) usage; exit 0;; *) die "unknown option: $1";; esac; done
 }
 main() {
+  # The legacy helper cannot coordinate durable reservations across plans.
+  # Its fixed fixture mode remains useful; live changes use managed adapters.
   parse "$@"; [[ $EUID -eq 0 ]] || [[ "$TEST_MODE" == 1 ]] || die "must run as root"
+  [[ "$MODE" = analyze || "$TEST_MODE" = 1 ]] || die 'live mutation requires an immutable plan; use opu-patch-plan and opu-grid-node-patch/rollback'
   [[ "$MODE" =~ ^(analyze|apply|rollback)$ ]] || die "--mode must be analyze, apply, or rollback"
   valid_path "$GRID_HOME" || die "--grid-home must be a normalized absolute path"; [[ -z "$NODE_FILE" ]] || valid_path "$NODE_FILE" || die "--nodes must be a normalized absolute path"; valid_path "$LOG_ROOT" || die "--log-root must be a normalized absolute path"; valid_node "$REMOTE_USER" || die "--remote-user contains unsupported characters"; [[ "$MIN_FREE_MB" =~ ^[0-9]{1,7}$ ]] && [ "$MIN_FREE_MB" -ge 256 ] || die "--min-free-mb must be an integer of at least 256"
   if [[ "$MODE" == rollback ]]; then valid_patch_id "$PATCH_ID" || die "rollback requires numeric --patch-id"; else valid_path "$PATCH_DIR" || die "--patch-dir must be a normalized absolute path"; fi

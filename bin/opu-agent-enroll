@@ -7,6 +7,8 @@ umask 077
 export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=lib/opu/python.sh
+. "$ROOT/lib/opu/python.sh"
 CMD=${1:-}
 [ "$#" -eq 0 ] || shift
 NODE=""; AGENT=""
@@ -40,7 +42,7 @@ case "$CMD" in
 esac
 
 OPU_ENROLL_CMD="$CMD" OPU_ENROLL_NODE="$NODE" OPU_ENROLL_AGENT="$AGENT" \
-python3 - "$ROOT" <<'PY'
+opu_python - "$ROOT" <<'PY'
 import json, os, sys
 sys.path.insert(0, os.path.join(sys.argv[1], "webapp"))
 import agent_enroll

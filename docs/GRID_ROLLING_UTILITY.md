@@ -1,15 +1,16 @@
 # Grid Infrastructure Rolling Patch Utility
 
-`bin/opu-grid-rolling-patch` is a root-operated, fixed-workflow utility for a
-one-off Oracle Grid Infrastructure patch that Oracle certifies for rolling,
-local OPatch installation. It is intentionally separate from `opu-agent`,
-which remains the read-only control-plane foundation.
+`bin/opu-grid-rolling-patch` retains live analysis and fixed-workflow fixtures.
+Live `apply` and `rollback` are disabled because this legacy CLI does not own
+the immutable controller's durable target reservations. Use `opu-patch-plan`
+with `opu-grid-node-patch` / `opu-grid-node-rollback`, or the managed OPatchAuto
+adapters, for approved execution.
 
 ## Guardrails
 
 - `analyze` checks CRS health, inventory, and OPatch conflicts without mutation.
-- `apply` and `rollback` need explicit `--approve` and persist completed node
-  steps so an identical command can resume after a failure.
+- `apply` and `rollback` are available only in the explicit test fixture mode;
+  their old `--approve` flag does not grant live mutation authority.
 - Each run writes a run manifest, completed-step ledger, main log, and
   `last.failure` record under its evidence directory.
 - Every node must be an active Clusterware member, pass local and remote CRS
@@ -32,10 +33,7 @@ bin/opu-grid-rolling-patch --grid-home /u01/app/19.0.0/grid \
   --patch-dir /stage/38723830 --mode analyze \
   --remote-user opc --min-free-mb 4096
 
-bin/opu-grid-rolling-patch --grid-home /u01/app/19.0.0/grid \
-  --patch-dir /stage/38723830 --mode apply --approve
 ```
 
-To roll back, replace `--patch-dir` with `--patch-id 38723830` and set
-`--mode rollback --approve`. Logs and resume markers reside under
-`/var/tmp/opu-grid-rolling-<mode>-<patch-id>/` by default.
+Analysis logs reside under `/var/tmp/opu-grid-rolling-analyze-<patch-id>/` by
+default. Production apply and rollback use separately approved managed plans.

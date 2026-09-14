@@ -55,19 +55,23 @@ def checklist_required() -> bool:
     }
 
 
+def _has_exact_marker(text: str, key: str) -> bool:
+    return any(line.strip() == key for line in text.splitlines())
+
+
 def checklist_status() -> dict[str, bool]:
     text = _cert_text() or ""
-    return {key: key in text for key in CHECKLIST_KEYS}
+    return {key: _has_exact_marker(text, key) for key in CHECKLIST_KEYS}
 
 
 def is_certified() -> bool:
     text = _cert_text()
     if text is None:
         return False
-    if "OPU_PRODUCTION_CERTIFIED=1" not in text:
+    if not _has_exact_marker(text, "OPU_PRODUCTION_CERTIFIED=1"):
         return False
     if checklist_required():
-        return all(key in text for key in CHECKLIST_KEYS)
+        return all(_has_exact_marker(text, key) for key in CHECKLIST_KEYS)
     return True
 
 

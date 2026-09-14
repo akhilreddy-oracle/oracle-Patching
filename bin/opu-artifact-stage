@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Stage complete Oracle patch media at an absolute path on this host, from
+# either a tar stream on stdin (replicated from another managed host) or a
+# patch zip already present locally. Fails closed unless the extracted tree
+# is complete (etc/config metadata + non-empty files/ payload) and its
+# inventory patchID matches the directory name. An existing complete stage
+# is never overwritten without --replace; a metadata-only stage is moved
+# aside, never deleted.
+set -euo pipefail
+umask 022
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/execution.sh"
+
+ARTIFACT=""; OWNER=""; GROUP=""; MODE=""; ZIP=""; OUT=""; REPLACE=0; WORK=""
+usage() { printf '%s\n' 'Usage: opu-artifact-stage --artifact ABSOLUTE_DIRECTORY --owner USER[:GROUP] (--from-tar-stdin | --from-zip ABSOLUTE_ZIP) [--replace] [--output ABSOLUTE_JSON]'; }
+die() { opu_error "$1"; exit "${2:-70}"; }
+group_exists() {
+  if command -v getent >/dev/null 2>&1; then getent group "$1" >/dev/null 2>&1
+  else id -Gn "$OWNER" 2>/dev/null | tr ' ' '\n' | grep -qx -- "$1" || grep -q "^$1:" /etc/group 2>/dev/null; fi
+}
+parse() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --artifact) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; ARTIFACT=$2; shift 2;;
+      --owner) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; OWNER=$2; shift 2;;
+      --from-tar-stdin) MODE=tar; shift;;
+      --from-zip) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; MODE=zip; ZIP=$2; shift 2;;
+      --replace) REPLACE=1; shift;;
+      --output) [ "$#" -ge 2 ] || { usage >&2; exit 64; }; OUT=$2; shift 2;;
+      -h|--help) usage; exit 0;;
+      *) usage >&2; exit 64;;
+    esac
+  done
+  opu_find_python >/dev/null || exit $?
+  opu_validate_absolute_path "$ARTIFACT" artifact || exit $?
+  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  [ -n "$MODE" ] || { usage >&2; exit 64; }
+  case "$ARTIFACT" in */) ARTIFACT=${ARTIFACT%/};; esac
+  PARENT=$(dirname -- "$ARTIFACT"); NAME=$(basename -- "$ARTIFACT")
+  opu_validate_identifier "$NAME" 'artifact directory name' || exit $?
+  [ -d "$PARENT" ] && [ ! -L "$PARENT" ] || die "stage parent directory is missing or a symbolic link: $PARENT" 66
+  [ -z "$OWNER" ] && die '--owner is required' 64
+  case "$OWNER" in *:*) GROUP=${OWNER#*:}; OWNER=${OWNER%%:*};; esac
+  opu_validate_identifier "$OWNER" owner || exit $?
+  [ -z "$GROUP" ] || opu_validate_identifier "$GROUP" group || exit $?
+  id -u "$OWNER" >/dev/null 2>&1 || die "owner does not exist on this host: $OWNER" 67
+  [ -n "$GROUP" ] || GROUP=$(id -gn "$OWNER")
+  group_exists "$GROUP" || die "group does not exist on this host: $GROUP" 67
+  if [ "$MODE" = zip ]; then
+    opu_validate_absolute_path "$ZIP" zip || exit $?
+    [ -f "$ZIP" ] && [ ! -L "$ZIP" ] || die "zip is missing or a symbolic link: $ZIP" 66
+  fi
+  if [ "$(id -u)" -ne 0 ] && [ "$(id -un)" != "$OWNER" ]; then
+    die "must run as root or as $OWNER to stage media owned by $OWNER" 77
+  fi
+}
+# Complete media has OPatch metadata and a non-empty files/ payload.
+is_complete() {
+  local dir=$1 count
+  [ -f "$dir/etc/config/inventory.xml" ] && [ -f "$dir/etc/config/actions.xml" ] || return 1
+  [ -d "$dir/files" ] && [ ! -L "$dir/files" ] || return 1
+  count=$(find "$dir/files" -xdev -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "${count:-0}" -gt 0 ]
+}
+main() {
+  parse "$@"
+  local extracted previous="" count bytes patch_id now source_json
+  opu_execution_lock_file "$PARENT/.opu-media-$NAME.lock" 6 || die "media lock is unsafe or another process is staging this artifact" 75
+  # WORK is script-global: the EXIT trap runs after main() returns.
+  WORK=$(mktemp -d "$PARENT/.opu-stage-$NAME.XXXXXX")
+  trap 'rm -rf "${WORK:-}"' EXIT HUP INT TERM
+  local work=$WORK
+  chmod 700 "$work"
+  case "$MODE" in
+    tar)
+      cat >"$work/source.tar" || die 'could not spool incoming archive' 74
+      opu_python "$ROOT/lib/opu/artifact_media.py" tar "$work/source.tar" "$work" "$NAME" || die 'unsafe or invalid tar media' 65;;
+    zip)
+      opu_python "$ROOT/lib/opu/artifact_media.py" zip "$ZIP" "$work" "$NAME" || die 'unsafe or invalid zip media' 65;;
+  esac
+  extracted="$work/$NAME"
+  [ -d "$extracted" ] && [ ! -L "$extracted" ] || die "extracted media does not contain a top-level '$NAME' directory" 65
+  is_complete "$extracted" || die "extracted media is incomplete: expected etc/config/{inventory,actions}.xml and a non-empty files/ payload under $NAME" 65
+  # Same patch-id schemas opu-artifact-inspect accepts (RU metadata varies by release).
+  patch_id=$(grep -hoE 'patchID[[:space:]]*=[[:space:]]*"?[0-9]+|<patchID>[0-9]+</patchID>|<patch_id[[:space:]]+number="[0-9]+"' "$extracted/etc/config/inventory.xml" 2>/dev/null | grep -Eo '[0-9]+' | sort -nu | paste -sd ' ' -)
+  [ -n "$patch_id" ] || die 'inventory.xml carries no patch ID' 65
+  [ "$(wc -w <<<"$patch_id")" -eq 1 ] || die "inventory.xml carries multiple patch IDs: $patch_id" 65
+  [ "$patch_id" = "$NAME" ] || die "inventory patchID $patch_id does not match directory name $NAME" 65
+  if [ "$(id -u)" -eq 0 ]; then chown -R "$OWNER:$GROUP" "$extracted"; fi
+  chmod -R u+rwX,go+rX "$extracted"
+  if [ -e "$ARTIFACT" ] || [ -L "$ARTIFACT" ]; then
+    if [ -L "$ARTIFACT" ]; then
+      die "existing artifact path is a symbolic link; refusing to replace: $ARTIFACT" 65
+    elif is_complete "$ARTIFACT" && [ "$REPLACE" -ne 1 ]; then
+      die "existing media at $ARTIFACT is already complete; pass --replace to overwrite it" 65
+    fi
+    now=$(date -u '+%Y%m%dT%H%M%SZ')
+    previous="$PARENT/.$NAME.replaced-$now"
+    if [ -e "$previous" ]; then previous="${previous}.$$"; fi
+    [ ! -e "$previous" ] || die 'replacement backup path already exists' 65
+    mv -- "$ARTIFACT" "$previous"
+  fi
+  mv -- "$extracted" "$ARTIFACT"
+  count=$(find "$ARTIFACT" -xdev -type f | wc -l | tr -d ' ')
+  bytes=$(du -sk -- "$ARTIFACT" | awk '{print $1 * 1024}')
+  case "$MODE" in
+    tar) source_json='{"kind":"tar_stdin"}';;
+    zip) source_json=$(jq -cn --arg path "$ZIP" '{kind:"zip",path:$path}');;
+  esac
+  jq -cn --arg artifact "$ARTIFACT" --arg owner "$OWNER" --arg group "$GROUP" --arg patch "$patch_id" --arg host "$(hostname -s 2>/dev/null || hostname)" \
+    --arg previous "$previous" --argjson files "$count" --argjson bytes "$bytes" --argjson source "$source_json" --arg at "$(opu_now_utc)" \
+    '{schema_version:"1.0",status:"staged",host:$host,artifact:$artifact,patch_id:$patch,owner:$owner,group:$group,files:$files,bytes:$bytes,source:$source,previous:(if ($previous|length) > 0 then $previous else null end),staged_at:$at}' \
+    | if [ -n "$OUT" ]; then tee "$OUT"; else cat; fi
+}
+main "$@"

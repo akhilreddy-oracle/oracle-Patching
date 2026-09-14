@@ -10,6 +10,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/execution.sh"
 
 PLAN_STATE_DIR=${OPU_PLAN_STATE_DIR:-/var/lib/oracle-patching-plans}
 OPERATION=${OPU_OJVM_OPERATION:-apply}
@@ -149,6 +150,7 @@ verify_recovery() {
 }
 
 verify_artifact() {
+  opu_python "$ROOT/lib/opu/artifact_media.py" validate-tree "$PATCH_DIR" || die 'sealed patch media tree is unsafe'
   local artifact_actual
   [ -d "$PATCH_DIR" ] && [ ! -L "$PATCH_DIR" ] || die 'sealed patch directory is missing or symbolic link'
   [ -z "$(find "$PATCH_DIR" -xdev -type l -print -quit)" ] || die 'sealed patch directory contains symbolic links'
@@ -388,8 +390,15 @@ wait_for_upgrade_health() {
 }
 
 datapatch_run() {
+  local mode=${1:-apply}
   # See opu-database-single-instance-patch stage_datapatch() for why -noqi.
-  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" "PATH=$ORACLE_HOME_TARGET/bin:$ORACLE_HOME_TARGET/OPatch:/usr/bin:/bin" "$ORACLE_HOME_TARGET/OPatch/datapatch" -verbose -noqi
+  # 19.31+ requires an explicit -apply/-rollback with a patch id whenever -noqi
+  # is set; otherwise "-noqi" is consumed as the patch-list value.
+  case "$mode" in
+    apply|rollback) ;;
+    *) die "datapatch_run mode must be apply or rollback" ;;
+  esac
+  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" "PATH=$ORACLE_HOME_TARGET/bin:$ORACLE_HOME_TARGET/OPatch:/usr/bin:/bin" "$ORACLE_HOME_TARGET/OPatch/datapatch" -verbose "-$mode" "$PATCH_ID" -noqi
 }
 
 require_marker() {
@@ -584,7 +593,7 @@ stage_ojvm_datapatch_upgrade() {
   require_marker start-upgrade-complete 'OJVM datapatch requires a succeeded sealed upgrade-mode startup task'
   inventory_has_patch "$TASK_DIR/datapatch-lspatches.log" || die 'datapatch refused because the binary patch is absent'
   current_upgrade_health "$TASK_DIR/datapatch-pre-health.log" || die 'database is not in upgrade mode for OJVM datapatch'
-  datapatch_run
+  datapatch_run apply
   : >"$TASK_DIR/binary-state-known"
   : >"$RUN_DIR/datapatch-complete"
 }
@@ -660,7 +669,14 @@ stage_ojvm_rollback_binary() {
   pmon_running && die 'database is still running; OJVM binary rollback requires a full shutdown' || true
   : >"$TASK_DIR/database-down"
   : >"$TASK_DIR/binary-state-unknown"
-  opatch_run rollback -id "$PATCH_ID"
+  # Without -silent, OPatch prompts interactively and fails under automation.
+  set +e
+  opatch_run rollback -id "$PATCH_ID" -silent >"$TASK_DIR/opatch-rollback.log" 2>&1
+  opatch_rc=$?
+  set -e
+  printf '%s\n' "$opatch_rc" >"$TASK_DIR/opatch-rollback.exit-code"
+  cat "$TASK_DIR/opatch-rollback.log"
+  [ "$opatch_rc" -eq 0 ] || die "OPatch rollback failed with exit code $opatch_rc"
   if inventory_has_patch "$TASK_DIR/rollback-after-lspatches.log"; then die "OPatch returned success but patch $PATCH_ID remains in binary inventory"; fi
   rm -f "$TASK_DIR/binary-state-unknown"
   : >"$TASK_DIR/binary-state-known"
@@ -684,7 +700,7 @@ stage_ojvm_rollback_datapatch() {
   require_marker rollback-start-upgrade-complete 'OJVM rollback datapatch requires a succeeded sealed upgrade-mode startup task'
   if inventory_has_patch "$TASK_DIR/rollback-datapatch-lspatches.log"; then die 'rollback datapatch refused because the binary patch remains installed'; fi
   current_upgrade_health "$TASK_DIR/rollback-datapatch-pre-health.log" || die 'database is not in upgrade mode for rollback datapatch'
-  datapatch_run
+  datapatch_run rollback
   : >"$TASK_DIR/binary-state-known"
   : >"$RUN_DIR/rollback-datapatch-complete"
 }
@@ -793,6 +809,7 @@ emit_evidence() {
   stdout_sha=$(opu_hash_file "$TASK_DIR/stdout.log"); stderr_sha=$(opu_hash_file "$TASK_DIR/stderr.log"); tmp="$TASK_DIR/evidence.tmp"
   jq -cn --arg collector "$EXECUTOR_COLLECTOR" --arg intent "$EXECUTOR_INTENT" --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg plan_sha "$PLAN_SHA" --arg status "$status" --arg postcondition "$postcondition" --arg detail "$detail" --arg outcome_class "$outcome_class" --arg started "$STARTED_AT" --arg finished "$finished" --arg actor "$ACTOR" --arg stage "$STAGE" --arg database "$DATABASE" --arg oracle_home "$ORACLE_HOME_TARGET" --arg owner "$ORACLE_OWNER" --arg sid "${ORACLE_SID:-}" --arg patch "$PATCH_ID" --arg artifact_sha "$ARTIFACT_SHA" --arg recovery_sha "${RECOVERY_FILE_SHA:-}" --arg recovery_record "${RECOVERY_RECORD_SHA:-}" --arg source_plan_sha "${SOURCE_APPLY_PLAN_SHA:-}" --arg source_evidence_sha "${SOURCE_APPLY_EVIDENCE_SHA:-}" --arg source_evidence_record "${SOURCE_APPLY_EVIDENCE_RECORD_SHA:-}" --arg stdout "$TASK_DIR/stdout.log" --arg stdout_sha "$stdout_sha" --arg stderr "$TASK_DIR/stderr.log" --arg stderr_sha "$stderr_sha" --argjson exit_code "$exit_code" \
     '{schema_version:"1.0",collector:{name:$collector,version:"1"},intent:$intent,plan_id:$plan,task_id:$task,plan_sha256:$plan_sha,status:$status,postcondition:{status:$postcondition,detail:$detail},outcome_class:$outcome_class,started_at:$started,finished_at:$finished,exit_code:$exit_code,actor:$actor,stage:$stage,target:{database_unique_name:$database,oracle_home:$oracle_home,owner:$owner,oracle_sid:(if $sid == "" then null else $sid end)},patch:{patch_id:$patch,artifact_sha256:$artifact_sha},recovery:{manifest_sha256:(if $recovery_sha == "" then null else $recovery_sha end),record_sha256:(if $recovery_record == "" then null else $recovery_record end)},logs:{stdout:{path:$stdout,sha256:$stdout_sha},stderr:{path:$stderr,sha256:$stderr_sha}}} + (if $intent == "patch_rollback" then {source_apply:{plan_sha256:$source_plan_sha,final_evidence_sha256:$source_evidence_sha,final_evidence_record_sha256:$source_evidence_record}} else {} end)' >"$tmp"
+  opu_execution_seal_attempt "$tmp" || return $?
   canonical=$(jq -cS . "$tmp"); record_sha=$(opu_hash_string "$canonical"); jq --arg record_sha "$record_sha" '.record_sha256=$record_sha' "$tmp" >"$TASK_DIR/evidence.json"; rm -f "$tmp"
 }
 
@@ -817,18 +834,19 @@ classify_outcome() {
 
 execute_task() {
   local claim_output stage_pid heartbeat_pid stage_rc finished status postcondition detail outcome_class complete_rc
-  require_root; load_plan; verify_source_documents
-  mkdir -p "$EXECUTION_STATE_DIR/plans/$PLAN_ID"; RUN_DIR="$EXECUTION_STATE_DIR/plans/$PLAN_ID"; TASK_DIR="$RUN_DIR/tasks/$TASK_ID"; mkdir -p "$RUN_DIR/tasks"
+  require_root; opu_execution_host_lock || return $?; load_plan; verify_source_documents
+  mkdir -p "$EXECUTION_STATE_DIR/plans/$PLAN_ID"; RUN_DIR="$EXECUTION_STATE_DIR/plans/$PLAN_ID"; opu_execution_prepare_attempt "$RUN_DIR/tasks" "$PLAN_STATE_DIR/plans/$PLAN_ID/tasks/$TASK_ID.json" "$TASK_ID" || return $?; mkdir -p "$RUN_DIR/tasks"
   [ ! -e "$TASK_DIR" ] || die "execution evidence already exists for task $TASK_ID"
   BINDING_FILE="$RUN_DIR/target-binding.json"
   acquire_executor_lock
   claim_output=$(env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" claim --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --lease-seconds "$LEASE_SECONDS") || die 'could not claim the sealed task'
   mkdir "$TASK_DIR"
   printf '%s\n' "$claim_output" >"$TASK_DIR/claim.json"; load_task_after_claim
+  opu_execution_verify_attempt "$TASK_FILE" || return $?
   STARTED_AT=$(opu_now_utc)
   set +e
   (set -e; close_inherited_executor_lock; run_typed_stage) >"$TASK_DIR/stdout.log" 2>"$TASK_DIR/stderr.log" & stage_pid=$!
-  (close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
+  (exec 7>&-; close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
   wait "$stage_pid"; stage_rc=$?
   kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true
   set -e

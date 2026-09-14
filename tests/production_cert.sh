@@ -19,6 +19,15 @@ printf 'OPU_PRODUCTION_CERTIFIED=1\n' >"$TMP/ok.cert"
 OPU_PRODUCTION_MODE=1 OPU_PRODUCTION_CERT_FILE="$TMP/ok.cert" \
   "$ROOT/scripts/verify_production_cert.sh" >/dev/null
 
+# Substring lookalikes must fail closed (was fail-open with grep -F).
+printf 'OPU_PRODUCTION_CERTIFIED=10\n' >"$TMP/suffix.cert"
+set +e
+OPU_PRODUCTION_MODE=1 OPU_PRODUCTION_CERT_FILE="$TMP/suffix.cert" \
+  "$ROOT/scripts/verify_production_cert.sh" >/dev/null 2>&1
+suffix_rc=$?
+set -e
+[ "$suffix_rc" -eq 2 ]
+
 # Checklist required
 set +e
 OPU_PRODUCTION_MODE=1 OPU_PRODUCTION_REQUIRE_CHECKLIST=1 OPU_PRODUCTION_CERT_FILE="$TMP/ok.cert" \

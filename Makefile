@@ -1,40 +1,29 @@
 .PHONY: test lint contracts check
 
-test:
-	./tests/run.sh
-	./tests/jobs.sh
-	./tests/topology_snapshot.sh
-	./tests/opatch_platform_discovery.sh
-	./tests/reconcile.sh
-	./tests/artifact_inspect.sh
-	./tests/procedure_validate.sh
-	./tests/opatch_compatibility.sh
-	./tests/compatibility_reconcile.sh
-	./tests/opatch_upgrade.sh
-	./tests/recovery_prepare.sh
-	./tests/recovery_evidence.sh
-	./tests/grid_recovery_evidence.sh
-	./tests/patch_plan.sh
-	./tests/single_instance_patch.sh
-	./tests/rac_database_patch.sh
-	./tests/grid_node_patch.sh
-	./tests/grid_node_rollback.sh
-	./tests/grid_opatchauto_patch.sh
-	./tests/ojvm_patch.sh
-	./tests/out_of_place_patch.sh
-	./tests/readiness.sh
-	./tests/dataguard.sh
-	./tests/dataguard_switchover.sh
-	./tests/patch_plan_dataguard.sh
-	./tests/webapp_testmode_rac_grid.sh
-	./tests/live_multinode_preflight.sh
-	./tests/release_signing.sh
-	./tests/agent_queue_rbac.sh
-	./tests/agent_work_run.sh
-	./tests/production_cert.sh
-	./tests/database_rolling_patch.sh
-	./tests/grid_rolling_patch.sh
-	./tests/integrations.sh
+# Every suite owns a disposable fixture/state directory, so make -j4 check
+# can run independent suites concurrently without changing the test scope.
+SHELL_TESTS := python_runtime execution_lock_files execution_lifecycle run jobs topology_snapshot opatch_platform_discovery \
+	reconcile artifact_inspect procedure_validate opatch_compatibility compatibility_reconcile \
+	artifact_stage webapp_stage_artifact opatch_upgrade recovery_prepare recovery_evidence \
+	grid_recovery_evidence patch_plan single_instance_patch rac_database_patch grid_node_patch \
+	grid_node_rollback grid_opatchauto_patch ojvm_patch out_of_place_patch readiness \
+	dataguard dataguard_live dataguard_switchover patch_plan_dataguard discovery_phases \
+	webapp_testmode_rac_grid live_multinode_preflight release_signing agent_queue_rbac agent_work_run \
+	production_cert shell_fail_open_regressions database_rolling_patch grid_rolling_patch integrations
+PYTHON_TESTS := runtime_package agent_queue_hardening artifact_safety webapp_control
+TEST_TARGETS := $(addprefix test-shell-,$(SHELL_TESTS)) $(addprefix test-python-,$(PYTHON_TESTS)) test-frontend
+.PHONY: $(TEST_TARGETS)
+
+test: $(TEST_TARGETS)
+
+$(addprefix test-shell-,$(SHELL_TESTS)): test-shell-%:
+	bash ./tests/$*.sh
+
+$(addprefix test-python-,$(PYTHON_TESTS)): test-python-%:
+	python3 -B tests/$*.py
+
+test-frontend:
+	node --test tests/frontend.mjs
 
 lint:
 	./scripts/lint.sh

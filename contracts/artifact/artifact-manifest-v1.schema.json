@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oracle-patching-utility.invalid/contracts/artifact/artifact-manifest-v1.schema.json",
+  "title": "Inspected Oracle patch artifact manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "platform": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "name", "source", "source_sha256"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[0-9]+$"},
+        "name": {"type": "string", "minLength": 1},
+        "source": {"const": "etc/config/inventory.xml"},
+        "source_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "artifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "reason", "path", "file_count", "sha256", "patch_ids", "platforms", "metadata_files", "readme_files", "classification_evidence"],
+      "properties": {
+        "status": {"enum": ["ready_for_catalog", "blocked"]},
+        "reason": {"type": ["string", "null"]},
+        "path": {"type": "string", "pattern": "^/"},
+        "file_count": {"type": "integer", "minimum": 0},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "patch_ids": {"type": "array", "items": {"type": "string", "pattern": "^[0-9]{1,20}$"}, "uniqueItems": true},
+        "platforms": {"type": "array", "items": {"$ref": "#/$defs/platform"}},
+        "metadata_files": {"type": "array", "items": {"$ref": "#/$defs/file"}},
+        "readme_files": {"type": "array", "items": {"$ref": "#/$defs/file"}},
+        "classification_evidence": {"type": "string"}
+      },
+      "allOf": [{
+        "if": {"properties": {"status": {"const": "ready_for_catalog"}}},
+        "then": {"properties": {"reason": {"type": "null"}, "file_count": {"minimum": 1}, "patch_ids": {"minItems": 1, "maxItems": 1}, "platforms": {"minItems": 1, "maxItems": 1}, "metadata_files": {"minItems": 1}}},
+        "else": {"properties": {"reason": {"type": "string", "minLength": 1}}}
+      }]
+    }
+  }
+}

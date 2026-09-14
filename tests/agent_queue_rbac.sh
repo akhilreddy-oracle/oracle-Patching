@@ -5,6 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/opu-agent-queue.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
+export OPU_AGENT_TEST_MODE=1
 export OPU_AGENT_QUEUE_DIR="$TMP/queue"
 export OPU_WEBAPP_PRINCIPALS_FILE="$TMP/principals.json"
 export PYTHONPATH="$ROOT/webapp${PYTHONPATH:+:$PYTHONPATH}"
@@ -18,7 +19,7 @@ job = agent_queue.publish_task(plan_id="p1", task_id="001-a", node="node1", adap
 assert job["status"] == "queued"
 claimed = agent_queue.claim("node1", "agent-a", lease_seconds=60)
 assert claimed and claimed["claimed_by"] == "agent-a"
-done = agent_queue.complete(claimed["job_id"], "agent-a", result={"ok": True})
+done = agent_queue.complete(claimed["job_id"], "agent-a", result={"ok": True}, claim_token=claimed["claim_token"])
 assert done["status"] == "completed"
 assert agent_queue.claim("node1", "agent-a", lease_seconds=60) is None
 

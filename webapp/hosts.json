@@ -5,7 +5,7 @@
       "label": "oracle-test-rac (sapproject1)",
       "ssh_alias": "oracle-test-rac",
       "remote_root": "/home/opc/patching-oracle",
-      "sudo": false,
+      "sudo": true,
       "nodes": [
         {"name": "sapproject1", "ssh_alias": "oracle-test-rac"},
         {"name": "sapproject2", "ssh_alias": "oracle-test-rac2"}
@@ -14,11 +14,21 @@
     {
       "id": "targetdb",
       "label": "targetdb (standalone ORCL)",
-      "ssh_alias": "targetdb",
+      "ssh_alias": "target",
       "remote_root": "/home/opc/patching-oracle",
       "sudo": true,
       "nodes": [
-        {"name": "targetdb", "ssh_alias": "targetdb"}
+        {"name": "targetdb", "ssh_alias": "target"}
+      ]
+    },
+    {
+      "id": "sourcedb",
+      "label": "sourcedb (source)",
+      "ssh_alias": "source",
+      "remote_root": "/home/opc/patching-oracle",
+      "sudo": true,
+      "nodes": [
+        {"name": "sourcedb", "ssh_alias": "source"}
       ]
     }
   ]

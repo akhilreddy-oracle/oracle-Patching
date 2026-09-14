@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/tests/fixtures/retire_plans.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/opu-grid-opatchauto.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
@@ -132,6 +133,7 @@ EOF
 cat >"$PATCH_DIR/etc/config/inventory.xml" <<'EOF'
 <patch patchID="39034529"><description>Grid Release Update</description><os_platforms><platform id="226" name="Linux x86-64"/></os_platforms></patch>
 EOF
+mkdir -p "$PATCH_DIR/files/lib" && printf 'test patch payload\n' >"$PATCH_DIR/files/lib/libtestpatch.so"
 printf '%s\n' \
   'Grid OPatchAuto rolling patch test README' \
   'opatchauto apply /u01/patch/39034529 -oh /u01/app/19c/grid' \
@@ -194,6 +196,8 @@ create_plan() {
     --recovery-evidence "$TMP/recovery.json" --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
   plan approve --plan-id "$plan_id" --actor dba-approver --approval-ticket TEST-OPATCHAUTO-39034529 >/dev/null
   plan authorize --plan-id "$plan_id" --actor patch-operator >/dev/null
+  # Independent simulated target scenario; lifecycle tests cover retained reservations.
+  retire_fixture_plans "$PLAN_STATE"
   plan dispatch --plan-id "$plan_id" --actor patch-operator >/dev/null
 }
 
@@ -272,6 +276,8 @@ plan create-rollback --plan-id opatchauto-rollback --requester rollback-admin \
   --source-plan-id opatchauto-success --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
 plan approve --plan-id opatchauto-rollback --actor dba-approver --approval-ticket TEST-OPATCHAUTO-RB >/dev/null
 plan authorize --plan-id opatchauto-rollback --actor patch-operator >/dev/null
+# Independent simulated target scenario; lifecycle tests cover retained reservations.
+retire_fixture_plans "$PLAN_STATE"
 plan dispatch --plan-id opatchauto-rollback --actor patch-operator >/dev/null
 for node_name in node2 node1; do
   for stage_name in opatchauto_rollback_precheck opatchauto_rollback opatchauto_rollback_node_validate; do

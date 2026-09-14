@@ -19,4 +19,13 @@ jq '.target.platform_id = "46"' "$TMP/procedure.json" >"$TMP/wrong-platform.json
 if "$ROOT/bin/opu-procedure-validate" --procedure "$TMP/wrong-platform.json" --artifact "$TMP/artifact.json" >/dev/null 2>&1; then echo 'procedure platform differing from artifact inventory was accepted' >&2; exit 1; fi
 jq '.artifact.readme_files = []' "$TMP/artifact.json" >"$TMP/no-readme-artifact.json"
 if "$ROOT/bin/opu-procedure-validate" --procedure "$TMP/procedure.json" --artifact "$TMP/no-readme-artifact.json" >/dev/null 2>&1; then echo 'artifact without a hashed README was accepted' >&2; exit 1; fi
+jq '.required_opatch_version="" | .target.database_unique_name="" | .rollback.precondition="" | .mandatory_prechecks=["artifact_integrity","platform_applicability","opatch_version","conflict_check"]' "$TMP/procedure.json" >"$TMP/incomplete.json"
+if "$ROOT/bin/opu-procedure-validate" --procedure "$TMP/incomplete.json" --artifact "$TMP/artifact.json" >"$TMP/incomplete.out" 2>"$TMP/incomplete.err"; then
+  echo 'incomplete procedure was accepted' >&2
+  exit 1
+fi
+grep -q 'required_opatch_version must be a dotted OPatch version' "$TMP/incomplete.err" || { echo 'missing required_opatch_version diagnostic' >&2; cat "$TMP/incomplete.err" >&2; exit 1; }
+grep -q 'database_unique_name is required' "$TMP/incomplete.err" || { echo 'missing database_unique_name diagnostic' >&2; cat "$TMP/incomplete.err" >&2; exit 1; }
+grep -q 'backup_or_restore' "$TMP/incomplete.err" || { echo 'missing backup_or_restore diagnostic' >&2; cat "$TMP/incomplete.err" >&2; exit 1; }
+grep -q 'rollback.precondition must be a non-empty' "$TMP/incomplete.err" || { echo 'missing rollback.precondition diagnostic' >&2; cat "$TMP/incomplete.err" >&2; exit 1; }
 printf '%s\n' 'procedure validation test passed'

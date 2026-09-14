@@ -9,6 +9,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/execution.sh"
 
 PLAN_STATE_DIR=${OPU_PLAN_STATE_DIR:-/var/lib/oracle-patching-plans}
 EXECUTION_STATE_DIR=${OPU_GRID_OPATCHAUTO_STATE_DIR:-/var/lib/oracle-patching-utility/grid-opatchauto}
@@ -144,6 +145,7 @@ artifact_digest() {
 }
 
 verify_artifact() {
+  opu_python "$ROOT/lib/opu/artifact_media.py" validate-tree "$PATCH_DIR" || die 'sealed patch media tree is unsafe'
   local actual metadata_ids platform_count platform_id platform_name
   [ -d "$PATCH_DIR" ] && [ ! -L "$PATCH_DIR" ] || die 'sealed Grid patch directory is missing or symbolic link'
   [ -z "$(find "$PATCH_DIR" -xdev -type l -print -quit)" ] || die 'sealed Grid patch directory contains symbolic links'
@@ -773,21 +775,23 @@ emit_evidence() {
       --arg collector "$EXECUTOR_COLLECTOR" --arg intent "$EXECUTOR_INTENT" '
       {schema_version:"1.0",collector:{name:$collector,version:"1"},intent:$intent,plan_id:$plan,task_id:$task,plan_sha256:$plan_sha,status:$status,postcondition:{status:$postcondition,detail:$detail},outcome_class:$outcome,started_at:$started,finished_at:$finished,exit_code:$exit_code,actor:$actor,stage:$stage,target:{grid_home:$grid_home,owner:$owner,coordinator_node:$coordinator,node:$node},patch:{patch_id:$patch,artifact_sha256:$artifact},source_documents:{readiness:$readiness,reconciliation:$reconciliation,artifact_manifest:$artifact_manifest,procedure_validation:$procedure,compatibility:$compatibility,policy:$policy},recovery:{manifest_sha256:$recovery_file,record_sha256:$recovery_record},cluster:{active_version:$active_version,upgrade_state:$upgrade_state,active_patch_level:$active_patch,release_patch_level:$release_patch},artifacts:$artifacts,logs:{stdout:{path:$stdout,sha256:$stdout_sha},stderr:{path:$stderr,sha256:$stderr_sha}}}' >"$tmp"
   fi
+  opu_execution_seal_attempt "$tmp" || return $?
   canonical=$(jq -cS . "$tmp"); record_sha=$(opu_hash_string "$canonical"); jq --arg record_sha "$record_sha" '.record_sha256=$record_sha' "$tmp" >"$TASK_DIR/evidence.json"; rm -f "$tmp"
 }
 
 execute_task() {
   local claim_output stage_pid heartbeat_pid stage_rc finished status postcondition detail outcome complete_rc
-  require_root; load_plan
-  RUN_DIR="$EXECUTION_STATE_DIR/plans/$PLAN_ID"; TASK_DIR="$RUN_DIR/tasks/$TASK_ID"; mkdir -p "$RUN_DIR/tasks"
+  require_root; opu_execution_host_lock || return $?; load_plan
+  RUN_DIR="$EXECUTION_STATE_DIR/plans/$PLAN_ID"; opu_execution_prepare_attempt "$RUN_DIR/tasks" "$PLAN_STATE_DIR/plans/$PLAN_ID/tasks/$TASK_ID.json" "$TASK_ID" || return $?; mkdir -p "$RUN_DIR/tasks"
   [ ! -e "$TASK_DIR" ] || die "Grid OPatchAuto execution evidence already exists for task $TASK_ID"
   claim_output=$(env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" claim --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --lease-seconds "$LEASE_SECONDS") || die 'could not claim the sealed Grid OPatchAuto task'
   mkdir "$TASK_DIR"; printf '%s\n' "$claim_output" >"$TASK_DIR/claim.json"; load_task_after_claim
+  opu_execution_verify_attempt "$TASK_FILE" || return $?
   NODE_RUN_DIR="$RUN_DIR/nodes/$LOCAL_NODE"; mkdir -p "$NODE_RUN_DIR"; BINDING_FILE="$NODE_RUN_DIR/target-binding.json"; acquire_executor_lock
   STARTED_AT=$(opu_now_utc)
   set +e
   (set -e; close_inherited_executor_lock; run_typed_stage) >"$TASK_DIR/stdout.log" 2>"$TASK_DIR/stderr.log" & stage_pid=$!
-  (close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
+  (exec 7>&-; close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
   wait "$stage_pid"; stage_rc=$?
   kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true
   set -e

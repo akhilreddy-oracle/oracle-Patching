@@ -3,6 +3,9 @@
 # Shared primitives for the Oracle Patching Utility agent.
 # This file is sourced only from code shipped with the agent.
 
+# shellcheck source=lib/opu/python.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/python.sh"
+
 # shellcheck disable=SC2034 # read by bin/opu-agent, which sources this file
 OPU_AGENT_VERSION="0.1.0"
 # shellcheck disable=SC2034 # read by bin/opu-agent, which sources this file
@@ -135,6 +138,61 @@ opu_validate_absolute_path() {
     esac
 }
 
+# Resolve path to a usable directory. Intermediate components may be symlinks
+# (e.g. OCI /u01 -> /u02/u01). A symlink leaf is accepted when it canonicalizes
+# to a real directory (not a symlink-to-file / dangling link). Prints the
+# canonical directory path on stdout for the caller to adopt.
+opu_resolve_directory() {
+    local path label resolved
+    path=${1-}
+    label=${2:-path}
+    if [ -z "$path" ]; then
+        printf '%s is required\n' "$label" >&2
+        return 64
+    fi
+    if [ -L "$path" ]; then
+        resolved=$(readlink -f -- "$path" 2>/dev/null || true)
+        if [ -z "$resolved" ] || [ ! -e "$resolved" ]; then
+            printf '%s is a symbolic link with a missing target: %s\n' "$label" "$path" >&2
+            return 66
+        fi
+        if [ -L "$resolved" ] || [ ! -d "$resolved" ]; then
+            printf '%s symbolic link must resolve to a directory: %s -> %s\n' "$label" "$path" "$resolved" >&2
+            return 66
+        fi
+        printf '%s\n' "$resolved"
+        return 0
+    fi
+    if [ ! -e "$path" ]; then
+        printf '%s does not exist: %s\n' "$label" "$path" >&2
+        return 66
+    fi
+    if [ ! -d "$path" ]; then
+        printf '%s must be a directory: %s\n' "$label" "$path" >&2
+        return 66
+    fi
+    # Canonicalize so intermediate symlinks (e.g. /u01 -> /u02/u01) do not
+    # confuse later find -xdev / prefix stripping; keep user-visible path if
+    # readlink fails.
+    resolved=$(readlink -f -- "$path" 2>/dev/null || true)
+    if [ -n "$resolved" ] && [ -d "$resolved" ] && [ ! -L "$resolved" ]; then
+        printf '%s\n' "$resolved"
+    else
+        printf '%s\n' "$path"
+    fi
+    return 0
+}
+
+# Back-compat wrapper: require a directory (symlink-to-dir allowed via resolve).
+opu_require_real_directory() {
+    local path label resolved
+    path=${1-}
+    label=${2:-path}
+    resolved=$(opu_resolve_directory "$path" "$label") || return $?
+    [ -n "$resolved" ] || return 66
+    return 0
+}
+
 opu_safe_field() {
     if printf '%s' "${1-}" | grep '[[:cntrl:]]' >/dev/null 2>&1; then
         return 1
@@ -223,6 +281,14 @@ opu_operation_error() {
     OPU_ERROR_RETRYABLE=${3:-false}
 }
 
+# Exact line match for production certification markers. Substring grep would
+# accept OPU_PRODUCTION_CERTIFIED=10 / =1foo and fail open.
+opu_cert_marker_line() {
+    local file=$1 key=$2
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    grep -Eq "^${key}$" "$file"
+}
+
 # S13 starter gate: when OPU_PRODUCTION_MODE is enabled, mutation authority
 # requires an explicit local certification marker. Lab/default builds leave
 # production mode off and are unaffected.
@@ -238,14 +304,14 @@ opu_require_production_certified() {
         opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is missing: $cert"
         return 77
     }
-    grep -Fq 'OPU_PRODUCTION_CERTIFIED=1' "$cert" || {
+    opu_cert_marker_line "$cert" 'OPU_PRODUCTION_CERTIFIED=1' || {
         opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is invalid: $cert"
         return 77
     }
     case "${OPU_PRODUCTION_REQUIRE_CHECKLIST:-0}" in
         1|true|yes|on)
             for key in OPU_SBOM_VERIFIED=1 OPU_RELEASE_SIGNED=1 OPU_THREAT_MODEL_SIGNED=1; do
-                grep -Fq "$key" "$cert" || {
+                opu_cert_marker_line "$cert" "$key" || {
                     opu_error "OPU_PRODUCTION_MODE checklist incomplete; missing $key in $cert"
                     return 77
                 }

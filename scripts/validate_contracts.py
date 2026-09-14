@@ -1,28 +1,38 @@
 #!/usr/bin/env python3
-"""Validate every contracts/**/*.schema.json file as well-formed Draft 2020-12
-JSON Schema, and validate the bundled procedure examples/templates against
-their schema with placeholder tokens substituted for schema-conformant
-dummy values.
+"""Validate schemas, bundled examples, and generated runtime fixture output.
 
-This is a Q0 contract-gate check (see docs/PROGRAM_CHARTER.md): the schemas
-under contracts/ previously had no automated check at all, so a malformed or
-drifted schema could sit unnoticed indefinitely.
+The runtime gate executes real collectors/evaluators and a constrained fixture
+executor, then checks required evidence, shapes, and timestamps against their
+contracts. Negative probes ensure absent fields are actually rejected.
 """
 from __future__ import annotations
 
 import json
+from datetime import datetime
 import re
 import sys
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema.exceptions import SchemaError
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACTS = ROOT / "contracts"
 
 PLACEHOLDER = re.compile(r"^REPLACE_WITH_.*")
 DUMMY_SHA256 = "a" * 64
+FORMAT_CHECKER = FormatChecker()
+
+
+@FORMAT_CHECKER.checks("date-time", raises=ValueError)
+def valid_datetime(value) -> bool:
+    """Require offset-aware timestamps without optional jsonschema extras."""
+    if not isinstance(value, str):
+        return True  # The schema's type keyword handles non-string values.
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})", value):
+        return False
+    parsed = datetime.fromisoformat(value.upper().replace("Z", "+00:00"))
+    return parsed.tzinfo is not None
 
 
 def dummy_for(key: str) -> str:
@@ -69,7 +79,7 @@ def check_procedure_examples() -> list[str]:
     errors = []
     schema_path = CONTRACTS / "procedure" / "oracle-patch-procedure-v1.schema.json"
     schema = json.loads(schema_path.read_text())
-    validator = Draft202012Validator(schema)
+    validator = Draft202012Validator(schema, format_checker=FORMAT_CHECKER)
     example_dir = CONTRACTS / "procedure" / "examples"
     examples = sorted(example_dir.glob("*.json"))
     if not examples:
@@ -85,8 +95,23 @@ def check_procedure_examples() -> list[str]:
     return errors
 
 
+def validate_payload(schema_relative: str, instance: dict, label: str) -> list[str]:
+    """Validate actual runtime output, including date/time and required fields."""
+    schema = json.loads((CONTRACTS / schema_relative).read_text())
+    validator = Draft202012Validator(schema, format_checker=FORMAT_CHECKER)
+    errors = []
+    for problem in sorted(validator.iter_errors(instance), key=lambda error: str(list(error.path))):
+        location = "/".join(str(part) for part in problem.path) or "<root>"
+        errors.append(f"{label}: {location}: {problem.message}")
+    return errors
+
+
 def main() -> int:
     errors = check_schema_files() + check_procedure_examples()
+    if not errors:
+        sys.path.insert(0, str(ROOT / "tests"))
+        from runtime_contracts import check_runtime_contracts
+        errors.extend(check_runtime_contracts(validate_payload))
     if errors:
         print(f"contract validation failed ({len(errors)} problem(s)):", file=sys.stderr)
         for e in errors:
@@ -94,7 +119,7 @@ def main() -> int:
         return 1
     schema_count = len(list(CONTRACTS.rglob("*.schema.json")))
     example_count = len(list((CONTRACTS / "procedure" / "examples").glob("*.json")))
-    print(f"contract validation passed: {schema_count} schemas, {example_count} procedure examples")
+    print(f"contract validation passed: {schema_count} schemas, {example_count} procedure examples, generated runtime payloads and negative boundary probes")
     return 0
 
 
