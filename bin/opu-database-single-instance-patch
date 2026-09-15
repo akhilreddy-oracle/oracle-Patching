@@ -235,10 +235,22 @@ sqlplus_fixed() {
   as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$sid" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/sqlplus" -L -s '/ as sysdba'
 }
 
+# Persistent services must not inherit the shared host lock. The executor,
+# patch tools, probes and shutdown commands continue holding descriptor 7.
+startup_database() {
+  cat <<'SQL' | sqlplus_fixed "$ORACLE_SID" 7>&-
+whenever sqlerror exit failure
+whenever oserror exit failure
+startup;
+exit;
+SQL
+}
+
 database_probe() {
   local sid=$1 output_file=$2
   cat <<'SQL' | sqlplus_fixed "$sid" >"$output_file" 2>&1
 whenever sqlerror exit failure
+whenever oserror exit failure
 set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
 select 'INSTANCE_NAME=' || instance_name from v$instance;
 select 'INSTANCE_STATUS=' || status from v$instance;
@@ -346,13 +358,18 @@ wait_for_pmon_state() {
 listener_action() {
   local action=$1
   [ -n "$LISTENER_NAME" ] || { printf '%s\n' 'No listener was bound to this plan.'; return 0; }
-  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" "$action" "$LISTENER_NAME"
+  if [ "$action" = start ]; then
+    as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" "$action" "$LISTENER_NAME" 7>&-
+  else
+    as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" "$action" "$LISTENER_NAME"
+  fi
 }
 
 listener_ready() {
   local output
   [ -n "$LISTENER_NAME" ] || return 0
   output=$(listener_action status 2>&1) || return
+  printf '%s\n' "$output" >"$TASK_DIR/report-listener.log"
   printf '%s\n' "$output" | grep -E "Instance \"?$ORACLE_SID\"?, status READY" >/dev/null
 }
 
@@ -385,11 +402,7 @@ apply_exit_guard() {
   if [ "$original_rc" -ne 0 ] && [ "${APPLY_DATABASE_STOPPED:-0}" = 1 ] && [ "${APPLY_BINARY_STARTED:-0}" = 0 ]; then
     {
       printf '%s\n' 'Binary apply did not start; restoring the pre-apply database service state.'
-      cat <<'SQL' | sqlplus_fixed "$ORACLE_SID"
-whenever sqlerror exit failure
-startup;
-exit;
-SQL
+      startup_database
       wait_for_database_health "$TASK_DIR/preapply-recovery-health.log"
       if [ "${APPLY_LISTENER_STOPPED:-0}" = 1 ]; then listener_action start; fi
       cat <<'SQL' | sqlplus_fixed "$ORACLE_SID" >/dev/null
@@ -421,6 +434,56 @@ stage_precheck() {
   check_apply_capacity
   current_health "$TASK_DIR/precheck-health.log" || die 'database health changed before execution'
   wait_for_listener_ready || die 'bound listener is not ready before execution'
+  verify_extjob_permissions
+  dictionary_probe "$TASK_DIR/precheck-dictionary.log"
+  sqlpatch_latest "$TASK_DIR/precheck-sqlpatch.log"
+}
+
+# Verify the README requirement without promoting Oracle-writable bytes to a
+# root setuid executable. A README hash proves instructions, not binary
+# provenance. Any missing ownership/mode requirement blocks; no repair occurs.
+verify_extjob_permissions() {
+  local readme digest required=0 matched_readme=0
+  while IFS= read -r -d '' readme; do
+    digest=$(opu_hash_file "$readme")
+    jq -e --arg sha "$digest" '.procedure.oracle_references[]? | select(.kind == "patch_readme" and .sha256 == $sha)' "$(jq -r '.source_documents.procedure_validation.path' "$PLAN_FILE")" >/dev/null || continue
+    matched_readme=1
+    if LC_ALL=C grep -aEq 'chown[[:space:]]+root[[:space:]]+\$ORACLE_HOME/bin/extjob' "$readme" &&
+       LC_ALL=C grep -aEq 'chmod[[:space:]]+4750[[:space:]]+\$ORACLE_HOME/bin/extjob' "$readme"; then required=1; break; fi
+  done < <(find "$PATCH_DIR" -type f -iname 'readme*' -print0)
+  [ "$matched_readme" -eq 1 ] || die 'sealed patch README is missing or changed; extjob requirements cannot be verified'
+  [ "$required" -eq 1 ] || return 0
+  opu_python - "$ORACLE_HOME_TARGET" "$TEST_MODE" <<'PY_EXTJOB' >"$TASK_DIR/extjob-permissions.log"
+import os, stat, sys
+home, test = sys.argv[1:]
+expected_uid = os.getuid() if test == "1" else 0
+# Test fixtures never create setuid executables; production always requires
+# the README's root-owned 4750 metadata.
+expected_mode = 0o750 if test == "1" else 0o4750
+home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    bin_fd = os.open("bin", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd)
+    try:
+        fd = os.open("extjob", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=bin_fd)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise SystemExit("extjob must be a regular single-link file")
+            after = os.fstat(fd)
+            named = os.stat("extjob", dir_fd=bin_fd, follow_symlinks=False)
+            if (named.st_dev, named.st_ino) != (after.st_dev, after.st_ino):
+                raise SystemExit("extjob identity changed during verification")
+            if after.st_uid != expected_uid or stat.S_IMODE(after.st_mode) != expected_mode:
+                raise SystemExit("extjob ownership/mode differs from README: uid=%s mode=%04o; expected uid=%s mode=%04o; automated privilege repair is unavailable without trusted binary provenance" %
+                                 (after.st_uid, stat.S_IMODE(after.st_mode), expected_uid, expected_mode))
+            print("extjob permissions verified: uid=%s mode=%04o" % (after.st_uid, expected_mode))
+        finally:
+            os.close(fd)
+    finally:
+        os.close(bin_fd)
+finally:
+    os.close(home_fd)
+PY_EXTJOB
 }
 
 stage_apply() {
@@ -433,6 +496,7 @@ stage_apply() {
   opatch_prereq_check CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/apply-platform-applicability.log"
   opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/apply-conflict.log"
   check_apply_capacity
+  verify_extjob_permissions
   cat <<'SQL' | sqlplus_fixed "$ORACLE_SID"
 whenever sqlerror exit failure
 shutdown immediate;
@@ -463,11 +527,8 @@ SQL
   inventory_has_patch "$TASK_DIR/apply-after-lspatches.log" || die "OPatch returned success but patch $PATCH_ID is absent from binary inventory"
   rm -f "$TASK_DIR/binary-state-unknown"
   : >"$TASK_DIR/binary-state-known"
-  cat <<'SQL' | sqlplus_fixed "$ORACLE_SID"
-whenever sqlerror exit failure
-startup;
-exit;
-SQL
+  verify_extjob_permissions
+  startup_database
   wait_for_pmon_state up || die 'database PMON did not return after startup'
   listener_action start
   cat <<'SQL' | sqlplus_fixed "$ORACLE_SID" >/dev/null
@@ -488,39 +549,175 @@ stage_validate() {
   wait_for_listener_ready || die 'listener validation failed after binary patch'
 }
 
+datapatch_run() {
+  as_owner "$ORACLE_OWNER" env -u JAVA_HOME -u OPATCH_JRE "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" "PATH=$ORACLE_HOME_TARGET/bin:$ORACLE_HOME_TARGET/OPatch:/usr/bin:/bin" "$ORACLE_HOME_TARGET/OPatch/datapatch" "$@"
+}
+
+dictionary_probe() {
+  local output_file=$1
+  cat <<'SQL' | sqlplus_fixed "$ORACLE_SID" >"$output_file" 2>&1
+whenever sqlerror exit failure
+whenever oserror exit failure
+set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
+select 'INVALID_OBJECTS=' || count(*) from dba_objects where status='INVALID';
+select 'ENABLED_COMPONENTS=' || count(*) from dba_registry where nvl(status,'UNKNOWN') not in ('OPTION OFF','REMOVED');
+select 'NONVALID_COMPONENTS=' || count(*) from dba_registry where nvl(status,'UNKNOWN') not in ('VALID','OPTION OFF','REMOVED');
+select 'COMPONENT=' || comp_id || '|' || nvl(status,'UNKNOWN') from dba_registry order by comp_id;
+exit;
+SQL
+}
+
+require_healthy_dictionary() {
+  local output_file=$1 invalid components enabled
+  dictionary_probe "$output_file"
+  invalid=$(probe_value INVALID_OBJECTS "$output_file")
+  components=$(probe_value NONVALID_COMPONENTS "$output_file")
+  enabled=$(probe_value ENABLED_COMPONENTS "$output_file")
+  [ "$invalid" = 0 ] && [ "$components" = 0 ] && [[ "$enabled" =~ ^[0-9]+$ ]] && [ "$enabled" -gt 0 ] ||
+    die 'dictionary validation requires zero invalid objects and every enabled component VALID'
+}
+
+# One native mutation attempt, automatic inventory-based patch selection.
+# Oracle-readable runtime inputs/logs are copied into root-only task evidence.
+run_native_datapatch() (
+  set -e
+  local expected_action=$1 runtime inventory_sha native_rc file
+  runtime=$(mktemp -d /tmp/opu-single-sql.XXXXXXXX)
+  # shellcheck disable=SC2317,SC2329 # Called indirectly by the subshell EXIT trap below.
+  finish_sql_runtime() {
+    local original_rc=$? seal_rc=0
+    trap - EXIT
+    # Open each native log without following symlinks; retain partial logs even
+    # when datapatch fails. Never copy arbitrary directories or special files.
+    opu_python - "$runtime" "$TASK_DIR" <<'PY_LOGS' || seal_rc=74
+import hashlib, json, os, stat, sys
+runtime, task = sys.argv[1:]
+root_fd = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    for name in os.listdir(root_fd):
+        if name != "local-inventory.xml" and not (name.startswith("utlrp") and name.endswith((".log", ".lst"))):
+            continue
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd)
+        try:
+            source = os.fstat(fd)
+            if not stat.S_ISREG(source.st_mode) or source.st_nlink != 1:
+                raise SystemExit("unsafe native SQL runtime artifact")
+            with os.fdopen(os.dup(fd), "rb") as inp, open(os.path.join(task, name), "xb") as out:
+                while True:
+                    chunk = inp.read(1024 * 1024)
+                    if not chunk: break
+                    out.write(chunk)
+        finally:
+            os.close(fd)
+finally:
+    os.close(root_fd)
+# Only completed SQL-stage artifacts are stable here. The supervisor may
+# still truncate heartbeat-error.log; it is deliberately excluded.
+allowed = {
+    "datapatch-help.log", "datapatch-arguments.log", "datapatch.log",
+    "datapatch.exit-code", "datapatch-sqlpatch.log", "datapatch-dictionary.log",
+    "local-inventory.log", "local-inventory-validation.log",
+    "local-inventory-before.xml", "local-inventory-before.sha256", "local-inventory.xml",
+    "utlrp-console.log", "utlrp.exit-code", "datapatch-lspatches.log",
+    "datapatch-lspatches.log.stderr", "datapatch-pre-health.log",
+    "rollback-datapatch-lspatches.log", "rollback-datapatch-lspatches.log.stderr",
+    "rollback-datapatch-pre-health.log",
+}
+artifacts = []
+with open(os.path.join(task, "sql-runtime.sha256"), "x", encoding="utf-8") as manifest:
+    for name in sorted(os.listdir(task)):
+        if name not in allowed and not (name.startswith("utlrp") and name.endswith((".log", ".lst"))):
+            continue
+        path = os.path.join(task, name)
+        if not os.path.isfile(path) or os.path.islink(path):
+            raise SystemExit("unsafe completed SQL artifact")
+        digest = hashlib.sha256()
+        with open(path, "rb") as inp:
+            for chunk in iter(lambda: inp.read(1024 * 1024), b""): digest.update(chunk)
+        sha = digest.hexdigest()
+        manifest.write(sha + "  " + name + "\n")
+        artifacts.append({"path": path, "sha256": sha})
+manifest_path = os.path.join(task, "sql-runtime.sha256")
+with open(manifest_path, "rb") as inp:
+    artifacts.append({"path": manifest_path, "sha256": hashlib.sha256(inp.read()).hexdigest()})
+with open(os.path.join(task, "sql-artifacts.json"), "x", encoding="utf-8") as out:
+    json.dump(sorted(artifacts, key=lambda item: item["path"]), out)
+
+PY_LOGS
+    rm -rf -- "$runtime"
+    [ "$original_rc" -eq 0 ] || exit "$original_rc"
+    exit "$seal_rc"
+  }
+  trap finish_sql_runtime EXIT
+  if [ "$(id -un)" != "$ORACLE_OWNER" ]; then chown "$ORACLE_OWNER" "$runtime"; fi
+  chmod 0700 "$runtime"
+  cd "$runtime"
+  [ -x "$ORACLE_HOME_TARGET/perl/bin/perl" ] && [ -f "$ORACLE_HOME_TARGET/rdbms/admin/catcon.pl" ] && [ ! -L "$ORACLE_HOME_TARGET/rdbms/admin/catcon.pl" ] && [ -f "$ORACLE_HOME_TARGET/rdbms/admin/utlrp.sql" ] && [ ! -L "$ORACLE_HOME_TARGET/rdbms/admin/utlrp.sql" ] || die 'shipped Oracle recompilation tools are missing or unsafe'
+  local args=(-verbose)
+  if datapatch_run -help >"$TASK_DIR/datapatch-help.log" 2>&1 && grep -Eq '(^|[[:space:]])-local_inventory([[:space:]]|$)' "$TASK_DIR/datapatch-help.log"; then
+    opatch_run lsinventory -xml "$runtime/local-inventory.xml" -oh "$ORACLE_HOME_TARGET" >"$TASK_DIR/local-inventory.log" 2>&1
+    # The native directory is Oracle-owned. Copy from a no-follow descriptor
+    # before parsing as root, so a substituted link cannot disclose other files.
+    opu_python - "$runtime" "$TASK_DIR/local-inventory-before.xml" <<'PY_INVENTORY'
+import os, stat, sys
+runtime, target = sys.argv[1:]
+directory = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    fd = os.open("local-inventory.xml", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        source = os.fstat(fd)
+        if not stat.S_ISREG(source.st_mode) or source.st_nlink != 1 or source.st_size == 0:
+            raise SystemExit("OPatch inventory must be a regular nonempty single-link file")
+        with os.fdopen(os.dup(fd), "rb") as inp, open(target, "xb") as out:
+            for chunk in iter(lambda: inp.read(1024 * 1024), b""): out.write(chunk)
+    finally:
+        os.close(fd)
+finally:
+    os.close(directory)
+PY_INVENTORY
+    xmllint --nonet --noout "$TASK_DIR/local-inventory-before.xml" >"$TASK_DIR/local-inventory-validation.log" 2>&1 || die 'native OPatch inventory XML is malformed'
+    inventory_sha=$(opu_hash_file "$TASK_DIR/local-inventory-before.xml")
+    printf '%s\n' "$inventory_sha" >"$TASK_DIR/local-inventory-before.sha256"
+    args+=(-local_inventory "$runtime/local-inventory.xml")
+  fi
+  printf '%s\n' "${args[@]}" >"$TASK_DIR/datapatch-arguments.log"
+  set +e
+  datapatch_run "${args[@]}" >"$TASK_DIR/datapatch.log" 2>&1
+  native_rc=$?
+  set -e
+  printf '%s\n' "$native_rc" >"$TASK_DIR/datapatch.exit-code"
+  cat "$TASK_DIR/datapatch.log"
+  [ "$native_rc" -eq 0 ] || return "$native_rc"
+  if grep -Eq 'ORA-[0-9]{5}|SP2-[0-9]{4}|Error:|[Pp]rereq checks failed|[Pp]atching failed|WITH ERRORS' "$TASK_DIR/datapatch.log"; then die 'datapatch reported errors despite a successful exit code'; fi
+  if [ -n "${inventory_sha:-}" ]; then [ "$(opu_hash_file "$runtime/local-inventory.xml")" = "$inventory_sha" ] || die 'inventory XML changed during datapatch'; fi
+  require_latest_sqlpatch "$expected_action" "$TASK_DIR/datapatch-sqlpatch.log"
+  set +e
+  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/perl/bin/perl" "$ORACLE_HOME_TARGET/rdbms/admin/catcon.pl" -n 1 -e -b utlrp -d "$ORACLE_HOME_TARGET/rdbms/admin" utlrp.sql >"$TASK_DIR/utlrp-console.log" 2>&1
+  native_rc=$?
+  set -e
+  printf '%s\n' "$native_rc" >"$TASK_DIR/utlrp.exit-code"
+  [ "$native_rc" -eq 0 ] || return "$native_rc"
+  for file in "$TASK_DIR/utlrp-console.log" "$runtime"/utlrp*.log "$runtime"/utlrp*.lst; do
+    [ -f "$file" ] || continue
+    if grep -Eq '^[[:space:]]*(ORA-[0-9]{5}|SP2-[0-9]{4}):' "$file"; then die 'Oracle recompilation logs contain a database or SQLPlus error'; fi
+  done
+  require_healthy_dictionary "$TASK_DIR/datapatch-dictionary.log"
+)
+
 stage_datapatch() {
   load_binding; verify_recovery; verify_open_window
   inventory_has_patch "$TASK_DIR/datapatch-lspatches.log" || die 'datapatch refused because the binary patch is absent'
   current_health "$TASK_DIR/datapatch-pre-health.log" || die 'database is not healthy for datapatch'
-  # -noqi: skip DBMS_QOPATCH's queryable-inventory cross-check. That check
-  # runs through an external-table preprocessor (qopiprep.bat) whose
-  # environment Oracle sandboxes independently of ORACLE_HOME/JAVA_HOME, so
-  # it fails outright whenever the Oracle home is reached via a symlink
-  # (e.g. /u01 -> /u02/u01) regardless of host environment configuration.
-  # It is a supplementary consistency check, not part of applying the SQL
-  # patch or updating DBA_REGISTRY_SQLPATCH.
-  # 19.31+ datapatch requires an explicit -apply/-rollback with -noqi.
-  # Pass the sealed patch id as -apply's value: a bare "-apply -noqi" makes
-  # datapatch treat "-noqi" as the apply patch-list and leave noqi unset.
-  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" "PATH=$ORACLE_HOME_TARGET/bin:$ORACLE_HOME_TARGET/OPatch:/usr/bin:/bin" "$ORACLE_HOME_TARGET/OPatch/datapatch" -verbose -apply "$PATCH_ID" -noqi
+  run_native_datapatch APPLY
 }
 
 stage_final_validate() {
-  local invalid maximum_invalid success non_success
   load_binding; inventory_has_patch "$TASK_DIR/final-lspatches.log" || die "patch $PATCH_ID is absent from final binary inventory"
   current_health "$TASK_DIR/final-health.log" || die 'database final health check failed'
   wait_for_listener_ready || die 'listener final validation failed'
-  invalid=$(probe_value INVALID_OBJECTS "$TASK_DIR/final-health.log"); maximum_invalid=$(jq -r '.database.maximum_invalid_objects' "$(jq -r '.source_documents.policy.path' "$PLAN_FILE")")
-  [[ "$invalid" =~ ^[0-9]+$ ]] && [ "$invalid" -le "$maximum_invalid" ] || die 'invalid-object count exceeds the sealed policy'
-  cat <<SQL | sqlplus_fixed "$ORACLE_SID" >"$TASK_DIR/sqlpatch-final.log"
-whenever sqlerror exit failure
-set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
-select 'SQLPATCH_SUCCESS=' || count(*) from dba_registry_sqlpatch where patch_id=$PATCH_ID and action='APPLY' and status='SUCCESS';
-select 'SQLPATCH_NON_SUCCESS=' || count(*) from dba_registry_sqlpatch where patch_id=$PATCH_ID and status<>'SUCCESS';
-exit;
-SQL
-  success=$(probe_value SQLPATCH_SUCCESS "$TASK_DIR/sqlpatch-final.log"); non_success=$(probe_value SQLPATCH_NON_SUCCESS "$TASK_DIR/sqlpatch-final.log")
-  [[ "$success" =~ ^[0-9]+$ ]] && [ "$success" -gt 0 ] && [ "$non_success" = 0 ] || die "SQL patch registry does not show a clean SUCCESS for patch $PATCH_ID"
+  verify_extjob_permissions
+  require_healthy_dictionary "$TASK_DIR/final-dictionary.log"
+  require_latest_sqlpatch APPLY "$TASK_DIR/sqlpatch-final.log"
 }
 
 verify_rollback_procedure() {
@@ -588,6 +785,7 @@ sqlpatch_latest() {
   local output_file=$1
   cat <<SQL | sqlplus_fixed "$ORACLE_SID" >"$output_file"
 whenever sqlerror exit failure
+whenever oserror exit failure
 set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
 select 'SQLPATCH_LATEST_ACTION=' || action from (select action, row_number() over (order by action_time desc, install_id desc) as rn from dba_registry_sqlpatch where patch_id=$PATCH_ID) where rn=1;
 select 'SQLPATCH_LATEST_STATUS=' || status from (select status, row_number() over (order by action_time desc, install_id desc) as rn from dba_registry_sqlpatch where patch_id=$PATCH_ID) where rn=1;
@@ -608,11 +806,7 @@ rollback_exit_guard() {
   if [ "$original_rc" -ne 0 ] && [ "${ROLLBACK_DATABASE_STOPPED:-0}" = 1 ] && [ "${ROLLBACK_BINARY_STARTED:-0}" = 0 ]; then
     {
       printf '%s\n' 'Binary rollback did not start; restoring the pre-rollback database service state.'
-      cat <<'SQL' | sqlplus_fixed "$ORACLE_SID"
-whenever sqlerror exit failure
-startup;
-exit;
-SQL
+      startup_database
       wait_for_database_health "$TASK_DIR/prerollback-recovery-health.log"
       if [ "${ROLLBACK_LISTENER_STOPPED:-0}" = 1 ]; then listener_action start; fi
       cat <<'SQL' | sqlplus_fixed "$ORACLE_SID" >/dev/null
@@ -644,6 +838,7 @@ stage_rollback_precheck() {
   current_health "$TASK_DIR/rollback-precheck-health.log" || die 'database health changed before rollback'
   wait_for_listener_ready || die 'bound listener is not ready before rollback'
   require_latest_sqlpatch APPLY "$TASK_DIR/rollback-precheck-sqlpatch.log"
+  dictionary_probe "$TASK_DIR/rollback-precheck-dictionary.log"
 }
 
 stage_rollback_binary() {
@@ -678,11 +873,7 @@ SQL
   [ "$opatch_rc" -eq 0 ] || die "OPatch rollback failed with exit code $opatch_rc"
   if inventory_has_patch "$TASK_DIR/rollback-after-lspatches.log"; then die "OPatch returned success but patch $PATCH_ID remains in binary inventory"; fi
   rm -f "$TASK_DIR/binary-state-unknown"; : >"$TASK_DIR/binary-state-known"
-  cat <<'SQL' | sqlplus_fixed "$ORACLE_SID"
-whenever sqlerror exit failure
-startup;
-exit;
-SQL
+  startup_database
   wait_for_pmon_state up || die 'database PMON did not return after binary rollback'
   listener_action start
   cat <<'SQL' | sqlplus_fixed "$ORACLE_SID" >/dev/null
@@ -707,18 +898,15 @@ stage_rollback_datapatch() {
   load_binding; verify_source_apply; verify_rollback_procedure; verify_recovery; verify_open_window
   if inventory_has_patch "$TASK_DIR/rollback-datapatch-lspatches.log"; then die 'rollback datapatch refused because the binary patch remains installed'; fi
   current_health "$TASK_DIR/rollback-datapatch-pre-health.log" || die 'database is not healthy for rollback datapatch'
-  # See stage_datapatch() for why -noqi is required; pass patch id so -noqi is not eaten.
-  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "ORACLE_SID=$ORACLE_SID" "PATH=$ORACLE_HOME_TARGET/bin:$ORACLE_HOME_TARGET/OPatch:/usr/bin:/bin" "$ORACLE_HOME_TARGET/OPatch/datapatch" -verbose -rollback "$PATCH_ID" -noqi
+  run_native_datapatch ROLLBACK
 }
 
 stage_rollback_final_validate() {
-  local invalid maximum_invalid
   load_binding; verify_source_apply; verify_rollback_procedure
   if inventory_has_patch "$TASK_DIR/rollback-final-lspatches.log"; then die "patch $PATCH_ID remains in final binary inventory"; fi
   current_health "$TASK_DIR/rollback-final-health.log" || die 'database rollback final health check failed'
   wait_for_listener_ready || die 'listener rollback final validation failed'
-  invalid=$(probe_value INVALID_OBJECTS "$TASK_DIR/rollback-final-health.log"); maximum_invalid=$(jq -r '.database.maximum_invalid_objects' "$(jq -r '.source_documents.policy.path' "$PLAN_FILE")")
-  [[ "$invalid" =~ ^[0-9]+$ ]] && [ "$invalid" -le "$maximum_invalid" ] || die 'invalid-object count exceeds the sealed policy after rollback'
+  require_healthy_dictionary "$TASK_DIR/rollback-final-dictionary.log"
   require_latest_sqlpatch ROLLBACK "$TASK_DIR/rollback-final-sqlpatch.log"
 }
 
@@ -791,6 +979,40 @@ emit_evidence() {
   stdout_sha=$(opu_hash_file "$TASK_DIR/stdout.log"); stderr_sha=$(opu_hash_file "$TASK_DIR/stderr.log"); tmp="$TASK_DIR/evidence.tmp"
   jq -cn --arg collector "$EXECUTOR_COLLECTOR" --arg intent "$EXECUTOR_INTENT" --arg plan "$PLAN_ID" --arg task "$TASK_ID" --arg plan_sha "$PLAN_SHA" --arg status "$status" --arg postcondition "$postcondition" --arg detail "$detail" --arg outcome_class "$outcome_class" --arg started "$STARTED_AT" --arg finished "$finished" --arg actor "$ACTOR" --arg stage "$STAGE" --arg database "$DATABASE" --arg oracle_home "$ORACLE_HOME_TARGET" --arg owner "$ORACLE_OWNER" --arg sid "${ORACLE_SID:-}" --arg patch "$PATCH_ID" --arg artifact_sha "$ARTIFACT_SHA" --arg recovery_sha "${RECOVERY_FILE_SHA:-}" --arg recovery_record "${RECOVERY_RECORD_SHA:-}" --arg source_plan_sha "${SOURCE_APPLY_PLAN_SHA:-}" --arg source_evidence_sha "${SOURCE_APPLY_EVIDENCE_SHA:-}" --arg source_evidence_record "${SOURCE_APPLY_EVIDENCE_RECORD_SHA:-}" --arg stdout "$TASK_DIR/stdout.log" --arg stdout_sha "$stdout_sha" --arg stderr "$TASK_DIR/stderr.log" --arg stderr_sha "$stderr_sha" --argjson exit_code "$exit_code" \
     '{schema_version:"1.0",collector:{name:$collector,version:"1"},intent:$intent,plan_id:$plan,task_id:$task,plan_sha256:$plan_sha,status:$status,postcondition:{status:$postcondition,detail:$detail},outcome_class:$outcome_class,started_at:$started,finished_at:$finished,exit_code:$exit_code,actor:$actor,stage:$stage,target:{database_unique_name:$database,oracle_home:$oracle_home,owner:$owner,oracle_sid:(if $sid == "" then null else $sid end)},patch:{patch_id:$patch,artifact_sha256:$artifact_sha},recovery:{manifest_sha256:(if $recovery_sha == "" then null else $recovery_sha end),record_sha256:(if $recovery_record == "" then null else $recovery_record end)},logs:{stdout:{path:$stdout,sha256:$stdout_sha},stderr:{path:$stderr,sha256:$stderr_sha}}} + (if $intent == "patch_rollback" then {source_apply:{plan_sha256:$source_plan_sha,final_evidence_sha256:$source_evidence_sha,final_evidence_record_sha256:$source_evidence_record}} else {} end)' >"$tmp"
+  # Preserve bounded reporting observations already collected by this stage.
+  # The heartbeat log remains mutable and is never included in this manifest.
+  opu_python - "$TASK_DIR" <<'PY_REPORT_ARTIFACTS' || return $?
+import hashlib, json, os, re, stat, sys
+task = sys.argv[1]
+manifest = os.path.join(task, "sql-artifacts.json")
+artifacts = json.load(open(manifest)) if os.path.isfile(manifest) else []
+known = {item["path"]: item["sha256"] for item in artifacts}
+allowed = re.compile(r"(?:(?:precheck|final|rollback-precheck|rollback-final)-(?:lspatches|health|dictionary)|precheck-sqlpatch|rollback-precheck-sqlpatch|sqlpatch-final|rollback-final-sqlpatch|report-listener)\.log\Z")
+for name in sorted(os.listdir(task)):
+    if not allowed.fullmatch(name): continue
+    path = os.path.join(task, name)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 16 * 1024 * 1024:
+            raise SystemExit("unsafe reporting artifact")
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            data = stream.read(16 * 1024 * 1024 + 1)
+        after, named = os.fstat(fd), os.lstat(path)
+        identity = lambda entry: (entry.st_dev, entry.st_ino, entry.st_size, entry.st_mtime_ns)
+        if len(data) > 16 * 1024 * 1024 or identity(info) != identity(after) or identity(info) != identity(named):
+            raise SystemExit("reporting artifact changed while hashing")
+        digest = hashlib.sha256(data).hexdigest()
+        if path in known and known[path] != digest: raise SystemExit("reporting artifact changed")
+        known[path] = digest
+    finally: os.close(fd)
+with open(os.path.join(task, "reporting-artifacts.json"), "x", encoding="utf-8") as stream:
+    json.dump([{"path": path, "sha256": sha} for path, sha in sorted(known.items())], stream)
+PY_REPORT_ARTIFACTS
+  if jq -e 'length > 0' "$TASK_DIR/reporting-artifacts.json" >/dev/null; then
+    jq --slurpfile artifacts "$TASK_DIR/reporting-artifacts.json" '.artifacts=$artifacts[0]' "$tmp" >"$tmp.sql"
+    mv "$tmp.sql" "$tmp"
+  fi
   opu_execution_seal_attempt "$tmp" || return $?
   canonical=$(jq -cS . "$tmp"); record_sha=$(opu_hash_string "$canonical"); jq --arg record_sha "$record_sha" '.record_sha256=$record_sha' "$tmp" >"$TASK_DIR/evidence.json"; rm -f "$tmp"
 }

@@ -12,6 +12,15 @@ export class RunStartError extends Error {
   }
 }
 
+export class RunOutcomeUnknownError extends Error {
+  constructor(runId, record) {
+    super(`Run ${runId} has an unknown outcome. Inspect and reconcile it before starting more work.`);
+    this.name = "RunOutcomeUnknownError";
+    this.runId = runId;
+    this.record = record;
+  }
+}
+
 export async function startRun(url, body) {
   const res = await apiFetch(url, {
     method: "POST",
@@ -43,7 +52,7 @@ export async function pollRun(runId, { onTick, intervalMs = 1200, signal = getRe
     }
     if (onTick) onTick(record);
     if (record.status === "unknown") {
-      throw new Error(`Run ${runId} has an unknown outcome. An operator must reconcile it before starting more work.`);
+      throw new RunOutcomeUnknownError(runId, record);
     }
     if (record.status === "succeeded" || record.status === "failed") return record;
     await sleep(intervalMs);

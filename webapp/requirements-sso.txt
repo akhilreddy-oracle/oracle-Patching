@@ -1,0 +1,2 @@
+# Optional company-login dependency; the lab app runs without OIDC configured.
+PyJWT[crypto]==2.14.0

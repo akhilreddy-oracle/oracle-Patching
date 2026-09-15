@@ -19,6 +19,13 @@ Arbitrary remote shell execution is deliberately outside the design.
 
 ## Current phase
 
+The application enhancements include a guided backup-to-patch workflow,
+actionable readiness findings, fleet filters, persistent execution observations,
+verified evidence reports, optional configurable company login and an approval
+inbox. See [application enhancements](docs/APPLICATION_ENHANCEMENTS.md) for the
+supported scope and [release validation](docs/RELEASE_VALIDATION.md) for the
+fixture, live lab and production evidence levels.
+
 Architecture and delivery decomposition are complete. The current build has
 read-only discovery, evidence reconciliation, artifact/procedure validation,
 OPatch compatibility, policy readiness, verified recovery evidence, and typed

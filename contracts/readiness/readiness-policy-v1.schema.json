@@ -2,12 +2,86 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Oracle patch readiness policy v1",
   "type": "object",
-  "required": ["schema_version", "maximum_snapshot_age_seconds", "require_xml_inventory", "recovery", "database"],
+  "required": [
+    "schema_version",
+    "maximum_snapshot_age_seconds",
+    "require_xml_inventory",
+    "recovery",
+    "database"
+  ],
   "properties": {
-    "schema_version": {"const": "1.0"},
-    "maximum_snapshot_age_seconds": {"type": "integer", "minimum": 1},
-    "require_xml_inventory": {"type": "boolean"},
-    "recovery": {"type": "object"},
-    "database": {"type": "object"}
+    "schema_version": {
+      "const": "1.0"
+    },
+    "maximum_snapshot_age_seconds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "require_xml_inventory": {
+      "type": "boolean"
+    },
+    "recovery": {
+      "type": "object",
+      "properties": {
+        "require_backup": {
+          "type": "boolean"
+        },
+        "storage_mode": {
+          "enum": [
+            "fra",
+            "filesystem"
+          ]
+        },
+        "capacity_basis": {
+          "enum": [
+            "allocated",
+            "rman_unused_blocks"
+          ]
+        },
+        "minimum_filesystem_free_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_backup_age_minutes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "minimum_fra_free_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "require_guaranteed_restore_point": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "storage_mode"
+            ],
+            "properties": {
+              "storage_mode": {
+                "const": "filesystem"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "require_backup",
+              "minimum_filesystem_free_bytes"
+            ],
+            "properties": {
+              "require_backup": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "database": {
+      "type": "object"
+    }
   }
 }

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Bounded, sealed-plan recovery of inherited standalone service locks.
+set -euo pipefail
+umask 077
+export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/python.sh"
+opu_python "$ROOT/lib/opu/lock_recovery.py" "$@"

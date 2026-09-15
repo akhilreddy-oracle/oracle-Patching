@@ -102,8 +102,14 @@ def check_runtime_contracts(validate_payload) -> list[str]:
                     malformed["files"] = "missing evidence files"
                 if not validate_payload(schema, malformed, label):
                     errors.append(f"{label}: validator accepted missing required evidence or wrong shape")
+                if label == "standalone precheck execution":
+                    invalid_artifact = copy.deepcopy(payload)
+                    invalid_artifact["artifacts"] = [{"path": "/fixture/log", "sha256": "invalid"}]
+                    if not validate_payload(schema, invalid_artifact, label):
+                        errors.append("standalone evidence accepted an invalid artifact digest")
     except Exception as exc:
-        errors.append(f"runtime contract generation failed: {exc}")
+        detail = getattr(exc, "stderr", "")
+        errors.append(f"runtime contract generation failed: {exc}" + (f": {detail[-2000:]}" if detail else ""))
     return errors
 
 

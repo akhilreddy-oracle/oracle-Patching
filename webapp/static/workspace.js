@@ -7,13 +7,7 @@ import { renderPlanStage } from "./stages/plan.js";
 import { renderExecuteStage } from "./stages/execute.js";
 import { renderRecoveryStage } from "./stages/recovery.js";
 
-const STAGES = [
-  { id: "discover", label: "Discover", hint: "Live SSH · phases A–E" },
-  { id: "readiness", label: "Readiness", hint: "Reconcile → evaluate" },
-  { id: "plan", label: "Plan", hint: "Seal · approve · authorize" },
-  { id: "execute", label: "Execute", hint: "Dispatch · tasks" },
-  { id: "recovery", label: "Recovery", hint: "RMAN evidence" },
-];
+import { WIZARD_STAGES as STAGES, wizardContext, targetSummary } from "./patch_wizard.js";
 
 export async function renderWorkspace(mount, hostId, stage) {
   mount.innerHTML = "";
@@ -24,10 +18,11 @@ export async function renderWorkspace(mount, hostId, stage) {
     el("div", { class: "ws-header-text" }, [
       el("p", { class: "ws-kicker", text: "Patching workspace" }),
       el("h1", { class: "ws-title", text: hostId }),
-      el("p", { class: "ws-sub", text: "Live discovery, readiness gates, sealed plan, then execute — one host at a time." }),
+      el("p", { class: "ws-sub", text: "Select the target and patch, validate recovery, review the sealed plan, then apply and verify." }),
     ]),
   ]);
   mount.appendChild(header);
+  mount.appendChild(targetSummary(wizardContext(stageStatuses.steps, hostId)));
 
   const rail = el("nav", { class: "stage-rail", "aria-label": "Lifecycle" });
   for (const s of STAGES) {
@@ -68,7 +63,9 @@ async function loadStageStatuses(hostId) {
   try {
     const res = await apiFetch(`/api/hosts/${encodeURIComponent(hostId)}/pipeline`);
     const data = await res.json();
+    if (!res.ok) throw new Error(data.message || "Could not load host evidence");
     const steps = data.steps || [];
+    out.steps = steps;
     const byId = Object.fromEntries(steps.map((s) => [s.step, s]));
 
     const disc = byId.discovery;

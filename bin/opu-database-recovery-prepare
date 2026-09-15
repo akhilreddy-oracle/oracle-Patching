@@ -8,6 +8,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/execution.sh"
 
 STATE_ROOT=${OPU_RECOVERY_PREP_STATE_DIR:-/var/lib/oracle-patching-utility/recovery-preparations}
 MAX_WINDOW_SECONDS=86400
@@ -58,9 +59,9 @@ as_owner() {
   local owner=$1
   shift
   if constrained_test_mode || [ "$(id -un)" = "$owner" ]; then
-    "$@"
+    "$@" 6>&-
   else
-    runuser -u "$owner" -- "$@"
+    runuser -u "$owner" -- "$@" 6>&-
   fi
 }
 
@@ -123,12 +124,24 @@ load_request() {
   verify_source_request
 }
 
+load_mutating_request() {
+  local request_id=$1 directory
+  valid_id "$request_id" request-id || die 'invalid request-id'
+  directory=$(request_dir "$request_id")
+  [ -d "$directory" ] && [ ! -L "$directory" ] || die 'recovery request directory is unavailable or unsafe'
+  # Persistent inode, checked before and after flock by the shared helper.
+  # All mutation entry points take this lock before reading mutable state.
+  # as_owner closes fd6 for Oracle commands so daemons cannot retain it.
+  opu_execution_lock_file "$directory/operation.lock" 6 || die 'another operation owns this recovery request or its lock file is unsafe'
+  load_request "$request_id"
+}
+
 update_request() {
-  local filter=$1
+  local filter=$1 tmp="$REQUEST_FILE.tmp.$$"
   shift
-  jq "$@" "$filter | del(.record_sha256)" "$REQUEST_FILE" >"$REQUEST_FILE.tmp"
-  mv "$REQUEST_FILE.tmp" "$REQUEST_FILE"
-  seal_file "$REQUEST_FILE"
+  jq "$@" "$filter | del(.record_sha256)" "$REQUEST_FILE" >"$tmp"
+  seal_file "$tmp"
+  mv "$tmp" "$REQUEST_FILE"
 }
 
 set_execution_phase() {
@@ -165,6 +178,7 @@ verify_bound_inputs() {
   [ -f "$snapshot" ] && [ -f "$policy" ] || die 'bound snapshot or policy is missing'
   [ "$(sha_file "$snapshot")" = "$snapshot_sha" ] || die 'bound snapshot digest changed'
   [ "$(sha_file "$policy")" = "$policy_sha" ] || die 'bound policy digest changed'
+  opu_python "$ROOT/lib/opu/recovery_capacity.py" policy --policy "$policy" || die 'bound recovery capacity policy is invalid'
   jq -e '.schema_version == "1.0" and .collector.name == "oracle.topology.discover"' "$snapshot" >/dev/null || die 'bound topology snapshot is invalid'
   max_age=$(jq -r '.maximum_snapshot_age_seconds // empty' "$policy")
   [[ "$max_age" =~ ^[0-9]+$ ]] && [ "$max_age" -ge 60 ] && [ "$max_age" -le 86400 ] || die 'policy snapshot maximum age is invalid'
@@ -217,6 +231,21 @@ cleanup_execution_lock() {
   fi
 }
 
+acquire_host_lock() {
+  # Fixture isolation must not change the production host-wide lock identity.
+  if constrained_test_mode && [ -z "${OPU_EXECUTION_LOCK_DIR:-}" ]; then
+    OPU_EXECUTION_LOCK_DIR="$STATE_ROOT/host-locks"
+  fi
+  opu_execution_host_lock || die 'another Oracle operation owns the shared host lock'
+}
+
+bind_request_target() {
+  ORACLE_HOME_TARGET=$(jq -r '.target.oracle_home' "$REQUEST_FILE")
+  ORACLE_OWNER=$(jq -r '.target.owner' "$REQUEST_FILE")
+  ORACLE_SID=$(jq -r '.target.oracle_sid' "$REQUEST_FILE")
+  DATABASE_UNIQUE=$(jq -r '.target.database_unique_name' "$REQUEST_FILE")
+}
+
 run_sql_file() {
   local oracle_home_target=$1 owner=$2 sid=$3 input=$4 output=$5
   as_owner "$owner" env \
@@ -226,7 +255,7 @@ run_sql_file() {
 }
 
 probe_live_database() {
-  local output=$1 sql_file="$REQUEST_DIR/evidence/live-probe.sql" line extra
+  local output=$1 sql_file="${PREFLIGHT_WORK_DIR:-$REQUEST_DIR/evidence}/live-probe.sql" line extra
   cat >"$sql_file" <<'SQL'
 whenever sqlerror exit failure
 set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
@@ -260,18 +289,42 @@ resolve_central_inventory() {
   safe_path "$CENTRAL_INVENTORY_PATH" central-inventory-canonical
 }
 
+measure_capacity() {
+  local backup_parent=$1 work_dir=${PREFLIGHT_WORK_DIR:-$REQUEST_DIR/evidence} policy sql_file output_file
+  policy=$(jq -r '.policy.path' "$REQUEST_FILE")
+  sql_file="$work_dir/capacity-probe.sql"; output_file="$work_dir/capacity-probe.log"
+  cat >"$sql_file" <<'SQL'
+whenever sqlerror exit failure
+set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
+-- OPU_RECOVERY_PREP_CAPACITY
+select 'META|' || (select value from v$parameter where name='compatible') || '|' ||
+       (select count(*) from v$restore_point where guarantee_flashback_database='YES') || '|' ||
+       (select dbid from v$database) || '|' || (select count(*) from v$datafile) || '|' ||
+       (select nvl(sum(bytes),0) from v$datafile) || '|' ||
+       (select nvl(sum(block_size*file_size_blks),0) from v$controlfile)
+  from dual;
+select 'FILE|' || v.file# || '|' || v.bytes || '|' || d.bytes || '|' || t.extent_management || '|' ||
+       f.free_bytes || '|' || d.status || '|' || d.online_status || '|' || t.status || '|' ||
+       v.name || '|' || d.file_id
+  from v$datafile v left join dba_data_files d on d.file_id=v.file#
+       left join dba_tablespaces t on t.tablespace_name=d.tablespace_name
+       left join (select file_id,sum(bytes) free_bytes from dba_free_space group by file_id) f on f.file_id=v.file#
+ order by v.file#;
+exit;
+SQL
+  run_sql_file "$ORACLE_HOME_TARGET" "$ORACLE_OWNER" "$ORACLE_SID" "$sql_file" "$output_file" || die 'live recovery capacity query failed'
+  CAPACITY_JSON=$(opu_python "$ROOT/lib/opu/recovery_capacity.py" measure --policy "$policy" \
+    --probe "$output_file" --database-bytes "$LIVE_DATABASE_BYTES" --dbid "$LIVE_DBID" \
+    --home "$ORACLE_HOME_TARGET" --inventory "$CENTRAL_INVENTORY_PATH" \
+    --backup-parent "$backup_parent" --spfile "$LIVE_SPFILE") || die 'backup capacity cannot be proven'
+  CAPACITY_AVAILABLE_BYTES=$(jq -r '.available_bytes' <<<"$CAPACITY_JSON")
+  CAPACITY_REQUIRED_BYTES=$(jq -r '.required_bytes' <<<"$CAPACITY_JSON")
+}
+
 check_capacity() {
-  local backup_parent=$1 available_kb available_bytes oracle_home_kb inventory_kb required_bytes
-  available_kb=$(df -Pk "$backup_parent" | awk 'NR==2 {print $4}')
-  oracle_home_kb=$(du -sk "$ORACLE_HOME_TARGET" | awk '{print $1}')
-  inventory_kb=$(du -sk "$CENTRAL_INVENTORY_PATH" | awk '{print $1}')
-  [[ "$available_kb" =~ ^[0-9]+$ ]] && [[ "$oracle_home_kb" =~ ^[0-9]+$ ]] || die 'backup capacity cannot be determined'
-  [[ "$inventory_kb" =~ ^[0-9]+$ ]] || die 'Central Inventory capacity cannot be determined'
-  available_bytes=$((available_kb * 1024))
-  required_bytes=$(((LIVE_DATABASE_BYTES + (oracle_home_kb + inventory_kb) * 1024) * 120 / 100))
-  [ "$available_bytes" -ge "$required_bytes" ] || die "insufficient backup capacity: required=$required_bytes available=$available_bytes"
-  CAPACITY_AVAILABLE_BYTES=$available_bytes
-  CAPACITY_REQUIRED_BYTES=$required_bytes
+  measure_capacity "$1"
+  printf '%s\n' "$CAPACITY_JSON" >"$REQUEST_DIR/evidence/capacity.json"
+  jq -e '.admitted == true' <<<"$CAPACITY_JSON" >/dev/null || die "insufficient backup capacity: required=$CAPACITY_REQUIRED_BYTES available=$CAPACITY_AVAILABLE_BYTES"
 }
 
 verify_backup_location() {
@@ -289,7 +342,7 @@ verify_backup_location() {
     [ -n "$backup_device" ] && [ -n "$home_device" ] || die 'filesystem identity cannot be determined'
     [ "$backup_device" != "$home_device" ] || die 'policy requires backup storage on a distinct filesystem'
   fi
-  sql_file="$REQUEST_DIR/evidence/database-files.sql"; output_file="$REQUEST_DIR/evidence/database-files.log"
+  sql_file="${PREFLIGHT_WORK_DIR:-$REQUEST_DIR/evidence}/database-files.sql"; output_file="${PREFLIGHT_WORK_DIR:-$REQUEST_DIR/evidence}/database-files.log"
   cat >"$sql_file" <<'SQL'
 whenever sqlerror exit failure
 set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
@@ -377,6 +430,7 @@ create_request() {
   verify_window_shape "$window_start" "$window_end"
   jq -e '.schema_version == "1.0" and .collector.name == "oracle.topology.discover" and .cluster.status == "unavailable" and (.cluster.nodes | length == 0)' "$snapshot" >/dev/null || die 'snapshot is not a standalone-database topology'
   jq -e '.schema_version == "1.0" and (.maximum_snapshot_age_seconds | type == "number")' "$policy" >/dev/null || die 'policy contract is invalid'
+  opu_python "$ROOT/lib/opu/recovery_capacity.py" policy --policy "$policy" || die 'recovery capacity policy is invalid'
   count=$(jq -r --arg database "$database" '[.databases[] | select(.db_unique_name == $database)] | length' "$snapshot")
   [ "$count" -eq 1 ] || die 'snapshot must contain exactly one requested database'
   oracle_home_target=$(jq -r --arg database "$database" '.databases[] | select(.db_unique_name == $database) | .oracle_home // empty' "$snapshot")
@@ -416,35 +470,84 @@ create_request() {
   cat "$REQUEST_FILE"
 }
 
-analyze_request() {
-  local request_id='' status=passed reason='' backup_parent backup_root
+analyze_request() (
+  local request_id='' status=passed reason='' backup_parent backup_root analysis_tmp rc capacity=null
+  local ORACLE_HOME_TARGET ORACLE_OWNER ORACLE_SID DATABASE_UNIQUE
   [ "$#" -eq 2 ] && [ "$1" = --request-id ] || { usage >&2; exit 64; }
   request_id=$2; load_request "$request_id"
-  if ! (verify_bound_inputs) 2>/dev/null; then status=blocked; reason='bound snapshot, policy, freshness, or window is invalid'; fi
-  if [ "$status" = passed ] && ! (resolve_snapshot_target) 2>/dev/null; then status=blocked; reason='sealed target no longer matches snapshot'; fi
   backup_parent=$(jq -r '.backup.parent' "$REQUEST_FILE"); backup_root=$(jq -r '.backup.root' "$REQUEST_FILE")
-  if [ "$status" = passed ] && { [ ! -d "$backup_parent" ] || [ -L "$backup_parent" ]; }; then status=blocked; reason='backup parent is unavailable'; fi
-  if [ "$status" = passed ] && [ -e "$backup_root" ]; then status=blocked; reason='derived backup root already exists'; fi
-  jq -cn --arg request_id "$request_id" --arg status "$status" --arg reason "$reason" --arg root "$backup_root" '{schema_version:"1.0",request_id:$request_id,status:$status,reason:(if $reason == "" then null else $reason end),backup_root:$root}'
+  analysis_tmp=$(mktemp -d "${TMPDIR:-/tmp}/opu-recovery-analysis.XXXXXX")
+  trap 'rm -rf -- "$analysis_tmp"' EXIT
+  # The child has its own errexit scope. SQL and filesystem probes only write
+  # to disposable scratch; neither the request nor its evidence is modified.
+  set +e
+  (
+    set -e
+    require_root; verify_bound_inputs; resolve_snapshot_target
+    [ -d "$backup_parent" ] && [ ! -L "$backup_parent" ] || die 'backup parent is unavailable'
+    [ ! -e "$backup_root" ] || die 'derived backup root already exists'
+    PREFLIGHT_WORK_DIR=$analysis_tmp
+    bind_request_target
+    probe_live_database "$analysis_tmp/live-probe.log" || die 'live database identity probe failed'
+    [ "$LIVE_DATABASE" = "$DATABASE_UNIQUE" ] && [ "$LIVE_SID" = "$ORACLE_SID" ] || die 'live database identity differs from request'
+    [ "$LIVE_ROLE" = PRIMARY ] && [ "$LIVE_OPEN_MODE" = 'READ WRITE' ] && [ "$LIVE_LOG_MODE" = NOARCHIVELOG ] && [ "$LIVE_INSTANCE_STATUS" = OPEN ] || die 'recovery preparation requires an OPEN PRIMARY READ WRITE NOARCHIVELOG database'
+    [ -n "$LIVE_SPFILE" ] || die 'database is not using an SPFILE'
+    resolve_central_inventory
+    measure_capacity "$backup_parent"
+    printf '%s\n' "$CAPACITY_JSON" >"$analysis_tmp/capacity.json"
+    verify_backup_location "$backup_parent"
+  ) >"$analysis_tmp/output.log" 2>"$analysis_tmp/error.log"
+  rc=$?
+  set -e
+  if [ -f "$analysis_tmp/capacity.json" ]; then capacity=$(cat "$analysis_tmp/capacity.json"); fi
+  if [ "$rc" -ne 0 ]; then
+    status=blocked; reason=$(tail -n1 "$analysis_tmp/error.log")
+    [ -n "$reason" ] || reason='live preflight could not be completed'
+  elif ! jq -e '.admitted == true' <<<"$capacity" >/dev/null; then
+    status=blocked; reason='insufficient backup filesystem capacity including overhead and policy reserve'
+  fi
+  jq -cn --slurpfile request "$REQUEST_FILE" --arg at "$(opu_now_utc)" --arg request_id "$request_id" --arg status "$status" --arg reason "$reason" --arg root "$backup_root" --argjson capacity "$capacity" \
+    '{schema_version:"1.0",request_id:$request_id,status:$status,analyzed_at:$at,source_request:$request[0].source_request,source_snapshot:$request[0].source_snapshot,policy:$request[0].policy,target:$request[0].target,reason:(if $reason == "" then null else $reason end),backup_root:$root,capacity:$capacity}'
   [ "$status" = passed ] || exit 2
-}
+)
 
 approve_request() {
-  local request_id='' actor='' ticket=''
+  local request_id='' actor='' ticket='' analysis reason analyzed_at now max_age
   while [ "$#" -gt 0 ]; do case "$1" in --request-id) request_id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; --approval-ticket) ticket=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
-  require_root; load_request "$request_id"
+  require_root; load_mutating_request "$request_id"
   valid_id "$actor" actor || die 'invalid actor'; valid_id "$ticket" approval-ticket || die 'invalid approval-ticket'
   [ "$(jq -r '.state' "$REQUEST_FILE")" = awaiting_approval ] || die 'request is not awaiting approval'
   [ "$actor" != "$(jq -r '.requester' "$REQUEST_FILE")" ] || die 'requester cannot approve its own recovery preparation'
   verify_bound_inputs; resolve_snapshot_target
-  update_request '.state="approved" | .approval={actor:$actor,ticket:$ticket,approved_at:$at}' --arg actor "$actor" --arg ticket "$ticket" --arg at "$(opu_now_utc)"
+  # Approval always performs its own read-only native probes. A cached web
+  # result, a previous successful analysis, or a direct CLI call cannot skip
+  # capacity, SPFILE and live target checks. No services are stopped here.
+  if ! analysis=$(analyze_request --request-id "$request_id"); then
+    reason=$(jq -r '.reason // "native analysis failed"' <<<"$analysis" 2>/dev/null) || reason='native analysis failed'
+    die "recovery analysis must pass before approval: $reason"
+  fi
+  load_request "$request_id"
+  [ "$(jq -r '.state' "$REQUEST_FILE")" = awaiting_approval ] || die 'request changed while approval analysis was running'
+  verify_bound_inputs; resolve_snapshot_target
+  jq -e --slurpfile request "$REQUEST_FILE" '
+    .status == "passed" and .capacity.admitted == true and
+    .request_id == $request[0].request_id and .source_request == $request[0].source_request and
+    .source_snapshot == $request[0].source_snapshot and .policy == $request[0].policy and
+    .target == $request[0].target and .backup_root == $request[0].backup.root
+  ' <<<"$analysis" >/dev/null || die 'approval analysis is not bound to the immutable recovery request'
+  analyzed_at=$(epoch "$(jq -r '.analyzed_at' <<<"$analysis")") || die 'approval analysis timestamp is invalid'
+  now=$(date -u +%s)
+  max_age=$(jq -r '.maximum_snapshot_age_seconds' "$(jq -r '.policy.path' "$REQUEST_FILE")")
+  [ "$analyzed_at" -le "$now" ] && [ $((now - analyzed_at)) -le "$max_age" ] || die 'approval analysis is stale or future-dated'
+  update_request '.state="approved" | .approval={actor:$actor,ticket:$ticket,approved_at:$at,analysis:$analysis}' \
+    --arg actor "$actor" --arg ticket "$ticket" --arg at "$(opu_now_utc)" --argjson analysis "$analysis"
   cat "$REQUEST_FILE"
 }
 
 authorize_request() {
   local request_id='' actor='' approver requester
   while [ "$#" -gt 0 ]; do case "$1" in --request-id) request_id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
-  require_root; load_request "$request_id"; valid_id "$actor" actor || die 'invalid actor'
+  require_root; load_mutating_request "$request_id"; valid_id "$actor" actor || die 'invalid actor'
   [ "$(jq -r '.state' "$REQUEST_FILE")" = approved ] || die 'request is not approved'
   approver=$(jq -r '.approval.actor' "$REQUEST_FILE"); requester=$(jq -r '.requester' "$REQUEST_FILE")
   [ "$actor" != "$approver" ] && [ "$actor" != "$requester" ] || die 'authorizer must differ from requester and approver'
@@ -459,14 +562,14 @@ restore_services_after_failure() {
   printf '%s\n' 'whenever sqlerror exit failure' 'alter database open;' 'exit;' >"$open_sql"
   if ! run_sql_file "$ORACLE_HOME_TARGET" "$ORACLE_OWNER" "$ORACLE_SID" "$open_sql" "$REQUEST_DIR/evidence/failure-open.log"; then
     printf '%s\n' 'whenever sqlerror exit failure' 'startup;' 'exit;' >"$startup_sql"
-    run_sql_file "$ORACLE_HOME_TARGET" "$ORACLE_OWNER" "$ORACLE_SID" "$startup_sql" "$REQUEST_DIR/evidence/failure-startup.log" || true
+    run_sql_file "$ORACLE_HOME_TARGET" "$ORACLE_OWNER" "$ORACLE_SID" "$startup_sql" "$REQUEST_DIR/evidence/failure-startup.log" 7>&- || true
   fi
   if probe_live_database "$health_file" && [ "$LIVE_DATABASE" = "$DATABASE_UNIQUE" ] && [ "$LIVE_OPEN_MODE" = 'READ WRITE' ] && [ "$LIVE_INSTANCE_STATUS" = OPEN ]; then health_ok=1; fi
   listener_name=${LISTENER_NAME:-}
   if [ "${LISTENER_WAS_RUNNING:-0}" = 1 ] && [ -n "$listener_name" ]; then
     listener_log="$REQUEST_DIR/evidence/failure-listener-start.log"
     if ! as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" status "$listener_name" >"$listener_log" 2>&1; then
-      as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" start "$listener_name" >>"$listener_log" 2>&1 || listener_ok=0
+      as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" start "$listener_name" 7>&- >>"$listener_log" 2>&1 || listener_ok=0
     fi
     if [ "$listener_ok" -eq 1 ]; then
       as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" status "$listener_name" >>"$listener_log" 2>&1 || listener_ok=0
@@ -519,18 +622,16 @@ execute_request() {
   local inventory_path inventory_parent inventory_name oracle_parent oracle_name tag post_snapshot post_reconciliation recovery_evidence topology_tool
   local oracle_group lock_key listener_pre_log listener_expected listener_services_sha
   while [ "$#" -gt 0 ]; do case "$1" in --request-id) request_id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
-  require_root; load_request "$request_id"; valid_id "$actor" actor || die 'invalid actor'
+  require_root; load_mutating_request "$request_id"; valid_id "$actor" actor || die 'invalid actor'
   state=$(jq -r '.state' "$REQUEST_FILE")
   if [ "$state" = completed ]; then cat "$REQUEST_FILE"; return; fi
   [ "$state" = authorized ] || die 'request is not execution-authorized'
   [ "$actor" = "$(jq -r '.authorization.actor' "$REQUEST_FILE")" ] || die 'execution actor differs from the sealed authorizer'
   verify_bound_inputs; resolve_snapshot_target; verify_open_window
-  ORACLE_HOME_TARGET=$(jq -r '.target.oracle_home' "$REQUEST_FILE")
-  ORACLE_OWNER=$(jq -r '.target.owner' "$REQUEST_FILE")
-  ORACLE_SID=$(jq -r '.target.oracle_sid' "$REQUEST_FILE")
-  DATABASE_UNIQUE=$(jq -r '.target.database_unique_name' "$REQUEST_FILE")
+  bind_request_target
   oracle_group=$(id -gn "$ORACLE_OWNER" 2>/dev/null || true)
   valid_id "$oracle_group" oracle-group || die 'Oracle owner primary group cannot be determined'
+  acquire_host_lock
   mkdir -p "$STATE_ROOT/locks"
   lock_key=$(printf '%s|%s' "$ORACLE_HOME_TARGET" "$DATABASE_UNIQUE" | sha256sum | awk '{print $1}')
   LOCK_DIR="$STATE_ROOT/locks/$lock_key.lock"
@@ -563,7 +664,7 @@ execute_request() {
     listener_services_sha=$(sha_file "$listener_expected")
   fi
   LISTENER_EXPECTED_SERVICES=$listener_expected
-  update_request '.state="running" | .execution={actor:$actor,started_at:$at,phase:"initializing",capacity:{required_bytes:$required,available_bytes:$available},listener:(if $listener == "" then null else $listener end),listener_pre_stop:(if $listener_log == "" then null else {log:{path:$listener_log,sha256:$listener_log_sha},services:{path:$services,sha256:$services_sha}} end)}' --arg actor "$actor" --arg at "$(opu_now_utc)" --argjson required "$CAPACITY_REQUIRED_BYTES" --argjson available "$CAPACITY_AVAILABLE_BYTES" --arg listener "$LISTENER_NAME" --arg listener_log "$listener_pre_log" --arg listener_log_sha "$(if [ -n "$listener_pre_log" ]; then sha_file "$listener_pre_log"; fi)" --arg services "$listener_expected" --arg services_sha "$listener_services_sha"
+  update_request '.state="running" | .execution={actor:$actor,started_at:$at,phase:"initializing",capacity:$capacity,listener:(if $listener == "" then null else $listener end),listener_pre_stop:(if $listener_log == "" then null else {log:{path:$listener_log,sha256:$listener_log_sha},services:{path:$services,sha256:$services_sha}} end)}' --arg actor "$actor" --arg at "$(opu_now_utc)" --argjson capacity "$CAPACITY_JSON" --arg listener "$LISTENER_NAME" --arg listener_log "$listener_pre_log" --arg listener_log_sha "$(if [ -n "$listener_pre_log" ]; then sha_file "$listener_pre_log"; fi)" --arg services "$listener_expected" --arg services_sha "$listener_services_sha"
   EXECUTION_SUCCEEDED=0; MUTATION_STARTED=0; CURRENT_PHASE=initializing
   trap 'execute_exit_trap $?' EXIT
   mkdir "$backup_root"
@@ -620,7 +721,7 @@ EOF
   mv "$backup_root/inventory/${inventory_name}.tar.gz.tmp" "$backup_root/inventory/${inventory_name}.tar.gz"
   set_execution_phase mount
   mount_sql="$REQUEST_DIR/evidence/mount.sql"; printf '%s\n' 'whenever sqlerror exit failure' 'startup mount;' 'exit;' >"$mount_sql"
-  run_sql_file "$ORACLE_HOME_TARGET" "$ORACLE_OWNER" "$ORACLE_SID" "$mount_sql" "$REQUEST_DIR/evidence/mount.log"
+  run_sql_file "$ORACLE_HOME_TARGET" "$ORACLE_OWNER" "$ORACLE_SID" "$mount_sql" "$REQUEST_DIR/evidence/mount.log" 7>&-
   mount_check_sql="$REQUEST_DIR/evidence/mount-check.sql"
   cat >"$mount_check_sql" <<'SQL'
 whenever sqlerror exit failure
@@ -649,7 +750,7 @@ SQL
   open_sql="$REQUEST_DIR/evidence/open.sql"; printf '%s\n' 'whenever sqlerror exit failure' 'alter database open;' 'exit;' >"$open_sql"
   run_sql_file "$ORACLE_HOME_TARGET" "$ORACLE_OWNER" "$ORACLE_SID" "$open_sql" "$REQUEST_DIR/evidence/open.log"
   if [ "$LISTENER_WAS_RUNNING" -eq 1 ]; then
-    as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" start "$LISTENER_NAME" >"$REQUEST_DIR/evidence/listener-start.log" 2>&1
+    as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" start "$LISTENER_NAME" 7>&- >"$REQUEST_DIR/evidence/listener-start.log" 2>&1
   else printf '%s\n' 'No target-home listener needed restoration.' >"$REQUEST_DIR/evidence/listener-start.log"; fi
   register_sql="$REQUEST_DIR/evidence/register.sql"; printf '%s\n' 'whenever sqlerror exit failure' 'alter system register;' 'exit;' >"$register_sql"
   run_sql_file "$ORACLE_HOME_TARGET" "$ORACLE_OWNER" "$ORACLE_SID" "$register_sql" "$REQUEST_DIR/evidence/register.log"
@@ -682,10 +783,10 @@ SQL
       safe_path "$topology_tool" test-topology-tool
       [ -x "$topology_tool" ] || die 'test topology tool is not executable'
     fi
-    "$topology_tool" --output "$post_snapshot" --pretty >"$REQUEST_DIR/evidence/post-backup-discovery.log"
-    "$ROOT/bin/opu-snapshot-reconcile" --snapshot "$post_snapshot" --output "$post_reconciliation" >"$REQUEST_DIR/evidence/post-backup-reconcile.log"
+    "$topology_tool" --output "$post_snapshot" --pretty 6>&- >"$REQUEST_DIR/evidence/post-backup-discovery.log"
+    "$ROOT/bin/opu-snapshot-reconcile" --snapshot "$post_snapshot" --output "$post_reconciliation" 6>&- >"$REQUEST_DIR/evidence/post-backup-reconcile.log"
     jq -e '.status == "consistent"' "$post_reconciliation" >/dev/null || die 'fresh post-backup topology did not reconcile'
-    "$ROOT/bin/opu-recovery-evidence-collect" --snapshot "$post_snapshot" --database "$DATABASE_UNIQUE" --backup-root "$backup_root" --output "$recovery_evidence" >"$REQUEST_DIR/evidence/recovery-collector.log"
+    "$ROOT/bin/opu-recovery-evidence-collect" --snapshot "$post_snapshot" --database "$DATABASE_UNIQUE" --backup-root "$backup_root" --output "$recovery_evidence" 6>&- >"$REQUEST_DIR/evidence/recovery-collector.log"
     jq -e '.status == "passed"' "$recovery_evidence" >/dev/null || die 'prepared recovery set failed deep validation'
   else
     constrained_test_mode || die 'post-backup validation cannot be skipped outside a constrained test state'
@@ -700,13 +801,10 @@ SQL
 reconcile_request() {
   local request_id='' actor='' lock_key owner_file owner_pid final_state restored=false
   while [ "$#" -gt 0 ]; do case "$1" in --request-id) request_id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) usage >&2; exit 64;; esac; done
-  require_root; load_request "$request_id"; valid_id "$actor" actor || die 'invalid actor'
+  require_root; load_mutating_request "$request_id"; valid_id "$actor" actor || die 'invalid actor'
   [ "$(jq -r '.state' "$REQUEST_FILE")" = running ] || die 'only an interrupted running request can be reconciled'
   [ "$actor" = "$(jq -r '.authorization.actor' "$REQUEST_FILE")" ] || die 'reconciliation actor differs from the sealed authorizer'
-  ORACLE_HOME_TARGET=$(jq -r '.target.oracle_home' "$REQUEST_FILE")
-  ORACLE_OWNER=$(jq -r '.target.owner' "$REQUEST_FILE")
-  ORACLE_SID=$(jq -r '.target.oracle_sid' "$REQUEST_FILE")
-  DATABASE_UNIQUE=$(jq -r '.target.database_unique_name' "$REQUEST_FILE")
+  bind_request_target
   configure_listener_timeout
   LISTENER_NAME=$(jq -r '.execution.listener // empty' "$REQUEST_FILE")
   LISTENER_WAS_RUNNING=0; [ -n "$LISTENER_NAME" ] && LISTENER_WAS_RUNNING=1
@@ -718,6 +816,7 @@ reconcile_request() {
     jq -cn --arg request_id "$request_id" --argjson pid "$owner_pid" '{schema_version:"1.0",request_id:$request_id,status:"in_progress",owner_pid:$pid}'
     exit 2
   fi
+  acquire_host_lock
   LOCK_OWNED=0
   if [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ]; then LOCK_OWNED=1; fi
   if restore_services_after_failure; then final_state=failed_services_restored; restored=true; else final_state=recovery_required; fi

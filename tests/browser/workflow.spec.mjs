@@ -1,0 +1,166 @@
+import { test, expect } from './fixtures.mjs';
+
+const main = page => page.locator('#app');
+
+test('recovery target requirements distinguish native SPFILE analysis from unsupported or stale discovery', async ({ page, fixture }) => {
+  await page.goto('/#/hosts/source/recovery');
+  await expect(main(page).getByRole('button', { name: 'Create live recovery request', exact: true })).toBeEnabled();
+  await expect(main(page).locator('.recovery-capability')).toContainText('Unknown: discovery does not collect SPFILE use');
+  await expect(main(page).locator('.recovery-capability')).toContainText('Database is using an SPFILE');
+  for (const [label, observed, required, next] of [
+    ['Log mode', 'ARCHIVELOG', 'NOARCHIVELOG', 'Select a database supported by this recovery adapter'],
+    ['Discovery freshness', 'Expired', 'Fresh saved discovery', 'Run Discover for this host'],
+  ]) {
+    fixture.recoveryCapabilities = [{ database: 'ORCL', status: 'blocked', can_create: false,
+      requirements: [{ label, observed, required, status: 'blocked', next_action: next }], next_action: next }];
+    await page.reload();
+    await expect(main(page).getByRole('button', { name: 'Create live recovery request', exact: true })).toBeDisabled();
+    const capability = main(page).locator('.recovery-capability');
+    await expect(capability).toContainText('Preparation blocked');
+    await expect(capability).toContainText(observed);
+    await expect(capability).toContainText(required);
+    await expect(capability).toContainText(next);
+  }
+  fixture.recoveryCapabilities = [];
+  await page.reload();
+  await expect(main(page).getByRole('button', { name: 'Create live recovery request', exact: true })).toBeDisabled();
+  await expect(main(page).locator('.recovery-capability')).toContainText('Capability unknown');
+  expect(fixture.writes).toEqual([]);
+});
+
+test('wizard reviews target, verified README and Advanced fields before accepting a maintenance window', async ({ page, fixture }, testInfo) => {
+  await page.goto('/#/hosts/source/readiness');
+  const view = main(page);
+  await expect(view.getByText('LIVE · managed host over SSH', { exact: true })).toBeVisible();
+  await expect(view.getByRole('region', { name: 'Selected patch target', exact: true }).getByText('Oracle home: /fixture/oracle/dbhome_1', { exact: true })).toBeVisible();
+  await expect(view.getByRole('combobox', { name: 'Database unique name', exact: true })).toHaveValue('ORCL');
+  await expect(view.getByLabel('Required OPatch', { exact: true })).toHaveValue('12.2.0.1.49');
+  await expect(view.getByLabel('Mandatory prechecks', { exact: true })).not.toBeVisible();
+  await view.getByText('Advanced settings — procedure contract', { exact: true }).click();
+  await expect(view.getByLabel('Mandatory prechecks', { exact: true })).toBeVisible();
+  await expect(view.locator('.readiness-finding')).toContainText('ActualUnknown — evidence not supplied');
+  await expect(view.locator('.readiness-finding')).toContainText('RequiredBackup age ≤ 1440 minutes');
+  await page.screenshot({ path: testInfo.outputPath('readiness-wizard.png'), fullPage: true });
+  await view.locator('.stage-rail').getByRole('link', { name: 'Plan', exact: false }).click();
+  await expect(view.getByText('README bound to validated procedure', { exact: true })).toBeVisible();
+  await expect(view.getByLabel('Plan ID', { exact: true })).not.toBeVisible();
+  await view.getByLabel('Window start (UTC)', { exact: true }).fill('2030-01-01T10:00:00');
+  await view.getByRole('button', { name: 'Create plan', exact: true }).click();
+  await expect(view.getByText(/Use complete UTC timestamps/)).toBeVisible();
+  expect(fixture.writes).toEqual([]);
+  await page.screenshot({ path: testInfo.outputPath('plan-review.png'), fullPage: true });
+});
+
+test('fleet filters preserve unknown and stale evidence instead of displaying compliant green status', async ({ page, fixture }, testInfo) => {
+  await page.goto('/#/estate');
+  const fleet = main(page).locator('.fleet-dashboard');
+  await expect(fleet.getByRole('row')).toHaveCount(4);
+  const stale = fleet.getByRole('row').filter({ hasText: 'OLD' });
+  await expect(stale).toContainText('unknown');
+  await expect(stale).not.toContainText('ready_for_approval');
+  await fleet.getByLabel('Environment', { exact: true }).selectOption('unknown');
+  await expect(fleet.getByRole('row')).toHaveCount(2);
+  await expect(fleet.getByRole('row').filter({ hasText: 'UNKNOWN' })).toContainText('Observation time unknown');
+  await fleet.getByLabel('Environment', { exact: true }).selectOption('all');
+  await fleet.getByLabel('Backup freshness', { exact: true }).selectOption('missing');
+  await expect(fleet.getByRole('row')).toHaveCount(2);
+  await expect(fleet.getByRole('link', { name: 'Review backup', exact: true })).toHaveAttribute('href', '#/hosts/source/recovery');
+  expect(fixture.writes).toEqual([]);
+  await page.screenshot({ path: testInfo.outputPath('fleet-compliance.png'), fullPage: true });
+});
+
+test('backup preparation keeps analysis and approval gates, then confirms selected evidence for readiness', async ({ page, fixture }, testInfo) => {
+  const request = { request_id: 'backup-browser', host_id: 'source', mode: 'live', state: 'awaiting_approval', requester: 'fixture-requester', target: { database_unique_name: 'ORCL', oracle_home: '/fixture/oracle/dbhome_1' }, analysis: { status: 'blocked', reason: 'Insufficient filesystem capacity' } };
+  fixture.recoveries.push(request);
+  await page.goto('/#/recovery/backup-browser');
+  await expect(main(page).getByRole('button', { name: 'Approve', exact: true })).toBeDisabled();
+  await expect(main(page).getByText('Insufficient filesystem capacity', { exact: true })).toBeVisible();
+  request.state = 'completed';
+  request.result = { recovery_evidence: { path: '/fixture/recovery-evidence.json' } };
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'POST' && url.pathname.endsWith('/recovery-collect')) {
+      fixture.steps.at(-1).recovery_selection = { request_id: request.request_id, host_id: 'source', policy: fixture.policy };
+      fixture.runs.collect = { run_id: 'collect', status: 'succeeded', result: { status: 'passed' } };
+      await send({ run_id: 'collect' }, 202); return true;
+    }
+    return false;
+  };
+  await page.goto('/#/hosts/source/recovery');
+  await main(page).getByRole('button', { name: 'Validate for patch planning', exact: true }).click();
+  await expect(main(page).locator('.recovery-selection')).toContainText('Selected request: backup-browser');
+  await main(page).getByRole('link', { name: 'Continue to readiness evaluation →', exact: true }).click();
+  await expect(main(page).getByRole('button', { name: 'Use selected backup policy', exact: true })).toBeVisible();
+  expect(fixture.writes.map(row => row.path)).toEqual(['/api/hosts/source/pipeline/recovery-collect']);
+  await page.screenshot({ path: testInfo.outputPath('selected-backup.png'), fullPage: true });
+});
+
+test('unknown backup outcome survives reconnect and permits record inspection without relaunch', async ({ page, fixture }) => {
+  const request = { request_id: 'backup-unknown', host_id: 'source', mode: 'live', state: 'authorized', latest_run: { run_id: 'run-disconnect', status: 'unknown', error: { message: 'Connection lost after launch' }, context: { request_id: 'backup-unknown' } } };
+  fixture.recoveries.push(request);
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'POST' && url.pathname === '/api/runs/run-disconnect/reconcile') {
+      request.latest_run.status = 'failed'; request.state = 'recovery_required';
+      await send(request.latest_run); return true;
+    } return false;
+  };
+  await page.goto('/#/recovery/backup-unknown');
+  await page.reload();
+  await expect(main(page).getByText('Connection lost after launch', { exact: true })).toBeVisible();
+  await expect(main(page).getByRole('button', { name: 'Execute', exact: true })).toHaveCount(0);
+  await main(page).getByRole('button', { name: 'Inspect and reconcile', exact: true }).click();
+  expect(fixture.writes.map(row => row.path)).toEqual(['/api/runs/run-disconnect/reconcile']);
+});
+
+test('approval inbox separates review from execution and flags self-requested work', async ({ page, fixture }, testInfo) => {
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'GET' && url.pathname === '/api/approvals') {
+      await send({ actor: 'fixture-operator', items: [{ id: 'review-1', kind: 'plan', state: 'awaiting_approval', requester: 'fixture-operator', self_requested: true, host_id: 'source', target: { database_unique_name: 'ORCL' } }] }); return true;
+    } return false;
+  };
+  await page.goto('/#/approvals');
+  await expect(main(page).getByRole('heading', { name: 'Approval inbox', exact: true })).toBeVisible();
+  await expect(main(page).getByText(/An independent approver is required/)).toBeVisible();
+  await expect(main(page).getByRole('link', { name: 'Review request', exact: true })).toHaveAttribute('href', '#/plans/review-1');
+  expect(fixture.writes).toEqual([]);
+  await page.screenshot({ path: testInfo.outputPath('approval-inbox.png'), fullPage: true });
+});
+
+test('execution dashboard retains unknown outcome, distinguishes heartbeat, and exports only verified report facts', async ({ page, fixture }, testInfo) => {
+  const now = Math.floor(Date.now() / 1000);
+  const run = { run_id: 'patch-run', status: 'unknown', can_observe: true, elapsed_seconds: 120, controller_poll: { observed_at: now, state: 'disconnected' }, observation: { remote_clock: now, received_at: now, worker_heartbeat: { available: true, last_renewed_at: now - 30, task_status: 'pending' }, logs: { 'stdout.log': { text: 'Fixture native datapatch validation output', truncated: false } } }, context: { plan_id: 'patch-browser', task_id: '005-final-validate-local' }, error: { message: 'Native terminal result remains unverified' } };
+  const tasks = [{ task_id: '002-apply-source', stage: 'apply', node: 'source', status: 'succeeded', claimed_at_epoch: now - 1000, completed_at_epoch: now - 800, evidence_verified: true }, { task_id: '004-datapatch-local', stage: 'datapatch', node: 'local', status: 'succeeded', claimed_at_epoch: now - 500, completed_at_epoch: now - 300, evidence_verified: true }, { task_id: '005-final-validate-local', stage: 'final_validate', node: 'local', status: 'pending', evidence_verified: false }];
+  const dashboard = { state: 'paused', tasks, runs: [run], timeline: [{ at: now, event: 'unknown', message: 'Connection lost; reconcile the existing run.', task_id: '005-final-validate-local' }], guidance: 'Inspect and reconcile the interrupted run. Applying the patch again is blocked.' };
+  const report = { plan_id: 'patch-browser', after_scope: 'Partial task evidence', interpretation: 'Final validation is incomplete; this is not a completed patch report.', comparison: [
+    { label: 'SQL patch status', before: { status: 'verified', value: 'Absent' }, after: { status: 'verified', value: 'APPLY SUCCESS', source: { label: 'Datapatch task evidence' } } },
+    { label: 'Listener health', before: { status: 'verified', value: 'READY' }, after: { status: 'unknown', value: 'unverified text must not appear' } },
+  ], rollback: { status: 'unknown', reason: 'Native eligibility has not been verified.' }, gaps: [{ source: 'final validation', reason: 'Pending task' }] };
+  fixture.plans.push({ plan_id: 'patch-browser', host_id: 'source', state: 'paused', intent: 'patch_apply', patch_id: '39034528', requester: 'fixture-requester', unresolved_run: run, maintenance_window: { start: '2030-01-01T10:00:00Z', end: '2030-01-01T14:00:00Z' } });
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'GET' && url.pathname === '/api/plans/patch-browser/tasks') { await send({ tasks }); return true; }
+    if (method === 'GET' && url.pathname === '/api/plans/patch-browser/execution') { await send(dashboard); return true; }
+    if (method === 'GET' && url.pathname === '/api/plans/patch-browser/report') { await send(report); return true; }
+    if (method === 'POST' && url.pathname === '/api/plans/patch-browser/execution-observe') {
+      fixture.runs.observe = { run_id: 'observe', status: 'succeeded', result: { status: 'observed' } };
+      await send({ run_id: 'observe' }, 202); return true;
+    } return false;
+  };
+  await page.goto('/#/plans/patch-browser');
+  const view = main(page);
+  await expect(view.getByRole('heading', { name: 'Execution dashboard', exact: true })).toBeVisible();
+  await expect(view.getByRole('list', { name: 'Persistent task timeline', exact: true })).toContainText('final_validate');
+  await expect(view.getByRole('button', { name: 'Execute remaining tasks', exact: true })).toHaveCount(0);
+  await view.getByText('Native logs · bounded and redacted', { exact: true }).click();
+  await expect(view.getByText('Fixture native datapatch validation output', { exact: true })).toBeVisible();
+  await view.getByRole('button', { name: 'Refresh native logs', exact: true }).click();
+  await expect(view.getByText(/Native lease last renewed/)).toBeVisible();
+  await view.getByRole('button', { name: 'View before and after report', exact: true }).click();
+  await expect(view.getByRole('row').filter({ hasText: 'Listener health' })).toContainText('Unknown');
+  await expect(view.getByText('unverified text must not appear', { exact: true })).toHaveCount(0);
+  const downloadPromise = page.waitForEvent('download');
+  await view.getByRole('button', { name: 'Export evidence JSON', exact: true }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe('patch-browser-evidence.json');
+  await download.saveAs(testInfo.outputPath('patch-browser-evidence.json'));
+  expect(fixture.writes.map(row => row.path)).toEqual(['/api/plans/patch-browser/execution-observe']);
+  await page.screenshot({ path: testInfo.outputPath('execution-dashboard.png'), fullPage: true });
+});

@@ -72,6 +72,30 @@ class PlanError(Exception):
         return payload
 
 
+def _redacted_diagnostic(text: str) -> str:
+    # Redact before truncating so a long credential cannot lose its identifying
+    # prefix at the tail boundary.
+    diagnostic = re.sub(r"(?i)(\bBearer\s+)\S+", r"\1[REDACTED]", text)
+    diagnostic = re.sub(
+        r"(?i)(\b(?:password|passwd|pwd|token|secret|api[_-]?key)\b[\"']?\s*(?:[:=]\s*|\s+))"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1[REDACTED]", diagnostic,
+    )
+    return diagnostic.strip()[-4000:]
+
+
+def _unverified_remote_terminal(returncode: int, verified, stderr: str) -> PlanError:
+    """Retain bounded diagnostics without treating an unclaimed task as finished."""
+    task_status = verified.get("status") if isinstance(verified, dict) else None
+    if task_status not in {"pending", "running", "unknown", "succeeded", "failed"}:
+        task_status = "unknown"
+    return PlanError(
+        "remote exit exists but sealed task has no verified terminal result",
+        stderr=_redacted_diagnostic(stderr),
+        result={"exit_code": returncode, "task_status": task_status},
+    )
+
+
 def validate_plan_id(plan_id: str) -> str:
     if not plan_id or not _ID_RE.match(plan_id):
         raise PlanError(f"plan_id contains unsupported characters: {plan_id!r}")
@@ -327,7 +351,32 @@ def next_task(plan_id: str) -> dict | None:
 
 def status(plan_id: str) -> dict:
     validate_plan_id(plan_id)
-    return _with_host_identity(_run(["status", "--plan-id", plan_id]))
+    plan = _with_host_identity(_run(["status", "--plan-id", plan_id]))
+    key = f"plan:{plan_id}:execute"
+    # These registry reads do not take the registry file lock: status is also
+    # called while the existing reconciliation endpoint holds that lock.
+    run_id = pipeline_runner.active_run_id(key)
+    record = pipeline_runner.get_run(run_id) if run_id else None
+    run = record.to_json() if record is not None else None
+    if run and run.get("key") == key and run.get("status") in {"unknown", "reconciling"}:
+        error = run.get("error") or {}
+        diagnostic = {}
+        if isinstance(error, dict):
+            diagnostic = {name: _redacted_diagnostic(error[name]) for name in ("error", "message", "stderr") if isinstance(error.get(name), str)}
+            result = error.get("result")
+            if isinstance(result, dict):
+                values = {}
+                if isinstance(result.get("exit_code"), int) and not isinstance(result["exit_code"], bool):
+                    values["exit_code"] = result["exit_code"]
+                if isinstance(result.get("task_status"), str):
+                    values["task_status"] = _redacted_diagnostic(result["task_status"])[:64]
+                if values:
+                    diagnostic["result"] = values
+        plan["unresolved_run"] = {
+            "run_id": run["run_id"], "status": run["status"],
+            "context": run.get("context") or {}, "error": diagnostic,
+        }
+    return plan
 
 
 def _read_sealed_actor(plan_id: str, name: str) -> str | None:
@@ -789,6 +838,7 @@ def _execute_live(plan_id: str, plan: dict, task: dict, actor: str) -> dict:
             "supported adapters: " + ", ".join(sorted(LIVE_EXECUTOR_BY_ADAPTER))
         )
     host = _resolve_live_host_for_task(plan, task)
+    pipeline_runner.record_event('task_selected', 'Preparing the next sealed task', task_id=task['task_id'], stage=task.get('stage'), node=task.get('node'))
     remote_root = _sync_plan_to_host(host, plan_id)
     remote_executor = f"{host['remote_root'].rstrip('/')}/{rel_executor}"
     remote_argv = [
@@ -796,6 +846,8 @@ def _execute_live(plan_id: str, plan: dict, task: dict, actor: str) -> dict:
         "execute", "--plan-id", plan_id, "--task-id", task["task_id"],
         "--actor", actor, "--lease-seconds", "3600",
     ]
+    pipeline_runner.set_execution_context(task_definition_sha256=task.get('task_definition_sha256'),
+                                          task_retry_count=task.get('retry_count', 0))
     returncode, stdout, stderr = _run_detached_remote(host, plan_id, task["task_id"], remote_argv)
 
     try:
@@ -805,12 +857,13 @@ def _execute_live(plan_id: str, plan: dict, task: dict, actor: str) -> dict:
 
     verified = _run(["task-status", "--plan-id", plan_id, "--task-id", task["task_id"]])
     if not isinstance(verified, dict) or verified.get("status") not in {"succeeded", "failed"}:
-        raise PlanError("remote exit exists but sealed task has no verified terminal result")
+        raise _unverified_remote_terminal(returncode, verified, stderr)
     if (returncode == 0) != (verified["status"] == "succeeded"):
         raise PlanError("remote exit contradicts the verified terminal task result")
     if status(plan_id).get("state") == "succeeded":
         _run(["reconcile", "--plan-id", plan_id, "--actor", actor])
     pipeline_runner.set_execution_context(detached_terminal=True)
+    pipeline_runner.record_event('task_verified', 'Native task result and evidence verified', task_id=task['task_id'], status=verified['status'])
     return _parse_executor_result(task["task_id"], returncode, stdout, stderr)
 
 
@@ -855,6 +908,7 @@ def _run_detached_remote(host: dict, plan_id: str, task_id: str, remote_argv: li
         host_id=host.get("id"), ssh_alias=ssh_alias,
         remote_root=host["remote_root"], remote_run_dir=run_dir,
     )
+    pipeline_runner.record_event('remote_launch', 'Launching the sealed worker', task_id=task_id, node=host.get('node_name') or host.get('id'))
     try:
         launched = remote.run_remote_shell(ssh_alias, launch, timeout=LIVE_POLL_SSH_TIMEOUT_SECONDS, sudo=sudo)
     except remote.RemoteError as exc:
@@ -881,6 +935,7 @@ def _run_detached_remote(host: dict, plan_id: str, task_id: str, remote_argv: li
             if polled.returncode != 0:
                 raise remote.RemoteError("ssh_poll_failed", f"poll exited {polled.returncode}", stderr=polled.stderr)
         except remote.RemoteError as exc:
+            pipeline_runner.controller_poll('contact_lost')
             ssh_failures += 1
             if ssh_failures >= LIVE_POLL_MAX_CONSECUTIVE_SSH_FAILURES:
                 raise PlanError(
@@ -892,6 +947,7 @@ def _run_detached_remote(host: dict, plan_id: str, task_id: str, remote_argv: li
         ssh_failures = 0
         lines = polled.stdout.strip().splitlines()
         state = lines[0] if lines else ""
+        pipeline_runner.controller_poll(state.lower() or 'unknown')
         if state == "RC":
             try:
                 returncode = int((lines[1] if len(lines) > 1 else "").strip() or "1")
@@ -960,7 +1016,7 @@ def reconcile_detached_run(record: dict) -> dict:
         _sync_plan_from_host(host, plan_id, _remote_plan_root(host))
         verified = _run(["task-status", "--plan-id", plan_id, "--task-id", task_id])
         if not isinstance(verified, dict) or verified.get("status") not in {"succeeded", "failed"}:
-            raise PlanError("remote exit exists but sealed task has no verified terminal result")
+            return {"status": "unknown", "error": _unverified_remote_terminal(returncode, verified, stderr).to_json()}
         if (returncode == 0) != (verified["status"] == "succeeded"):
             raise PlanError("remote exit contradicts verified task custody")
         if status(plan_id).get("state") == "succeeded":

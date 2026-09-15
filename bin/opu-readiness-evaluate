@@ -6,10 +6,11 @@ umask 077
 export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/recovery_evidence.sh"
 
-RECONCILIATION=""; ARTIFACT=""; PROCEDURE=""; COMPATIBILITY=""; POLICY=""; OUT=""; DATAGUARD=""
+RECONCILIATION=""; ARTIFACT=""; PROCEDURE=""; COMPATIBILITY=""; POLICY=""; OUT=""; DATAGUARD=""; RECOVERY=""
 declare -a SNAPSHOTS=() GATES=()
-usage() { printf '%s\n' 'Usage: opu-readiness-evaluate --reconciliation ABSOLUTE_JSON --snapshot ABSOLUTE_JSON [--snapshot ABSOLUTE_JSON ...] --artifact ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON --compatibility ABSOLUTE_JSON --policy ABSOLUTE_JSON [--dataguard ABSOLUTE_JSON] [--output ABSOLUTE_JSON]'; }
+usage() { printf '%s\n' 'Usage: opu-readiness-evaluate --reconciliation ABSOLUTE_JSON --snapshot ABSOLUTE_JSON [--snapshot ABSOLUTE_JSON ...] --artifact ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON --compatibility ABSOLUTE_JSON --policy ABSOLUTE_JSON [--dataguard ABSOLUTE_JSON] [--recovery-evidence ABSOLUTE_JSON] [--output ABSOLUTE_JSON]'; }
 gate() { GATES+=("$1|$2|$3"); }
 require_file() { local f=$1 label=$2; opu_validate_absolute_path "$f" "$label" || exit $?; [ -f "$f" ] && [ ! -L "$f" ] || { echo "$label is missing or symbolic link: $f" >&2; exit 66; }; }
 parse() {
@@ -17,12 +18,13 @@ parse() {
     --reconciliation) RECONCILIATION=${2:-}; shift 2;; --snapshot) SNAPSHOTS+=("${2:-}"); shift 2;;
     --artifact) ARTIFACT=${2:-}; shift 2;; --procedure-validation) PROCEDURE=${2:-}; shift 2;;
     --compatibility) COMPATIBILITY=${2:-}; shift 2;; --policy) POLICY=${2:-}; shift 2;;
-    --dataguard) DATAGUARD=${2:-}; shift 2;;
+    --dataguard) DATAGUARD=${2:-}; shift 2;; --recovery-evidence) RECOVERY=${2:-}; shift 2;;
     --output) OUT=${2:-}; shift 2;; -h|--help) usage; exit 0;; *) usage >&2; exit 64;; esac; done
   [ "${#SNAPSHOTS[@]}" -gt 0 ] || { usage >&2; exit 64; }
   for pair in "$RECONCILIATION|reconciliation" "$ARTIFACT|artifact" "$PROCEDURE|procedure-validation" "$COMPATIBILITY|compatibility" "$POLICY|policy"; do require_file "${pair%%|*}" "${pair#*|}"; done
   for f in "${SNAPSHOTS[@]}"; do require_file "$f" snapshot; done
   [ -z "$DATAGUARD" ] || require_file "$DATAGUARD" dataguard-evaluation
+  [ -z "$RECOVERY" ] || require_file "$RECOVERY" recovery-evidence
   [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
   command -v jq >/dev/null || { echo 'jq is required' >&2; exit 69; }
 }
@@ -33,10 +35,21 @@ has_blocker() { local item; for item in "${GATES[@]}"; do [ "$(cut -d'|' -f2 <<<
 check_contracts() {
   jq -e '.schema_version == "1.0" and (.maximum_snapshot_age_seconds | type == "number" and . > 0) and (.require_xml_inventory | type == "boolean") and (.recovery.require_backup | type == "boolean") and (.recovery.max_backup_age_minutes | type == "number" and . >= 0) and (.recovery.minimum_fra_free_bytes | type == "number" and . >= 0) and (.recovery.require_guaranteed_restore_point | type == "boolean") and (.database.require_primary_read_write | type == "boolean") and (.database.maximum_invalid_objects | type == "number" and . >= 0)' "$POLICY" >/dev/null || { echo 'readiness policy violates the v1 contract' >&2; exit 65; }
   jq -e '.schema_version == "1.0" and (.status == "ready_for_planning") and (.procedure.patch_id | test("^[0-9]{1,20}$")) and (.procedure.artifact_sha256 | test("^[a-f0-9]{64}$")) and (.procedure.target.platform_id | test("^[0-9]+$"))' "$PROCEDURE" >/dev/null || { echo 'procedure validation result is not ready or lacks a sealed platform' >&2; exit 65; }
+  jq -e '.recovery |
+    (if has("storage_mode") then (.storage_mode | IN("fra","filesystem")) else true end) and
+    (if has("capacity_basis") then (.capacity_basis | IN("allocated","rman_unused_blocks")) else true end) and
+    (if has("minimum_filesystem_free_bytes") then (.minimum_filesystem_free_bytes | type == "number" and . >= 0 and floor == .) else .storage_mode != "filesystem" end) and
+    (if .storage_mode == "filesystem" then .require_backup == true else true end)
+  ' "$POLICY" >/dev/null || { echo 'readiness recovery storage policy is invalid' >&2; exit 65; }
+  if [ "$(jq -r '.recovery.storage_mode // "fra"' "$POLICY")" = filesystem ]; then
+    jq -e '.procedure.target.family == "database" and .procedure.target.topology == "single_instance"' "$PROCEDURE" >/dev/null || {
+      echo 'filesystem recovery currently requires a standalone database procedure' >&2; exit 65;
+    }
+  fi
 }
 target_homes() { local snapshot=$1; if [ "$TARGET_FAMILY" = grid ]; then jq -r '[.cluster.grid_home] | .[] | select(type == "string" and length > 0) | [. , "grid"] | @tsv' "$snapshot"; else jq -r '.databases[] | [.oracle_home, .db_unique_name] | @tsv' "$snapshot"; fi; }
 check_recovery() {
-  local snapshot=$1 host=$2 db=$3 require_backup max_age min_free require_grp age limit used free grp
+  local snapshot=$1 host=$2 db=$3 require_backup max_age min_free require_grp age limit used free grp mode home owner detail
   require_backup=$(jq -r '.recovery.require_backup' "$POLICY"); max_age=$(jq -r '.recovery.max_backup_age_minutes' "$POLICY"); min_free=$(jq -r '.recovery.minimum_fra_free_bytes' "$POLICY"); require_grp=$(jq -r '.recovery.require_guaranteed_restore_point' "$POLICY")
   # Customer waiver: policy.require_backup=false skips backup, FRA, and GRP gates.
   if [ "$require_backup" = false ]; then
@@ -52,7 +65,20 @@ check_recovery() {
   [ "$age" -ge 0 ] 2>/dev/null && [ "$age" -le "$max_age" ] || gate recovery_backup blocker "$host database $db has no backup within policy age."
   # Both FRA limit and used bytes must be present and non-negative. Missing used
   # used to default to -1 and inflate free space (limit - (-1)); fail closed.
-  if [[ "$limit" =~ ^[0-9]+$ ]] && [[ "$used" =~ ^[0-9]+$ ]] && [ "$used" -le "$limit" ]; then
+  mode=$(jq -r '.recovery.storage_mode // "fra"' "$POLICY")
+  if [ "$mode" = filesystem ]; then
+    home=$(jq -r --arg db "$db" '.databases[] | select(.db_unique_name == $db) | .oracle_home' "$snapshot")
+    owner=$(jq -r --arg home "$home" '.oracle_homes[] | select(.path == $home) | .owner' "$snapshot")
+    if [ -z "$RECOVERY" ]; then
+      gate recovery_filesystem blocker "$host database $db requires a selected, validated filesystem recovery set. Prepare recovery, then validate it for patch planning."
+    elif ! jq -e --arg db "$db" --arg home "$home" --arg owner "$owner" '.target.database_unique_name == $db and .target.oracle_home == $home and .target.owner == $owner' "$RECOVERY" >/dev/null; then
+      gate recovery_filesystem blocker "$host database $db recovery evidence targets another database home or owner."
+    elif detail=$(verify_database_recovery_current "$RECOVERY" "$RECONCILIATION" "$POLICY" "$(date -u +%s)" 2>&1); then
+      gate recovery_filesystem pass "$host database $db has a current selected recovery set with validated database, Oracle home, inventory and filesystem reserve."
+    else
+      gate recovery_filesystem blocker "$host database $db: $detail"
+    fi
+  elif [[ "$limit" =~ ^[0-9]+$ ]] && [[ "$used" =~ ^[0-9]+$ ]] && [ "$used" -le "$limit" ]; then
     free=$((limit - used))
     [ "$free" -ge "$min_free" ] || gate recovery_fra blocker "$host database $db has insufficient FRA free capacity."
   else
@@ -171,6 +197,7 @@ emit() {
   snapshot_json=$(jq -cS 'sort_by(.path)' <<<"$snapshot_json")
   valid_at=$(iso_from_epoch "$earliest_valid") || valid_at=1970-01-01T00:00:00Z
   hashes=$(jq -cn --arg reconciliation "$(opu_hash_file "$RECONCILIATION")" --arg artifact "$(opu_hash_file "$ARTIFACT")" --arg procedure_validation "$(opu_hash_file "$PROCEDURE")" --arg compatibility "$(opu_hash_file "$COMPATIBILITY")" --arg policy "$(opu_hash_file "$POLICY")" '{reconciliation_sha256:$reconciliation,artifact_manifest_sha256:$artifact,procedure_validation_sha256:$procedure_validation,compatibility_sha256:$compatibility,policy_sha256:$policy}')
+  if [ -n "$RECOVERY" ]; then hashes=$(jq --arg sha "$(opu_hash_file "$RECOVERY")" '. + {recovery_sha256:$sha}' <<<"$hashes"); fi
   jq -cn --arg status "$status" --arg patch "$PATCH_ID" --arg family "$TARGET_FAMILY" --arg method "$TARGET_METHOD" --arg platform "$TARGET_PLATFORM" \
     --arg evaluated_at "$evaluated_at" --arg valid_until "$valid_at" --argjson snapshots "$snapshot_json" \
     --argjson gates "$(gate_json)" --argjson evidence "$hashes" \

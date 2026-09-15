@@ -4,6 +4,11 @@ printf '%s\n' "$*" >>"$OPU_TEST_OPATCH_CALLS"
 case "${1:-}" in
   version) printf '%s\n' 'OPatch Version: 12.2.0.1.51' ;;
   lspatches) [ -f "$OPU_TEST_PATCH_STATE" ] && printf '%s\n' '39034528;Database Release Update' || true ;;
+  lsinventory)
+    { [ "$#" -eq 5 ] || { [ "$#" -eq 7 ] && [ "$6" = -jdk ] && [ "$7" = "$ORACLE_HOME/jdk" ]; }; } && \
+      [ "$2" = -xml ] && [ -n "$3" ] && [ "$4" = -oh ] && [ "$5" = "$ORACLE_HOME" ] || exit 64
+    printf '<inventory><home>%s</home><patches>%s</patches></inventory>\n' "$ORACLE_HOME" "$(cat "$OPU_TEST_PATCH_STATE" 2>/dev/null || true)" >"$3"
+    ;;
   prereq)
     case "${2:-}" in
       CheckPatchApplicableOnCurrentPlatform)

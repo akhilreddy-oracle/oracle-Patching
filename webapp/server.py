@@ -19,9 +19,14 @@ import os
 import time
 
 import auth
+import company_auth
+import fleet
+import fleet_metadata
 import agent_queue
 import evidence
+import extjobctl
 import itsm
+import lockctl
 import notifications
 import pipeline_runner
 import pipeline_steps
@@ -158,13 +163,17 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "opu-webapp/0.1"
 
     def log_message(self, fmt, *args):  # keep default access logging, just tagged
-        print(f"[webapp] {self.address_string()} {fmt % args}", flush=True)
+        if urlparse(self.path).path.startswith("/auth/"):
+            print(f"[webapp] {self.address_string()} {self.command} {urlparse(self.path).path}", flush=True)
+        else:
+            print(f"[webapp] {self.address_string()} {fmt % args}", flush=True)
 
     def _send_json(self, status: int, payload) -> None:
         body = json.dumps(payload, indent=2, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -222,7 +231,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _require_api_auth(self) -> bool:
         try:
-            self._principal = auth.require_api_auth(self.headers.get("Authorization"))
+            self._company_session = None
+            if company_auth.configured() and (company_auth.cookie_value(self.headers.get("Cookie"), company_auth.SESSION_COOKIE)
+                                               or not self.headers.get("Authorization")):
+                self._company_session = company_auth.authenticate(self.headers.get("Cookie"), method=self.command,
+                    csrf=self.headers.get("X-CSRF-Token"), origin=self.headers.get("Origin"))
+                self._principal = self._company_session["actor"]
+            else:
+                self._principal = auth.require_api_auth(self.headers.get("Authorization"))
             asserted = self.headers.get("X-OPU-Actor")
             if self._principal and asserted and asserted != self._principal:
                 raise auth.AuthError("X-OPU-Actor does not match the authenticated principal", status=403)
@@ -233,6 +249,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(exc.to_json()).encode("utf-8")
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
             return False
@@ -243,7 +260,12 @@ class Handler(BaseHTTPRequestHandler):
             if principal and actor and actor != principal:
                 raise auth.AuthError("actor does not match the authenticated principal", status=403)
             actor = principal or actor
-            auth.require_role(actor, action)
+            if getattr(self, "_company_session", None):
+                roles = set(self._company_session["roles"])
+                if roles.isdisjoint(auth.ACTION_ROLES.get(action, set())):
+                    raise auth.AuthError("Company role does not permit this action", status=403)
+            else:
+                auth.require_role(actor, action)
             return True
         except auth.AuthError as exc:
             self._send_json(exc.status, exc.to_json())
@@ -256,9 +278,13 @@ class Handler(BaseHTTPRequestHandler):
             action = "agent" if path == "/api/agent/jobs" else "read"
         elif path.startswith("/api/agent/"):
             action = "agent"
+        elif path.startswith("/api/fleet/hosts/") and path.endswith("/metadata"):
+            action = "manage_fleet"
         elif "/pipeline/" in path or path.startswith("/api/runs/"):
             action = "execute"
-        elif path in {"/api/plans", "/api/plans/testmode-demo", "/api/recovery/testmode-demo"} or path.endswith("/create-rollback"):
+        elif path == "/api/auth/logout":
+            action = "read"
+        elif path in {"/api/plans", "/api/recovery", "/api/plans/testmode-demo", "/api/recovery/testmode-demo"} or path.endswith("/create-rollback"):
             action = "create"
         elif path.endswith("/approve"):
             action = "approve"
@@ -272,8 +298,42 @@ class Handler(BaseHTTPRequestHandler):
             action = "execute"
         return self._require_role(actor, action)
 
+    def _has_role(self, action: str) -> bool:
+        """Presentation hint only; every write still passes _authorize_path."""
+        company = getattr(self, "_company_session", None)
+        if company:
+            return not set(company["roles"]).isdisjoint(auth.ACTION_ROLES.get(action, set()))
+        actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
+        try:
+            auth.require_role(actor, action)
+            return True
+        except auth.AuthError:
+            return False
+
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         path = urlparse(self.path).path
+
+        if path in {"/api/auth/config", "/auth/login", "/auth/callback"}:
+            try:
+                if path == "/api/auth/config":
+                    self._send_json(200, company_auth.status())
+                    return
+                if path == "/auth/login":
+                    location, cookie_header = company_auth.login()
+                    cookies = [cookie_header]
+                else:
+                    cookies = company_auth.callback(parse_qs(urlparse(self.path).query, keep_blank_values=True), self.headers.get("Cookie"))
+                    location = "/"
+                self.send_response(303)
+                self.send_header("Location", location)
+                self.send_header("Cache-Control", "no-store")
+                for value in cookies:
+                    self.send_header("Set-Cookie", value)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except auth.AuthError as exc:
+                self._send_json(exc.status, exc.to_json())
+            return
 
         if path == "/api/health":
             # Unauthenticated liveness probe for monitoring.
@@ -288,7 +348,59 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in {"/api/auth/whoami", "/api/session"}:
             actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
-            self._send_json(200, auth.whoami(actor))
+            company = getattr(self, "_company_session", None)
+            self._send_json(200, {key: value for key, value in company.items() if key != "groups"} if company else auth.whoami(actor))
+            return
+
+        if path == "/api/fleet":
+            self._send_json(200, fleet.build(load_hosts(), can_manage_metadata=self._has_role("manage_fleet")))
+            return
+
+        if path == "/api/validation":
+            import release_status
+            self._send_json(200, release_status.status())
+            return
+
+        if path == "/api/approvals":
+            actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
+            items = []
+            for kind, records in (("plan", planctl.list_plans()), ("recovery", recoveryctl.list_requests())):
+                for item in records:
+                    if item.get("state") not in {"awaiting_approval", "approved"}:
+                        continue
+                    item_id = item.get("plan_id" if kind == "plan" else "request_id")
+                    items.append({"kind": kind, "id": item_id, "state": item["state"], "requester": item.get("requester"),
+                        "target": item.get("target"), "host_id": item.get("host_id"), "window": item.get("maintenance_window", item.get("window")),
+                        "next_action": "review_approval" if item["state"] == "awaiting_approval" else "review_authorization",
+                        "self_requested": bool(actor and item.get("requester") == actor)})
+            self._send_json(200, {"items": items, "actor": actor})
+            return
+
+        if path.startswith("/api/plans/") and path.endswith(("/execution", "/report")):
+            import execution_console
+            import evidence_reports
+            suffix = "/report" if path.endswith("/report") else "/execution"
+            plan_id = path[len("/api/plans/"):-len(suffix)]
+            try:
+                if suffix == "/execution":
+                    self._send_json(200, execution_console.snapshot(plan_id))
+                else:
+                    report = evidence_reports.build(plan_id)
+                    format_name = parse_qs(urlparse(self.path).query).get("format", ["json"])[0]
+                    if format_name == "json":
+                        self._send_json(200, report)
+                    else:
+                        content, content_type, filename = evidence_reports.export(report, format_name)
+                        payload = content.encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", content_type)
+                        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        self.wfile.write(payload)
+            except (planctl.PlanError, ValueError) as exc:
+                self._send_json(400, {"error": "report_unavailable", "message": str(exc)})
             return
 
         if path == "/api/production/status":
@@ -462,16 +574,33 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/recovery":
-            host_id = parse_qs(urlparse(self.path).query).get("host_id", [None])[0]
-            self._send_json(200, {"requests": recoveryctl.list_requests(host_id=host_id)})
+            host_values = parse_qs(urlparse(self.path).query, keep_blank_values=True).get("host_id", [])
+            if len(host_values) > 1 or (host_values and not host_values[0]):
+                self._send_json(400, {"error": "invalid_host", "message": "Provide one nonempty host_id"})
+                return
+            host_id = host_values[0] if host_values else None
+            if host_id is not None and self._resolved_host(host_id) is None:
+                self._send_json(404, {"error": "unknown_host", "message": "Unknown configured host"})
+                return
+            try:
+                targets = recoveryctl.target_capabilities(host_id) if host_id is not None else {}
+                self._send_json(200, {"requests": recoveryctl.list_requests(host_id=host_id), **recoveryctl.capability(), **targets})
+            except ValueError as exc:
+                self._send_json(400, {"error": "invalid_host", "message": str(exc)})
             return
 
         if path.startswith("/api/recovery/"):
             request_id = path[len("/api/recovery/"):]
             try:
-                self._send_json(200, recoveryctl.status(request_id))
+                recovery = recoveryctl.status(request_id)
+                runs = pipeline_runner.list_runs(key_prefix=f"recovery:{request_id}:")
+                recovery["latest_run"] = runs[0] if runs else None
+                recovery["active_run"] = next((run for run in runs if run.get("status") in {"queued", "running", "unknown", "reconciling"}), None)
+                self._send_json(200, recovery)
             except recoveryctl.RecoveryError as exc:
                 self._send_json(404, exc.to_json())
+            except remote.RemoteError as exc:
+                self._send_json(502, exc.to_json())
             return
 
         if path == "/":
@@ -494,7 +623,8 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeError) as exc:
             self._send_json(400, {"error": "invalid_body", "message": str(exc)})
             return
-        for field in ("actor", "requester", "plan_id", "request_id", "task_id", "host_id", "node", "agent_id", "approval_ticket", "source_plan_id", "window_start", "window_end", "adapter", "artifact_dir", "agent_token", "claim_token"):
+        submitted_body_fields = set(body)
+        for field in ("actor", "requester", "plan_id", "request_id", "task_id", "run_id", "host_id", "node", "agent_id", "approval_ticket", "source_plan_id", "window_start", "window_end", "adapter", "artifact_dir", "agent_token", "claim_token"):
             if field in body and not isinstance(body[field], str):
                 self._send_json(400, {"error": "invalid_body", "message": f"{field} must be a string"})
                 return
@@ -517,13 +647,86 @@ class Handler(BaseHTTPRequestHandler):
             body.setdefault("actor", principal)
             body.setdefault("requester", principal)
 
+        if path.startswith("/api/fleet/hosts/") and path.endswith("/metadata"):
+            host_id = unquote(path[len("/api/fleet/hosts/"):-len("/metadata")])
+            fields = {"expected_version", "environment", "desired_patch_baseline"}
+            if submitted_body_fields != fields:
+                self._send_json(400, {"error": "invalid_body", "message": "Only expected_version, environment and desired_patch_baseline are accepted"})
+                return
+            actor = principal or self.headers.get("X-OPU-Actor")
+            try:
+                result = fleet_metadata.update(load_hosts(), host_id, {key: body[key] for key in fields}, actor=actor)
+                self._send_json(200, result)
+            except fleet_metadata.MetadataError as exc:
+                self._send_json(exc.status, exc.to_json())
+            return
+
+        if path == "/api/auth/logout":
+            if not getattr(self, "_company_session", None):
+                self._send_json(400, {"error": "no_company_session"})
+                return
+            cookie_header = company_auth.logout(self.headers.get("Cookie"))
+            self.send_response(204)
+            self.send_header("Set-Cookie", cookie_header)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if path == "/api/recovery":
+            allowed = {"request_id", "requester", "actor", "host_id", "database", "backup_parent", "window_start", "window_end", "policy"}
+            if set(body) - allowed:
+                self._send_json(400, {"error": "invalid_body", "message": "Unexpected live recovery fields"})
+                return
+            try:
+                for field in ("request_id", "requester", "host_id", "database", "backup_parent", "window_start", "window_end"):
+                    if not isinstance(body.get(field), str) or not body[field].strip():
+                        raise ValueError(f"{field} is required")
+                host = self._resolved_host(body["host_id"])
+                if host is None:
+                    raise ValueError("Unknown configured recovery host")
+                recoveryctl._identifier(body["request_id"], "request_id")
+                def create(_record):
+                    return recoveryctl.create_live(body["request_id"], body["requester"], host=host, host_id=body["host_id"],
+                        database=body["database"], backup_parent=body["backup_parent"], window_start=body["window_start"],
+                        window_end=body["window_end"], policy=body.get("policy"))
+                record = pipeline_runner.start_run("recovery", f"recovery:{body['request_id']}:create", create)
+                self._send_json(202, {"run_id": record.run_id})
+            except pipeline_runner.RunConflict as exc:
+                self._send_run_conflict(exc)
+            except (ValueError, recoveryctl.RecoveryError) as exc:
+                self._send_json(400, {"error": "invalid_recovery", "message": str(exc)})
+            return
+
+        if path.startswith("/api/plans/") and path.endswith("/execution-observe"):
+            import execution_console
+            plan_id = path[len("/api/plans/"):-len("/execution-observe")]
+            try:
+                planctl.validate_plan_id(plan_id)
+                run_id = body.get("run_id")
+                if not isinstance(run_id, str) or not run_id:
+                    raise ValueError("run_id is required")
+                record = pipeline_runner.start_run("execution_observe", f"plan:{plan_id}:observe",
+                    lambda _record: execution_console.observe(plan_id, run_id))
+                self._send_json(202, {"run_id": record.run_id})
+            except pipeline_runner.RunConflict as exc:
+                self._send_run_conflict(exc)
+            except (ValueError, planctl.PlanError) as exc:
+                self._send_json(400, {"error": "invalid_observation", "message": str(exc)})
+            return
+
         if path.startswith("/api/runs/") and path.endswith("/reconcile"):
             run_id = path[len("/api/runs/"):-len("/reconcile")]
             try:
                 result = pipeline_runner.reconcile_run(
                     run_id,
                     actor=principal or body.get("actor"),
-                    inspect=planctl.reconcile_detached_run,
+                    inspect=lambda record: (
+                        recoveryctl.reconcile_detached_run(record)
+                        if (record.get("context") or {}).get("recovery_request_id")
+                        else lockctl.reconcile_detached_run(record)
+                        if (record.get("context") or {}).get("lock_recovery") is True
+                        else lockctl.reconcile_execution_run(record)
+                    ),
                     confirm_no_active_execution=body.get("confirm_no_active_execution") is True,
                     note=body.get("note"),
                 )
@@ -628,6 +831,62 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
                 record = pipeline_runner.start_run("plan", f"plan:{plan_id}:testmode-demo", run)
+            except pipeline_runner.RunConflict as exc:
+                self._send_run_conflict(exc)
+                return
+            self._send_json(202, {"run_id": record.run_id})
+            return
+
+        if path.startswith("/api/plans/") and path.endswith("/extjob-inspect"):
+            plan_id = path[len("/api/plans/"):-len("/extjob-inspect")]
+            actor = body.get("actor")
+            try:
+                if submitted_body_fields - {"actor"}:
+                    raise extjobctl.ExtjobError("extjob inspection accepts only actor")
+                extjobctl.validate_input(plan_id, actor)
+            except extjobctl.ExtjobError as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            if not self._require_role(actor, "execute"):
+                return
+
+            def run(record, plan_id=plan_id, actor=actor):
+                return extjobctl.inspect(plan_id, actor, inspection_run_id=record.run_id)
+
+            try:
+                # Reserve execution while synchronizing and inspecting. The
+                # read-only worker never claims a task or detaches execution.
+                record = pipeline_runner.start_run("extjob_inspect", f"plan:{plan_id}:execute", run)
+            except pipeline_runner.RunConflict as exc:
+                self._send_run_conflict(exc)
+                return
+            self._send_json(202, {"run_id": record.run_id})
+            return
+
+        if path.startswith("/api/plans/") and path.endswith(("/lock-inspect", "/lock-recover")):
+            operation = "recover" if path.endswith("/lock-recover") else "inspect"
+            suffix = f"/lock-{operation}"
+            plan_id = path[len("/api/plans/"):-len(suffix)]
+            actor = body.get("actor")
+            if not isinstance(actor, str) or not actor.strip():
+                self._send_json(400, {"error": "missing_field", "message": "actor is required"})
+                return
+            run_id = body.get("run_id")
+            if run_id is not None and (not isinstance(run_id, str) or not run_id.strip()):
+                self._send_json(400, {"error": "invalid_body", "message": "run_id must be a nonempty string"})
+                return
+            if not self._require_role(actor, "execute"):
+                return
+
+            def run(record, plan_id=plan_id, actor=actor, run_id=run_id, operation=operation):
+                if operation == "recover":
+                    return lockctl.recover(plan_id, actor, run_id, maintenance_run_id=record.run_id)
+                return lockctl.inspect(plan_id, actor, run_id)
+
+            kind = "lock_recovery" if operation == "recover" else "lock_inspect"
+            key = f"plan:{plan_id}:lock-recovery" if operation == "recover" else f"plan:{plan_id}:lock-inspect"
+            try:
+                record = pipeline_runner.start_run(kind, key, run)
             except pipeline_runner.RunConflict as exc:
                 self._send_run_conflict(exc)
                 return
@@ -1057,7 +1316,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     port = int(os.environ.get("OPU_WEBAPP_PORT") or "8765")
-    if auth.rbac_enabled():
+    if company_auth.configured():
+        company_auth.config()
+    elif auth.rbac_enabled():
         auth.validate_configuration()
     else:
         auth.ensure_token()

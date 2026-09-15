@@ -1,5 +1,5 @@
 import { el } from "./dom.js";
-import { apiFetch, getReadSignal } from "./api.js";
+import { apiFetch, getReadSignal, setSessionCsrf } from "./api.js";
 import { getActor, setActor, onActorChange, setSessionIdentity, authenticatedActor } from "./actor.js";
 import { getApiToken, setApiToken } from "./api.js";
 
@@ -23,12 +23,14 @@ export async function refreshSession() {
     const session = await response.json();
     signal?.throwIfAborted();
     setSessionIdentity(session);
+    setSessionCsrf(session.csrf_token);
     if (sessionNote) sessionNote.textContent = session.rbac_enabled
-      ? `Authenticated as ${session.actor}. Roles: ${(session.roles || []).join(", ")}.`
+      ? `Authenticated as ${session.display_name || session.actor}. Roles: ${(session.roles || []).join(", ")}.${session.expires_at ? ` Session expires ${new Date(session.expires_at * 1000).toLocaleTimeString()}.` : ""}`
       : "Lab session: select an actor for separation of duties.";
   } catch (error) {
     if (error.name !== "AbortError") {
       setSessionIdentity(null);
+      setSessionCsrf(null);
       if (sessionNote) sessionNote.textContent = error.message;
     }
     throw error;
@@ -96,6 +98,22 @@ export function mountSession(container) {
     ])
   );
   container.appendChild(sessionNote);
+  const company = el("div", { class: "company-login" });
+  container.appendChild(company);
+  fetch("/api/auth/config").then(async (res) => {
+    if (!res.ok) throw new Error("Company login configuration needs administrator attention.");
+    const config = await res.json();
+    if (!config.configured) return;
+    company.appendChild(el("a", { class: "btn", href: config.login_url, text: config.label || "Company sign in" }));
+    const logout = el("button", { type: "button", class: "btn btn-secondary", text: "Sign out" });
+    logout.addEventListener("click", async () => {
+      try {
+        await apiFetch("/api/auth/logout", { method: "POST", body: "{}" });
+        setSessionCsrf(null); setSessionIdentity(null); setApiToken(""); location.assign("/");
+      } catch (error) { sessionNote.textContent = error.message; }
+    });
+    company.appendChild(logout);
+  }).catch((error) => { company.appendChild(el("p", { class: "rail-muted", text: error.message })); });
 }
 
 export async function refreshHostNav(activeHostId) {

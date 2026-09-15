@@ -191,6 +191,64 @@ srhash=$(sha256sum "$TMP/standalone-reconciliation.json" | awk '{print $1}'); sa
 jq -n --arg r "$srhash" --arg a "$sahash" --arg p "$sphash" --arg c "$schash" --arg y "$syhash" \
   --arg evaluated "$collected" --arg valid "$end" --arg snapshot "$TMP/standalone-snapshot.json" --arg snapshot_sha "$standalone_snapshot_sha" \
   '{schema_version:"1.0",status:"ready_for_approval",patch_id:"12345678",target:{family:"database",method:"opatch",platform_id:"226"},evaluated_at:$evaluated,valid_until:$valid,snapshot_evidence:[{path:$snapshot,sha256:$snapshot_sha,host:"node1",collected_at:$evaluated,valid_until:$valid}],evidence:{reconciliation_sha256:$r,artifact_manifest_sha256:$a,procedure_validation_sha256:$p,compatibility_sha256:$c,policy_sha256:$y}}' >"$TMP/standalone-readiness.json"
+
+# A valid backup is not interchangeable with the exact backup checked by
+# readiness. Prove both sealed records work with their own matching readiness,
+# then reject the swap specifically at the readiness-to-backup digest check.
+binding_create() {
+  run create --plan-id "$1" --requester patch-admin --readiness "$2" \
+    --reconciliation "$TMP/standalone-reconciliation.json" --artifact-manifest "$TMP/standalone-artifact.json" \
+    --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" \
+    --policy "${4:-$TMP/standalone-policy.json}" --recovery-evidence "$3" \
+    --window-start "$start" --window-end "$end"
+}
+binding_seal() {
+  local record_sha
+  record_sha=$(printf '%s' "$(jq -cS 'del(.record_sha256)' "$1")" | sha256sum | awk '{print $1}')
+  jq --arg sha "$record_sha" '.record_sha256=$sha' "$1" >"$2"
+}
+binding_a_sha=$(sha256sum "$TMP/recovery.json" | awk '{print $1}')
+jq --arg sha "$binding_a_sha" '.evidence.recovery_sha256=$sha' "$TMP/standalone-readiness.json" >"$TMP/binding-a-readiness.json"
+binding_create binding-a-valid "$TMP/binding-a-readiness.json" "$TMP/recovery.json" >"$TMP/binding-a-plan.json"
+jq -e --arg sha "$binding_a_sha" '.recovery.manifest_sha256 == $sha' "$TMP/binding-a-plan.json" >/dev/null
+jq '.backup.selected_recovery_set.restore_piece_handles=["/tmp/other-backup/piece"] | .backup.selected_recovery_set.datafile_backup_sets=[21,22]' "$TMP/recovery.json" >"$TMP/binding-b.tmp"
+binding_seal "$TMP/binding-b.tmp" "$TMP/binding-b.json"
+binding_b_sha=$(sha256sum "$TMP/binding-b.json" | awk '{print $1}')
+[ "$binding_a_sha" != "$binding_b_sha" ]
+jq --arg sha "$binding_b_sha" '.evidence.recovery_sha256=$sha' "$TMP/standalone-readiness.json" >"$TMP/binding-b-readiness.json"
+binding_create binding-b-valid "$TMP/binding-b-readiness.json" "$TMP/binding-b.json" >"$TMP/binding-b-plan.json"
+jq -e --arg sha "$binding_b_sha" '.recovery.manifest_sha256 == $sha' "$TMP/binding-b-plan.json" >/dev/null
+binding_rc=0
+binding_create binding-swapped "$TMP/binding-a-readiness.json" "$TMP/binding-b.json" >"$TMP/binding-swapped.out" 2>"$TMP/binding-swapped.err" || binding_rc=$?
+[ "$binding_rc" -eq 74 ] || { echo "swapped valid recovery should fail binding with rc74, got $binding_rc" >&2; exit 1; }
+grep -q 'selected recovery evidence differs from the backup bound by readiness' "$TMP/binding-swapped.err"
+[ ! -e "$TMP/state/plans/binding-swapped" ]
+
+# Filesystem mode requires the readiness digest even for a structurally valid,
+# fresh, fully covered recovery record. The positive control proves the fixture
+# passes the filesystem evidence contract before testing its missing binding.
+jq '.recovery += {storage_mode:"filesystem",minimum_filesystem_free_bytes:100}' "$TMP/standalone-policy.json" >"$TMP/binding-filesystem-policy.json"
+binding_filesystem_policy_sha=$(sha256sum "$TMP/binding-filesystem-policy.json" | awk '{print $1}')
+jq --arg sha "$digest" --arg observed "$collected" '
+  .backup.root="/tmp/backup" |
+  .backup.preparation={manifest:{sha256:$sha,record_sha256:$sha},central_inventory_archive:{sha256:$sha},oraInst_loc:{sha256:$sha}} |
+  .backup.coverage={datafiles_current:1,datafiles_backed:1,base_datafiles:1,controlfile_records:1,spfile_records:1,outside_root_pieces:0,unavailable_pieces:0} |
+  .backup.storage={type:"filesystem",path:"/tmp/backup",device_id:"1",total_bytes:1000,available_bytes:500,observed_at:$observed} |
+  .verification.checksum_log={sha256:$sha} | .verification.oracle_home_archive_log={sha256:$sha} |
+  .verification.rman_syntax={log:{sha256:$sha},exit_code:{value:0,sha256:$sha}} |
+  .verification.rman_log.exit_code={value:0,sha256:$sha}
+' "$TMP/recovery.json" >"$TMP/binding-filesystem.tmp"
+binding_seal "$TMP/binding-filesystem.tmp" "$TMP/binding-filesystem.json"
+binding_filesystem_sha=$(sha256sum "$TMP/binding-filesystem.json" | awk '{print $1}')
+jq --arg policy "$binding_filesystem_policy_sha" --arg recovery "$binding_filesystem_sha" '.evidence.policy_sha256=$policy | .evidence.recovery_sha256=$recovery' "$TMP/standalone-readiness.json" >"$TMP/binding-filesystem-readiness.json"
+binding_create binding-filesystem-valid "$TMP/binding-filesystem-readiness.json" "$TMP/binding-filesystem.json" "$TMP/binding-filesystem-policy.json" >/dev/null
+jq 'del(.evidence.recovery_sha256)' "$TMP/binding-filesystem-readiness.json" >"$TMP/binding-filesystem-missing.json"
+binding_rc=0
+binding_create binding-filesystem-missing "$TMP/binding-filesystem-missing.json" "$TMP/binding-filesystem.json" "$TMP/binding-filesystem-policy.json" >"$TMP/binding-missing.out" 2>"$TMP/binding-missing.err" || binding_rc=$?
+[ "$binding_rc" -eq 74 ] || { echo "missing filesystem recovery binding should fail with rc74, got $binding_rc" >&2; exit 1; }
+grep -q 'selected recovery evidence differs from the backup bound by readiness' "$TMP/binding-missing.err"
+[ ! -e "$TMP/state/plans/binding-filesystem-missing" ]
+
 run create --plan-id standalone-001 --requester patch-admin --readiness "$TMP/standalone-readiness.json" --reconciliation "$TMP/standalone-reconciliation.json" --artifact-manifest "$TMP/standalone-artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/standalone-policy.json" --recovery-evidence "$TMP/recovery.json" --window-start "$start" --window-end "$end" >"$TMP/standalone-plan.json"
 jq -e '.target == {family:"database",method:"opatch",platform_id:"226",database_unique_name:"ORCL",oracle_home:"/opt/oracle/dbhome",owner:"oracle",platform_name:"Linux x86-64"} and .artifact.platforms[0].id == "226" and .procedure.platform_id == "226" and .recovery.manifest_path and .recovery.manifest_sha256 and (.snapshot_evidence | length == 1)' "$TMP/standalone-plan.json" >/dev/null
 run approve --plan-id standalone-001 --actor dba-approver --approval-ticket CHG-STANDALONE

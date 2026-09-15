@@ -1,5 +1,5 @@
 import { el } from "./dom.js";
-import { getActor, setActor, onActorChange, authenticatedActor } from "./actor.js";
+import { getActor, setActor, onActorChange, authenticatedActor, companySessionState } from "./actor.js";
 import { getApiToken } from "./api.js";
 import { focusSessionField } from "./shell.js";
 
@@ -84,8 +84,14 @@ export function requireActor(input, errBox, label = "Actor") {
 }
 
 export function requireToken(errBox) {
+  const companySession = companySessionState();
+  if (companySession === "active") return true;
+  if (companySession !== "absent") {
+    showFormError(errBox, "Company session expired or unavailable. Sign in again before continuing.");
+    return false;
+  }
   if (!getApiToken()) {
-    showFormError(errBox, "API token is required — paste it in the session panel (webapp/var/api-token).");
+    showFormError(errBox, "Sign in with your company account, or enter an API token in the session panel.");
     focusSessionField("token");
     return false;
   }

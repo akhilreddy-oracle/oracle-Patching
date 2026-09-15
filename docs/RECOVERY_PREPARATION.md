@@ -81,6 +81,61 @@ following fixed operations:
 Operator-supplied SQL, RMAN text, archive flags, filenames, and arbitrary
 commands are not accepted.
 
+## Filesystem capacity admission
+
+Preparation writes the new recovery set to its sealed backup parent. The
+readiness policy can explicitly select filesystem recovery storage:
+
+```json
+{
+  "recovery": {
+    "storage_mode": "filesystem",
+    "capacity_basis": "rman_unused_blocks",
+    "minimum_filesystem_free_bytes": 10737418240
+  }
+}
+```
+
+These fields are part of the policy digest sealed into the request. Omitted
+`capacity_basis` defaults to `allocated`; an omitted filesystem reserve is
+zero. The reserve must be a nonnegative JSON integer. Selecting a capacity
+basis does not waive backup, validation, approval, or maintenance-window
+requirements. The example reserve is 10 GiB; choose a reserve appropriate to
+the filesystem and workload before requesting approval.
+
+The default capacity calculation includes every allocated datafile byte.
+The opt-in `rman_unused_blocks` basis subtracts only measured free extents
+from files whose eligibility can be proved: `COMPATIBLE` is at least 10.2,
+there are no guaranteed restore points, the datafile is locally managed,
+and its dictionary identity, allocation, and visibility match the complete
+current `V$DATAFILE` inventory. A file with missing or ineligible metadata
+receives its full allocated budget. Incomplete inventory coverage falls back
+to the full database allocation. Contradictory or malformed measurements
+block admission. This follows Oracle's documented
+[unused-block compression conditions](https://docs.oracle.com/en/database/oracle/oracle-database/19/bradv/rman-backup-concepts.html)
+for the fixed level-0 backup set on a DISK channel.
+
+No binary compression ratio, historical backup size, segment-only estimate,
+or sparse-file disk allocation supplies a discount. Oracle home and Central
+Inventory archives are budgeted using apparent input sizes and archive
+headers. The calculation also includes control-file and SPFILE bytes, adds
+20% overhead rounded upward, then adds the sealed filesystem reserve.
+Execution measures available filesystem bytes again before creating the
+backup root. Admission is a preflight measurement, not a reservation of
+filesystem space; other writers can consume free space afterward.
+
+`analyze --request-id ID` performs the live identity, storage location, and
+capacity probes using disposable scratch files. It does not update request
+state, append request evidence, acquire a mutation lock, or change Oracle
+services. Its JSON `capacity` field includes requested and effective basis,
+allocated bytes, per-file measurements and fallback reasons, provable unused
+bytes, archive budgets, overhead, reserve, required bytes, and available
+bytes. Capacity rejection returns `status: "blocked"`, the same measurements,
+and exit code 2. Execution repeats the checks under the shared host lock and
+seals the measurements into `execution.capacity`, retaining the raw probe
+and its digest. The backup remains forced and independently validated against
+the exact new pieces; capacity eligibility does not reduce backup coverage.
+
 Listener registration waits for up to 120 seconds by default. Environments
 that require a different bounded interval can set
 `database.listener_registration_timeout_seconds` in the sealed readiness
@@ -110,11 +165,86 @@ including `validating_rman`, `quiesce`, `archive`, `mount`, `backup`,
 as request evidence. RMAN scripts contain only RMAN language; SQL*Plus
 `WHENEVER SQLERROR` directives are never emitted into them.
 
-Execution holds one atomic lock per database and Oracle home. If the worker is
-terminated, `reconcile` first proves that its recorded PID is no longer alive,
-then runs only the fixed service-restoration path and records either
+Execution holds the shared host mutation lock used by the patch adapters as
+well as one atomic recovery lock per database and Oracle home. RMAN inherits
+the host lock so a surviving backup process continues excluding another
+operation. SQL*Plus `STARTUP`/`STARTUP MOUNT` and listener-start commands close
+their copy of descriptor 7; permanent Oracle services cannot retain that
+lock after the supervising recovery process exits. The parent retains it
+throughout service restoration and evidence validation.
+
+If the worker is terminated, `reconcile` first proves that its recorded PID is
+no longer alive and acquires the same shared host lock. A surviving RMAN job
+or another patch operation therefore blocks reconciliation. Reconciliation
+runs only the fixed service-restoration path and records either
 `failed_services_restored` or `recovery_required`; it never resumes RMAN work
 from an unknown point.
 
 The resulting `recovery_evidence` path and digest, not the preparation request
 alone, are supplied to `opu-patch-plan`.
+
+
+## Application workflow
+
+Live recovery is available through `POST /api/recovery`. The body contains
+`request_id`, `requester`, a configured `host_id`, a discovered `database`, an
+existing absolute `backup_parent`, UTC `window_start` and `window_end`, and an
+optional complete readiness `policy`. Without an explicit policy, the saved
+host policy is used. A successful readiness evaluation is not required to
+prepare the missing backup. The application validates the full policy contract,
+snapshot freshness, exact standalone database/home/owner/SID, and configured
+host binding before submitting remote work. The native adapter repeats its
+admission checks before downtime.
+
+From the host's Recovery stage:
+
+1. Create a preparation request and inspect its live capacity analysis.
+2. Have a different actor approve it with an approval ticket, then a third actor
+   authorize it. The authenticated principal supplies the real actor identity.
+3. Execute the approved recovery request during its maintenance window. Backup,
+   service restoration, independent backup checks, and RMAN
+   `RESTORE DATABASE VALIDATE` belong to this one native preparation operation.
+4. Select **Validate for patch planning**. The application requires a successful
+   detached wrapper, native completion, and unchanged imported evidence. It then
+   independently recollects recovery evidence against the current host snapshot.
+5. Evaluate readiness, inspect the patch plan, obtain the separate patch
+   approval and authorization, execute the patch, and inspect final database and
+   listener validation.
+
+Restore validation checks RMAN's ability to read and validate the required
+backup pieces. It is not a restored database on another host and must not be
+presented as a completed disaster-recovery rehearsal. The initial live adapter
+is standalone PRIMARY, READ WRITE, NOARCHIVELOG with an SPFILE; other topologies
+remain subject to their existing admission limits.
+
+Selecting recovery evidence exposes the sealed preparation policy as an
+explicit draft choice. It never silently replaces the saved readiness policy.
+A failed selection invalidates prior recovery and readiness authority. Each
+readiness refresh recollects the selected recovery set against the new snapshot;
+request completion alone does not waive freshness or restore-validation gates.
+
+## Application disconnect handling
+
+Backup execution and service reconciliation both run in separate detached
+remote wrappers. Their unique run directories and action identities are
+persisted before SSH launch. A lost response is an unknown result, never an
+instruction to submit another backup. `/api/runs/<run_id>/reconcile` inspects
+that same persisted wrapper and does not restart services.
+
+An explicit `/api/recovery/<request_id>/reconcile` may start the native service
+restoration operation only after the original wrapper is proven dead and the
+sealed authorization actor matches. Missing, malformed, or mismatched PID
+records remain unknown. Reconciliation itself has its own durable launch and
+cannot be resubmitted after a disconnect. The native executor additionally
+requires the shared host lock, preventing restoration while an orphaned RMAN
+process still owns it. Recovery-required outcomes remain failures even when
+the reconciliation wrapper exited successfully.
+
+`GET /api/recovery` reports capability and the production certification gate.
+Capability indicates that the application implementation is available; it is
+not host compatibility, a completed backup, live-lab verification, or production
+approval. Regression tests use mocked SSH and isolated native fixtures. They
+cover the application control sequence, immutable target/input bindings, stale
+and malformed policy rejection, detached backup/reconciliation failures, and
+selection of validated evidence. No live database mutation is part of these
+automated tests.
