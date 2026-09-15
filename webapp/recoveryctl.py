@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import runtime_paths
 import re
 import shlex
 import subprocess
@@ -36,8 +37,8 @@ TOOL = REPO_ROOT / "bin" / "opu-database-recovery-prepare"
 # path can never look like a real deployment location. Confirmed by hitting
 # this directly: bin/opu-database-recovery-prepare:33-39.
 RECOVERY_DIR = Path("/tmp/opu-webapp-recovery-fixtures")
-LIVE_DIR = Path(__file__).resolve().parent / "var" / "recovery-live"
-HOSTS_FILE = Path(__file__).resolve().parent / "hosts.json"
+LIVE_DIR = runtime_paths.state_dir() / "recovery-live"
+HOSTS_FILE = runtime_paths.hosts_file()
 REMOTE_STATE_DIR = "/var/lib/oracle-patching-utility/recovery-preparations"
 LIVE_EXECUTE_TIMEOUT_SECONDS = 86400
 LIVE_POLL_INTERVAL_SECONDS = 5
@@ -202,6 +203,8 @@ def _env_for(request_id: str) -> dict:
 
 
 def _run(request_id: str, args: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict | None:
+    if args and args[0] not in {"status", "list", "report"}:
+        runtime_paths.require_fixtures_allowed()
     argv = [str(TOOL), *args]
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=_env_for(request_id))
@@ -231,6 +234,7 @@ def create_testmode_demo(request_id: str, requester: str, *, host_id: str | None
         evidence.validate_host_id(host_id)
     if _live_path(request_id).exists():
         raise RecoveryError("A live recovery request already uses this request_id")
+    runtime_paths.require_fixtures_allowed()
     fx = recovery_fixtures.build(fixture_dir, request_id)
     (fixture_dir / "webapp-metadata.json").write_text(json.dumps({"host_id": host_id}) + "\n")
     args = [

@@ -14,11 +14,12 @@ import secrets
 import datetime as dt
 import time
 from pathlib import Path
+import runtime_paths
 
 TOKEN_ENV = "OPU_WEBAPP_TOKEN"
-TOKEN_FILE = Path(__file__).resolve().parent / "var" / "api-token"
+TOKEN_FILE = runtime_paths.state_dir() / "api-token"
 PRINCIPALS_ENV = "OPU_WEBAPP_PRINCIPALS_FILE"
-PRINCIPALS_FILE = Path(__file__).resolve().parent / "var" / "principals.json"
+PRINCIPALS_FILE = runtime_paths.state_dir() / "principals.json"
 RBAC_ENV = "OPU_WEBAPP_RBAC"
 _CACHED_TOKEN: str | None = None
 

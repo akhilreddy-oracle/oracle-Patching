@@ -19,6 +19,8 @@ import os
 import time
 
 import auth
+import assistant
+import local_llm
 import company_auth
 import fleet
 import fleet_metadata
@@ -35,10 +37,11 @@ import production
 import procedure_hints
 import recoveryctl
 import remote
+import runtime_paths
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-HOSTS_FILE = ROOT / "hosts.json"
+HOSTS_FILE = runtime_paths.hosts_file()
 SSH_TIMEOUT_SECONDS = 45
 DISCOVERY_TIMEOUT_SECONDS = pipeline_steps.DISCOVERY_TIMEOUT_SECONDS
 
@@ -169,6 +172,9 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[webapp] {self.address_string()} {fmt % args}", flush=True)
 
     def _send_json(self, status: int, payload) -> None:
+        if getattr(self, "_response_sink", None) is not None:
+            self._response_sink.append((status, payload))
+            return
         body = json.dumps(payload, indent=2, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -276,6 +282,8 @@ class Handler(BaseHTTPRequestHandler):
         actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
         if method == "GET":
             action = "agent" if path == "/api/agent/jobs" else "read"
+        elif path.startswith("/api/assistant/"):
+            action = "read"
         elif path.startswith("/api/agent/"):
             action = "agent"
         elif path.startswith("/api/fleet/hosts/") and path.endswith("/metadata"):
@@ -344,6 +352,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/api/") and not self._authorize_path("GET", path):
+            return
+
+        if path.startswith("/api/assistant/"):
+            self._assistant_route("GET", path, {})
             return
 
         if path in {"/api/auth/whoami", "/api/session"}:
@@ -623,6 +635,11 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeError) as exc:
             self._send_json(400, {"error": "invalid_body", "message": str(exc)})
             return
+        self._dispatch_post(path, body)
+
+    def _dispatch_post(self, path: str, body: dict) -> None:
+        """Shared native command dispatcher for API and confirmed assistant actions."""
+        self._parsed_body = body
         submitted_body_fields = set(body)
         for field in ("actor", "requester", "plan_id", "request_id", "task_id", "run_id", "host_id", "node", "agent_id", "approval_ticket", "source_plan_id", "window_start", "window_end", "adapter", "artifact_dir", "agent_token", "claim_token"):
             if field in body and not isinstance(body[field], str):
@@ -646,6 +663,21 @@ class Handler(BaseHTTPRequestHandler):
                     return
             body.setdefault("actor", principal)
             body.setdefault("requester", principal)
+
+        if path.startswith("/api/assistant/"):
+            if submitted_body_fields & {"actor", "requester"}:
+                self._send_json(400, {"error": "invalid_body", "message": "Assistant identity comes only from the authenticated session"})
+                return
+            # Remove only the server-injected identity fields.
+            self._assistant_route("POST", path, {key: value for key, value in body.items() if key not in {"actor", "requester"}})
+            return
+
+        if path in {"/api/plans/testmode-demo", "/api/recovery/testmode-demo"}:
+            try:
+                runtime_paths.require_fixtures_allowed()
+            except ValueError as exc:
+                self._send_json(403, {"error": "fixtures_disabled", "message": str(exc)})
+                return
 
         if path.startswith("/api/fleet/hosts/") and path.endswith("/metadata"):
             host_id = unquote(path[len("/api/fleet/hosts/"):-len("/metadata")])
@@ -1148,6 +1180,65 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self.send_error(404)
+
+    def _submit_assistant_action(self, path, body):
+        """Reuse normal role checks, native guards, dedupe keys and notifications."""
+        responses = []
+        previous_body = getattr(self, "_parsed_body", None)
+        self._response_sink = responses
+        try:
+            if self._authorize_path("POST", path):
+                self._dispatch_post(path, dict(body))
+        finally:
+            self._response_sink = None
+            self._parsed_body = previous_body
+        if len(responses) != 1:
+            raise assistant.AssistantError("Native command did not return one verified response", 502)
+        return responses[0]
+
+    def _assistant_route(self, method, path, body):
+        owner = getattr(self, "_principal", None)
+        try:
+            if path == "/api/assistant/config" and method == "GET":
+                self._send_json(200, {**local_llm.config_status(), "can_chat": bool(owner)})
+                return
+            if not owner:
+                raise assistant.AssistantError("Sign in with an individual identity to use the assistant", 403)
+            allowed = {action for action in auth.ACTION_ROLES if self._has_role(action)}
+            parts = path.strip("/").split("/")
+            if parts[:3] != ["api", "assistant", "conversations"]:
+                raise assistant.AssistantError("Unknown assistant route", 404)
+            if len(parts) == 3:
+                if method == "GET":
+                    self._send_json(200, {"conversations": assistant.list_conversations(owner)})
+                elif not body:
+                    self._send_json(201, {"conversation": assistant.create(owner)})
+                else:
+                    raise assistant.AssistantError("Conversation creation accepts an empty object")
+                return
+            conversation_id = parts[3]
+            if len(parts) == 4 and method == "GET":
+                self._send_json(200, {"conversation": assistant.get(owner, conversation_id)})
+                return
+            if method == "POST" and len(parts) == 5 and parts[4] == "messages":
+                if set(body) != {"content"}:
+                    raise assistant.AssistantError("Messages accept only content")
+                run_id = assistant.send(owner, conversation_id, body["content"], allowed, load_hosts)
+                self._send_json(202, {"run_id": run_id})
+                return
+            if method == "POST" and len(parts) == 7 and parts[4] == "actions" and parts[6] in {"execute", "dismiss"}:
+                dismiss = parts[6] == "dismiss"
+                if set(body) != (set() if dismiss else {"digest"}):
+                    raise assistant.AssistantError("Unexpected action fields")
+                result = assistant.action(owner, conversation_id, parts[5], dismiss=dismiss, digest=body.get("digest"),
+                    allowed=allowed, load_hosts=load_hosts, submit=self._submit_assistant_action)
+                self._send_json(200 if dismiss else 202, {"conversation": result} if dismiss else {"run_id": result})
+                return
+            raise assistant.AssistantError("Unknown assistant route", 404)
+        except pipeline_runner.RunConflict as exc:
+            self._send_run_conflict(exc)
+        except (assistant.AssistantError, assistant.capabilities.ToolError, local_llm.LLMError, planctl.PlanError, recoveryctl.RecoveryError) as exc:
+            self._send_json(getattr(exc, "status", 400), {"error": "assistant_error", "message": str(exc)})
 
     def _post_plan_action(self, action: str, plan_id: str | None, body: dict) -> None:
         try:

@@ -1,0 +1,39 @@
+[Unit]
+Description=Oracle Patching controller
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=opu-controller
+Group=opu-controller
+WorkingDirectory=/opt/oracle-patching/current
+EnvironmentFile=/etc/oracle-patching/controller.env
+ExecStartPre=/opt/oracle-patching/current/.venv/bin/python -B /opt/oracle-patching/current/deploy/controller.py check-service
+ExecStart=/opt/oracle-patching/current/.venv/bin/python -B /opt/oracle-patching/current/webapp/server.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillMode=control-group
+UMask=0077
+RuntimeDirectory=oracle-patching
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/oracle-patching/controller /var/lib/oracle-patching-home /run/oracle-patching
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# SSH, DNS, the local model and HTTPS company login need these families.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

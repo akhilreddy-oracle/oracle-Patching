@@ -93,9 +93,11 @@ verification. Oracle binaries are TEST_MODE shims. `connected_fixture.py` permit
 only the single fixture alias, native executable allowlist and paths inside the
 disposable tree at the transport boundary. It executes the controller's actual
 detached launch scripts locally, preserving PID/exit-status checks and native
-sealed evidence import. Other remote targets, outbound connections/DNS and real
-SSH/network commands are blocked. All generated state and backups remain in the
-disposable tree.
+sealed evidence import. A deterministic model protocol simulator listens at
+**127.0.0.1:18767** for the chat acceptance test; only that exact loopback model
+destination is permitted for outbound DNS/connections. Other remote targets and
+real SSH/network commands are blocked. All generated state and backups remain
+in the disposable tree.
 
 The following workflows run through visible application controls:
 
@@ -118,6 +120,12 @@ The following workflows run through visible application controls:
   topology observations are simulated; native snapshot reconciliation, artifact
   inspection, procedure validation and OPatch compatibility checks derive the
   prerequisite documents.
+- Chat inspection and proposal using the real local-model HTTP client and a
+  deterministic model simulator. A proposal launches no native work. Confirming
+  an unapproved plan leaves it awaiting approval; independent approval,
+  authorization and dispatch then permit an explicitly confirmed proposal to
+  run all five fixture stages. Saved results survive reload. Separate UI cases
+  cover expired/unknown proposals, lost responses, typed confirmation and layout.
 
 A separate integration scenario checks that anonymous and invalid credentials
 cannot load the workflow, and that a real HTTP request from an operator principal
@@ -130,7 +138,8 @@ The separate demo routes still use independent fixtures. The connected test uses
 the actual managed-host branch (whose API mode is `live`), but this is a test of
 controller admission and evidence custody, **not live-lab proof**. It does not
 prove real SSH transport, real Oracle/RMAN behavior, an actual restore to another
-database, a company identity provider, or production certification.
+database, actual model reasoning quality, a company identity provider, or
+production certification.
 
 Successful scenarios save screenshots, and exports are retained under
 `test-results/`. Failures save screenshots and Playwright traces. The HTML report

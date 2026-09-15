@@ -19,6 +19,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+import runtime_paths
 
 import evidence
 import production
@@ -31,9 +32,9 @@ from adapters import EXECUTOR_PATHS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLAN_TOOL = REPO_ROOT / "bin" / "opu-patch-plan"
-PLAN_STATE_DIR = Path(__file__).resolve().parent / "var" / "plans"
-TESTMODE_DIR = Path(__file__).resolve().parent / "var" / "testmode"
-HOSTS_FILE = Path(__file__).resolve().parent / "hosts.json"
+PLAN_STATE_DIR = runtime_paths.state_dir() / "plans"
+TESTMODE_DIR = runtime_paths.state_dir() / "testmode"
+HOSTS_FILE = runtime_paths.hosts_file()
 DEFAULT_TIMEOUT_SECONDS = 30
 LIVE_EXECUTE_TIMEOUT_SECONDS = 3600
 
@@ -543,6 +544,7 @@ def _create_testmode_plan(plan_id: str, requester: str, window_start: str, windo
     """
     validate_plan_id(plan_id)
     TESTMODE_DIR.mkdir(parents=True, exist_ok=True)
+    runtime_paths.require_fixtures_allowed()
     fixture_dir = (TESTMODE_DIR / plan_id).resolve()
     if TESTMODE_DIR.resolve() not in fixture_dir.parents and fixture_dir != TESTMODE_DIR.resolve():
         raise PlanError(f"plan_id escapes testmode root: {plan_id!r}")
@@ -804,6 +806,7 @@ def _execute_testmode(plan_id: str, task: dict, actor: str, fixture_dir: Path) -
     executor = EXECUTOR_BY_ADAPTER.get(adapter)
     if executor is None:
         raise PlanError(f"No TEST_MODE executor is wired up for adapter: {adapter}")
+    runtime_paths.require_fixtures_allowed()
     fx_env = testmode_fixtures.env_for(fixture_dir)
     exec_env = os.environ.copy()
     exec_env["OPU_PLAN_STATE_DIR"] = str(PLAN_STATE_DIR)
@@ -1115,6 +1118,8 @@ def publish_agent_queue(plan_id: str) -> list[dict]:
 
     validate_plan_id(plan_id)
     plan = status(plan_id)
+    if _fixture_dir_for_plan(plan, plan_id) is not None:
+        runtime_paths.require_fixtures_allowed()
     tasks = list_tasks(plan_id)
     return agent_queue.publish_plan_tasks(plan, tasks)
 

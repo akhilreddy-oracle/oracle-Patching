@@ -23,7 +23,7 @@ import remote
 
 ROOT = Path(__file__).resolve().parent.parent
 SYNC_DIRS = ("bin", "lib", "operations")
-RUNTIME_MODULES = ("adapters.py", "durable.py", "agent_queue.py", "agent_enroll.py", "agent_worker.py")
+RUNTIME_MODULES = ("adapters.py", "durable.py", "runtime_paths.py", "agent_queue.py", "agent_enroll.py", "agent_worker.py")
 STAMP_NAME = ".opu-tools-fingerprint"
 # Re-verify a host at most this often per webapp process; the stamp check is
 # one SSH round-trip, so this only trims chatter within a burst of steps.

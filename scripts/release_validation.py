@@ -17,7 +17,7 @@ import stat
 import subprocess
 import time
 
-SOURCE_DIRS = ("bin", "lib", "operations", "contracts", "webapp", "scripts", "tests", ".github")
+SOURCE_DIRS = ("bin", "lib", "operations", "contracts", "webapp", "scripts", "tests", "deploy", ".github")
 SOURCE_FILES = ("Makefile", ".shellcheckrc", "package.json", "package-lock.json", "playwright.config.mjs", "webapp/requirements-sso.txt")
 EXCLUDE = {"var", "__pycache__", "node_modules", ".venv", ".git", "test-results", "playwright-report"}
 COMMANDS = {"check": ["make", "-j4", "check"], "browser": ["npm", "run", "test:browser"]}

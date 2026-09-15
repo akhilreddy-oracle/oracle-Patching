@@ -15,12 +15,13 @@ import json
 import os
 import time
 from pathlib import Path
+import runtime_paths
 
 from durable import file_lock, write_json
 from adapters import EXECUTOR_PATHS
 
 QUEUE_DIR_ENV = "OPU_AGENT_QUEUE_DIR"
-DEFAULT_QUEUE_DIR = Path(__file__).resolve().parent / "var" / "agent-queue"
+DEFAULT_QUEUE_DIR = runtime_paths.state_dir() / "agent-queue"
 ENROLLMENT_REQUIRED_ENV = "OPU_AGENT_ENROLLMENT_REQUIRED"
 
 

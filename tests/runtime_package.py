@@ -84,6 +84,7 @@ class RuntimePackage(unittest.TestCase):
             self.assertIn('discover', result.stdout)
             self.assertFalse((root / 'webapp/hosts.json').exists())
             self.assertFalse((root / 'webapp/var').exists())
+            self.assertTrue((root / 'webapp/runtime_paths.py').is_file())
 
     def test_fingerprint_changes_on_deletion_or_mode_even_with_same_newest_mtime(self):
         with tempfile.TemporaryDirectory() as tmp:

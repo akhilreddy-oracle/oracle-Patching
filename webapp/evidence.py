@@ -12,8 +12,9 @@ import os
 import re
 import tempfile
 from pathlib import Path
+import runtime_paths
 
-VAR_DIR = Path(__file__).resolve().parent / "var" / "hosts"
+VAR_DIR = runtime_paths.state_dir() / "hosts"
 
 # Matches lib/opu/common.sh opu_validate_identifier — rejects path separators.
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
