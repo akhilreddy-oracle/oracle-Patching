@@ -4,6 +4,8 @@ import { runToCompletion } from "./runs.js";
 import { helperText } from "./ux.js";
 import { refreshHostNav } from "./shell.js";
 
+import { renderFleet } from "./fleet.js";
+
 export async function renderEstate(mount) {
   mount.innerHTML = "";
   mount.appendChild(
@@ -15,6 +17,10 @@ export async function renderEstate(mount) {
       ]),
     ])
   );
+
+  const fleet = el("section", { class: "panel fleet-dashboard" });
+  mount.appendChild(fleet);
+  await renderFleet(fleet);
 
   const toolbar = el("div", { class: "toolbar" }, [
     el("button", { id: "estate-refresh-btn", type: "button", text: "Refresh live SSH" }),
@@ -92,6 +98,7 @@ export async function renderEstate(mount) {
           }
         }
         paint(list, data.hosts, outcomes);
+        await renderFleet(fleet);
         await refreshHostNav(null);
       }
     } catch {

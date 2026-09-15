@@ -150,6 +150,66 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertEqual(self.request("/api/hosts/h/pipeline/discovery", raw=b"{}", length=-1)[0], 400)
             start.assert_not_called()
 
+    def test_lock_routes_require_execution_role_and_typed_bound_identity(self):
+        with patch.object(pipeline_runner, "start_run") as start:
+            for operation in ("inspect", "recover"):
+                path = "/api/plans/p/lock-" + operation
+                for actor in ("viewer", "requester", "approver"):
+                    self.assertEqual(self.request(path, actor=actor)[0], 403)
+                self.assertEqual(self.request(path, body={"actor": "other"})[0], 403)
+                for field in ("actor", "run_id"):
+                    for value in (1, [], {}, None, True):
+                        with self.subTest(operation=operation, field=field, value=value):
+                            self.assertEqual(self.request(path, body={field: value})[0], 400)
+                self.assertEqual(self.request(path, body={"run_id": " "})[0], 400)
+            start.assert_not_called()
+
+    def test_lock_routes_use_distinct_managed_runs_and_never_execute_tasks(self):
+        launches = []
+
+        def start(kind, key, function):
+            launches.append((kind, key))
+            record = SimpleNamespace(run_id="bbbbbbbbbbbb")
+            function(record)
+            return record
+
+        with patch.object(pipeline_runner, "start_run", side_effect=start), \
+             patch.object(server.lockctl, "inspect", return_value={}) as inspect, \
+             patch.object(server.lockctl, "recover", return_value={}) as recover, \
+             patch.object(planctl, "execute_next_task") as execute, \
+             patch.object(planctl, "execute_remaining_tasks") as remaining:
+            for operation in ("inspect", "recover"):
+                status, payload = self.request("/api/plans/p/lock-" + operation, body={"run_id": "aaaaaaaaaaaa"})
+                self.assertEqual((status, payload), (202, {"run_id": "bbbbbbbbbbbb"}))
+            self.assertEqual(launches, [("lock_inspect", "plan:p:lock-inspect"), ("lock_recovery", "plan:p:lock-recovery")])
+            inspect.assert_called_once_with("p", "operator", "aaaaaaaaaaaa")
+            recover.assert_called_once_with("p", "operator", "aaaaaaaaaaaa", maintenance_run_id="bbbbbbbbbbbb")
+            execute.assert_not_called()
+            remaining.assert_not_called()
+        with patch.object(pipeline_runner, "start_run", side_effect=pipeline_runner.RunConflict("existing maintenance", "cccccccccccc")):
+            status, payload = self.request("/api/plans/p/lock-recover", body={"run_id": "aaaaaaaaaaaa"})
+            self.assertEqual(status, 409)
+            self.assertEqual(payload["run_id"], "cccccccccccc")
+
+    def test_reconcile_route_dispatches_maintenance_and_original_execution_inspectors(self):
+        for is_maintenance in (False, True):
+            with self.subTest(maintenance=is_maintenance):
+                record = {"context": {"lock_recovery": is_maintenance}}
+
+                def reconcile(run_id, **options):
+                    self.assertEqual(run_id, "aaaaaaaaaaaa")
+                    self.assertEqual(options["actor"], "operator")
+                    return options["inspect"](record)
+
+                with patch.object(pipeline_runner, "reconcile_run", side_effect=reconcile), \
+                     patch.object(server.lockctl, "reconcile_detached_run", return_value={"status": "unknown"}) as maintenance, \
+                     patch.object(server.lockctl, "reconcile_execution_run", return_value={"status": "unknown"}) as execution, \
+                     patch.object(server.lockctl, "recover") as recover:
+                    self.assertEqual(self.request("/api/runs/aaaaaaaaaaaa/reconcile"), (200, {"status": "unknown"}))
+                    (maintenance if is_maintenance else execution).assert_called_once_with(record)
+                    (execution if is_maintenance else maintenance).assert_not_called()
+                    recover.assert_not_called()
+
     def test_agent_credentials_and_fence_are_forwarded(self):
         with patch.object(server.agent_queue, "claim", return_value={"job_id": "p__t"}) as claim:
             self.assertEqual(self.request("/api/agent/claim", body={"agent_id": "operator", "node": "n", "agent_token": "secret"})[0], 200)
@@ -286,6 +346,119 @@ sys.stdin.readline()
             self.assertNotIn("nohup", shell.call_args.args[1])
             sync.assert_called_once()
             self.assertEqual(verified.call_args.args[0], ["task-status", "--plan-id", "p", "--task-id", "t"])
+
+    def test_live_nonterminal_task_keeps_bounded_native_diagnostics(self):
+        host = {"id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu"}
+        task = {"task_id": "t", "adapter": "database_single_instance_opatch", "task_definition_sha256": "a" * 64, "retry_count": 1}
+        stderr = "x" * 5000 + "\npassword=private-value token='private-token'\nAuthorization: Bearer private-bearer\nanother Oracle executor owns this host\n"
+        with patch.object(planctl.production, "require_live_mutation_allowed"), \
+             patch.object(planctl, "_resolve_live_host_for_task", return_value=host), \
+             patch.object(planctl, "_sync_plan_to_host", return_value="/opt/opu/plans"), \
+             patch.object(planctl, "_run_detached_remote", return_value=(75, "private stdout", stderr)) as launch, \
+             patch.object(planctl, "_sync_plan_from_host"), \
+             patch.object(planctl, "_run", return_value={"status": "pending"}) as verified, \
+             patch.object(pipeline_runner, "set_execution_context") as context:
+            with self.assertRaises(planctl.PlanError) as raised:
+                planctl._execute_live("p", {}, task, "operator")
+            error = raised.exception.to_json()
+            self.assertEqual(error["result"], {"exit_code": 75, "task_status": "pending"})
+            self.assertLessEqual(len(error["stderr"]), 4000)
+            self.assertIn("another Oracle executor owns this host", error["stderr"])
+            for secret in ("private-value", "private-token", "private-bearer", "private stdout"):
+                self.assertNotIn(secret, json.dumps(error))
+            self.assertIn("[REDACTED]", error["stderr"])
+            launch.assert_called_once()
+            verified.assert_called_once_with(["task-status", "--plan-id", "p", "--task-id", "t"])
+            context.assert_called_once_with(task_definition_sha256="a" * 64, task_retry_count=1)
+
+    def test_live_verified_terminal_result_is_unchanged(self):
+        host = {"id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu"}
+        task = {"task_id": "t", "adapter": "database_single_instance_opatch", "task_definition_sha256": "a" * 64, "retry_count": 1}
+        with patch.object(planctl.production, "require_live_mutation_allowed"), \
+             patch.object(planctl, "_resolve_live_host_for_task", return_value=host), \
+             patch.object(planctl, "_sync_plan_to_host", return_value="/opt/opu/plans"), \
+             patch.object(planctl, "_run_detached_remote", return_value=(0, '{"status":"succeeded"}', "")) as launch, \
+             patch.object(planctl, "_sync_plan_from_host"), \
+             patch.object(planctl, "_run", return_value={"status": "succeeded"}) as verified, \
+             patch.object(planctl, "status", return_value={"state": "running"}), \
+             patch.object(pipeline_runner, "set_execution_context") as context:
+            self.assertEqual(planctl._execute_live("p", {}, task, "operator"), {"status": "succeeded"})
+            launch.assert_called_once()
+            verified.assert_called_once_with(["task-status", "--plan-id", "p", "--task-id", "t"])
+            self.assertEqual([item.kwargs for item in context.call_args_list],
+                             [{"task_definition_sha256": "a" * 64, "task_retry_count": 1}, {"detached_terminal": True}])
+
+    def test_reconciliation_reports_preclaim_error_without_clearing_unknown(self):
+        host = {"id": "h", "node_name": "n", "ssh_alias": "alias", "remote_root": "/opt/opu"}
+        context = {"detached_execution": True, "plan_id": "p", "task_id": "t", "node": "n", "host_id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu", "remote_run_dir": "/opt/opu/var/webapp-runs/p/t/" + "a" * 32}
+        old = self.orphan(context=context)
+        stderr = "another Oracle executor owns this host\ntoken=private-token"
+        with patch.object(planctl, "_resolve_node_host", return_value=host), \
+             patch.object(planctl.remote, "run_remote_shell", return_value=SimpleNamespace(returncode=0, stdout="RC\n75\n")) as shell, \
+             patch.object(planctl.remote, "run_remote_raw", side_effect=[SimpleNamespace(returncode=0, stdout="private stdout"), SimpleNamespace(returncode=0, stdout=stderr)]) as read, \
+             patch.object(planctl, "_sync_plan_from_host") as sync, \
+             patch.object(planctl, "_run", return_value={"status": "pending"}) as verified, \
+             patch.object(planctl, "_run_detached_remote") as launch:
+            result = pipeline_runner.reconcile_run(old.run_id, actor="operator", inspect=planctl.reconcile_detached_run)
+            self.assertEqual(result["status"], "unknown")
+            self.assertEqual(result["error"]["result"], {"exit_code": 75, "task_status": "pending"})
+            self.assertIn("another Oracle executor owns this host", result["error"]["stderr"])
+            self.assertNotIn("private-token", json.dumps(result))
+            self.assertNotIn("private stdout", json.dumps(result))
+            self.assertEqual(pipeline_runner.active_run_id(old.key), old.run_id)
+            with self.assertRaises(pipeline_runner.RunConflict):
+                pipeline_runner.start_run("plan", old.key, lambda record: {})
+            shell.assert_called_once()
+            self.assertNotIn("nohup", shell.call_args.args[1])
+            self.assertEqual(read.call_count, 2)
+            sync.assert_called_once()
+            verified.assert_called_once_with(["task-status", "--plan-id", "p", "--task-id", "t"])
+            launch.assert_not_called()
+
+    def test_plan_status_exposes_matching_unknown_run_without_reconciliation(self):
+        record = pipeline_runner.RunRecord("123456abcdef", "plan", "plan:p:execute")
+        record.status = "unknown"
+        record.context = {"plan_id": "p", "task_id": "t", "detached_execution": True}
+        record.error = {"message": "No terminal result", "stderr": "host is locked token=private-token", "result": {"exit_code": 75, "task_status": "pending", "stdout": "private stdout"}}
+        record._persist()
+        before = (pipeline_runner.RUNS_DIR / record.run_id / "run.json").read_bytes()
+        # Exercise disk lookup while the reconciliation endpoint's file lock
+        # is already held. Status must not reacquire that file lock.
+        with pipeline_runner.file_lock(pipeline_runner.RUNS_DIR / ".registry.lock"), \
+             patch.object(planctl, "_run", return_value={"plan_id": "p", "state": "running"}) as native, \
+             patch.object(planctl, "reconcile_detached_run") as reconcile, \
+             patch.object(planctl, "_run_detached_remote") as launch:
+            plan = planctl.status("p")
+            self.assertEqual(plan["unresolved_run"]["run_id"], record.run_id)
+            self.assertEqual(plan["unresolved_run"]["status"], "unknown")
+            self.assertEqual(plan["unresolved_run"]["context"], record.context)
+            self.assertEqual(plan["unresolved_run"]["error"]["result"], {"exit_code": 75, "task_status": "pending"})
+            self.assertIn("host is locked", plan["unresolved_run"]["error"]["stderr"])
+            self.assertNotIn("private-token", json.dumps(plan))
+            self.assertNotIn("private stdout", json.dumps(plan))
+            native.assert_called_once_with(["status", "--plan-id", "p"])
+            reconcile.assert_not_called()
+            launch.assert_not_called()
+        self.assertEqual((pipeline_runner.RUNS_DIR / record.run_id / "run.json").read_bytes(), before)
+        self.assertEqual(pipeline_runner.active_run_id(record.key), record.run_id)
+
+    def test_plan_status_excludes_other_and_terminal_runs(self):
+        record = pipeline_runner.RunRecord("123456abcdef", "plan", "plan:other:execute")
+        record.status = "unknown"
+        record._persist()
+        with patch.object(planctl, "_run", side_effect=lambda args: {"plan_id": "p", "state": "running"}):
+            self.assertNotIn("unresolved_run", planctl.status("p"))
+            pipeline_runner.RUNS[record.run_id] = record
+            # A stale/mismatched in-memory index must not attribute another
+            # plan's run to this plan.
+            pipeline_runner._ACTIVE_KEYS["plan:p:execute"] = record.run_id
+            self.assertNotIn("unresolved_run", planctl.status("p"))
+            record.key = "plan:p:execute"
+            for run_status in ("queued", "running", "succeeded", "failed"):
+                record.status = run_status
+                self.assertNotIn("unresolved_run", planctl.status("p"), run_status)
+            record.status = "reconciling"
+            self.assertEqual(planctl.status("p")["unresolved_run"]["status"], "reconciling")
 
     def test_remote_archive_cannot_escape_plan_root(self):
         buffer = io.BytesIO()

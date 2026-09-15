@@ -7,6 +7,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
 . "$ROOT/lib/opu/execution.sh"
+. "$ROOT/lib/opu/recovery_evidence.sh"
 STATE_DIR=${OPU_PLAN_STATE_DIR:-/var/lib/oracle-patching-plans}
 usage() { printf '%s\n' 'Usage:' '  opu-patch-plan create --plan-id ID --requester ID --readiness ABSOLUTE_JSON --reconciliation ABSOLUTE_JSON --artifact-manifest ABSOLUTE_JSON --procedure-validation ABSOLUTE_JSON --compatibility ABSOLUTE_JSON --policy ABSOLUTE_JSON [--recovery-evidence ABSOLUTE_JSON] [--dataguard-order ABSOLUTE_JSON] --window-start UTC_ISO8601 --window-end UTC_ISO8601' '  opu-patch-plan create-rollback --plan-id ID --requester ID --source-plan-id ID --window-start UTC_ISO8601 --window-end UTC_ISO8601' '  opu-patch-plan approve --plan-id ID --actor ID --approval-ticket ID' '  opu-patch-plan authorize --plan-id ID --actor ID' '  opu-patch-plan dispatch --plan-id ID --actor ID' '  opu-patch-plan next --plan-id ID' '  opu-patch-plan claim --plan-id ID --task-id ID --actor ID [--lease-seconds 300]' '  opu-patch-plan renew --plan-id ID --task-id ID --actor ID [--lease-seconds 300]' '  opu-patch-plan complete --plan-id ID --task-id ID --actor ID --status succeeded|failed (--evidence ABSOLUTE_JSON | --evidence-sha256 SHA256)' '  opu-patch-plan reconcile --plan-id ID --actor ID' '  opu-patch-plan retry-task --plan-id ID --task-id ID --actor ID' '  opu-patch-plan task-status --plan-id ID --task-id ID' '  opu-patch-plan status --plan-id ID'; }
 plan_dir() { printf '%s/plans/%s' "$STATE_DIR" "$1"; }
@@ -74,67 +75,7 @@ verify_readiness_current() {
   READINESS_VALID_UNTIL_EPOCH=$valid_epoch
   READINESS_VALID_UNTIL=$valid_until
 }
-verify_database_recovery_current() {
-  local recovery_file=$1 snapshot_binding_file=$2 policy_file=$3 reference_epoch=${4:-$(date -u +%s)}
-  local expected_file_sha=${5:-} expected_record_sha=${6:-} actual_file_sha record_sha canonical
-  local observed_at completed_at observed_epoch completed_epoch recorded_age calculated_age max_age max_age_seconds
-  local source_snapshot source_snapshot_sha
-  require_file "$recovery_file" recovery-evidence || return
-  actual_file_sha=$(opu_hash_file "$recovery_file")
-  [ -z "$expected_file_sha" ] || [ "$actual_file_sha" = "$expected_file_sha" ] || {
-    opu_error 'recovery evidence changed after plan creation'; return 74;
-  }
-  jq -e '
-    .schema_version == "1.0" and .collector.name == "oracle.recovery.evidence" and .collector.version == "1" and
-    .status == "passed" and
-    (.source_snapshot.path | type == "string" and startswith("/")) and
-    (.source_snapshot.sha256 | test("^[a-f0-9]{64}$")) and
-    (.backup.selected_recovery_set.observed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
-    (.backup.selected_recovery_set.oldest_datafile_backup_completed_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
-    (.backup.selected_recovery_set.age_seconds_at_collection | type == "number" and . >= 0 and floor == .) and
-    (.backup.selected_recovery_set.restore_piece_handles | type == "array" and length > 0 and length == (unique | length)) and
-    (.backup.selected_recovery_set.datafile_backup_sets | type == "array" and length > 0)
-  ' "$recovery_file" >/dev/null || { opu_error 'recovery evidence lacks an exact selected-backup freshness contract'; return 65; }
-  record_sha=$(jq -r '.record_sha256 // empty' "$recovery_file")
-  [[ "$record_sha" =~ ^[a-f0-9]{64}$ ]] || { opu_error 'recovery evidence has no valid record digest'; return 74; }
-  canonical=$(jq -cS 'del(.record_sha256)' "$recovery_file") || return 74
-  [ "$record_sha" = "$(opu_hash_string "$canonical")" ] || { opu_error 'recovery evidence record integrity verification failed'; return 74; }
-  [ -z "$expected_record_sha" ] || [ "$record_sha" = "$expected_record_sha" ] || {
-    opu_error 'recovery evidence record differs from the plan'; return 74;
-  }
-  jq -e --slurpfile binding "$snapshot_binding_file" '
-    .source_snapshot as $source |
-    any(($binding[0].snapshot_evidence // [])[];
-      .path == $source.path and .sha256 == $source.sha256)
-  ' "$recovery_file" >/dev/null || { opu_error 'recovery evidence is not bound to a reconciled readiness snapshot'; return 74; }
-  source_snapshot=$(jq -r '.source_snapshot.path' "$recovery_file")
-  source_snapshot_sha=$(jq -r '.source_snapshot.sha256' "$recovery_file")
-  require_file "$source_snapshot" recovery-source-snapshot || return
-  [ "$(opu_hash_file "$source_snapshot")" = "$source_snapshot_sha" ] || {
-    opu_error 'recovery source snapshot changed'; return 74;
-  }
-  observed_at=$(jq -r '.backup.selected_recovery_set.observed_at' "$recovery_file")
-  completed_at=$(jq -r '.backup.selected_recovery_set.oldest_datafile_backup_completed_at' "$recovery_file")
-  recorded_age=$(jq -r '.backup.selected_recovery_set.age_seconds_at_collection' "$recovery_file")
-  observed_epoch=$(epoch "$observed_at") || { opu_error 'recovery backup observation time is invalid'; return 65; }
-  completed_epoch=$(epoch "$completed_at") || { opu_error 'selected recovery backup completion time is invalid'; return 65; }
-  [ "$completed_epoch" -le "$observed_epoch" ] && [ "$observed_epoch" -le "$reference_epoch" ] || {
-    opu_error 'selected recovery backup timing is future-dated'; return 65;
-  }
-  calculated_age=$((observed_epoch - completed_epoch))
-  [ "$recorded_age" -eq "$calculated_age" ] || {
-    opu_error 'selected recovery backup age does not match its sealed timestamps'; return 74;
-  }
-  max_age=$(jq -r '.recovery.max_backup_age_minutes // empty' "$policy_file")
-  [[ "$max_age" =~ ^[0-9]+$ ]] || { opu_error 'policy has no valid selected-backup age limit'; return 65; }
-  max_age_seconds=$((max_age * 60))
-  RECOVERY_VALID_UNTIL_EPOCH=$((completed_epoch + max_age_seconds))
-  [ "$reference_epoch" -le "$RECOVERY_VALID_UNTIL_EPOCH" ] || {
-    opu_error 'the exact selected recovery backup is older than policy permits'; return 65;
-  }
-  RECOVERY_COMPLETED_AT=$completed_at
-  RECOVERY_VALID_UNTIL=$(iso_from_epoch "$RECOVERY_VALID_UNTIL_EPOCH") || return 65
-}
+
 verify_apply_plan_readiness_current() {
   local plan_file=$1 readiness_file reconciliation_file policy_file name source_path expected_sha recovery_file reference_epoch
   [ "$(jq -r '.intent // "patch_apply"' "$plan_file")" = patch_apply ] || return 0
@@ -361,6 +302,12 @@ verify_inputs() {
       jq -e --arg owner "$TARGET_OWNER" '.target.owner == $owner' "$recovery" >/dev/null || { opu_error 'recovery evidence owner does not match the reconciled database home'; return 65; }
       verify_database_recovery_current "$recovery" "$reconciliation" "$policy" "$(date -u +%s)" || return
       RECOVERY_FILE_SHA=$(opu_hash_file "$recovery"); RECOVERY_RECORD_SHA=$(jq -r '.record_sha256' "$recovery")
+      if jq -e '.evidence | has("recovery_sha256")' "$readiness" >/dev/null || [ "$(jq -r '.recovery.storage_mode // "fra"' "$policy")" = filesystem ]; then
+        [ "$(jq -r '.evidence.recovery_sha256 // empty' "$readiness")" = "$RECOVERY_FILE_SHA" ] || {
+          opu_error 'selected recovery evidence differs from the backup bound by readiness; re-evaluate readiness with this backup'
+          return 74
+        }
+      fi
     fi
   elif [ "$adapter" = grid_rolling_opatch ] || [ "$adapter" = grid_rolling_opatchauto ]; then
     if [ -z "$recovery" ]; then

@@ -11,6 +11,8 @@ import hashlib
 import os
 import re
 import secrets
+import datetime as dt
+import time
 from pathlib import Path
 
 TOKEN_ENV = "OPU_WEBAPP_TOKEN"
@@ -29,6 +31,7 @@ ACTION_ROLES: dict[str, set[str]] = {
     "dispatch": {"operator", "admin"},
     "execute": {"operator", "admin"},
     "agent": {"operator", "admin"},
+    "manage_fleet": {"admin"},
 }
 
 
@@ -98,7 +101,8 @@ def require_api_auth(authorization_header: str | None) -> str | None:
     if rbac_enabled():
         entries = _load_entries(required=True)
         digest = hashlib.sha256((provided or "").encode()).hexdigest()
-        matches = [entry["actor"] for entry in entries
+        matches = [entry["actor"] for entry in entries if not entry.get("disabled")
+                   and (entry.get("expires_epoch") is None or entry["expires_epoch"] > time.time())
                    if entry.get("token_sha256") and secrets.compare_digest(digest, entry["token_sha256"])]
         if provided and len(matches) == 1:
             return matches[0]
@@ -110,6 +114,9 @@ def require_api_auth(authorization_header: str | None) -> str | None:
 
 
 def rbac_enabled() -> bool:
+    if (os.environ.get("OPU_OIDC_CONFIG") or (TOKEN_FILE.parent / "oidc.json").exists()
+            or (TOKEN_FILE.parent / "oidc.json").is_symlink()):
+        return True
     if (os.environ.get("OPU_PRODUCTION_MODE") or "").strip().lower() in {"1", "true", "yes", "on"}:
         return True
     flag = (os.environ.get(RBAC_ENV) or "").strip().lower()
@@ -157,13 +164,29 @@ def _load_entries(*, required: bool = False) -> list[dict]:
         actors.add(actor)
         if digest:
             digests.add(digest)
-        entries.append({"actor": actor, "roles": roles, "token_sha256": digest})
+        expires = entry.get("expires_at")
+        expires_epoch = None
+        if expires is not None:
+            try:
+                parsed = dt.datetime.fromisoformat(expires.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    raise ValueError()
+                expires_epoch = parsed.timestamp()
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise AuthError("Principal expiry must be a timestamp with timezone", status=503) from exc
+        disabled = entry.get("disabled", False)
+        if type(disabled) is not bool:
+            raise AuthError("Principal disabled must be boolean", status=503)
+        entries.append({"actor": actor, "roles": roles, "token_sha256": digest,
+                        "expires_epoch": expires_epoch, "disabled": disabled})
     return entries
 
 
 def load_principals() -> dict[str, set[str]]:
     out: dict[str, set[str]] = {}
     for entry in _load_entries():
+        if entry.get("disabled") or (entry.get("expires_epoch") is not None and entry["expires_epoch"] <= time.time()):
+            continue
         actor = str(entry.get("actor") or "").strip()
         roles = {str(r).strip() for r in (entry.get("roles") or []) if str(r).strip()}
         if actor and roles:

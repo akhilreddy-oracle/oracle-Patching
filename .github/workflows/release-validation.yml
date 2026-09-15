@@ -1,0 +1,54 @@
+name: Fixture release validation
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fixture-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fixture-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install fixture test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck libxml2-utils
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -r scripts/requirements.txt -r webapp/requirements-sso.txt
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
+      - name: Verify fixture evidence reader
+        run: python3 -B tests/browser/release_validation_test.py
+      - name: Check contracts, tests, failure drills and browser workflow
+        run: python3 -B scripts/release_validation.py --suite all --output release-validation
+      - name: Preserve fixture validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: fixture-validation-${{ github.sha }}
+          path: |
+            release-validation/
+            playwright-report/
+            test-results/
+          if-no-files-found: warn
+          retention-days: 30

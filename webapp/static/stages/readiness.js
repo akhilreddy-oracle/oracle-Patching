@@ -15,8 +15,10 @@ import {
   summarizeBlockedEvidence,
   mediaRemediation,
 } from "../ux.js";
-import { backupPolicyChooser, policyRecoveryBlock, getBackupPolicy } from "../backup_policy.js";
+import { backupPolicyChooser, policyRecoveryBlock, getBackupPolicy, hydrateBackupPolicy, savedPolicyFromSteps, validateRecoveryPolicy } from "../backup_policy.js";
 import { PROCEDURE_ADAPTERS, REQUIRED_PRECHECKS, REQUIRED_POSTCHECKS, buildProcedure, procedureMatchesArtifact } from "../procedure_adapters.js";
+
+import { blockerCards } from "../readiness_blockers.js";
 
 const STEP_LABELS = {
   reconcile: "Topology reconciliation",
@@ -71,12 +73,16 @@ export async function renderReadinessStage(mount, hostId) {
       el("h2", { class: "stage-title", text: "Readiness" }),
       el("p", {
         class: "stage-lead",
-        text: "Gates after discovery. Blocked is a safety result, not a crash. Finish Discover first.",
+        text: "Choose the discovered database and staged patch, review README requirements, then resolve readiness findings. Prepare and validate backup in Recovery before sealing a plan.",
       }),
     ])
   );
 
-  mount.appendChild(backupPolicyChooser(hostId));
+  const policyControls = el("div");
+  mount.appendChild(policyControls);
+  let policyLoaded = false;
+  let selectedPolicyDraft = null;
+  let selectedPolicyBinding = null;
 
   const list = el("div", { class: "step-list" });
   mount.appendChild(list);
@@ -113,7 +119,38 @@ export async function renderReadinessStage(mount, hostId) {
     // Never paint fake "not run" cards when we do not have pipeline evidence —
     // that is exactly how a missing token looks like an empty inspect step.
     if (loadFailed) return;
+    if (!policyLoaded) {
+      hydrateBackupPolicy(hostId, savedPolicyFromSteps(steps));
+      policyControls.appendChild(backupPolicyChooser(hostId));
+      policyLoaded = true;
+    }
 
+    const recoverySelection = steps.find((s) => s.step === "readiness-evaluate")?.recovery_selection;
+    const currentSelectionBinding = JSON.stringify([recoverySelection?.host_id, recoverySelection?.request_id, recoverySelection?.policy]);
+    if (selectedPolicyDraft && currentSelectionBinding !== selectedPolicyBinding) {
+      selectedPolicyDraft = null;
+      selectedPolicyBinding = null;
+      hydrateBackupPolicy(hostId, savedPolicyFromSteps(steps));
+      policyControls.innerHTML = "";
+      policyControls.appendChild(backupPolicyChooser(hostId));
+    }
+    if (recoverySelection?.host_id === hostId && recoverySelection.policy && typeof recoverySelection.policy === "object") {
+      const usePolicy = el("button", { type: "button", text: "Use selected backup policy" });
+      usePolicy.addEventListener("click", async () => {
+        selectedPolicyDraft = recoverySelection.policy;
+        selectedPolicyBinding = currentSelectionBinding;
+        hydrateBackupPolicy(hostId, selectedPolicyDraft);
+        policyControls.innerHTML = "";
+        policyControls.appendChild(backupPolicyChooser(hostId));
+        await refresh();
+      });
+      list.appendChild(el("section", { class: "panel" }, [
+        el("h3", { class: "panel-title", text: "Selected backup policy" }),
+        helperText(`Recovery request: ${recoverySelection.request_id}. ${selectedPolicyDraft ? "Its policy is loaded into the draft controls. Evaluate readiness to verify and save it." : "Review and explicitly load its policy for the readiness evaluation. Existing saved readiness remains unchanged until evaluation."}`),
+        el("details", {}, [el("summary", { text: "Review preparation policy" }), el("pre", { class: "mono", text: JSON.stringify(recoverySelection.policy, null, 2) })]),
+        usePolicy,
+      ]));
+    }
     const disc = steps.find((s) => s.step === "discovery");
     if (!disc?.done) {
       list.appendChild(
@@ -127,7 +164,7 @@ export async function renderReadinessStage(mount, hostId) {
     }
     for (const stepId of READINESS_STEPS) {
       const stepState = steps.find((s) => s.step === stepId) || { step: stepId, done: false };
-      list.appendChild(stepCard(hostId, stepState, steps, refresh));
+      list.appendChild(stepCard(hostId, stepState, steps, refresh, selectedPolicyDraft));
     }
   }
 
@@ -153,7 +190,7 @@ function missingPrereqs(step, allSteps) {
   return need.filter((id) => !byId[id]?.done);
 }
 
-function stepCard(hostId, stepState, allSteps, refresh) {
+function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft) {
   const { step, evidence } = stepState;
   // Evidence presence means the step ran — don't rely only on a top-level status
   // (artifact-inspect nests status under evidence.artifact.status).
@@ -191,8 +228,10 @@ function stepCard(hostId, stepState, allSteps, refresh) {
 
   const blocked = done && /blocked|incomplete|failed/i.test(String(status));
   if (blocked) {
+    const findings = step === "readiness-evaluate" ? blockerCards(evidence, allSteps, hostId) : null;
+    if (findings) card.appendChild(findings);
     const summary = summarizeBlockedEvidence(evidence);
-    if (summary?.length) {
+    if (summary?.length && !findings) {
       card.appendChild(el("ul", { class: "blocked-summary" }, summary.map((line) => el("li", { text: line }))));
     }
     if (step === "readiness-evaluate" && staleSnapshotGate(evidence)) {
@@ -230,7 +269,7 @@ function stepCard(hostId, stepState, allSteps, refresh) {
     );
   }
 
-  buildControls(hostId, step, controls, logBox, refresh, allSteps, evidence, { statusBadge, statusExplanation, status });
+  buildControls(hostId, step, controls, logBox, refresh, allSteps, evidence, { statusBadge, statusExplanation, status, selectedPolicyDraft });
 
   if (step === "readiness-evaluate" && status === "ready_for_approval") {
     card.appendChild(
@@ -363,7 +402,7 @@ function buildControls(hostId, step, controls, logBox, refresh, allSteps, eviden
   }
 
   if (step === "readiness-evaluate") {
-    controls.appendChild(policyForm(base, logBox, refresh, errBox, allSteps));
+    controls.appendChild(policyForm(base, logBox, refresh, errBox, allSteps, presentation.selectedPolicyDraft));
   }
 }
 
@@ -535,14 +574,15 @@ function procedureForm(base, logBox, refresh, errBox, allSteps, presentation) {
   let validationAttempted = false;
   let autofilledOpatch = null;
   const form = el("div", { class: "pipeline-form" });
-  const patchId = el("input", { type: "text", placeholder: "e.g. 39034528" });
+  const patchId = el("select", {}, [el("option", { value: "", text: "Select an inspected patch" }), ...(initialArtifact?.patch_ids || []).map((id) => el("option", { value: id, text: id }))]);
   const family = el("input", { type: "text", readonly: "readonly" });
   const topology = el("input", { type: "text", readonly: "readonly" });
   const method = el("input", { type: "text", readonly: "readonly" });
   const adapter = el("select", {}, Object.entries(PROCEDURE_ADAPTERS).map(([value, config]) =>
     el("option", { value, text: config.label })
   ));
-  const dbName = el("input", { type: "text", placeholder: "database_unique_name" });
+  const discoveredDatabases = [...new Set((allSteps.find((entry) => entry.step === "discovery")?.evidence?.databases || []).map((entry) => entry.db_unique_name).filter(Boolean))];
+  const dbName = el("select", {}, [el("option", { value: "", text: "Select a discovered database" }), ...discoveredDatabases.map((name) => el("option", { value: name, text: name }))]);
   const platformId = el("input", { type: "text", placeholder: "e.g. 226" });
   const operations = el("input", {
     type: "text",
@@ -601,8 +641,14 @@ function procedureForm(base, logBox, refresh, errBox, allSteps, presentation) {
             : "Complete the draft and validate it before planning.";
     presentation.statusExplanation.className = unchanged ? "helper-text" : "helper-text helper-warn";
   }
+  const draftTarget = el("p", { class: "wizard-draft-target", "aria-live": "polite" });
+  const updateTarget = () => {
+    const target = (allSteps.find((entry) => entry.step === "discovery")?.evidence?.databases || []).find((db) => db.db_unique_name === dbName.value);
+    draftTarget.textContent = `Draft selection — Database: ${dbName.value || "not selected"} · Oracle home: ${target?.oracle_home || "unknown"} · Patch: ${patchId.value || "not selected"}`;
+  };
   function onEdit() {
     updateDraftStatus();
+    updateTarget();
   }
   for (const input of Object.values(inputs)) {
     input.addEventListener("input", onEdit);
@@ -641,6 +687,7 @@ function procedureForm(base, logBox, refresh, errBox, allSteps, presentation) {
   adapter.addEventListener("change", () => { syncAdapter(); onEdit(); });
   syncAdapter();
   updateDraftStatus();
+  updateTarget();
 
   const autofillBtn = runButton("Autofill from artifact", async () => {
     clearFormError(errBox);
@@ -702,6 +749,7 @@ function procedureForm(base, logBox, refresh, errBox, allSteps, presentation) {
     } finally {
       autofillBtn.disabled = false;
       updateDraftStatus();
+      updateTarget();
     }
   });
 
@@ -722,23 +770,20 @@ function procedureForm(base, logBox, refresh, errBox, allSteps, presentation) {
       "Select the adapter specified by the patch README. Autofill fills empty fields from unambiguous artifact and discovery evidence, and verifies the selected README for its minimum OPatch version. Existing values are preserved. Enter the exact rollback condition from the README. Required prechecks are always retained."
     )
   );
+  form.appendChild(draftTarget);
   form.appendChild(readmeSource);
-  form.appendChild(
+  form.appendChild(el("div", { class: "form-grid" }, [
+    field("Patch ID", patchId), databaseField, field("Adapter", adapter),
+    field("README identifier", readmeIdentifier), field("Required OPatch", requiredOpatch),
+  ]));
+  form.appendChild(el("details", { class: "advanced-settings" }, [
+    el("summary", { text: "Advanced settings — procedure contract" }),
     el("div", { class: "form-grid" }, [
-      field("Patch ID", patchId),
-      field("Family", family),
-      field("Topology", topology),
-      field("Adapter", adapter),
-      field("Method", method),
-      databaseField,
-      field("Platform ID", platformId),
-      field("Required OPatch", requiredOpatch),
-      field("Operations", operations),
-      field("README identifier", readmeIdentifier),
-      field("Mandatory prechecks", mandatoryPre),
-      field("Mandatory postchecks", mandatoryPost),
-    ])
-  );
+      field("Family", family), field("Topology", topology), field("Method", method),
+      field("Platform ID", platformId), field("Operations", operations),
+      field("Mandatory prechecks", mandatoryPre), field("Mandatory postchecks", mandatoryPost),
+    ]),
+  ]));
   form.appendChild(field("Rollback precondition", rollbackPrecondition));
   form.appendChild(autofillBtn);
 
@@ -784,38 +829,47 @@ function procedureForm(base, logBox, refresh, errBox, allSteps, presentation) {
   return form;
 }
 
-function policyForm(base, logBox, refresh, errBox, allSteps) {
+function policyForm(base, logBox, refresh, errBox, allSteps, selectedPolicyDraft) {
   const form = el("div", { class: "pipeline-form" });
   const hostId = decodeURIComponent(base.split("/hosts/")[1]?.split("/")[0] || "");
-  const maxSnapshotAge = el("input", { type: "number", value: "1800" });
+  const savedPolicy = selectedPolicyDraft || savedPolicyFromSteps(allSteps) || {};
+  const maxSnapshotAge = el("input", { type: "number", value: String(savedPolicy.maximum_snapshot_age_seconds ?? 1800) });
   const requireXmlInventory = el("input", { type: "checkbox", checked: "checked" });
   const requirePrimaryRW = el("input", { type: "checkbox", checked: "checked" });
-  const maxInvalidObjects = el("input", { type: "number", value: "0" });
+  const maxInvalidObjects = el("input", { type: "number", value: String(savedPolicy.database?.maximum_invalid_objects ?? 0) });
+  requireXmlInventory.checked = savedPolicy.require_xml_inventory ?? true;
+  requirePrimaryRW.checked = savedPolicy.database?.require_primary_read_write ?? true;
   const waiverNote = el("p", {
     class: "helper-text",
     text:
       getBackupPolicy(hostId) === "waive"
         ? "Backup waived for this host — recovery gates will be skipped (require_backup=false)."
-        : "Backup required — set “Allow patching without backup” above to waive.",
+        : "Backup is required. Filesystem backups need a completed recovery request validated for this host’s current evidence.",
   });
   if (getBackupPolicy(hostId) === "waive") waiverNote.classList.add("helper-warn");
 
   form.appendChild(waiverNote);
-  form.appendChild(
+  form.appendChild(el("p", { class: "stage-next" }, [
+    el("a", { href: `#/hosts/${encodeURIComponent(hostId)}/recovery`, text: "Prepare or validate recovery evidence →" }),
+  ]));
+  form.appendChild(el("details", { class: "advanced-settings" }, [
+    el("summary", { text: "Advanced settings — readiness policy" }),
     el("div", { class: "form-grid" }, [
       field("Max snapshot age (s)", maxSnapshotAge),
       field("Require XML inventory", requireXmlInventory),
       field("Require primary R/W", requirePrimaryRW),
       field("Max invalid objects", maxInvalidObjects),
-    ])
-  );
+    ]),
+  ]));
 
   const buildPolicy = () => ({
+    ...savedPolicy,
     schema_version: "1.0",
     maximum_snapshot_age_seconds: Number(maxSnapshotAge.value),
     require_xml_inventory: requireXmlInventory.checked,
     recovery: policyRecoveryBlock(hostId),
     database: {
+      ...savedPolicy.database,
       require_primary_read_write: requirePrimaryRW.checked,
       maximum_invalid_objects: Number(maxInvalidObjects.value),
     },
@@ -839,6 +893,8 @@ function policyForm(base, logBox, refresh, errBox, allSteps) {
       return;
     }
     const policy = buildPolicy();
+    const policyError = validateRecoveryPolicy(policy.recovery);
+    if (policyError) { showFormError(errBox, policyError); return; }
     const age = snapshotAgeSeconds();
     if (age != null && age > policy.maximum_snapshot_age_seconds) {
       const mins = Math.round(age / 60);
@@ -896,7 +952,10 @@ function policyForm(base, logBox, refresh, errBox, allSteps) {
       showFormError(errBox, "Run Artifact inspection and Procedure validation once first — the chain reuses their saved inputs.");
       return;
     }
-    await runChain(buildPolicy());
+    const policy = buildPolicy();
+    const policyError = validateRecoveryPolicy(policy.recovery);
+    if (policyError) { showFormError(errBox, policyError); return; }
+    await runChain(policy);
   });
   chainBtn.title = chainReady
     ? "Runs discovery, reconcile, artifact inspect, procedure validate, compatibility, reconciliation and readiness back to back."

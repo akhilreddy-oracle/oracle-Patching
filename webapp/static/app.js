@@ -12,6 +12,8 @@ import {
   renderRollbackNew,
 } from "./plans.js";
 import { renderRecoveryList, renderRecoveryNew, renderRecoveryDetail } from "./recovery_pages.js";
+import { renderApprovals } from "./approvals.js";
+import { renderValidation } from "./validation.js";
 
 const STAGES = new Set(["discover", "readiness", "plan", "execute", "recovery"]);
 const app = document.getElementById("app");
@@ -38,6 +40,8 @@ function parseRoute() {
     return { name: "plan-detail", id: decodeURIComponent(parts[1]) };
   }
   if (parts[0] === "plans") return { name: "plan-list" };
+  if (parts[0] === "approvals") return { name: "approvals" };
+  if (parts[0] === "validation") return { name: "validation" };
   if (parts[0] === "recovery" && parts[1] === "new") return { name: "recovery-new" };
   if (parts[0] === "recovery" && parts[1]) {
     return { name: "recovery-detail", id: decodeURIComponent(parts[1]) };
@@ -62,7 +66,13 @@ async function loadPage(view, signal) {
   signal.throwIfAborted();
   syncSecondaryNav(route.name === "plan-list" || route.name === "plan-detail" ? "plans" : route.name === "recovery-list" || route.name === "recovery-detail" ? "recovery" : "");
 
-  if (route.name === "workspace") {
+  if (route.name === "validation") {
+    syncSecondaryNav("validation");
+    await renderValidation(view);
+  } else if (route.name === "approvals") {
+    syncSecondaryNav("approvals");
+    await renderApprovals(view);
+  } else if (route.name === "workspace") {
     await renderWorkspace(view, route.id, route.stage);
   } else if (route.name === "plan-new") {
     await renderPlanNew(view, route.hostId);

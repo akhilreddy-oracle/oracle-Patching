@@ -53,6 +53,11 @@ FAIL_ROLLBACK="$TMP/fail-rollback"
 SQLPATCH_ACTION_STATE="$TMP/sqlpatch-action.state"
 OPATCH_CALLS="$TMP/opatch-calls.log"
 CAPACITY_BYTES=""
+DATAPATCH_CALLS="$TMP/datapatch-calls.log"
+FD_CALLS="$TMP/fd-calls.log"
+SQL_FLAGS="$TMP/sql-flags"
+mkdir "$SQL_FLAGS"
+export OPU_TEST_SQL_FLAGS="$SQL_FLAGS" OPU_TEST_DATAPATCH_CALLS="$DATAPATCH_CALLS" OPU_TEST_FD_CALLS="$FD_CALLS"
 
 mkdir -p "$TEST_HOME/bin" "$TEST_HOME/OPatch" "$TEST_HOME/jdk/bin" \
   "$PATCH_DIR/etc/config" "$BACKUP_ROOT/rman" "$BACKUP_ROOT/oracle-home"
@@ -63,14 +68,27 @@ cat >"$TEST_HOME/bin/sqlplus" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 input=$(cat)
+fd=closed; if { : >&7; } 2>/dev/null; then fd=open; fi
+if grep -q '^startup;' <<<"$input"; then
+  [ "$fd" = closed ] || { echo 'startup inherited the host lock' >&2; exit 91; }
+  printf 'startup:%s\n' "$fd" >>"$OPU_TEST_FD_CALLS"
+else
+  [ "$fd" = open ] || { echo 'SQL probe or shutdown lost the host lock' >&2; exit 92; }
+  printf 'sql:%s\n' "$fd" >>"$OPU_TEST_FD_CALLS"
+fi
 if grep -q 'shutdown immediate' <<<"$input"; then
   [ "$(cat "$OPU_TEST_DATABASE_STATE")" = up ] || exit 1
   printf 'down\n' >"$OPU_TEST_DATABASE_STATE"
 elif grep -q '^startup;' <<<"$input"; then
   printf 'up\n' >"$OPU_TEST_DATABASE_STATE"
+elif grep -q 'NONVALID_COMPONENTS=' <<<"$input"; then
+  invalid=0; components=0
+  [ ! -f "$OPU_TEST_SQL_FLAGS/invalid-objects" ] || invalid=1
+  [ ! -f "$OPU_TEST_SQL_FLAGS/invalid-component" ] || components=1
+  printf '%s\n' "INVALID_OBJECTS=$invalid" 'ENABLED_COMPONENTS=2' "NONVALID_COMPONENTS=$components" 'COMPONENT=CATALOG|VALID' 'COMPONENT=RAC|OPTION OFF'
 elif grep -q 'SQLPATCH_LATEST_ACTION=' <<<"$input"; then
   action=$(cat "$OPU_TEST_SQLPATCH_ACTION_STATE" 2>/dev/null || true)
-  [ -n "$action" ] || exit 1
+  [ -n "$action" ] || exit 0
   printf '%s\n' "SQLPATCH_LATEST_ACTION=$action" 'SQLPATCH_LATEST_STATUS=SUCCESS'
 elif grep -q 'SQLPATCH_SUCCESS=' <<<"$input"; then
   if [ -f "$OPU_TEST_DATAPATCH_STATE" ]; then
@@ -96,6 +114,10 @@ EOF
 cat >"$TEST_HOME/bin/lsnrctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+fd=closed; if { : >&7; } 2>/dev/null; then fd=open; fi
+case "${1:-}" in start) [ "$fd" = closed ] || exit 93;; *) [ "$fd" = open ] || exit 94;; esac
+printf 'listener-%s:%s\n' "${1:-}" "$fd" >>"$OPU_TEST_FD_CALLS"
+if [ "${1:-}" = stop ] && [ -f "$OPU_TEST_SQL_FLAGS/fail-listener-stop" ]; then exit 76; fi
 case "${1:-}" in
   start) printf 'up\n' >"$OPU_TEST_LISTENER_STATE"; printf 'listener started\n' ;;
   stop) printf 'down\n' >"$OPU_TEST_LISTENER_STATE"; printf 'listener stopped\n' ;;
@@ -112,9 +134,17 @@ cat >"$TEST_HOME/OPatch/opatch" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$OPU_TEST_OPATCH_CALLS"
+{ : >&7; } 2>/dev/null || { echo 'OPatch lost the shared host lock' >&2; exit 95; }
+printf 'opatch:open\n' >>"$OPU_TEST_FD_CALLS"
 case "${1:-}" in
   version) printf '%s\n' 'OPatch Version: 12.2.0.1.51' ;;
   lspatches) [ -f "$OPU_TEST_PATCH_STATE" ] && printf '%s\n' '39034528;Database Release Update' || true ;;
+  lsinventory)
+    [ "${2:-}" = -xml ] && [ -n "${3:-}" ] || exit 64
+    if [ -f "$OPU_TEST_SQL_FLAGS/malformed-xml" ]; then printf '<broken' >"$3"; else
+      printf '<inventory><home>%s</home><patches>%s</patches></inventory>\n' "$ORACLE_HOME" "$(cat "$OPU_TEST_PATCH_STATE" 2>/dev/null || true)" >"$3"
+    fi
+    ;;
   prereq)
     case "${2:-}" in
       CheckPatchApplicableOnCurrentPlatform)
@@ -128,6 +158,7 @@ case "${1:-}" in
   apply)
     [ ! -f "$OPU_TEST_FAIL_OPATCH" ] || { printf 'simulated OPatch failure\n' >&2; exit 73; }
     printf '39034528\n' >"$OPU_TEST_PATCH_STATE"
+    if [ -f "$OPU_TEST_SQL_FLAGS/extjob-reset-by-opatch" ]; then chmod 0700 "$ORACLE_HOME/bin/extjob"; fi
     printf '%s\n' 'OPatch succeeded.'
     ;;
   rollback)
@@ -145,12 +176,49 @@ EOF
 cat >"$TEST_HOME/OPatch/datapatch" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+printf '%s\n' "$*" >>"$OPU_TEST_DATAPATCH_CALLS"
+{ : >&7; } 2>/dev/null || { echo 'datapatch lost the host lock' >&2; exit 96; }
+printf 'datapatch:open\n' >>"$OPU_TEST_FD_CALLS"
+if [ "${1:-}" = -help ]; then
+  if [ ! -f "$OPU_TEST_SQL_FLAGS/no-local-inventory" ]; then printf '%s\n' '  -local_inventory [xml_filename]'; fi
+  exit 0
+fi
+case " $* " in *' -noqi '*|*' -apply '*|*' -rollback '*|*' -force '*) echo 'inventory bypass or forced patch selection' >&2; exit 97;; esac
+[ "${1:-}" = -verbose ] || exit 64
+if [ "$#" -gt 1 ]; then
+  [ "$#" -eq 3 ] && [ "$2" = -local_inventory ] && [ -s "$3" ] || exit 64
+  xmllint --nonet --noout "$3" || exit 65
+fi
 [ ! -f "$OPU_TEST_FAIL_DATAPATCH" ] || { printf 'simulated datapatch failure\n' >&2; exit 74; }
 [ "$(cat "$OPU_TEST_DATABASE_STATE")" = up ]
-if [ -f "$OPU_TEST_PATCH_STATE" ]; then printf 'APPLY\n' >"$OPU_TEST_SQLPATCH_ACTION_STATE"; else printf 'ROLLBACK\n' >"$OPU_TEST_SQLPATCH_ACTION_STATE"; fi
+if [ -f "$OPU_TEST_PATCH_STATE" ]; then action=APPLY; else action=ROLLBACK; fi
+if [ -f "$OPU_TEST_SQL_FLAGS/opposite-latest" ]; then
+  if [ "$action" = APPLY ]; then action=ROLLBACK; else action=APPLY; fi
+fi
+printf '%s\n' "$action" >"$OPU_TEST_SQLPATCH_ACTION_STATE"
 printf 'complete\n' >"$OPU_TEST_DATAPATCH_STATE"
+if [ -f "$OPU_TEST_SQL_FLAGS/datapatch-log-error" ]; then printf 'ORA-20001: simulated SQL error\n'; fi
 printf '%s\n' 'SQL Patching tool complete.'
 EOF
+
+mkdir -p "$TEST_HOME/perl/bin" "$TEST_HOME/rdbms/admin"
+printf 'fixture Oracle catcon\n' >"$TEST_HOME/rdbms/admin/catcon.pl"
+printf 'fixture Oracle utlrp\n' >"$TEST_HOME/rdbms/admin/utlrp.sql"
+printf 'fixture extjob; never executed\n' >"$TEST_HOME/bin/extjob"
+# TEST_MODE models the permission check using this UID and ordinary 0750;
+# fixtures do not need or create a setuid executable.
+chmod 0750 "$TEST_HOME/bin/extjob"
+cat >"$TEST_HOME/perl/bin/perl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+{ : >&7; } 2>/dev/null || exit 98
+[ "$*" = "$ORACLE_HOME/rdbms/admin/catcon.pl -n 1 -e -b utlrp -d $ORACLE_HOME/rdbms/admin utlrp.sql" ] || exit 64
+printf 'recompile:open\n' >>"$OPU_TEST_FD_CALLS"
+printf '%s\n' 'SQL> Rem add support for ORA-30552' 'SQL> Rem add support for ORA-38301' ' 49  -- due to ORA-30552 during ALTER INDEX...ENABLE command' 'ERRORS DURING RECOMPILATION' '0' >utlrp0.log
+if [ -f "$OPU_TEST_SQL_FLAGS/utlrp-log-error" ]; then printf 'ORA-00604: simulated recompile failure\n' >>utlrp0.log; fi
+if [ -f "$OPU_TEST_SQL_FLAGS/utlrp-exit-error" ]; then exit 78; fi
+EOF
+chmod 750 "$TEST_HOME/perl/bin/perl"
 
 cat >"$TEST_HOME/jdk/bin/java" <<'EOF'
 #!/usr/bin/env bash
@@ -167,7 +235,9 @@ mkdir -p "$PATCH_DIR/files/lib" && printf 'test patch payload\n' >"$PATCH_DIR/fi
 printf '%s\n' \
   'Database Release Update test README' \
   'opatch rollback -id 39034528' \
-  'datapatch -verbose' >"$PATCH_DIR/README.txt"
+  'datapatch -verbose' \
+  'chown root $ORACLE_HOME/bin/extjob' \
+  'chmod 4750 $ORACLE_HOME/bin/extjob' >"$PATCH_DIR/README.txt"
 "$ROOT/bin/opu-artifact-inspect" --artifact "$PATCH_DIR" --output "$TMP/artifact.json" >/dev/null
 ARTIFACT_SHA=$(jq -r '.artifact.sha256' "$TMP/artifact.json")
 README_SHA=$(sha256sum "$PATCH_DIR/README.txt" | awk '{print $1}')
@@ -404,6 +474,13 @@ for expected_stage in precheck apply validate datapatch final_validate; do
   jq -e --arg stage "$expected_stage" '.status == "succeeded" and .stage == $stage and .postcondition.status == "passed" and (.outcome_class | IN("no_mutation","binary_state_known")) and (.record_sha256 | test("^[a-f0-9]{64}$"))' "$TMP/$expected_stage-result.json" >/dev/null
 done
 
+for report_file in precheck-lspatches.log precheck-health.log precheck-dictionary.log precheck-sqlpatch.log report-listener.log; do
+  jq -e --arg name "/$report_file" '[.artifacts[] | select(.path | endswith($name))] | length == 1' "$TMP/precheck-result.json" >/dev/null
+done
+for report_file in final-lspatches.log final-health.log final-dictionary.log sqlpatch-final.log report-listener.log; do
+  jq -e --arg name "/$report_file" '[.artifacts[] | select(.path | endswith($name))] | length == 1' "$TMP/final_validate-result.json" >/dev/null
+done
+
 plan status --plan-id standalone-success | jq -e '.state == "succeeded"' >/dev/null
 [ -f "$PATCH_STATE" ] && [ -f "$DATAPATCH_STATE" ]
 [ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ]
@@ -510,6 +587,175 @@ done
 plan status --plan-id standalone-waived-rollback | jq -e '.state == "succeeded"' >/dev/null
 [ ! -f "$PATCH_STATE" ] && [ "$(cat "$SQLPATCH_ACTION_STATE")" = ROLLBACK ]
 [ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ]
+
+grep -q '^startup:closed$' "$FD_CALLS"
+grep -q '^listener-start:closed$' "$FD_CALLS"
+grep -q '^listener-stop:open$' "$FD_CALLS"
+grep -q '^opatch:open$' "$FD_CALLS"
+grep -q '^datapatch:open$' "$FD_CALLS"
+grep -q '^recompile:open$' "$FD_CALLS"
+if grep -Eq -- '-noqi|-apply|-rollback|-force' "$DATAPATCH_CALLS"; then
+  echo 'datapatch was invoked with a bypass or forced patch selection' >&2; exit 1
+fi
+SQL_EVIDENCE=$(find "$EXECUTION_STATE/plans/standalone-success/tasks" -name evidence.json -exec grep -l 'sql-runtime.sha256' {} \;)
+[ -n "$SQL_EVIDENCE" ]
+jq -e '(.artifacts | length) > 0 and all(.artifacts[]; .sha256 | test("^[a-f0-9]{64}$")) and all(.artifacts[]; .path | contains("heartbeat") | not)' "$SQL_EVIDENCE" >/dev/null
+SQL_MANIFEST=$(jq -r '.artifacts[] | select(.path | endswith("/sql-runtime.sha256")) | .path' "$SQL_EVIDENCE")
+(cd "$(dirname "$SQL_MANIFEST")" && sha256sum -c "$SQL_MANIFEST") >/dev/null
+SQL_TASK=$(jq -r '.task_id' "$SQL_EVIDENCE")
+SQL_CUSTODY="$PLAN_STATE/plans/standalone-success/evidence/$SQL_TASK/custody.json"
+jq -e 'any(.files[]; .role == "artifact" and (.source_path | endswith("/utlrp0.log"))) and any(.files[]; .role == "artifact" and (.source_path | endswith("/local-inventory-before.xml")))' "$SQL_CUSTODY" >/dev/null
+
+# Each independent SQL failure pauses the existing managed task after exactly
+# one native call, preserving partial evidence without automatic retries.
+for flag in opposite-latest datapatch-log-error utlrp-log-error utlrp-exit-error invalid-component invalid-objects; do
+  create_plan "sql-failure-$flag"
+  for _stage in precheck apply validate; do
+    task=$(plan next --plan-id "sql-failure-$flag" | jq -r '.task_id')
+    execute "sql-failure-$flag" "$task" >/dev/null
+  done
+  touch "$SQL_FLAGS/$flag"
+  task=$(plan next --plan-id "sql-failure-$flag" | jq -r '.task_id')
+  before=$(grep -c '^-verbose' "$DATAPATCH_CALLS" || true)
+  if execute "sql-failure-$flag" "$task" >/dev/null 2>&1; then echo "accepted SQL failure: $flag" >&2; exit 1; fi
+  after=$(grep -c '^-verbose' "$DATAPATCH_CALLS" || true)
+  [ "$after" -eq "$((before + 1))" ]
+  plan status --plan-id "sql-failure-$flag" | jq -e '.state == "paused"' >/dev/null
+  jq -e '.status == "failed" and .postcondition.status == "failed" and (.artifacts | length > 0)' "$EXECUTION_STATE/plans/sql-failure-$flag/tasks/$task/evidence.json" >/dev/null
+  [ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ]
+  rm -f "$SQL_FLAGS/$flag" "$PATCH_STATE" "$DATAPATCH_STATE" "$SQLPATCH_ACTION_STATE"
+done
+
+# Installed tools without the documented local-inventory option receive only
+# -verbose; a native failure is never retried with another option.
+touch "$SQL_FLAGS/no-local-inventory"
+create_plan sql-native-inventory
+for _stage in precheck apply validate datapatch final_validate; do
+  task=$(plan next --plan-id sql-native-inventory | jq -r '.task_id')
+  execute sql-native-inventory "$task" >/dev/null
+done
+[ "$(grep '^-verbose' "$DATAPATCH_CALLS" | tail -n1)" = -verbose ]
+rm -f "$SQL_FLAGS/no-local-inventory" "$PATCH_STATE" "$DATAPATCH_STATE" "$SQLPATCH_ACTION_STATE"
+
+# SQL success cannot hide changed extjob metadata or missing README proof.
+create_plan final-extjob-metadata
+for _stage in precheck apply validate datapatch; do
+  task=$(plan next --plan-id final-extjob-metadata | jq -r '.task_id')
+  execute final-extjob-metadata "$task" >/dev/null
+done
+task=$(plan next --plan-id final-extjob-metadata | jq -r '.task_id')
+native_sql_calls=$(grep -c '^-verbose' "$DATAPATCH_CALLS")
+binary_apply_calls=$(grep -c '^apply ' "$OPATCH_CALLS")
+chmod 0700 "$TEST_HOME/bin/extjob"
+if execute final-extjob-metadata "$task" >/dev/null 2>&1; then echo 'final validation ignored extjob permissions' >&2; exit 1; fi
+final_evidence="$EXECUTION_STATE/plans/final-extjob-metadata/tasks/$task/evidence.json"
+jq -e '.stage == "final_validate" and .status == "failed" and .postcondition.status == "failed" and .outcome_class == "binary_state_known"' "$final_evidence" >/dev/null
+final_stderr=$(jq -r '.logs.stderr.path' "$final_evidence")
+grep -q 'extjob ownership/mode differs from README:.*mode=0700' "$final_stderr"
+[ "$(sha256sum "$final_stderr" | awk '{print $1}')" = "$(jq -r '.logs.stderr.sha256' "$final_evidence")" ]
+first_final_sha=$(sha256sum "$final_evidence" | awk '{print $1}')
+plan status --plan-id final-extjob-metadata | jq -e '.state == "paused"' >/dev/null
+[ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ]
+[ "$(cat "$SQLPATCH_ACTION_STATE")" = APPLY ] && [ -f "$PATCH_STATE" ]
+chmod 0750 "$TEST_HOME/bin/extjob"
+cp "$PATCH_DIR/README.txt" "$TMP/final-readme-original"
+for missing_proof in changed missing; do
+  plan retry-task --plan-id final-extjob-metadata --task-id "$task" --actor patch-operator >/dev/null
+  if [ "$missing_proof" = changed ]; then printf 'tamper\n' >>"$PATCH_DIR/README.txt"; else rm "$PATCH_DIR/README.txt"; fi
+  if execute final-extjob-metadata "$task" >/dev/null 2>&1; then echo "final validation accepted $missing_proof README" >&2; exit 1; fi
+  cp "$TMP/final-readme-original" "$PATCH_DIR/README.txt"
+done
+plan retry-task --plan-id final-extjob-metadata --task-id "$task" --actor patch-operator >/dev/null
+execute final-extjob-metadata "$task" >"$TMP/final-extjob-correct-result.json"
+jq -e '.stage == "final_validate" and .status == "succeeded" and .retry_count == 3' "$TMP/final-extjob-correct-result.json" >/dev/null
+plan status --plan-id final-extjob-metadata | jq -e '.state == "succeeded"' >/dev/null
+[ "$(sha256sum "$final_evidence" | awk '{print $1}')" = "$first_final_sha" ]
+[ "$(grep -c '^-verbose' "$DATAPATCH_CALLS")" = "$native_sql_calls" ]
+[ "$(grep -c '^apply ' "$OPATCH_CALLS")" = "$binary_apply_calls" ]
+rm -f "$PATCH_STATE" "$DATAPATCH_STATE" "$SQLPATCH_ACTION_STATE"
+
+# A historical APPLY success must not hide a newer ROLLBACK at the final gate.
+create_plan sql-final-latest-action
+for _stage in precheck apply validate datapatch; do
+  task=$(plan next --plan-id sql-final-latest-action | jq -r '.task_id')
+  execute sql-final-latest-action "$task" >/dev/null
+done
+printf 'ROLLBACK\n' >"$SQLPATCH_ACTION_STATE"
+task=$(plan next --plan-id sql-final-latest-action | jq -r '.task_id')
+if execute sql-final-latest-action "$task" >/dev/null 2>&1; then echo 'final validation accepted historical APPLY success' >&2; exit 1; fi
+plan status --plan-id sql-final-latest-action | jq -e '.state == "paused"' >/dev/null
+jq -e '.stage == "final_validate" and .status == "failed"' "$EXECUTION_STATE/plans/sql-final-latest-action/tasks/$task/evidence.json" >/dev/null
+rm -f "$PATCH_STATE" "$DATAPATCH_STATE" "$SQLPATCH_ACTION_STATE"
+
+# Malformed freshly generated inventory stops before any SQL mutation.
+create_plan sql-malformed-inventory
+for _stage in precheck apply validate; do
+  task=$(plan next --plan-id sql-malformed-inventory | jq -r '.task_id')
+  execute sql-malformed-inventory "$task" >/dev/null
+done
+touch "$SQL_FLAGS/malformed-xml"
+task=$(plan next --plan-id sql-malformed-inventory | jq -r '.task_id')
+before=$(grep -c '^-verbose' "$DATAPATCH_CALLS" || true)
+if execute sql-malformed-inventory "$task" >/dev/null 2>&1; then echo 'malformed XML accepted' >&2; exit 1; fi
+after=$(grep -c '^-verbose' "$DATAPATCH_CALLS" || true)
+[ "$before" -eq "$after" ]
+rm -f "$SQL_FLAGS/malformed-xml" "$PATCH_STATE" "$DATAPATCH_STATE" "$SQLPATCH_ACTION_STATE"
+
+# The pre-binary restoration path also launches services without the lock FD.
+create_plan startup-recovery-fd
+task=$(plan next --plan-id startup-recovery-fd | jq -r '.task_id')
+execute startup-recovery-fd "$task" >/dev/null
+touch "$SQL_FLAGS/fail-listener-stop"
+task=$(plan next --plan-id startup-recovery-fd | jq -r '.task_id')
+if execute startup-recovery-fd "$task" >/dev/null 2>&1; then echo 'listener stop failure ignored' >&2; exit 1; fi
+[ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ]
+[ ! -f "$PATCH_STATE" ]
+rm -f "$SQL_FLAGS/fail-listener-stop"
+
+# Verification must refuse a symlink and must never change its target.
+create_plan extjob-symlink
+task=$(plan next --plan-id extjob-symlink | jq -r '.task_id')
+execute extjob-symlink "$task" >/dev/null
+mv "$TEST_HOME/bin/extjob" "$TMP/extjob-regular"
+printf 'untouched\n' >"$TMP/outside-extjob"
+chmod 0600 "$TMP/outside-extjob"
+ln -s "$TMP/outside-extjob" "$TEST_HOME/bin/extjob"
+task=$(plan next --plan-id extjob-symlink | jq -r '.task_id')
+if execute extjob-symlink "$task" >/dev/null 2>&1; then echo 'symlink extjob accepted' >&2; exit 1; fi
+jq -e '.status == "failed" and .outcome_class == "no_mutation"' "$EXECUTION_STATE/plans/extjob-symlink/tasks/$task/evidence.json" >/dev/null
+[ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
+mode=$(stat -c '%a' "$TMP/outside-extjob" 2>/dev/null || stat -f '%Lp' "$TMP/outside-extjob")
+[ "$mode" = 600 ]
+rm "$TEST_HOME/bin/extjob"
+mv "$TMP/extjob-regular" "$TEST_HOME/bin/extjob"
+rm -f "$PATCH_STATE" "$DATAPATCH_STATE" "$SQLPATCH_ACTION_STATE"
+printf 'up\n' >"$DATABASE_STATE"
+printf 'up\n' >"$LISTENER_STATE"
+
+# Inadequate extjob permissions block before outage; the worker must not turn
+# existing Oracle-writable content into a root setuid executable.
+chmod 0700 "$TEST_HOME/bin/extjob"
+create_plan extjob-needs-privilege-repair
+task=$(plan next --plan-id extjob-needs-privilege-repair | jq -r '.task_id')
+if execute extjob-needs-privilege-repair "$task" >/dev/null 2>&1; then echo 'extjob privilege repair was accepted without provenance' >&2; exit 1; fi
+mode=$(stat -c '%a' "$TEST_HOME/bin/extjob" 2>/dev/null || stat -f '%Lp' "$TEST_HOME/bin/extjob")
+[ "$mode" = 700 ]
+[ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
+
+# If OPatch resets permissions, preserve the known binary result and stopped
+# service state. No privileged repair or automatic startup may conceal it.
+chmod 0750 "$TEST_HOME/bin/extjob"
+create_plan extjob-reset-after-apply
+task=$(plan next --plan-id extjob-reset-after-apply | jq -r '.task_id')
+execute extjob-reset-after-apply "$task" >/dev/null
+touch "$SQL_FLAGS/extjob-reset-by-opatch"
+task=$(plan next --plan-id extjob-reset-after-apply | jq -r '.task_id')
+if execute extjob-reset-after-apply "$task" >/dev/null 2>&1; then echo 'post-OPatch extjob permissions were ignored' >&2; exit 1; fi
+jq -e '.status == "failed" and .outcome_class == "database_down"' "$EXECUTION_STATE/plans/extjob-reset-after-apply/tasks/$task/evidence.json" >/dev/null
+[ -f "$EXECUTION_STATE/plans/extjob-reset-after-apply/tasks/$task/binary-state-known" ]
+[ -f "$PATCH_STATE" ] && [ "$(cat "$DATABASE_STATE")" = down ] && [ "$(cat "$LISTENER_STATE")" = down ]
+mode=$(stat -c '%a' "$TEST_HOME/bin/extjob" 2>/dev/null || stat -f '%Lp' "$TEST_HOME/bin/extjob")
+[ "$mode" = 700 ]
 
 [ -z "${FLOCK_PROBE:-}" ] || [ -s "$FLOCK_PROBE" ]
 printf '%s\n' 'standalone database patch executor test passed'

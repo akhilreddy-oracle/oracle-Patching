@@ -1,0 +1,16 @@
+{
+  "name": "oracle-patching-release-checks",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:browser": "playwright test",
+    "test:browser:integration": "playwright test --project backend-chromium",
+    "test:frontend": "node --test tests/frontend.mjs tests/release_ux.mjs tests/fleet_metadata.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

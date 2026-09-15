@@ -3,6 +3,8 @@ import { getActor } from "./actor.js";
 const TOKEN_KEY = "opu-webapp-token";
 export const TOKEN_EVENT = "opu-api-token-change";
 let readSignal;
+let sessionCsrf = "";
+export function setSessionCsrf(value) { sessionCsrf = value || ""; }
 
 export function getApiToken() {
   return localStorage.getItem(TOKEN_KEY) || "";
@@ -22,7 +24,7 @@ export function getReadSignal() { return readSignal; }
 export class ApiError extends Error {
   constructor(data, status) {
     super(status === 401
-      ? "Authentication required. Enter a valid API token in Session."
+      ? `Authentication required. ${data.message || "Sign in or enter an API token in Session."}`
       : data.message || `Request failed (${status}).`);
     this.name = "ApiError";
     this.status = status;
@@ -41,6 +43,7 @@ export async function apiFetch(url, options = {}) {
   const { acceptedStatuses = [], ...request } = options;
   const headers = apiHeaders(request.headers || {});
   if ((request.method || "GET").toUpperCase() !== "GET" && getActor()) headers["X-OPU-Actor"] = getActor();
+  if (!["GET", "HEAD"].includes((request.method || "GET").toUpperCase()) && sessionCsrf) headers["X-CSRF-Token"] = sessionCsrf;
   if (request.body !== undefined && !headers["Content-Type"]) {
     headers["Content-Type"] = "application/json";
   }

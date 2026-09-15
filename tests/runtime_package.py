@@ -58,7 +58,7 @@ def installer_commands(base, supported):
         # macOS has no flock CLI. Lock the actual inherited descriptor using
         # fcntl, preserving the shell installer's locking and command boundary.
         flock = commands / 'flock'
-        flock.write_text(f'#!{sys.executable}\n'
+        flock.write_text('#!/usr/bin/env python3.9\n'
                          'import fcntl, sys\n'
                          'assert sys.argv[1:3] == ["-w", "120"]\n'
                          'fcntl.flock(int(sys.argv[3]), fcntl.LOCK_EX)\n')

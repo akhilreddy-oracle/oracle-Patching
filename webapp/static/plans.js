@@ -2,6 +2,11 @@ import { el, badge, classifyStatus, renderErrorBox } from "./dom.js";
 import { apiFetch } from "./api.js";
 import { newestFirst } from "./host_scope.js";
 import { runToCompletion, RunStartError } from "./runs.js";
+import { executionFailure, reconciliationCard } from "./run_reconciliation.js";
+import { executionConsole } from "./execution_console.js";
+import { evidenceReport } from "./report_view.js";
+import { executionWindow } from "./plan_window.js";
+import { extjobInspection } from "./extjob_inspection.js";
 import { getActor, setActor, authenticatedActor } from "./actor.js";
 import {
   field,
@@ -330,15 +335,18 @@ export async function renderPlanDetail(mount, planId) {
 
   async function refresh(failure) {
     body.innerHTML = "";
-    const card = failureCard(failure);
-    if (card) body.appendChild(card);
     const res = await apiFetch(`/api/plans/${encodeURIComponent(planId)}`);
     const data = await res.json();
+    const display = data.unresolved_run
+      ? { run_id: data.unresolved_run.run_id, record: data.unresolved_run }
+      : failure;
+    const card = reconciliationCard(display, refresh) || failureCard(display);
+    if (card) body.appendChild(card);
     if (!res.ok) {
       renderErrorBox(body, data);
       return;
     }
-    await renderPlan(body, planId, data, refresh);
+    await renderPlan(body, planId, data, refresh, Boolean(display?.run_id));
   }
 
   await refresh();
@@ -394,12 +402,16 @@ function sodHint(plan, step) {
 }
 
 function stateGuidance(plan) {
+  if (["execution_authorized", "running", "paused"].includes(plan.state)) {
+    const windowState = executionWindow(plan);
+    if (!windowState.open) return windowState.detail;
+  }
   const map = {
     awaiting_approval: "Next: approve with a different actor than the requester (SoD). Ticket required if ITSM is on.",
     approved: "Next: authorize only while the maintenance window is open. Use a different actor than approver/requester as required by SoD.",
     execution_authorized: "Next: dispatch to materialize the task list and start the plan.",
     running: "Next: execute the next task (or remaining tasks). Stop on failed/blocked tasks.",
-    paused: "Plan is paused after a failed task — inspect the failure, fix the blocker, then Retry from Execute (or create a new plan if sealed inputs changed).",
+    paused: "Plan is paused after a failed task. Open the evidence report to inspect its saved failure. A retry needs a corrected blocker, an open window and native eligibility; completed tasks are preserved.",
     succeeded: plan.intent === "patch_apply" ? "Apply succeeded — you can create a rollback plan from this result." : "Plan succeeded.",
     failed: "Plan failed — inspect tasks and evidence before retrying or rolling back.",
   };
@@ -437,7 +449,7 @@ function deadPlanCard(plan, viability) {
   return el("section", { class: "card card-failure" }, kids);
 }
 
-async function renderPlan(body, planId, plan, refresh) {
+async function renderPlan(body, planId, plan, refresh, unresolved = false) {
   body.appendChild(
     el("div", { class: "meta-row" }, [
       el("span", {}, [document.createTextNode("Intent: "), el("strong", { text: plan.intent || "—" })]),
@@ -452,7 +464,7 @@ async function renderPlan(body, planId, plan, refresh) {
   if (dead) {
     body.appendChild(deadPlanCard(plan, viability));
   } else {
-    body.appendChild(nextStepBanner(stateGuidance(plan)));
+    body.appendChild(nextStepBanner(unresolved ? "Next: inspect and reconcile the interrupted run before executing another task." : stateGuidance(plan)));
   }
 
   if (plan.intent === "patch_rollback" && plan.source_apply) {
@@ -577,10 +589,13 @@ async function renderPlan(body, planId, plan, refresh) {
   } else if (["running", "paused", "succeeded"].includes(plan.state)) {
     controls.appendChild(el("h2", { text: "Tasks" }));
     if (plan.state === "running") {
+      const windowState = executionWindow(plan);
       const actor = el("input", { type: "text", value: getActor() });
       bindActorField(actor);
       const btn = el("button", { type: "button", text: "Execute next task" });
       const btnAll = el("button", { type: "button", text: "Execute remaining tasks" });
+      btn.disabled = unresolved || !windowState.open;
+      btnAll.disabled = unresolved || !windowState.open;
       controls.appendChild(
         helperText(
           "TEST_MODE fixtures run locally. Live plans sync sealed state to the task node over SSH and pull evidence back. Execute remaining runs until idle, success, or a failed/blocked task.",
@@ -588,14 +603,20 @@ async function renderPlan(body, planId, plan, refresh) {
         )
       );
       btn.addEventListener("click", async () => {
+        if (unresolved) return;
         clearFormError(errBox);
+        const currentWindow = executionWindow(plan);
+        if (!currentWindow.open) { showFormError(errBox, currentWindow.detail); return; }
         if (!requireToken(errBox)) return;
         const who = requireActor(actor, errBox, "Actor");
         if (!who) return;
         await runAction(logBox, btn, `/api/plans/${encodeURIComponent(planId)}/execute-next`, { actor: who }, refresh, errBox);
       });
       btnAll.addEventListener("click", async () => {
+        if (unresolved) return;
         clearFormError(errBox);
+        const currentWindow = executionWindow(plan);
+        if (!currentWindow.open) { showFormError(errBox, currentWindow.detail); return; }
         if (!requireToken(errBox)) return;
         const who = requireActor(actor, errBox, "Actor");
         if (!who) return;
@@ -603,7 +624,7 @@ async function renderPlan(body, planId, plan, refresh) {
       });
       controls.appendChild(el("div", { class: "pipeline-controls" }, [field("Actor", actor, "Synced with Acting as"), btn, btnAll]));
     }
-    controls.appendChild(await taskTable(planId));
+    controls.appendChild(await taskTable(planId, plan, unresolved));
   } else {
     controls.appendChild(el("h2", { text: "No actions available for this state" }));
     controls.appendChild(helperText(stateGuidance(plan)));
@@ -611,19 +632,21 @@ async function renderPlan(body, planId, plan, refresh) {
 
   controls.appendChild(logBox);
   body.appendChild(controls);
+  body.appendChild(executionConsole(planId));
+  body.appendChild(evidenceReport(planId));
 
   body.appendChild(
     el("details", { class: "pipeline-result" }, [el("summary", { text: "Plan JSON" }), el("pre", { class: "mono", text: JSON.stringify(plan, null, 2) })])
   );
 }
 
-async function taskTable(planId) {
+async function taskTable(planId, plan, unresolved) {
   const res = await apiFetch(`/api/plans/${encodeURIComponent(planId)}/tasks`);
   const data = await res.json();
   if (!data.tasks?.length) {
     return helperText("No tasks materialized yet.");
   }
-  return el("table", {}, [
+  const table = el("table", {}, [
     el("thead", {}, [el("tr", {}, [el("th", { text: "Task" }), el("th", { text: "Stage" }), el("th", { text: "Node" }), el("th", { text: "Status" })])]),
     el(
       "tbody",
@@ -638,6 +661,8 @@ async function taskTable(planId) {
       )
     ),
   ]);
+  const inspection = extjobInspection(planId, plan, data.tasks, unresolved);
+  return inspection ? el("div", {}, [table, inspection]) : table;
 }
 
 async function appendItsmBanner(controls) {
@@ -682,7 +707,7 @@ async function runAction(logBox, btn, url, body, refresh, errBox) {
     logBox.textContent = msg;
     if (errBox) showFormError(errBox, msg);
     try {
-      await refresh({ message: msg });
+      await refresh(executionFailure(err));
     } catch (_refreshErr) {
       // Keep the inline error if the refresh itself fails.
     }

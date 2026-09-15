@@ -9,6 +9,15 @@ export function authenticatedActor() {
   return identity?.rbac_enabled && identity.actor ? identity.actor : null;
 }
 
+/** UI admission hint from /api/session; the server authorizes every request. */
+export function companySessionState() {
+  if (identity?.mode !== "company") return "absent";
+  return identity.rbac_enabled === true && typeof identity.actor === "string" && identity.actor
+    && typeof identity.csrf_token === "string" && identity.csrf_token
+    && typeof identity.expires_at === "number" && Number.isFinite(identity.expires_at)
+    && identity.expires_at * 1000 > Date.now() ? "active" : "unavailable";
+}
+
 export function setSessionIdentity(session) {
   identity = session;
   setActor(authenticatedActor() || getActor());
@@ -53,7 +62,7 @@ export function mountActorWidget(container) {
     class: "actor-input actor-token",
     placeholder: "paste API token",
     value: getApiToken(),
-    title: "Bearer token from webapp/var/api-token (or OPU_WEBAPP_TOKEN). Required for every /api call.",
+    title: "API credential for a lab or service-principal session. Company sign-in uses its authenticated session.",
     autocomplete: "off",
     "aria-label": "API token",
   });
@@ -71,7 +80,7 @@ export function mountActorWidget(container) {
       ]),
       el("p", {
         class: "actor-hint",
-        text: "Acting as prefills Requester / Actor on plans & recovery. Token required for all API calls.",
+        text: "Company and service sessions bind the actor to your identity. Lab sessions use an API token and a selected actor.",
       }),
     ])
   );

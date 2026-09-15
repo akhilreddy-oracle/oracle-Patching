@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/opu-recovery-prepare.XXXXXX")
-trap 'if [ "${OPU_KEEP_TEST_TMP:-0}" = 1 ]; then printf "test_tmp=%s\\n" "$TMP" >&2; else rm -rf -- "$TMP"; fi' EXIT
+trap 'if [ -n "${LOCK_HOLDER_PID:-}" ]; then kill "$LOCK_HOLDER_PID" 2>/dev/null || true; fi; if [ "${OPU_KEEP_TEST_TMP:-0}" = 1 ]; then printf "test_tmp=%s\\n" "$TMP" >&2; else rm -rf -- "$TMP"; fi' EXIT
 
 TOOL="$ROOT/bin/opu-database-recovery-prepare"
 STATE_ROOT="$TMP/state"
@@ -19,21 +19,26 @@ printf 'OPEN\n' >"$RUNTIME/database.state"
 printf 'inventory_loc=%s\ninst_group=oinstall\n' "$INVENTORY" >"$ORACLE_HOME_TARGET/oraInst.loc"
 printf 'inventory content\n' >"$INVENTORY/ContentsXML"
 printf 'home content\n' >"$ORACLE_HOME_TARGET/bin/oracle"
+printf 'spfile\n' >"$RUNTIME/spfileORCL.ora"
 
 cat >"$ORACLE_HOME_TARGET/bin/sqlplus" <<'FAKE_SQLPLUS'
 #!/usr/bin/env bash
 set -euo pipefail
 input=$(cat)
+if { : >&7; } 2>/dev/null; then fd7=open; else fd7=closed; fi
 state_file="$OPU_TEST_RUNTIME/database.state"
 printf 'sql:%s\n' "$(printf '%s' "$input" | tr '\n' ' ')" >>"$OPU_TEST_RUNTIME/order.log"
 case "$input" in
   *OPU_RECOVERY_PREP_PROBE*)
     state=$(cat "$state_file")
     if [ "$state" = OPEN ]; then
-      printf 'ORCL|ORCL|PRIMARY|READ WRITE|NOARCHIVELOG|OPEN|12345|/tmp/spfileORCL.ora|1024\n'
+      printf 'ORCL|ORCL|PRIMARY|READ WRITE|NOARCHIVELOG|OPEN|12345|%s/spfileORCL.ora|1024\n' "$OPU_TEST_RUNTIME"
     else
-      printf 'ORCL|ORCL|PRIMARY|MOUNTED|NOARCHIVELOG|MOUNTED|12345|/tmp/spfileORCL.ora|1024\n'
+      printf 'ORCL|ORCL|PRIMARY|MOUNTED|NOARCHIVELOG|MOUNTED|12345|%s/spfileORCL.ora|1024\n' "$OPU_TEST_RUNTIME"
     fi
+    ;;
+  *OPU_RECOVERY_PREP_CAPACITY*)
+    printf 'META|19.0.0|0|12345|1|1024|512\nFILE|1|1024|1024|LOCAL|512|AVAILABLE|ONLINE|ONLINE|%s/oradata/system01.dbf|1\n' "$OPU_TEST_RUNTIME"
     ;;
   *OPU_RECOVERY_COVERAGE*)
     printf '1|1|1|1|1|0|0|%s|0\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -41,13 +46,15 @@ case "$input" in
   *OPU_RECOVERY_PREP_DATABASE_FILES*) printf '%s\n' "$OPU_TEST_RUNTIME/oradata/system01.dbf";;
   *'select distinct bs.recid'*) printf '1\n2\n3\n';;
   *'shutdown immediate;'*) printf 'DOWN\n' >"$state_file";;
-  *'startup mount;'*) printf 'MOUNT\n' >"$state_file";;
+  *'startup mount;'*) printf 'fd7:startup-mount:%s\n' "$fd7" >>"$OPU_TEST_RUNTIME/order.log"; printf 'MOUNT\n' >"$state_file";;
   *"select dbid || '|' || open_mode"*) printf '12345|MOUNTED|NOARCHIVELOG\n';;
   *'alter database open;'*)
+    if [ -e "$OPU_TEST_RUNTIME/fail-open-once" ]; then rm "$OPU_TEST_RUNTIME/fail-open-once"; exit 1; fi
     if [ -e "$OPU_TEST_RUNTIME/fail-open" ]; then printf 'ORA-01034\n' >&2; exit 1; fi
     printf 'OPEN\n' >"$state_file"
     ;;
   *'startup;'*)
+    printf 'fd7:startup:%s\n' "$fd7" >>"$OPU_TEST_RUNTIME/order.log"
     if [ -e "$OPU_TEST_RUNTIME/fail-open" ]; then printf 'ORA-01034\n' >&2; exit 1; fi
     printf 'OPEN\n' >"$state_file"
     ;;
@@ -58,6 +65,8 @@ FAKE_SQLPLUS
 cat >"$ORACLE_HOME_TARGET/bin/rman" <<'FAKE_RMAN'
 #!/usr/bin/env bash
 set -euo pipefail
+if { : >&7; } 2>/dev/null; then fd7=open; else fd7=closed; fi
+printf 'fd7:rman:%s\n' "$fd7" >>"$OPU_TEST_RUNTIME/order.log"
 command_file=''
 check_syntax=0
 while [ "$#" -gt 0 ]; do
@@ -115,7 +124,14 @@ cat >"$ORACLE_HOME_TARGET/bin/lsnrctl" <<'FAKE_LSNRCTL'
 set -euo pipefail
 printf 'listener:%s\n' "$*" >>"$OPU_TEST_RUNTIME/order.log"
 case "${1:-}" in
+  start)
+    if { : >&7; } 2>/dev/null; then fd7=open; else fd7=closed; fi
+    printf 'fd7:listener-start:%s\n' "$fd7" >>"$OPU_TEST_RUNTIME/order.log"
+    rm -f "$OPU_TEST_RUNTIME/listener-stopped"
+    ;;
+  stop) touch "$OPU_TEST_RUNTIME/listener-stopped";;
   services|status)
+    if [ -f "$OPU_TEST_RUNTIME/listener-stopped" ]; then exit 1; fi
     printf '%s\n' \
       'Services Summary...' \
       'Service "ORCL" has 1 instance(s).' \
@@ -154,6 +170,7 @@ jq -n '{schema_version:"1.0",maximum_snapshot_age_seconds:3600,recovery:{require
 
 tool() {
   OPU_RECOVERY_PREP_STATE_DIR="$STATE_ROOT" \
+  OPU_EXECUTION_LOCK_DIR="$TMP/host-locks" \
   OPU_RECOVERY_PREP_TEST_ALLOW_NONROOT=1 \
   OPU_RECOVERY_PREP_TEST_MODE=1 \
   OPU_TEST_MODE=1 \
@@ -168,7 +185,7 @@ tool() {
 
 create_request() {
   tool create --request-id "$1" --requester patch-admin \
-    --snapshot "$TMP/snapshot.json" --policy "$TMP/policy.json" \
+    --snapshot "$TMP/snapshot.json" --policy "${2:-$TMP/policy.json}" \
     --database ORCL --backup-parent "$BACKUP_PARENT" \
     --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
 }
@@ -182,22 +199,30 @@ tool create --request-id recovery-inventory-overlap --requester patch-admin \
   --snapshot "$TMP/snapshot.json" --policy "$TMP/policy.json" \
   --database ORCL --backup-parent "$INVENTORY/unsafe-backups" \
   --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
-approve_authorize recovery-inventory-overlap
-if tool execute --request-id recovery-inventory-overlap --actor patch-operator >/dev/null 2>&1; then
-  printf '%s\n' 'Central Inventory overlap was accepted' >&2; exit 1
+if tool approve --request-id recovery-inventory-overlap --actor dba-approver --approval-ticket TEST-OVERLAP >/dev/null 2>&1; then
+  printf '%s\n' 'Central Inventory overlap was approved' >&2; exit 1
 fi
-tool status --request-id recovery-inventory-overlap | jq -e '.state == "authorized"' >/dev/null
+tool status --request-id recovery-inventory-overlap | jq -e '.state == "awaiting_approval" and .approval == null' >/dev/null
 [ "$(cat "$RUNTIME/database.state")" = OPEN ]
 
 create_request recovery-ok
-tool analyze --request-id recovery-ok | jq -e '.status == "passed"' >/dev/null
+find "$STATE_ROOT/recovery-ok" -type f -exec sha256sum {} \; | sort >"$TMP/request-before.sha256"
+tool analyze --request-id recovery-ok | jq -e '.status == "passed" and .capacity.capacity_basis == "allocated" and .capacity.allocated_database_bytes == 1024 and .capacity.database_budget_bytes == 1024 and .capacity.admitted == true' >/dev/null
+find "$STATE_ROOT/recovery-ok" -type f -exec sha256sum {} \; | sort >"$TMP/request-after.sha256"
+cmp "$TMP/request-before.sha256" "$TMP/request-after.sha256"
+[ ! -e "$BACKUP_PARENT/recovery-ok" ]
+if grep -Eq 'rman:|sql:.*shutdown|listener:stop' "$RUNTIME/order.log"; then
+  echo 'read-only analysis attempted Oracle mutation' >&2; exit 1
+fi
 if tool approve --request-id recovery-ok --actor patch-admin --approval-ticket SELF >/dev/null 2>&1; then
   printf '%s\n' 'self-approval was accepted' >&2; exit 1
 fi
 approve_authorize recovery-ok
+tool status --request-id recovery-ok | jq -e '.approval.analysis.status == "passed" and .approval.analysis.capacity.admitted == true and .approval.analysis.source_request == .source_request and .approval.analysis.policy == .policy and .approval.analysis.source_snapshot == .source_snapshot' >/dev/null
 tool execute --request-id recovery-ok --actor patch-operator >"$TMP/completed.json"
 jq -e '.state == "completed" and .result.preparation_manifest.record_sha256 and .result.checksum_manifest.sha256 and .result.recovery_evidence.record_sha256' "$TMP/completed.json" >/dev/null
 jq -e '.execution.phase == "completed"' "$TMP/completed.json" >/dev/null
+jq -e '.execution.capacity.capacity_basis == "allocated" and .execution.capacity.complete_datafile_coverage == true and .execution.capacity.binary_compression_discount_bytes == 0' "$TMP/completed.json" >/dev/null
 [ "$(cat "$RUNTIME/database.state")" = OPEN ]
 [ ! -e "$BACKUP_PARENT/recovery-ok/INCOMPLETE" ]
 [ "$(wc -l <"$BACKUP_PARENT/recovery-ok/SHA256SUMS" | tr -d ' ')" -ge 7 ]
@@ -217,6 +242,9 @@ grep -q 'listener:stop LISTENER' "$RUNTIME/order.log"
 grep -q 'listener:start LISTENER' "$RUNTIME/order.log"
 [ "$(grep -c 'listener:services LISTENER' "$RUNTIME/order.log")" -ge 2 ]
 grep -q 'incremental level 0 check logical database force' "$RUNTIME/order.log"
+grep -q 'fd7:startup-mount:closed' "$RUNTIME/order.log"
+grep -q 'fd7:listener-start:closed' "$RUNTIME/order.log"
+grep -q 'fd7:rman:open' "$RUNTIME/order.log"
 recovery_evidence_path=$(jq -r '.result.recovery_evidence.path' "$TMP/completed.json")
 jq -e '.status == "passed" and .backup.preparation.manifest.record_sha256 and .backup.preparation.central_inventory_archive.sha256' "$recovery_evidence_path" >/dev/null
 
@@ -239,6 +267,33 @@ if tool execute --request-id recovery-required --actor patch-operator >/dev/null
 fi
 rm "$RUNTIME/fail-rman" "$RUNTIME/fail-open"
 tool status --request-id recovery-required | jq -e '.state == "recovery_required" and .failure.services_restored == false' >/dev/null
+grep -q 'fd7:startup:closed' "$RUNTIME/order.log"
+if grep -Eq 'fd7:(startup|startup-mount|listener-start):open|fd7:rman:closed' "$RUNTIME/order.log"; then
+  echo 'Oracle service inherited the host lock or RMAN lost it' >&2; exit 1
+fi
+printf 'OPEN\n' >"$RUNTIME/database.state"
+
+# An explicit unused-block policy reports its real measurements without changing
+# the request; an excessive reserve returns blocked JSON with the same details.
+jq '.recovery.capacity_basis="rman_unused_blocks" | .recovery.storage_mode="filesystem" | .recovery.minimum_filesystem_free_bytes=0' "$TMP/policy.json" >"$TMP/unused-policy.json"
+create_request recovery-unused "$TMP/unused-policy.json"
+tool analyze --request-id recovery-unused | jq -e '.status == "passed" and .capacity.capacity_basis == "rman_unused_blocks" and .capacity.database_budget_bytes == 512 and .capacity.provable_unused_bytes == 512' >/dev/null
+jq '.recovery.minimum_filesystem_free_bytes=1000000000000000000' "$TMP/unused-policy.json" >"$TMP/reserve-policy.json"
+create_request recovery-reserve "$TMP/reserve-policy.json"
+if tool analyze --request-id recovery-reserve >"$TMP/reserve-analysis.json"; then
+  echo 'unavailable policy reserve was admitted' >&2; exit 1
+fi
+jq -e '.status == "blocked" and .capacity.admitted == false and .capacity.minimum_filesystem_free_bytes == 1000000000000000000 and .capacity.required_bytes > .capacity.available_bytes' "$TMP/reserve-analysis.json" >/dev/null
+if tool approve --request-id recovery-reserve --actor dba-approver --approval-ticket TEST-RESERVE >/dev/null 2>&1; then
+  echo 'approval ignored filesystem reserve' >&2; exit 1
+fi
+tool status --request-id recovery-reserve | jq -e '.state == "awaiting_approval" and .approval == null' >/dev/null
+[ ! -e "$BACKUP_PARENT/recovery-reserve" ]
+jq '.recovery.minimum_filesystem_free_bytes=-1' "$TMP/policy.json" >"$TMP/invalid-policy.json"
+if create_request recovery-invalid-policy "$TMP/invalid-policy.json" >/dev/null 2>&1; then
+  echo 'invalid capacity policy was sealed' >&2; exit 1
+fi
+[ ! -e "$STATE_ROOT/recovery-invalid-policy" ]
 
 create_request recovery-lock
 approve_authorize recovery-lock
@@ -252,6 +307,52 @@ tool status --request-id recovery-lock | jq -e '.state == "authorized"' >/dev/nu
 [ ! -e "$BACKUP_PARENT_CANONICAL/recovery-lock" ]
 unlink "$STATE_ROOT/locks/$lock_key.lock/owner"
 rmdir "$STATE_ROOT/locks/$lock_key.lock"
+
+# A different adapter's actual shared host lock excludes both a new recovery
+# execution and service reconciliation of an interrupted recovery worker.
+create_request recovery-host-lock
+approve_authorize recovery-host-lock
+create_request recovery-reconcile
+approve_authorize recovery-reconcile
+cp "$STATE_ROOT/recovery-ok/evidence/listener-expected-services.txt" "$STATE_ROOT/recovery-reconcile/evidence/listener-expected-services.txt"
+jq '.state="running" | .execution={listener:"LISTENER",phase:"backup"} | del(.record_sha256)' "$STATE_ROOT/recovery-reconcile/request.json" >"$TMP/interrupted.json"
+interrupted_sha=$(printf '%s' "$(jq -cS . "$TMP/interrupted.json")" | sha256sum | awk '{print $1}')
+jq --arg sha "$interrupted_sha" '.record_sha256=$sha' "$TMP/interrupted.json" >"$STATE_ROOT/recovery-reconcile/request.json"
+mkdir "$STATE_ROOT/locks/$lock_key.lock"
+printf 'request_id=recovery-reconcile\npid=999999999\n' >"$STATE_ROOT/locks/$lock_key.lock/owner"
+OPU_EXECUTION_LOCK_DIR="$TMP/host-locks" bash -c '
+  set -e
+  . "$2/lib/opu/common.sh"
+  . "$2/lib/opu/execution.sh"
+  opu_execution_host_lock
+  touch "$1/host-lock-ready"
+  while [ ! -e "$1/host-lock-release" ]; do sleep 0.1; done
+' bash "$RUNTIME" "$ROOT" &
+LOCK_HOLDER_PID=$!
+for ((attempt=0; attempt<100; attempt++)); do [ -e "$RUNTIME/host-lock-ready" ] && break; sleep 0.05; done
+[ -e "$RUNTIME/host-lock-ready" ]
+if tool execute --request-id recovery-host-lock --actor patch-operator >/dev/null 2>&1; then
+  echo 'recovery execution bypassed another adapter host lock' >&2; exit 1
+fi
+tool status --request-id recovery-host-lock | jq -e '.state == "authorized"' >/dev/null
+order_sha=$(sha256sum "$RUNTIME/order.log" | awk '{print $1}')
+if tool reconcile --request-id recovery-reconcile --actor patch-operator >/dev/null 2>&1; then
+  echo 'recovery reconciliation bypassed another adapter host lock' >&2; exit 1
+fi
+[ "$(sha256sum "$RUNTIME/order.log" | awk '{print $1}')" = "$order_sha" ]
+tool status --request-id recovery-reconcile | jq -e '.state == "running"' >/dev/null
+[ -f "$STATE_ROOT/locks/$lock_key.lock/owner" ]
+touch "$RUNTIME/host-lock-release"
+wait "$LOCK_HOLDER_PID"
+LOCK_HOLDER_PID=''
+printf 'DOWN\n' >"$RUNTIME/database.state"
+touch "$RUNTIME/fail-open-once" "$RUNTIME/listener-stopped"
+tool reconcile --request-id recovery-reconcile --actor patch-operator | jq -e '.state == "failed_services_restored" and .reconciliation.classification == "failed_services_restored"' >/dev/null
+[ "$(cat "$RUNTIME/database.state")" = OPEN ]
+[ ! -e "$STATE_ROOT/locks/$lock_key.lock" ]
+if grep -Eq 'fd7:(startup|startup-mount|listener-start):open' "$RUNTIME/order.log"; then
+  echo 'reconciliation let permanent Oracle services inherit its host lock' >&2; exit 1
+fi
 
 create_request recovery-source-tamper
 jq '.requester="changed"' "$STATE_ROOT/recovery-source-tamper/request-input.json" >"$TMP/source-tamper.tmp"
@@ -271,4 +372,5 @@ if tool approve --request-id recovery-tamper --actor dba-approver --approval-tic
   printf '%s\n' 'tampered snapshot was accepted' >&2; exit 1
 fi
 
+python3 -B "$ROOT/tests/recovery_capacity.py"
 printf '%s\n' 'database recovery preparation test passed'

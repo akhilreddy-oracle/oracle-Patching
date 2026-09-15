@@ -82,4 +82,36 @@ jq -e '
   )
 ' "$TMP/standalone-drift-result.json" >/dev/null
 
+
+# Filesystem recovery substitutes a fully validated selected set for the FRA
+# gate, never a backup waiver. The same verifier is used again by patch plans.
+jq '.recovery |= (. + {require_backup:true,storage_mode:"filesystem",capacity_basis:"rman_unused_blocks",minimum_filesystem_free_bytes:100,max_backup_age_minutes:1440})' "$TMP/policy.json" >"$TMP/filesystem-policy.json"
+filesystem_eval() {
+  "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/standalone-reconciliation.json" --snapshot "$TMP/standalone.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/filesystem-policy.json" "$@"
+}
+if filesystem_eval --output "$TMP/no-recovery.json" >/dev/null; then echo 'filesystem backup without selected evidence was accepted' >&2; exit 1; fi
+jq -e 'any(.gates[]; .name == "recovery_filesystem" and .status == "blocker") and all(.gates[]; .name != "recovery_fra")' "$TMP/no-recovery.json" >/dev/null
+jq -n --arg snapshot "$TMP/standalone.json" --arg snapshot_sha "$standalone_sha" --arg now "$now" --arg digest "$digest" '
+ {schema_version:"1.0",collector:{name:"oracle.recovery.evidence",version:"1"},status:"passed",target:{database_unique_name:"ORCL",oracle_home:"/u01/db",owner:"oracle"},source_snapshot:{path:$snapshot,sha256:$snapshot_sha},backup:{root:"/backup/selected",checksum_manifest:{sha256:$digest},preparation:{manifest:{sha256:$digest,record_sha256:$digest},central_inventory_archive:{sha256:$digest},oraInst_loc:{sha256:$digest}},selected_recovery_set:{observed_at:$now,oldest_datafile_backup_completed_at:$now,age_seconds_at_collection:0,restore_piece_handles:["/backup/selected/db.bkp"],datafile_backup_sets:[1]},coverage:{datafiles_current:2,base_datafiles:2,controlfile_records:1,spfile_records:1,outside_root_pieces:0,unavailable_pieces:0},storage:{type:"filesystem",path:"/backup/selected",device_id:"1",total_bytes:1000,available_bytes:500,observed_at:$now}},verification:{checksum_log:{sha256:$digest},oracle_home_archive_log:{sha256:$digest},rman_syntax:{log:{sha256:$digest},exit_code:{value:0,sha256:$digest}},rman_log:{sha256:$digest,exit_code:{value:0,sha256:$digest}}}}' >"$TMP/filesystem-recovery-base.json"
+seal_recovery() {
+  local input=$1 output=$2 canonical sha
+  canonical=$(jq -cS 'del(.record_sha256)' "$input")
+  sha=$(printf '%s' "$canonical" | sha256sum | awk '{print $1}')
+  jq --arg sha "$sha" '.record_sha256=$sha' "$input" >"$output"
+}
+seal_recovery "$TMP/filesystem-recovery-base.json" "$TMP/filesystem-recovery.json"
+filesystem_eval --recovery-evidence "$TMP/filesystem-recovery.json" --output "$TMP/filesystem-result.json" >/dev/null
+jq -e '.status == "ready_for_approval" and any(.gates[]; .name == "recovery_filesystem" and .status == "pass") and (.evidence.recovery_sha256 | test("^[a-f0-9]{64}$"))' "$TMP/filesystem-result.json" >/dev/null
+for mutation in '.backup.storage.available_bytes=99' '.backup.storage.available_bytes=-1' '.backup.storage.observed_at="2000-01-01T00:00:00Z"' '.target.database_unique_name="OTHER"' '.source_snapshot.sha256="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' 'del(.backup.preparation)' '.verification.rman_log.exit_code.value=1' '.backup.coverage.base_datafiles=1'; do
+  jq "$mutation" "$TMP/filesystem-recovery-base.json" >"$TMP/recovery-mutated.json"
+  seal_recovery "$TMP/recovery-mutated.json" "$TMP/recovery-mutated-sealed.json"
+  if filesystem_eval --recovery-evidence "$TMP/recovery-mutated-sealed.json" >/dev/null 2>&1; then echo "unsafe filesystem evidence accepted: $mutation" >&2; exit 1; fi
+done
+jq '.backup.storage.available_bytes=501' "$TMP/filesystem-recovery.json" >"$TMP/recovery-tampered.json"
+if filesystem_eval --recovery-evidence "$TMP/recovery-tampered.json" >/dev/null 2>&1; then echo 'tampered filesystem evidence accepted' >&2; exit 1; fi
+for mutation in '.recovery.storage_mode=null' '.recovery.storage_mode="typo"' '.recovery.capacity_basis="ratio"' '.recovery.minimum_filesystem_free_bytes=-1' '.recovery.minimum_filesystem_free_bytes=null' '.recovery.require_backup=false'; do
+  jq "$mutation" "$TMP/filesystem-policy.json" >"$TMP/bad-filesystem-policy.json"
+  if "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/standalone-reconciliation.json" --snapshot "$TMP/standalone.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/bad-filesystem-policy.json" >/dev/null 2>&1; then echo "invalid filesystem policy accepted: $mutation" >&2; exit 1; fi
+done
+
 printf '%s\n' 'readiness evaluation test passed'

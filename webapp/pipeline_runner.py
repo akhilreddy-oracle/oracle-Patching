@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 import notifications
+from diagnostics import redact_text, redacted
 from durable import file_lock, write_json
 
 RUNS_DIR = Path(__file__).resolve().parent / "var" / "runs"
@@ -53,17 +54,31 @@ class RunRecord:
         self.owner = {"pid": os.getpid(), "instance": _PROCESS_ID}
         self.context: dict = {}
         self.reconciliation: dict | None = None
+        self.timeline: list[dict] = [{'sequence': 1, 'at': self.created_at, 'event': 'queued', 'message': 'Operation queued'}]
+        self.observation: dict | None = None
+        self.controller_poll: dict | None = None
         self._lock = threading.RLock()
 
     def log(self, line: str) -> None:
         with self._lock:
-            self.log_lines.append(line)
+            self.log_lines.append(redact_text(line, 4000))
             if len(self.log_lines) > 500:
                 self.log_lines = self.log_lines[-500:]
         self._persist()
 
+    def event(self, event: str, message: str, **details) -> None:
+        with self._lock:
+            sequence = max((item.get('sequence', 0) for item in self.timeline if isinstance(item.get('sequence', 0), int)), default=0) + 1
+            self.timeline.append({'sequence': sequence, 'at': time.time(), 'event': event,
+                                  'message': redact_text(message, 500), **redacted(details)})
+            self.timeline = self.timeline[-300:]
+        self._persist()
+
     def to_json(self) -> dict:
         with self._lock:
+            started = self.started_at or self.created_at
+            finished = self.finished_at or time.time()
+            elapsed = max(0, int(finished - started)) if isinstance(started, (int, float)) and isinstance(finished, (int, float)) else None
             return {
                 "run_id": self.run_id,
                 "kind": self.kind,
@@ -78,6 +93,10 @@ class RunRecord:
                 "owner": self.owner,
                 "context": dict(self.context),
                 "reconciliation": self.reconciliation,
+                "timeline": list(self.timeline),
+                "observation": redacted(self.observation),
+                "controller_poll": self.controller_poll,
+                "elapsed_seconds": elapsed,
             }
 
     def _persist(self) -> None:
@@ -94,6 +113,21 @@ def set_execution_context(**values) -> None:
         with record._lock:
             record.context.update(values)
             record._persist()
+
+
+def record_event(event: str, message: str, **details) -> None:
+    record = getattr(_CURRENT, 'record', None)
+    if record is not None:
+        record.event(event, message, **details)
+
+
+def controller_poll(state: str) -> None:
+    """A controller SSH observation is not a native worker heartbeat."""
+    record = getattr(_CURRENT, 'record', None)
+    if record is not None:
+        with record._lock:
+            record.controller_poll = {'observed_at': time.time(), 'state': state, 'source': 'controller_ssh_poll'}
+        record._persist()
 
 
 def _disk_active(key: str) -> str | None:
@@ -139,16 +173,19 @@ def start_run(kind: str, key: str, fn) -> RunRecord:
                 record.status = "running"
                 record.started_at = time.time()
             record._persist()
+            record.event('started', 'Controller started the operation')
             result = fn(record)
             with record._lock:
                 record.result = result
                 record.status = "succeeded"
+            record.event('succeeded', 'Controller operation completed')
         except Exception as exc:  # noqa: BLE001 - surfaced via the run record, never swallowed
             to_json = getattr(exc, "to_json", None)
             error = to_json() if callable(to_json) else {"message": str(exc)}
             with record._lock:
                 record.error = error
                 record.status = "unknown" if record.context.get("detached_execution") and not record.context.get("detached_terminal") else "failed"
+            record.event(record.status, (record.error.get('message') if isinstance(record.error, dict) else '') or 'Operation needs inspection')
         finally:
             with record._lock:
                 record.finished_at = time.time()
@@ -194,17 +231,22 @@ def _load_persisted(run_id: str) -> RunRecord | None:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(data, dict):
+        return None
     record = RunRecord(run_id, data.get("kind") or "unknown", data.get("key") or "")
     record.status = data.get("status") or "failed"
     record.created_at = data.get("created_at") or time.time()
     record.started_at = data.get("started_at")
     record.finished_at = data.get("finished_at")
-    record.log_lines = list(data.get("log_tail") or [])
+    record.log_lines = [redact_text(line, 4000) for line in data.get('log_tail') or []] if isinstance(data.get('log_tail'), list) else []
     record.result = data.get("result")
     record.error = data.get("error")
-    record.owner = data.get("owner") or {}
-    record.context = data.get("context") or {}
+    record.owner = data.get("owner") if isinstance(data.get('owner'), dict) else {}
+    record.context = data.get("context") if isinstance(data.get('context'), dict) else {}
     record.reconciliation = data.get("reconciliation")
+    record.timeline = [redacted(event) for event in data.get('timeline') or [] if isinstance(event, dict) and isinstance(event.get('at'), (int, float))] if isinstance(data.get('timeline'), list) else []
+    record.observation = data.get('observation') if isinstance(data.get('observation'), dict) else None
+    record.controller_poll = data.get('controller_poll') if isinstance(data.get('controller_poll'), dict) else None
     if record.status in _UNRESOLVED and record.owner.get("instance") != _PROCESS_ID:
         record.status = "unknown"
         record.error = {"message": "Controller ownership was lost; reconcile the execution before relaunching"}
@@ -254,6 +296,7 @@ def reconcile_run(run_id: str, *, actor: str | None, inspect, confirm_no_active_
             record.finished_at = time.time() if record.status != "unknown" else None
             record.reconciliation = {"actor": actor, "at": time.time(), "note": note, "status": record.status}
             record._persist()
+        record.event('reconciled', 'Operator inspected the existing execution outcome', outcome=record.status, actor=actor)
         if record.status not in _UNRESOLVED:
             with _REGISTRY_LOCK:
                 if _ACTIVE_KEYS.get(record.key) == run_id:
@@ -294,3 +337,16 @@ def get_run(run_id: str) -> RunRecord | None:
         if loaded is not None:
             RUNS[run_id] = loaded
         return loaded
+
+
+def list_runs(key_prefix: str | None = None) -> list[dict]:
+    """Newest-first durable records, retaining unknown ownership semantics."""
+    with _REGISTRY_LOCK:
+        ids = set(RUNS)
+    ids.update(path.parent.name for path in RUNS_DIR.glob('*/run.json') if _RUN_ID_RE.fullmatch(path.parent.name))
+    records = []
+    for run_id in ids:
+        record = get_run(run_id)
+        if record is not None and (key_prefix is None or record.key.startswith(key_prefix)):
+            records.append(record.to_json())
+    return sorted(records, key=lambda item: item.get('created_at') or 0, reverse=True)

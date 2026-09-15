@@ -73,6 +73,12 @@
         "record_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/log" }
+    },
     "logs": {
       "type": "object",
       "additionalProperties": false,

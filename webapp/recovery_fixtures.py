@@ -1,10 +1,9 @@
 """TEST_MODE fixture harness for opu-database-recovery-prepare.
 
 Shim scripts alongside this file (sqlplus.sh, rman.sh, lsnrctl.sh,
-fake-topology.sh) are extracted verbatim from tests/recovery_prepare.sh, the
-same discipline testmode_fixtures.py already uses for the patch executor —
-one definition of "what a fake Oracle recovery environment looks like",
-shared with the test suite rather than reimplemented.
+fake-topology.sh) model the constrained responses in tests/recovery_prepare.sh.
+tests/recovery_demo_fixture.py exercises the app-built files through native
+analysis and execution so missing probe responses or fixture files fail tests.
 
 Builds a self-contained fake standalone Oracle home plus a matching topology
 snapshot and policy document, and returns the environment variables needed to
@@ -47,13 +46,17 @@ def build(base_dir: Path, request_id: str) -> dict:
     backup_parent = base_dir / "backups"
     runtime = base_dir / "runtime"
     state_root = base_dir / "state"
-    for d in (oracle_home / "bin", oracle_home / "OPatch", inventory, backup_parent, runtime):
+    for d in (oracle_home / "bin", oracle_home / "OPatch", inventory, backup_parent, runtime / "oradata"):
         d.mkdir(parents=True, exist_ok=True)
     backup_parent_canonical = backup_parent.resolve()
 
     owner = pwd.getpwuid(os.getuid()).pw_name
 
     (runtime / "database.state").write_text("OPEN\n")
+    # The SQL probe reports these files. Native capacity analysis must measure
+    # real fixture files rather than depend on an unrelated path under /tmp.
+    (runtime / "spfileORCL.ora").write_text("fixture SPFILE\n")
+    (runtime / "oradata" / "system01.dbf").write_bytes(b"D" * 1024)
     (oracle_home / "oraInst.loc").write_text(f"inventory_loc={inventory}\ninst_group=oinstall\n")
     (inventory / "ContentsXML").write_text("inventory content\n")
     (oracle_home / "bin" / "oracle").write_text("home content\n")

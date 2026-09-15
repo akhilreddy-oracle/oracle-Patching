@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import hashlib
+import uuid
 
 import discovery_phases
 import evidence
@@ -27,6 +29,7 @@ DISCOVERY_TIMEOUT_SECONDS = 180
 ARTIFACT_INSPECT_TIMEOUT_SECONDS = 300
 # CheckPatchApplicable + CheckConflictAgainstOHWithDetail each take ~60–90s.
 COMPATIBILITY_COLLECT_TIMEOUT_SECONDS = 360
+RECOVERY_COLLECT_TIMEOUT_SECONDS = 3600
 
 _NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -151,6 +154,7 @@ def step_discovery(host_id: str, host: dict, body: dict) -> dict:
         "compatibility",
         "compatibility_reconciliation",
         "readiness",
+        "recovery",
     ):
         evidence.clear_evidence(host_id, name)
     return primary_payload
@@ -290,6 +294,10 @@ def step_readiness_evaluate(host_id: str, host: dict, body: dict) -> dict:
     _require(compat_reconciliation, "opu-readiness-evaluate", "compatibility-reconcile")
 
     policy_path = evidence.write_evidence(host_id, "policy", policy)
+    recovery_args: list[str] = []
+    recovery_path = evidence.evidence_path(host_id, "recovery")
+    if (policy.get("recovery") or {}).get("require_backup", True) and recovery_path.is_file():
+        recovery_args = ["--recovery-evidence", str(recovery_path)]
     result = localtools.run_tool(
         "opu-readiness-evaluate",
         [
@@ -299,10 +307,72 @@ def step_readiness_evaluate(host_id: str, host: dict, body: dict) -> dict:
             "--procedure-validation", str(procedure),
             "--compatibility", str(compat_reconciliation),
             "--policy", str(policy_path),
+            *recovery_args,
         ],
     )
     evidence.write_evidence(host_id, "readiness", result)
     return result
+
+
+def step_recovery_collect(host_id: str, host: dict, body: dict) -> dict:
+    """Revalidate a completed managed backup against this exact app snapshot.
+
+    Mirror the snapshot at its control-plane path, as live plan execution does.
+    The native collector seals that same path and digest; never rewrite or
+    re-sign its source_snapshot to conceal a different collection input.
+    """
+    import recoveryctl
+
+    request_id = body.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise remote.RemoteError("invalid_input", "Select a completed live recovery request")
+    for stale in ("recovery", "readiness", "recovery_selection"):
+        evidence.clear_evidence(host_id, stale)
+    request = recoveryctl.selection_status(request_id, host_id=host_id, host=host)
+    if request.get("mode") != "live" or request.get("host_id") != host_id or request.get("state") != "completed":
+        raise remote.RemoteError("invalid_recovery", "Recovery must be completed on this live host; demo or other-host evidence cannot be used")
+    nodes = _configured_nodes(host)
+    paths = evidence.list_snapshot_paths(host_id)
+    if len(nodes) != 1 or len(paths) != 1:
+        raise remote.RemoteError("unsupported_recovery", "Live recovery selection currently supports one standalone database node")
+    snapshot_path = paths[0]
+    snapshot_bytes = snapshot_path.read_bytes()
+    snapshot_sha = hashlib.sha256(snapshot_bytes).hexdigest()
+    snapshot = json.loads(snapshot_bytes)
+    if (snapshot.get("cluster") or {}).get("status") != "unavailable":
+        raise remote.RemoteError("unsupported_recovery", "A standalone topology snapshot is required")
+    target = request.get("target") or {}
+    database = target.get("database_unique_name")
+    matches = [db for db in snapshot.get("databases", []) if db.get("db_unique_name") == database and db.get("oracle_home") == target.get("oracle_home")]
+    if len(matches) != 1:
+        raise remote.RemoteError("invalid_recovery", "Recovery request does not match the current database and Oracle home")
+    backup_root = (request.get("result") or {}).get("backup_root")
+    if not isinstance(backup_root, str) or not backup_root.startswith("/"):
+        raise remote.RemoteError("invalid_recovery", "Completed recovery request has no validated backup root")
+    tools_sync.ensure_host_tools(host)
+    alias = nodes[0]["ssh_alias"]
+    sudo = bool(host.get("sudo"))
+    remote.push_file(alias, str(snapshot_path), snapshot_bytes, sudo=sudo)
+    output = f"{REMOTE_SCRATCH_DIR.format(host_id=host_id)}/recovery-{uuid.uuid4().hex}.json"
+    result = remote.run_remote_raw(alias, [
+        f"{host['remote_root']}/bin/opu-recovery-evidence-collect",
+        "--snapshot", str(snapshot_path), "--database", database,
+        "--backup-root", backup_root, "--output", output,
+    ], timeout=RECOVERY_COLLECT_TIMEOUT_SECONDS, sudo=sudo)
+    if result.returncode != 0:
+        raise remote.RemoteError("recovery_validation_failed", "Selected recovery set failed native validation", stderr=result.stderr.strip() or result.stdout[-4000:])
+    payload = json.loads(result.stdout)
+    if payload.get("status") != "passed" or payload.get("source_snapshot") != {"path": str(snapshot_path), "sha256": snapshot_sha}:
+        raise remote.RemoteError("invalid_recovery", "Native recovery result is not bound to the supplied snapshot")
+    collected_target = payload.get("target") or {}
+    if any(collected_target.get(key) != target.get(key) for key in ("database_unique_name", "oracle_home", "owner")):
+        raise remote.RemoteError("invalid_recovery", "Native recovery result targets a different database, home or owner")
+    if hashlib.sha256(snapshot_path.read_bytes()).hexdigest() != snapshot_sha:
+        raise remote.RemoteError("snapshot_changed", "Discovery changed during backup validation; collect again against the current snapshot")
+    evidence.write_evidence(host_id, "recovery", payload)
+    evidence.write_evidence(host_id, "recovery_selection", {"request_id": request_id, "host_id": host_id,
+        "backup_root": backup_root, "policy": request.get("preparation_policy")})
+    return payload
 
 
 def _refresh_procedure_input(host_id: str, procedure_input: dict) -> dict:
@@ -334,6 +404,7 @@ _CHAIN_OK = {
     "compatibility-collect": lambda r: r.get("status") == "passed",
     "compatibility-reconcile": lambda r: r.get("status") == "passed",
     "readiness-evaluate": lambda r: r.get("status") == "ready_for_approval",
+    "recovery-collect": lambda r: r.get("status") == "passed",
 }
 
 
@@ -372,6 +443,10 @@ def step_readiness_chain(host_id: str, host: dict, body: dict) -> dict:
         ("compatibility-reconcile", lambda: step_compatibility_reconcile(host_id, host, {})),
         ("readiness-evaluate", lambda: step_readiness_evaluate(host_id, host, {"policy": policy})),
     ]
+    recovery_policy = policy.get("recovery") or {}
+    selection = evidence.read_evidence(host_id, "recovery_selection") or {}
+    if recovery_policy.get("require_backup", True) and selection.get("request_id"):
+        plan.insert(-1, ("recovery-collect", lambda: step_recovery_collect(host_id, host, {"request_id": selection["request_id"]})))
     import time as _time
 
     steps: list[dict] = []
@@ -624,6 +699,7 @@ STEPS = {
     # Remediation actions (not part of the evidence chain / STEP_ORDER).
     "stage-artifact": step_stage_artifact,
     "readiness-chain": step_readiness_chain,
+    "recovery-collect": step_recovery_collect,
 }
 
 STEP_ORDER = [
@@ -677,6 +753,9 @@ def pipeline_state(host_id: str) -> list[dict]:
         }
         if step == "procedure-validate":
             entry["input"] = evidence.read_evidence(host_id, "procedure_input")
+        if step == "readiness-evaluate":
+            entry["input"] = evidence.read_evidence(host_id, "policy")
+            entry["recovery_selection"] = evidence.read_evidence(host_id, "recovery_selection")
         if step == "discovery":
             phases = discovery_phases.derive_discovery_phases(payload)
             entry["phases"] = phases

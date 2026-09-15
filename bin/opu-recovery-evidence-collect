@@ -83,7 +83,9 @@ parse() {
     esac
   done
   require_root
-  safe_oracle_path "$SNAPSHOT" snapshot || exit $?
+  # This is a JSON input path, never interpolated into SQL/RMAN. Control-plane
+  # snapshots may have spaces and are mirrored verbatim for plan binding.
+  opu_validate_absolute_path "$SNAPSHOT" snapshot || exit $?
   safe_oracle_path "$BACKUP_ROOT" backup-root || exit $?
   safe_oracle_path "$OUT" output || exit $?
   opu_validate_identifier "$DATABASE" database >/dev/null || die 'invalid database name'
@@ -360,9 +362,16 @@ validate_rman_sets() {
 }
 
 emit_record() {
-  local tmp canonical record_sha files_json keys_json preparation_json
+  local tmp canonical record_sha files_json keys_json preparation_json storage_json available_kb total_kb device_id
   files_json=$(jq -Rn '[inputs | split("\t") | {sha256:.[0],path:.[1]}]' <"$EVIDENCE_DIR/files.tsv")
   keys_json=$(jq -Rn '[inputs | tonumber]' <"$BACKUP_KEYS_FILE")
+  read -r total_kb available_kb < <(df -Pk "$BACKUP_ROOT" | awk 'NR==2 {print $2, $4}')
+  device_id=$(stat -c '%d' "$BACKUP_ROOT" 2>/dev/null || stat -f '%d' "$BACKUP_ROOT" 2>/dev/null) || die 'backup filesystem identity is unavailable'
+  [[ "$total_kb" =~ ^[0-9]+$ ]] && [[ "$available_kb" =~ ^[0-9]+$ ]] && [[ "$device_id" =~ ^[0-9]+$ ]] || die 'backup filesystem capacity is unavailable'
+  [ "$total_kb" -ge "$available_kb" ] || die 'backup filesystem capacity is invalid'
+  storage_json=$(jq -cn --arg path "$BACKUP_ROOT" --arg device "$device_id" --arg at "$(opu_now_utc)" \
+    --argjson total "$((total_kb * 1024))" --argjson available "$((available_kb * 1024))" \
+    '{type:"filesystem",path:$path,device_id:$device,total_bytes:$total,available_bytes:$available,observed_at:$at}')
   preparation_json=null
   if [ -n "$PREPARATION_MANIFEST" ]; then
     preparation_json=$(jq -cn \
@@ -389,8 +398,8 @@ emit_record() {
     --argjson controlfile_records "$CONTROLFILE_RECORDS" --argjson spfile_records "$SPFILE_RECORDS" \
     --arg observed_at "$SELECTED_OBSERVED_AT" --arg completed_at "$SELECTED_OLDEST_COMPLETED_AT" --argjson age_seconds "$SELECTED_AGE_SECONDS" \
     --argjson restore_handles "$SELECTED_RESTORE_HANDLES" --argjson datafile_sets "$keys_json" \
-    --argjson preparation "$preparation_json" \
-    '{schema_version:"1.0",collector:{name:"oracle.recovery.evidence",version:"1"},status:"passed",collected_at:$collected_at,target:{database_unique_name:$database,oracle_home:$oracle_home,owner:$owner,oracle_sid:$sid},backup:({root:$backup_root,checksum_manifest:{path:$checksum_path,sha256:$checksum_sha},files:$files,oracle_home_archive:$archive,rman_backup_set_keys:$keys,selected_recovery_set:{observed_at:$observed_at,oldest_datafile_backup_completed_at:$completed_at,age_seconds_at_collection:$age_seconds,restore_piece_handles:$restore_handles,datafile_backup_sets:$datafile_sets},coverage:{datafiles_backed:$datafiles_backed,base_datafiles:$base_datafiles,datafiles_current:$datafiles_current,controlfile_records:$controlfile_records,spfile_records:$spfile_records,outside_root_pieces:0,unavailable_pieces:0}} + (if $preparation == null then {} else {preparation:$preparation} end)),source_snapshot:{path:$snapshot_path,sha256:$snapshot_sha},verification:{checksum_log:{path:$checksum_log,sha256:$checksum_log_sha},oracle_home_archive_log:{path:$archive_log,sha256:$archive_log_sha},rman_syntax:{log:{path:$rman_syntax_log,sha256:$rman_syntax_log_sha},exit_code:{path:$rman_syntax_rc_path,sha256:$rman_syntax_rc_sha,value:$rman_syntax_rc}},rman_log:{path:$rman_log,sha256:$rman_log_sha,exit_code:{path:$rman_rc_path,sha256:$rman_rc_sha,value:$rman_rc}}}}' >"$tmp"
+    --argjson preparation "$preparation_json" --argjson storage "$storage_json" \
+    '{schema_version:"1.0",collector:{name:"oracle.recovery.evidence",version:"1"},status:"passed",collected_at:$collected_at,target:{database_unique_name:$database,oracle_home:$oracle_home,owner:$owner,oracle_sid:$sid},backup:({root:$backup_root,storage:$storage,checksum_manifest:{path:$checksum_path,sha256:$checksum_sha},files:$files,oracle_home_archive:$archive,rman_backup_set_keys:$keys,selected_recovery_set:{observed_at:$observed_at,oldest_datafile_backup_completed_at:$completed_at,age_seconds_at_collection:$age_seconds,restore_piece_handles:$restore_handles,datafile_backup_sets:$datafile_sets},coverage:{datafiles_backed:$datafiles_backed,base_datafiles:$base_datafiles,datafiles_current:$datafiles_current,controlfile_records:$controlfile_records,spfile_records:$spfile_records,outside_root_pieces:0,unavailable_pieces:0}} + (if $preparation == null then {} else {preparation:$preparation} end)),source_snapshot:{path:$snapshot_path,sha256:$snapshot_sha},verification:{checksum_log:{path:$checksum_log,sha256:$checksum_log_sha},oracle_home_archive_log:{path:$archive_log,sha256:$archive_log_sha},rman_syntax:{log:{path:$rman_syntax_log,sha256:$rman_syntax_log_sha},exit_code:{path:$rman_syntax_rc_path,sha256:$rman_syntax_rc_sha,value:$rman_syntax_rc}},rman_log:{path:$rman_log,sha256:$rman_log_sha,exit_code:{path:$rman_rc_path,sha256:$rman_rc_sha,value:$rman_rc}}}}' >"$tmp"
   canonical=$(jq -cS . "$tmp")
   record_sha=$(opu_hash_string "$canonical")
   jq --arg record_sha "$record_sha" '. + {record_sha256:$record_sha}' "$tmp" >"$OUT"

@@ -78,6 +78,7 @@ def build(base_dir: Path) -> dict:
     backup_root = base_dir / "backup" / "ORCL" / "run-001"
     for d in (
         oracle_home / "bin", oracle_home / "OPatch", oracle_home / "jdk" / "bin",
+        oracle_home / "perl" / "bin", oracle_home / "rdbms" / "admin",
         patch_dir / "etc" / "config", backup_root / "rman", backup_root / "oracle-home",
     ):
         d.mkdir(parents=True, exist_ok=True)
@@ -88,9 +89,12 @@ def build(base_dir: Path) -> dict:
         ("opatch.sh", oracle_home / "OPatch" / "opatch"),
         ("datapatch.sh", oracle_home / "OPatch" / "datapatch"),
         ("java.sh", oracle_home / "jdk" / "bin" / "java"),
+        ("perl.sh", oracle_home / "perl" / "bin" / "perl"),
     ):
         shutil.copy(SHIMS_DIR / shim, target)
         target.chmod(0o750)
+    (oracle_home / "rdbms" / "admin" / "catcon.pl").write_text("TEST_MODE catcon fixture; handled only by the fixed perl shim\n")
+    (oracle_home / "rdbms" / "admin" / "utlrp.sql").write_text("TEST_MODE utlrp fixture; handled only by the fixed perl shim\n")
 
     state = {
         "database": base_dir / "database.state",

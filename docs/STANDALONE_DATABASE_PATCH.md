@@ -24,11 +24,40 @@ The controller materializes and executes these stages serially:
    applies the binary patch, verifies inventory, and restores the database and
    listener.
 3. `validate` verifies binary inventory and service health.
-4. `datapatch` verifies recovery and the open window again, then invokes the
-   Oracle-home `datapatch -verbose` against the sealed SID.
+4. `datapatch` verifies recovery and the open window again. If the installed
+   tool documents `-local_inventory`, it uses fresh, validated OPatch XML from
+   the sealed Oracle home with `datapatch -verbose -local_inventory XML`.
+   Otherwise it uses ordinary `datapatch -verbose`. Oracle selects the SQL
+   actions from the actual inventory. No inventory bypass, forced patch list,
+   or automatic retry is used. The worker verifies the latest target SQL
+   action, then runs the home-shipped `utlrp.sql` through `catcon.pl`.
 5. `final_validate` requires binary inventory, PRIMARY/READ WRITE/OPEN health,
-   listener readiness, the policy-bound invalid-object threshold, and a clean
-   successful target-patch row in `DBA_REGISTRY_SQLPATCH`.
+   listener readiness, the README-required extjob ownership/mode, zero invalid
+   objects, every enabled registry component
+   `VALID`, and the latest target-patch row `APPLY/SUCCESS` in
+   `DBA_REGISTRY_SQLPATCH`. Historical successes cannot mask a later rollback
+   or failure. The rollback worker uses the same native SQL path and requires
+   the latest target row to be `ROLLBACK/SUCCESS`.
+
+Native SQL logs and local-inventory inputs are created in a private directory
+accessible to the Oracle owner, then copied and hashed into the sealed task
+evidence. Database and listener startup commands close the inherited host
+lock descriptor; the supervisor, OPatch, datapatch, probes and shutdown keep
+it. This prevents persistent services from retaining a completed task's lock.
+
+A hash-bound README that explicitly requires
+`chown root $ORACLE_HOME/bin/extjob` and `chmod 4750` activates a read-only
+ownership/mode check before outage, after binary apply, and during final
+validation. Missing or changed sealed README evidence blocks the check. It
+opens only the
+sealed home's regular, single-link extjob file without following symlinks.
+The worker never promotes existing Oracle-writable bytes to a root setuid
+executable: a README hash proves instructions, not executable provenance.
+If ownership or mode is wrong, the task fails for a separately reviewed repair
+with trusted binary provenance. If OPatch changed those permissions, this
+failure occurs after binary apply while services remain stopped. No automatic
+root permission repair is included. Test fixtures model this check using
+their current UID and ordinary mode `0750`; they never create setuid files.
 
 Run only the next controller-issued task:
 

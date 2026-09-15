@@ -23,6 +23,21 @@
 }
 
 * { box-sizing: border-box; }
+.readiness-findings { display: grid; gap: 14px; }
+.readiness-finding { padding: 16px; border: 1px solid var(--line); border-left: 3px solid var(--bad); background: var(--surface); }
+.readiness-finding h4 { margin: 0; }
+.finding-values { display: grid; grid-template-columns: minmax(72px, 110px) 1fr; gap: 8px 16px; }
+.finding-values dt { font-weight: 600; color: var(--muted); }
+.finding-values dd { margin: 0; overflow-wrap: anywhere; }
+.wizard-target { border-left: 4px solid var(--oracle-red); background: var(--surface); }
+.wizard-target .mono, .report-view .mono { overflow-wrap: anywhere; }
+.wizard-review { border-top: 2px solid var(--line-strong); }
+.table-scroll { overflow-x: auto; max-width: 100%; }
+.company-login { display: grid; gap: 8px; margin-top: 12px; }
+.company-login .btn { text-align: center; }
+.approval-card { margin-block: 16px; padding: 18px; background: var(--surface); border: 1px solid var(--line); }
+.approval-card h2 { margin-top: 0; }
+@media (max-width: 620px) { .finding-values { grid-template-columns: 1fr; gap: 4px; } .finding-values dd { margin-bottom: 10px; } }
 html { color-scheme: light; height: 100%; }
 body {
   margin: 0;
@@ -546,6 +561,101 @@ th {
 tr:last-child td { border-bottom: none; }
 .mono { font-family: var(--mono); font-size: 12px; }
 .node-list { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+
+/* Fleet filters and wide evidence must stay within the workspace. */
+.form-grid.fleet-filters {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: 14px 16px;
+  margin: 18px 0;
+  align-items: end;
+}
+.fleet-filters label, .fleet-metadata-form label { min-width: 0; }
+.fleet-filters select, .fleet-metadata-form input {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+.fleet-table-scroll {
+  min-width: 0;
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-bottom: 12px;
+}
+.fleet-table-scroll:focus-visible {
+  outline: 2px solid var(--oracle-red);
+  outline-offset: 2px;
+}
+.fleet-table {
+  table-layout: fixed;
+  min-width: 1220px;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+.fleet-table th, .fleet-table td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+  padding: 12px;
+}
+.fleet-table th { background: var(--paper); overflow-wrap: normal; }
+.fleet-table th:first-child, .fleet-table .fleet-identity {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--surface);
+  box-shadow: 1px 0 var(--line);
+}
+.fleet-table th:first-child { z-index: 2; background: var(--paper); }
+.fleet-table td p { margin: 0 0 6px; }
+.fleet-table td strong { display: block; margin-bottom: 6px; }
+.fleet-table .badge { max-width: 100%; margin-bottom: 6px; }
+.fleet-table td > :last-child { margin-bottom: 0; }
+.fleet-metadata-form { display: grid; gap: 10px; margin-top: 12px; }
+.fleet-metadata-form button { width: 100%; white-space: normal; }
+.fleet-actions summary { cursor: pointer; font-weight: 600; }
+.fleet-dashboard > .helper-text { overflow-wrap: anywhere; }
+
+@media (max-width: 620px) {
+  .fleet-scroll-hint { display: none; }
+  .fleet-table-scroll { border: 0; overflow: visible; }
+  .fleet-table { display: block; min-width: 0; }
+  .fleet-table colgroup { display: none; }
+  .fleet-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  .fleet-table tbody { display: grid; gap: 14px; }
+  .fleet-table tbody tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 8px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+  }
+  .fleet-table td {
+    display: block;
+    min-width: 0;
+    padding: 8px;
+    border: 0;
+  }
+  .fleet-table td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 6px;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+  }
+  .fleet-table .fleet-identity, .fleet-table .fleet-patches,
+  .fleet-table .fleet-evidence, .fleet-table .fleet-actions { grid-column: 1 / -1; }
+  .fleet-table .fleet-identity { position: static; box-shadow: none; }
+}
 
 .run-log {
   margin-top: 10px;
