@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import runtime_paths
 
 CERT_FILE_ENV = "OPU_PRODUCTION_CERT_FILE"
 MODE_ENV = "OPU_PRODUCTION_MODE"
-DEFAULT_CERT_FILE = Path(__file__).resolve().parent / "var" / "production.cert"
+DEFAULT_CERT_FILE = runtime_paths.state_dir() / "production.cert"
 
 
 class ProductionError(Exception):

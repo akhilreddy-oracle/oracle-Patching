@@ -12,6 +12,7 @@ from http.cookies import SimpleCookie
 import json
 import os
 from pathlib import Path
+import runtime_paths
 import re
 import secrets
 import sqlite3
@@ -24,8 +25,8 @@ import urllib.request
 import auth
 
 CONFIG_ENV = "OPU_OIDC_CONFIG"
-DEFAULT_CONFIG = Path(__file__).resolve().parent / "var/oidc.json"
-STATE_DIR = Path(__file__).resolve().parent / "var/company-auth"
+DEFAULT_CONFIG = runtime_paths.state_dir() / "oidc.json"
+STATE_DIR = runtime_paths.state_dir() / "company-auth"
 SESSION_COOKIE = "opu_company_session"
 STATE_COOKIE = "opu_login_state"
 MAX_JSON = 1024 * 1024

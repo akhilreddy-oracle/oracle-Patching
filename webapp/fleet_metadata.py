@@ -7,11 +7,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import runtime_paths
 import re
 import stat
 import tempfile
 
-STORE_FILE = Path(__file__).resolve().parent / "var" / "fleet-metadata.json"
+STORE_FILE = runtime_paths.state_dir() / "fleet-metadata.json"
 FIELDS = {"environment", "desired_patch_baseline"}
 _ENVIRONMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._/-]{0,63}\Z")
 _BASELINE = re.compile(r"[1-9][0-9]{0,19}\Z")

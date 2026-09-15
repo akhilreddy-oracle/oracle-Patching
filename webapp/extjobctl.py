@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import runtime_paths
 from pathlib import Path, PurePosixPath
 import re
 import stat
@@ -19,7 +20,7 @@ import remote
 import tools_sync
 
 ExtjobError = planctl.PlanError
-REFERENCE_DIR = Path(__file__).resolve().parent / "var" / "extjob-references"
+REFERENCE_DIR = runtime_paths.state_dir() / "extjob-references"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 _RUN_ID = re.compile(r"[a-f0-9]{12}\Z")

@@ -14,11 +14,12 @@ import re
 import secrets
 import time
 from pathlib import Path
+import runtime_paths
 from functools import wraps
 from durable import file_lock, write_json
 
 REGISTRY_FILE_ENV = "OPU_AGENT_REGISTRY_FILE"
-DEFAULT_REGISTRY_FILE = Path(__file__).resolve().parent / "var" / "agent-registry" / "agents.json"
+DEFAULT_REGISTRY_FILE = runtime_paths.state_dir() / "agent-registry" / "agents.json"
 
 # Matches lib/opu/common.sh opu_validate_identifier.
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")

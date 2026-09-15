@@ -15,12 +15,13 @@ import threading
 import time
 import uuid
 from pathlib import Path
+import runtime_paths
 
 import notifications
 from diagnostics import redact_text, redacted
 from durable import file_lock, write_json
 
-RUNS_DIR = Path(__file__).resolve().parent / "var" / "runs"
+RUNS_DIR = runtime_paths.state_dir() / "runs"
 RUNS: dict[str, "RunRecord"] = {}
 _REGISTRY_LOCK = threading.Lock()
 # key → active run_id (so 409 responses can hand the caller the in-flight run)

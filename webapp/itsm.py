@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import runtime_paths
 
 TICKETS_ENV = "OPU_ITSM_TICKETS_FILE"
 REQUIRED_ENV = "OPU_ITSM_REQUIRED"
-DEFAULT_TICKETS_FILE = Path(__file__).resolve().parent / "var" / "change-tickets.json"
+DEFAULT_TICKETS_FILE = runtime_paths.state_dir() / "change-tickets.json"
 
 
 class ItsmError(Exception):

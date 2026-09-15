@@ -14,8 +14,9 @@ import time
 import urllib.request
 from fnmatch import fnmatch
 from pathlib import Path
+import runtime_paths
 
-VAR_DIR = Path(__file__).resolve().parent / "var"
+VAR_DIR = runtime_paths.state_dir()
 CONFIG_ENV = "OPU_NOTIFICATIONS_FILE"
 EVENTS_ENV = "OPU_EVENTS_FILE"
 DEADLETTER_ENV = "OPU_NOTIFICATIONS_DEADLETTER_FILE"

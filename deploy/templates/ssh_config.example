@@ -1,0 +1,17 @@
+# Replace aliases, addresses and users using the reviewed managed-host inventory.
+# Verify known_hosts fingerprints through a trusted channel before installation.
+Host *
+    BatchMode yes
+    IdentitiesOnly yes
+    IdentityFile /var/lib/oracle-patching-home/.ssh/id_controller
+    UserKnownHostsFile /var/lib/oracle-patching-home/.ssh/known_hosts
+    StrictHostKeyChecking yes
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    ForwardAgent no
+    ServerAliveInterval 15
+    ServerAliveCountMax 8
+
+Host replace-with-managed-alias
+    HostName replace-with-managed-host
+    User replace-with-automation-user
