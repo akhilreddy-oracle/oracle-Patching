@@ -73,3 +73,8 @@ These tests cover temporary configuration, actual loopback HTTP requests,
 endpoint resolution/pinning, timeouts, error redaction and malformed outputs.
 They do not establish inference quality, model tool-calling reliability or
 availability on a deployment server.
+
+After installing the actual model, use the [server-side protocol assessment](MODEL_ACCEPTANCE.md)
+to check bounded synthetic responses and exact typed arguments through this
+same client. It executes no native workflow and produces a separate limited
+assessment receipt; simulated tests are never promoted to real-model evidence.

@@ -43,6 +43,9 @@ EXCLUDE = {'var', '.git', '.venv', '__pycache__', 'node_modules', 'recovery_fixt
 MAX_BUNDLE = 64 * 1024 * 1024
 INPUT_FILES = ('hosts_file', 'principals_file', 'ssh_config_file', 'known_hosts_file', 'ssh_private_key_file')
 REQUIRED_COMMANDS = ('bash', 'jq', 'xmllint', 'tar', 'gzip', 'ssh', 'sha256sum', 'flock', 'systemctl', 'nginx', 'useradd')
+# The controller installs jsonschema==4.26.0, whose Requires-Python is >=3.10.
+# Managed-host native tools have a separate minimum in lib/opu/python.sh.
+MIN_CONTROLLER_PYTHON = (3, 10)
 
 
 def require(condition, message):
@@ -217,8 +220,8 @@ def preflight(manifest, config):
     blockers = []
     if platform.system() != 'Linux' or not Path('/run/systemd/system').is_dir():
         blockers.append('A Linux host booted with systemd is required')
-    if sys.version_info < (3, 9):
-        blockers.append('Python 3.9 or later is required')
+    if sys.version_info < MIN_CONTROLLER_PYTHON:
+        blockers.append('Controller dependencies require Python 3.10 or later; use a supported versioned interpreter')
     if importlib.util.find_spec('venv') is None or importlib.util.find_spec('ensurepip') is None:
         blockers.append('Install the OS Python venv/ensurepip package before deployment')
     missing = [name for name in REQUIRED_COMMANDS if shutil.which(name) is None]

@@ -164,6 +164,25 @@ class DeploymentTests(unittest.TestCase):
             run.assert_not_called()
         self.assertEqual(sealed.read_text(), 'sealed absolute paths must not move')
 
+    def test_python_39_is_rejected_before_creating_installation_paths(self):
+        values, _ = self.config()
+        result = self.package()
+        manifest, contents = deploy.read_bundle(self.bundle, result['bundle_sha256'])
+        install = self.base / 'not-created'
+        with patch.object(deploy, 'INSTALL', install), \
+             patch.object(deploy.sys, 'version_info', (3, 9, 23)), \
+             patch.object(deploy.os, 'geteuid', return_value=0), \
+             patch.object(deploy.subprocess, 'run') as run:
+            admission = deploy.preflight(manifest, values)
+            self.assertTrue(any('Python 3.10 or later' in message for message in admission['blockers']))
+            with self.assertRaisesRegex(ValueError, 'Python 3.10 or later'):
+                deploy.install_fresh(manifest, contents, values)
+            run.assert_not_called()
+        self.assertFalse(install.exists())
+        with patch.object(deploy.sys, 'version_info', (3, 10, 0)):
+            admission = deploy.preflight(manifest, values)
+            self.assertFalse(any('Python 3.10 or later' in message for message in admission['blockers']))
+
     def test_fresh_install_stages_stopped_services_without_ssh_or_old_state(self):
         values, _ = self.config()
         result = self.package()

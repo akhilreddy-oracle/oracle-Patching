@@ -154,6 +154,15 @@ def config_status():
         return {"enabled": False, "configured": False, "model": None, "provider": None, "reason": exc.message}
 
 
+def load_config():
+    """Return validated effective settings without reading a credential value.
+
+    Intended for administrator-side diagnostics. Do not expose the returned
+    endpoint or credential environment-variable name through user-facing APIs.
+    """
+    return _load_config()
+
+
 def _tool_calls(calls, names, *, status):
     _require(isinstance(calls, list) and len(calls) <= MAX_TOOL_CALLS, "Local model tool calls are invalid or exceed the limit", status)
     result, seen = [], set()
@@ -318,8 +327,10 @@ def _exchange(c, raw):
         connection.close()
 
 
-def complete(messages, tools):
+def complete(messages, tools, *, expected_config=None):
     c = _load_config()
+    _require(expected_config is None or c == expected_config,
+             "Local assistant configuration changed before the request")
     _require(c["enabled"], "Local assistant is disabled")
     raw, names = _payload(messages, tools, c)
     response = _exchange(c, raw)

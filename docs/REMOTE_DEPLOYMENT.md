@@ -13,6 +13,13 @@ printing keys, environment secrets, database data or configuration contents:
 ssh -T opc@PATCHING_SERVER 'bash -s' < deploy/server-preflight.sh
 ```
 
+For Oracle Linux 8.10, follow the [Oracle Linux deployment supplement](ORACLE_LINUX_DEPLOYMENT.md).
+The inventory reports `PYTHON_SELECTED` when it finds a compatible interpreter
+with venv and ensurepip. Use that explicit interpreter for controller commands;
+the default `python3` on an older image can remain unchanged. A
+`READ_ONLY_COMPLETE` line means inventory finished, not that installation was
+approved or all prerequisites passed.
+
 Do not disable SSH host-key checking. Verify the server's fingerprint through a
 trusted channel before accepting a first connection. Provide the preflight
 output, public HTTPS hostname/TLS certificate arrangement, and whether this is
@@ -65,7 +72,7 @@ record, not a signed approval or production certificate.
 
 ## Prepare server inputs
 
-Install OS packages before running the installer: Python 3.9+ with venv and
+Install OS packages before running the installer: Python 3.10+ with venv and
 ensurepip, Bash, jq, libxml2 (`xmllint`), tar/gzip, OpenSSH client, coreutils
 (`sha256sum`), util-linux (`flock`), systemd and nginx. Package names differ
 between Oracle Linux and Ubuntu; use the preflight output to choose the matching
@@ -73,6 +80,8 @@ repositories. Python dependencies come from `scripts/requirements.txt` and
 `webapp/requirements-sso.txt` in the verified bundle. The installer uses pip in a
 new release-specific virtual environment; approved package-index connectivity
 or a configured internal wheel repository is required.
+The controller's pinned jsonschema dependency requires Python 3.10+; this
+minimum is separate from the native managed-host tools' Python requirement.
 
 Prepare root-owned input files that are not group/world writable, then adapt
 `deploy/templates/deployment.json.example`. Input paths must be absolute and
@@ -159,6 +168,13 @@ download process, then start the service and verify its local inventory and
 that its logs report cloud disabled. Do not publish port 11434, add a public
 proxy route to it, or enable cloud fallback. The application's typed workflow
 actions and separate actor approvals remain authoritative.
+
+Run the [local model protocol assessment](MODEL_ACCEPTANCE.md) as the controller
+account after enabling its reviewed configuration. The check uses synthetic
+inputs and the production client without executing native actions. Retain its
+new receipt alongside the model identity, configuration and later reviewed
+application tests. A passing protocol assessment alone does not verify a live
+patch or grant production approval.
 
 ## Existing controllers and version changes
 
