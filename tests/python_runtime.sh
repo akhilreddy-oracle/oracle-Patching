@@ -42,7 +42,7 @@ fi
 
 # Shell functions or an environment setting cannot substitute an unchecked
 # executable for the interpreter found on the caller's PATH.
-# shellcheck disable=SC2329 # The fixture must remain uncalled by opu_python.
+# shellcheck disable=SC2317,SC2329 # This guard fixture must remain uncalled by opu_python.
 python3() { fail 'invoked a shell function instead of the executable'; }
 output=$(OPU_PYTHON=/does/not/exist PATH="$TMP/default" opu_python -c 'print("verified")')
 [ "$output" = verified ] || fail 'an environment override changed selection'

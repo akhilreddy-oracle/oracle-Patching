@@ -583,7 +583,7 @@ run_native_datapatch() (
   set -e
   local expected_action=$1 runtime inventory_sha native_rc file
   runtime=$(mktemp -d /tmp/opu-single-sql.XXXXXXXX)
-  # shellcheck disable=SC2329 # Registered below as the subshell EXIT trap.
+  # shellcheck disable=SC2317,SC2329 # Called indirectly by the subshell EXIT trap below.
   finish_sql_runtime() {
     local original_rc=$? seal_rc=0
     trap - EXIT

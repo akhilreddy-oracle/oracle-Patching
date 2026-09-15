@@ -117,8 +117,8 @@ grep -q 'checking patch conflicts' "$TMP/analyze.log"
 # --- apply ---
 tool --patch-dir "$PATCH_DIR" --mode apply --approve >"$TMP/apply.log"
 [ -f "$RUNTIME/patch.state" ]
-[ "$(cat "$RUNTIME/prepatch-count" 2>/dev/null | wc -c | tr -d ' ')" = 1 ]
-[ "$(cat "$RUNTIME/postpatch-count" 2>/dev/null | wc -c | tr -d ' ')" = 1 ]
+[ "$(wc -c <"$RUNTIME/prepatch-count" 2>/dev/null | tr -d ' ')" = 1 ]
+[ "$(wc -c <"$RUNTIME/postpatch-count" 2>/dev/null | tr -d ' ')" = 1 ]
 grep -q 'completed successfully' "$TMP/apply.log"
 
 # --- apply is idempotent when already installed ---
