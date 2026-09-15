@@ -24,6 +24,24 @@ async function pipeline(page) {
   return (await response.json()).steps;
 }
 
+async function clickAndObserveTerminal(page, button, key, state) {
+  // Observe the application's own polling before clicking. Native analysis and
+  // evidence verification must finish before the separate UI-render deadline
+  // starts. Failed/unknown runs fail immediately; this never resubmits work.
+  const [response] = await Promise.all([
+    page.waitForResponse(async response => {
+      const url = new URL(response.url());
+      if (url.origin !== origin || !/^\/api\/runs\/[a-f0-9]+$/.test(url.pathname)
+          || response.request().method() !== 'GET' || response.status() !== 200) return false;
+      const run = await response.json();
+      return run.key === key && ['succeeded', 'failed', 'unknown'].includes(run.status);
+    }, { timeout: 45_000 }),
+    button.click(),
+  ]);
+  const run = await response.json();
+  expect(run, `Terminal outcome for ${key}: ${JSON.stringify(run.error)}`).toMatchObject({ key, status: 'succeeded', result: { state } });
+}
+
 test('connected controller acceptance: prepare one fixture backup, select it, evaluate readiness, patch the same database and export verification', async ({ page }, testInfo) => {
   test.setTimeout(360_000);
   const errors = [], writes = [], external = [];
@@ -59,10 +77,12 @@ test('connected controller acceptance: prepare one fixture backup, select it, ev
   await expect(main(page).locator('.recovery-analysis')).toContainText('passed', { timeout: 45_000 });
   await signIn(page, 'approver');
   await main(page).getByLabel('Ticket', { exact: true }).fill('SIMULATED-CONNECTED-RECOVERY');
-  await main(page).getByRole('button', { name: 'Approve', exact: true }).click();
+  await clickAndObserveTerminal(page, main(page).getByRole('button', { name: 'Approve', exact: true }),
+    `recovery:${recoveryId}:approve`, 'approved');
   await expect(main(page).getByRole('heading', { name: 'Authorize', exact: true })).toBeVisible();
   await signIn(page, 'operator');
-  await main(page).getByRole('button', { name: 'Authorize', exact: true }).click();
+  await clickAndObserveTerminal(page, main(page).getByRole('button', { name: 'Authorize', exact: true }),
+    `recovery:${recoveryId}:authorize`, 'authorized');
   await expect(main(page).getByRole('heading', { name: 'Execute', exact: true })).toBeVisible();
   await main(page).getByRole('button', { name: 'Execute', exact: true }).click();
   await expect(main(page).getByRole('heading', { name: 'Completed', exact: true })).toBeVisible({ timeout: 90_000 });
@@ -96,10 +116,12 @@ test('connected controller acceptance: prepare one fixture backup, select it, ev
   await expect(main(page).getByRole('heading', { name: planId, exact: true })).toBeVisible({ timeout: 30_000 });
   await signIn(page, 'approver');
   await main(page).getByLabel('Ticket', { exact: true }).fill('SIMULATED-CONNECTED-PATCH');
-  await main(page).getByRole('button', { name: 'Approve', exact: true }).click();
+  await clickAndObserveTerminal(page, main(page).getByRole('button', { name: 'Approve', exact: true }),
+    `plan:${planId}:approve`, 'approved');
   await expect(main(page).getByRole('heading', { name: 'Authorize', exact: true })).toBeVisible();
   await signIn(page, 'operator');
-  await main(page).getByRole('button', { name: 'Authorize', exact: true }).click();
+  await clickAndObserveTerminal(page, main(page).getByRole('button', { name: 'Authorize', exact: true }),
+    `plan:${planId}:authorize`, 'execution_authorized');
   await expect(main(page).getByRole('heading', { name: 'Dispatch', exact: true })).toBeVisible();
   await main(page).getByRole('button', { name: 'Dispatch', exact: true }).click();
   await expect(main(page).getByRole('button', { name: 'Execute remaining tasks', exact: true })).toBeVisible({ timeout: 30_000 });
