@@ -716,6 +716,12 @@ tr:last-child td { border-bottom: none; }
 }
 .error-box h2 { margin: 0 0 8px; color: var(--bad); font-size: 15px; }
 .error-message { font-weight: 600; }
+.auth-recovery { overflow-wrap: anywhere; }
+.auth-recovery-form { display: grid; gap: 8px; max-width: 440px; margin-block: 18px; }
+.auth-recovery-form label { font-weight: 600; }
+.auth-recovery-form input { width: 100%; min-width: 0; }
+.auth-recovery-form button { justify-self: start; }
+.auth-recovery-company:not(:empty) { margin-block: 16px 4px; }
 .error-detail {
   white-space: pre-wrap;
   font-family: var(--mono);

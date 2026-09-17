@@ -1,5 +1,5 @@
 import { mountSession, refreshSession, refreshHostNav, syncSecondaryNav, clearHostCache } from "./shell.js";
-import { TOKEN_EVENT } from "./api.js";
+import { TOKEN_EVENT, setSessionCsrf } from "./api.js";
 import { setSessionIdentity } from "./actor.js";
 import { createPageRenderer } from "./navigation.js";
 import { renderEstate } from "./estate.js";
@@ -106,6 +106,7 @@ window.addEventListener("hashchange", () => render());
 window.addEventListener(TOKEN_EVENT, () => {
   clearHostCache();
   setSessionIdentity(null);
+  setSessionCsrf(null);
   render({ focus: false });
 });
 window.addEventListener("storage", (event) => {

@@ -144,6 +144,33 @@ test('real list renderers surface authentication failures through the page bound
   }
 });
 
+test('authentication recovery exposes a blank password form and only replaces the credential on explicit sign-in', async () => {
+  storage.set('opu-webapp-token', 'old-shared-token');
+  fetch = async url => response(url === '/api/auth/config' ? { configured: false } : { message: 'Missing or invalid principal credential' }, url === '/api/auth/config' ? 200 : 401);
+  const page = mount(); const render = createPageRenderer(page, renderPlanList); await render();
+  const form = page.querySelector('.auth-recovery-form'); const input = form.querySelector('input');
+  assert.equal(input.getAttribute('type'), 'password'); assert.equal(input.value, '');
+  assert.equal(button(form, 'Sign in').getAttribute('type'), 'submit');
+  input.value = ' personal-principal-token '; await input.fire('input');
+  assert.equal(api.getApiToken(), 'old-shared-token');
+  let changed = 0; const handler = () => { changed++; }; window.addEventListener(api.TOKEN_EVENT, handler);
+  await form.fire('submit'); window.removeEventListener(api.TOKEN_EVENT, handler);
+  assert.equal(api.getApiToken(), 'personal-principal-token'); assert.equal(changed, 1);
+  assert.equal(input.value, ''); assert.doesNotMatch(page.textContent, /personal-principal-token|old-shared-token/);
+  assert.equal(location.hash, '#/estate'); render.cancel();
+});
+
+test('authentication recovery retains company login and can retry an unchanged token', async () => {
+  let attempts = 0;
+  fetch = async () => response({ configured: true, login_url: '/api/auth/login', label: 'Company sign in' });
+  const page = mount(); const render = createPageRenderer(page, async () => { attempts++; throw new api.ApiError({ message: 'Company sign in is required.' }, 401); });
+  await render(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(page.querySelector('a').getAttribute('href'), '/api/auth/login');
+  assert.match(page.textContent, /Company sign in is required/);
+  const form = page.querySelector('form'); form.querySelector('input').value = api.getApiToken();
+  await form.fire('submit'); assert.equal(attempts, 2); render.cancel();
+});
+
 test('navigation aborts old reads and prevents stale results or errors replacing a new page', async () => {
   let release; let firstSignal; let call = 0;
   const page = mount();

@@ -13,9 +13,15 @@ From the repository root, run:
 
 The launcher opens <http://127.0.0.1:8765/#/assistant> and, with `--copy-token`,
 copies the requester credential to the Mac clipboard. Paste it into **Session →
-API token**. The session should show **akhil-local**; its roles are requester
+API token**, or into the visible **Sign-in API token** form when the page asks
+you to sign in. The session should show **akhil-local**; its roles are requester
 and viewer. The token is never printed or placed in a URL. Omit `--copy-token`
 when the browser already has the correct credential.
+
+Each browser and address keeps its own login. Signing in to `127.0.0.1` in
+Safari does not sign in another browser or the `localhost` address. Refresh an
+older error page to show the sign-in form, paste the individual token, and click
+**Sign in**. The earlier shared `webapp/var/api-token` is not an individual token.
 
 Double-clicking `scripts/start-local-mac.command` in Finder also launches the
 application. After a Mac restart, run the launcher again. It does not install a

@@ -1,7 +1,7 @@
 import { el } from "./dom.js";
 import { apiFetch, getReadSignal, setSessionCsrf } from "./api.js";
 import { getActor, setActor, onActorChange, setSessionIdentity, authenticatedActor } from "./actor.js";
-import { getApiToken, setApiToken } from "./api.js";
+import { getApiToken, setApiToken, TOKEN_EVENT } from "./api.js";
 
 /** Soft lab default when localStorage is empty after hard refresh. Not an approver/operator. */
 const LAB_DEFAULT_ACTOR = "lab-operator";
@@ -76,12 +76,15 @@ export function mountSession(container) {
     id: "session-api-token",
     type: "password",
     class: "session-input",
-    placeholder: "paste from var/api-token",
+    placeholder: "Your personal API token",
     value: getApiToken(),
     autocomplete: "off",
     "aria-label": "API token",
   });
   tokenInput.addEventListener("input", () => setApiToken(tokenInput.value.trim()));
+  window.addEventListener(TOKEN_EVENT, () => {
+    if (document.activeElement !== tokenInput) tokenInput.value = getApiToken();
+  });
 
   sessionNote = el("p", { class: "rail-muted", role: "status", "aria-live": "polite", text: "Enter an API token to load your session." });
   container.appendChild(el("div", { class: "rail-section-label", text: "Session" }));
