@@ -7,6 +7,7 @@ is invoked; receipts are built and verified by the production receipt module.
 import copy
 import hashlib
 import json
+import random
 import threading
 import unittest
 from unittest.mock import patch
@@ -102,6 +103,127 @@ class LiveAssistantApiTests(fixture.AssistantApiTests):
             self.assertIn(expected, answer)
         self.assertIn(record.result["nodes"][0]["collected_at"], answer)
         self.assertFalse(conversation["busy"])
+        self.model.assert_not_called()
+        self.assert_no_mutation()
+
+    def test_live_arbitrary_configured_hosts_report_changing_run_values_without_known_constants(self):
+        """Changing the configured estate and collected facts changes the actual answer."""
+        rng = random.Random(20260917)
+        hosts = [{**self.host, "id": template.format(rng.getrandbits(32)),
+                  "label": f"Generated estate {index}",
+                  "ssh_alias": f"generated-{rng.getrandbits(32):08x}.invalid"}
+                 for index, template in enumerate(("ledger-{:08x}", "warehouse_{:08x}db", "retail.{:08x}"))]
+        self.hosts_file.write_text(json.dumps({"hosts": hosts}))
+        self.original_hosts = self.hosts_file.read_bytes()
+        patch_numbers = iter(rng.sample(range(10000000, 99999999), 21))
+        database_versions = iter(rng.sample(range(4, 99), 6))
+        opatch_versions = iter(rng.sample(range(30, 99), 6))
+        observations = {}
+        cache_patches = []
+        for host in hosts:
+            host_id = host["id"]
+            stale_patch = str(next(patch_numbers))
+            cache_patches.append(stale_patch)
+            stale = self.snapshot(stale_patch)
+            stale["collected_at"] = "2000-01-01T00:00:00Z"
+            evidence.write_evidence(host_id, "snapshot", stale)
+            observations[host_id] = []
+            for _generation in range(2):
+                snapshot = self.snapshot()
+                home, database = snapshot["oracle_homes"][0], snapshot["databases"][0]
+                nonce = f"{rng.getrandbits(48):012x}"
+                home.update(path=f"/srv/oracle/{host_id}/home_{nonce}",
+                    version=f"19.{next(database_versions)}.0.0.0",
+                    opatch_version=f"12.2.0.1.{next(opatch_versions)}",
+                    patches=[str(next(patch_numbers)) for _ in range(3)],
+                    opatch_inventory_xml_sha256=f"{rng.getrandbits(256):064x}")
+                database.update(db_unique_name=f"DB_{nonce.upper()}", oracle_home=home["path"])
+                database["runtime"]["database_version"] = home["version"]
+                observations[host_id].append(snapshot)
+        pending = copy.deepcopy(observations)
+
+        def generated_discovery(host_id, host, body):
+            self.assertEqual(host, next(row for row in hosts if row["id"] == host_id))
+            self.assertIs(body.get("inventory_receipt"), True)
+            self.assertEqual(body.get("expected_configuration_sha256"), live_inventory.configuration_digest(host))
+            run_id = pipeline_runner.current_run_id()
+            started = live_inventory.utc_now()
+            snapshot = pending[host_id].pop(0)
+            snapshot["collected_at"] = live_inventory.utc_now()
+            return live_inventory.build_receipt(host_id=host_id, host=host, run_id=run_id,
+                started_at=started, completed_at=live_inventory.utc_now(), node_snapshots=[(host_id, snapshot)])
+
+        self.steps["discovery"].side_effect = generated_discovery
+        run_ids = set()
+        for host in hosts:
+            host_id, conversation_id = host["id"], None
+            previous_facts = []
+            for generation, snapshot in enumerate(observations[host_id]):
+                with self.subTest(host_id=host_id, generation=generation):
+                    # Exercise both exact configured identifiers and a natural
+                    # database alias, without the source/target lab names.
+                    spoken_host = (host_id[:-2] + " database") if host_id.endswith("db") else host_id
+                    conversation_id, response = self.query(
+                        f"Check the current patch inventory on {spoken_host}", conversation_id=conversation_id)
+                    record = self.finish_query(response)
+                    self.assertEqual((record.kind, record.key, record.status),
+                                     ("pipeline", f"host:{host_id}:pipeline", "succeeded"))
+                    self.assertNotIn(record.run_id, run_ids)
+                    run_ids.add(record.run_id)
+                    native_args = self.steps["discovery"].call_args.args
+                    self.assertEqual(native_args[:2], (host_id, host))
+                    conversation = self.conversation(conversation_id)
+                    action = conversation["actions"][-1]
+                    self.assertEqual((action["arguments"]["host_id"], action["run_id"], action["state"]),
+                                     (host_id, record.run_id, "completed"))
+                    self.assertEqual(record.result["host_id"], host_id)
+                    self.assertEqual(record.result["run_id"], record.run_id)
+                    self.assertEqual(record.result["configuration_sha256"], live_inventory.configuration_digest(host))
+                    home, database = snapshot["oracle_homes"][0], snapshot["databases"][0]
+                    current_facts = [home["path"], home["version"], home["opatch_version"],
+                                     database["db_unique_name"], *home["patches"]]
+                    latest_answer = conversation["messages"][-1]["content"]
+                    for fact in [host_id, record.run_id, *current_facts]:
+                        self.assertIn(fact, latest_answer)
+                    for outdated in previous_facts + cache_patches:
+                        self.assertNotIn(outdated, latest_answer)
+                    previous_facts = current_facts
+        self.assertEqual(self.steps["discovery"].call_count, 6)
+        self.assertTrue(all(not values for values in pending.values()))
+        self.model.assert_not_called()
+        self.assert_no_mutation()
+
+    def test_live_generated_host_failure_never_reuses_previous_success_or_saved_values(self):
+        rng = random.Random(20260918)
+        host = {**self.host, "id": f"billing-{rng.getrandbits(40):010x}db",
+                "ssh_alias": f"new-{rng.getrandbits(32):08x}.invalid"}
+        self.hosts_file.write_text(json.dumps({"hosts": [host]}))
+        self.original_hosts = self.hosts_file.read_bytes()
+        live_patch, stale_patch = [str(value) for value in rng.sample(range(10000000, 99999999), 2)]
+        self.snapshot_transform = lambda snapshot: {**snapshot,
+            "oracle_homes": [{**snapshot["oracle_homes"][0], "patches": [live_patch]}]}
+        conversation_id, response = self.query(f"Check current patches on {host['id']}")
+        first_record = self.finish_query(response)
+        self.assertIn(live_patch, self.conversation(conversation_id)["messages"][-1]["content"])
+        evidence.write_evidence(host["id"], "snapshot", self.snapshot(stale_patch))
+        for outcome in (RuntimeError(f"Collection unavailable on {host['ssh_alias']}"), None):
+            with self.subTest(outcome=type(outcome).__name__):
+                self.steps["discovery"].side_effect = outcome
+                self.steps["discovery"].return_value = None
+                _, response = self.query(f"Check current patches on {host['id']}", conversation_id=conversation_id)
+                record = self.finish_query(response)
+                self.assertNotEqual(record.run_id, first_record.run_id)
+                self.assertEqual(record.key, f"host:{host['id']}:pipeline")
+                latest = self.conversation(conversation_id)
+                self.assertEqual(latest["actions"][-1]["run_id"], record.run_id)
+                self.assertNotEqual(latest["actions"][-1]["state"], "completed")
+                answer = latest["messages"][-1]["content"]
+                self.assertIn(host["id"], answer)
+                self.assertIn(record.run_id, answer)
+                self.assertNotIn(live_patch, answer)
+                self.assertNotIn(stale_patch, answer)
+                self.assertEqual(self.steps["discovery"].call_args.args[:2], (host["id"], host))
+        self.assertEqual(self.steps["discovery"].call_count, 3)
         self.model.assert_not_called()
         self.assert_no_mutation()
 

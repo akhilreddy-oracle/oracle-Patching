@@ -267,7 +267,7 @@ export async function renderAssistant(mount, conversationId = null) {
       ? "An operation is in progress. Its existing run is being inspected; no action is resubmitted."
       : "An operation is in progress. Refresh this conversation to inspect its saved result." }));
     const form = el("form", { class: "panel assistant-composer", "aria-label": "Send a message" });
-    const input = el("textarea", { rows: "4", value: draft, placeholder: "For example: Check the current patch inventory on targetdb", "aria-label": "Message", required: "", maxlength: "8000" });
+    const input = el("textarea", { rows: "4", value: draft, placeholder: "Ask for a live patch check and include a configured host name", "aria-label": "Message", required: "", maxlength: "8000" });
     input.disabled = !canChat;
     input.addEventListener("input", () => { draft = input.value; });
     const send = el("button", { type: "submit", text: "Send message" });

@@ -148,7 +148,9 @@ def _conditional_inventory_text(content):
 
 def _inventory_target(content, messages, hosts):
     """Only a user's unambiguous configured selection can select a live target."""
-    for clause in re.findall(r"\b(?:on|for|of)\s+([^?.!;\n]+)", content, re.I):
+    # A dot inside a configured ID is part of the target; only a sentence-ending
+    # dot terminates the clause. The inventory accepts DNS-style host names.
+    for clause in re.findall(r"\b(?:on|for|of)\s+(.+?)(?=[?!;\n]|\.(?:\s|$)|$)", content, re.I):
         # A known host mentioned elsewhere cannot override an explicit unknown
         # target (e.g. "on unknown-host? Source was the earlier target").
         if re.fullmatch(r"(?:it|that|this)(?:\s+(?:host|database|db))?", clause.strip(), re.I):

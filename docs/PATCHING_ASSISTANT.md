@@ -64,6 +64,18 @@ that result. This reports binary inventory per Oracle home; it does not infer
 an RU label from the base Oracle version or claim per-patch SQL status from an
 aggregate failure count. Partial inventory is identified explicitly.
 
+Live inventory facts are not embedded in application code. Host IDs and SSH
+targets come from the deployment's inventory; database names, homes, versions
+and installed patches come from each run's collector payload. Generated-data
+regressions exercise previously unseen host names (including dots), different
+inventories on consecutive runs, and failures after successful checks.
+
+The current live-inventory shortcut recognizes English request patterns with
+keyword/regex rules and formats verified facts deterministically. It is not a
+general model-driven intent planner. Other chat requests use the local model's
+typed tools and reviewed proposals. This distinction matters when evaluating
+new phrasing: no claim is made that arbitrary prompts trigger live discovery.
+
 Only this narrow live inventory request dispatches directly. Backup and patch
 actions remain proposals requiring confirmation and all native authorization,
 approval, readiness and maintenance-window gates. A restart or unknown launch
