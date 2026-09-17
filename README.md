@@ -32,6 +32,9 @@ workflow. [Linux deployment tooling](docs/REMOTE_DEPLOYMENT.md) provides version
 code, persistent state, TLS and optional same-server inference. Model availability,
 server deployment and live Oracle validation must be verified separately.
 
+For the configured MacBook installation, use the [local Mac launcher](docs/MAC_LOCAL_SETUP.md)
+to start the application and its dedicated Ollama service.
+
 Architecture and delivery decomposition are complete. The current build has
 read-only discovery, evidence reconciliation, artifact/procedure validation,
 OPatch compatibility, policy readiness, verified recovery evidence, and typed
