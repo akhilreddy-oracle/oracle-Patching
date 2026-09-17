@@ -406,6 +406,10 @@ class LiveAssistantApiTests(fixture.AssistantApiTests):
         requests = (
             "Do not check the patch version on source.",
             "Don't refresh; just show patch inventory on source.",
+            "Don’t check the patch version on source.",
+            "DON’T check the patch version on source.",
+            "Don‘t check the patch version on source.",
+            "Show patch version on source, but don’t connect.",
             "Show patch version on source without connecting.",
             "What would happen if I check the patch version on source?",
             "If I wanted to check patch inventory on source, what would run?",

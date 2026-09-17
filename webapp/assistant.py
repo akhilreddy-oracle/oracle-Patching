@@ -143,6 +143,8 @@ def _live_inventory_question(content):
 def _conditional_inventory_text(content):
     # Requests about commands, hypothetical checks or conditional permission
     # remain model-assisted proposals, never automatic native observations.
+    # Smart punctuation must not turn a negated request into permission.
+    content = content.replace("\u2019", "'").replace("\u2018", "'")
     return bool(re.search(r"\b(not|no|never|without|don't|dont|only|after|before|if|would|command|commands|example|suppose|imagine|should)\b",
                           content, re.I) or re.search(r"[\"`“”]", content))
 
