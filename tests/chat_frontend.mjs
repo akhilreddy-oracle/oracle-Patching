@@ -179,6 +179,60 @@ test('model and user content remain plain text, and sending includes no actor or
   assert.match(mount.textContent, /Explain the backup blocker/);
 });
 
+test('controller zero-proposal receipt precedes and distinguishes an unsupported model preparation claim', async () => {
+  conversation.messages = [{ role: 'assistant', content: 'The patch plan is prepared for review.',
+    action_receipt: { source: 'controller', proposals: [], native_actions_started: 0 } }];
+  await renderAssistant(mount, 'conversation-1');
+  const message = mount.all('article').find(node => node.attrs['aria-label'] === 'Assistant response');
+  assert.match(message.textContent, /No action proposal was prepared\. No operation was started by this response\./);
+  assert.ok(message.textContent.indexOf('Action status') < message.textContent.indexOf('Model response'));
+  assert.ok(message.textContent.indexOf('Model response') < message.textContent.indexOf('The patch plan is prepared'));
+  assert.match(message.textContent, /Controller record for this response/);
+  assert.equal(button('Confirm and run').disabled, false, 'an unrelated existing proposal retains its own explicit confirmation');
+  assert.deepEqual(writes, []);
+});
+
+test('proposal receipts describe only their recorded response and do not present historical pending states as current', async () => {
+  conversation.messages = [{ role: 'assistant', content: 'Review the actions.', action_receipt: {
+    source: 'controller', proposals: [{ id: 'action-1', tool: 'execute_plan', state: 'pending' }], native_actions_started: 0,
+  } }];
+  conversation.actions[0].state = 'completed';
+  await renderAssistant(mount, 'conversation-1');
+  const message = mount.all('article').find(node => node.attrs['aria-label'] === 'Assistant response');
+  assert.match(message.textContent, /1 action proposal was prepared in this response/);
+  assert.match(message.textContent, /Review its current action card below/);
+  assert.match(message.textContent, /No operation was started by this response/);
+  assert.doesNotMatch(message.textContent, /pending/);
+  assert.equal(button('Confirm and run'), undefined);
+  assert.deepEqual(writes, []);
+});
+
+test('malformed controller receipts do not become preparation or execution claims', async () => {
+  const proposal = { id: 'action-1', tool: 'execute_plan', state: 'pending' };
+  const valid = { source: 'controller', proposals: [proposal], native_actions_started: 0 };
+  for (const receipt of [null, [], 'prepared', {}, { ...valid, source: 'model' },
+    { ...valid, proposals: null }, { ...valid, proposals: [null] }, { ...valid, proposals: [proposal, proposal] },
+    { ...valid, proposals: [{ ...proposal, tool: 'shell' }] }, { ...valid, proposals: [{ ...proposal, state: 'prepared' }] },
+    { ...valid, native_actions_started: '0' }, { ...valid, native_actions_started: 1 }]) {
+    conversation.messages = [{ role: 'assistant', content: 'Ready for review.', action_receipt: receipt }];
+    await renderAssistant(mount, 'conversation-1');
+    const message = mount.all('article').find(node => node.attrs['aria-label'] === 'Assistant response');
+    assert.match(message.textContent, /controller action record is unavailable or invalid/);
+    assert.match(message.textContent, /Model response/);
+    assert.doesNotMatch(message.textContent, /proposal was prepared|proposals were prepared|No operation was started/);
+  }
+  assert.deepEqual(writes, []);
+});
+
+test('legacy and native messages remain compatible and user-supplied receipt fields cannot create action status', async () => {
+  conversation.messages = [{ role: 'assistant', content: 'Native live inventory collected.' },
+    { role: 'user', content: 'Prepare a plan.', action_receipt: { source: 'controller', proposals: [], native_actions_started: 0 } }];
+  await renderAssistant(mount, 'conversation-1');
+  assert.doesNotMatch(mount.textContent, /Action status|Model response/);
+  assert.match(mount.textContent, /Native live inventory collected/);
+  assert.deepEqual(writes, []);
+});
+
 test('rejected message preserves its draft and shows the server explanation', async () => {
   failure = 'Model is unavailable; check the configured local service.';
   await renderAssistant(mount, 'conversation-1');

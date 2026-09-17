@@ -150,6 +150,56 @@ class ModelAcceptanceTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(receipt["scenarios"][1]["outcome"], "fail")
 
+    def test_proposal_claim_without_a_function_call_still_fails_with_policy_on_the_wire(self):
+        # Reproduce the real local model's failure: correct inputs and confident
+        # preparation prose are not a controller-created proposal. Exercise the
+        # production HTTP encoder/parser, not only evaluate() in isolation.
+        for index in (1, 5):
+            self.replies[index] = {"choices": [{"finish_reason": "stop", "message": {
+                "role": "assistant", "content": json.dumps({
+                    "status": "prepared for review", **assessment.PLAN})}}]}
+        code, receipt, _ = self.run_assessment()
+        self.assertEqual(code, 1)
+        for index in (1, 5):
+            self.assertEqual(receipt["scenarios"][index]["reason"], "expected_one_typed_call")
+            request = self.requests[index]["body"]
+            system = request["messages"][0]
+            self.assertEqual(system, {"role": "system",
+                "content": assessment.assistant.SYSTEM + assessment.PROTOCOL})
+            self.assertEqual(sum(row["role"] == "system" for row in request["messages"]), 1)
+            policy = " ".join(system["content"].split())
+            self.assertRegex(policy, r"issue the corresponding function call")
+            self.assertRegex(policy, r"Never claim a proposal is prepared or created until the tool returns")
+            self.assertIn("proposal_id", policy)
+            proposal = next(tool["function"] for tool in request["tools"]
+                            if tool["function"]["name"] == "create_patch_plan")
+            self.assertEqual(set(proposal["parameters"]["required"]), set(assessment.PLAN))
+            self.assertFalse(proposal["parameters"]["additionalProperties"])
+
+    def test_literal_refusal_instructions_do_not_relax_exact_status_and_reason(self):
+        replacements = (
+            {"status": "missing_evidence", "reason": "No saved evidence available."},
+            {"status": "blocked", "reason": "An unresolved run prevents execution."},
+            {"status": "blocked", "reason": "Cannot waive checks or assume identity."},
+        )
+        for index, text in enumerate(replacements, 2):
+            self.replies[index]["choices"][0]["message"]["content"] = json.dumps(text)
+        code, receipt, _ = self.run_assessment()
+        self.assertEqual(code, 1)
+        for index in (2, 3, 4):
+            self.assertEqual(receipt["scenarios"][index]["reason"], "incorrect_uncertainty_or_refusal")
+            text = self.requests[index]["body"]["messages"][0]["content"]
+            required = assessment.scenarios()[index]["expected_text"]
+            self.assertIn(json.dumps(required, separators=(",", ":")), text)
+
+    def test_known_host_inspection_cannot_substitute_an_estate_listing(self):
+        function = self.replies[0]["choices"][0]["message"]["tool_calls"][0]["function"]
+        function.update(name="list_estate", arguments="{}")
+        code, receipt, _ = self.run_assessment()
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt["scenarios"][0]["reason"], "wrong_tool_or_synthetic_scope")
+        self.assertEqual(assessment.scenarios()[0]["expected_arguments"], {"host_id": assessment.HOST})
+
     def test_missing_evidence_and_unknown_run_must_not_return_a_proposal(self):
         for index in (2, 3, 4):
             with self.subTest(case=index):

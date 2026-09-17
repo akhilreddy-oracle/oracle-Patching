@@ -36,7 +36,7 @@ jq -e '.state == "rolled_back"' "$TMP/rollback.json" >/dev/null
 # shellcheck disable=SC1090
 . <(sed -n '/^restore_original_opatch() {/,/^}/p' "$ROOT/bin/opu-opatch-upgrade")
 # Called by the production helper extracted above.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329,SC2317 # Called indirectly by the extracted native helpers.
 as_owner() { shift; "$@"; }
 mkdir -p "$TMP/partial-home/OPatch" "$TMP/original"
 printf 'partial copy' >"$TMP/partial-home/OPatch/partial"

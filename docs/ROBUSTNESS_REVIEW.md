@@ -6,8 +6,11 @@ pending.** Passing an earlier revision or an individual suite does not establish
 that the complete changed release passes. This document is an audit record, not
 a production certificate.
 
-No new live Oracle operation, SSH connection, real model assessment, remote
-installation or company identity-provider login was performed for this audit.
+No new live Oracle operation, SSH connection, remote installation or company
+identity-provider login was performed for this audit. Two authorized assessments
+called the configured local model endpoint using synthetic protocol cases and
+executed zero native actions; their limitations and failed acceptance result are
+recorded below.
 
 ## Review coverage
 
@@ -21,7 +24,7 @@ outside the manual source review.
 | --- | --- | --- |
 | Browser application | All 35 files under `webapp/static`, including navigation, authentication, assistant, fleet, wizard, recovery, execution, reports and shared UI helpers; API integration and browser/frontend regressions | Cancelled requests cannot clear a newer identity or redraw an abandoned execution view. Submitted request IDs remain stable when fields change during a save. Invalid calendar dates are rejected. Failed discovery cannot show a successful refresh. Active/unknown recovery runs block conflicting analysis. Readiness inputs have accessible labels. |
 | Controller and authorization | HTTP routes, authentication/company-session boundaries, production configuration, native command-result parsing, host configuration and evidence invalidation | Live discovery requires execution permission; company sessions retain CSRF protection. Credentials and protected configuration files reject unsafe filesystem objects. Invalid production flags fail closed. Failed refresh invalidates derived readiness. Invalid native JSON/status combinations cannot become successful evidence. Duplicate host IDs and invalid connection boolean values are rejected. |
-| Assistant and transport | `assistant.py`, `assistant_tools.py`, `live_inventory.py`, `local_llm.py`, model-assessment harness; plan/recovery/lock/provenance control and SSH transfer modules | Current-inventory requests select exact configured targets and use native discovery. Actions retain approved host configuration and recheck authorization. Corrupt conversations and unresolved launches block further work. Remote launch setup failures stop execution. Transfers preserve private state, pinned connection settings and stable controller lock files. |
+| Assistant and transport | `assistant.py`, `assistant_tools.py`, `live_inventory.py`, `local_llm.py`, model-assessment harness; plan/recovery/lock/provenance control and SSH transfer modules | Current-inventory requests select exact configured targets and use native discovery. Model-backed responses carry a controller-owned action receipt, displayed before labeled model text; unsupported preparation prose cannot establish an actual proposal or execution. Actions retain approved host configuration and recheck authorization. Corrupt conversations and unresolved launches block further work. Remote launch setup failures stop execution. Transfers preserve private state, pinned connection settings and stable controller lock files. |
 | Plan and recovery controls | Entire native plan controller, backup-preparation controller, artifact-staging command and compatibility reconciler; lock-recovery/provenance wrappers and Python implementations; recovery-capacity calculation | Stable inode locks replace the reclaimable directory/PID race. Rollback separates every completed source worker from approval and authorization. Safe retry names match real dispatched stages. Backup and lock recovery recheck their window before downtime. Authority-file swaps cannot block on a FIFO. Artifact reports are published atomically. Compatibility blockers return the documented blocked status. |
 | Oracle adapters and evidence | Standalone, OJVM, out-of-place, RAC apply/rollback, Grid manual/OPatchAuto and legacy rolling adapters; topology/home discovery; recovery, compatibility, procedure, readiness, OPatch and inventory utilities; common execution/job/queue libraries | Invalid XML and unsuccessful native collection cannot supply authoritative inventory. Service starts do not inherit execution locks. SQL validation checks the latest action. Native failures remain failures, including RAC rollback. Remote arguments are quoted. OPatch upgrade holds host and request locks, binds PMON to the requested home, records service state before downtime and supports interrupted quiesce/restoration recovery. Backup checksums, partial-copy restoration, job transitions and out-of-place oratab metadata have regression coverage. Compatibility collection uses unique private log directories and rejects unsafe or reused outputs to retain prior evidence. RAC rollback shared functions were compared with the fully reviewed RAC apply implementation; differing blocks were read directly. |
 | Data Guard | Observe/evaluate/order/orchestration, role-change gates/executors and shared helpers | Standby targets retain their observed roles; downstream consumers verify input seals. Live role-change execution rejects simulation gates, requires recent bound observations and positive broker success plus healthy expected-role postchecks; failed postcheck diagnostics remain available for reconciliation. Readiness binds the exact database/home/role, sealed evaluation and observation time. Plan admission and later authorization recheck the exact earliest evidence expiry, and transport carries both evaluation and order. Targeted safety and integration regressions passed. Data Guard remains a separately scoped native workflow; this audit does not establish company-approval integration or live qualification. |
@@ -29,8 +32,8 @@ outside the manual source review.
 
 Reports and discovery presentation received focused changed-block reviews in
 addition to the controller review. The historical `scripts/build_blueprint.py`
-document generator was also read; it is outside the live application workflow. Contracts, test definitions and deployment
-assets are also exercised by the release gates; this is distinct from claiming
+document generator was also read; it is outside the live application workflow.
+Contracts, test definitions and deployment assets are also exercised by the release gates; this is distinct from claiming
 an independent line-by-line review of every test or documentation file.
 
 ## Status of the eight enhancements
@@ -53,9 +56,26 @@ Oracle procedure; it must not be represented as already completed.
 The local assistant is an additional capability. Explicit current patch-inventory
 questions use a role-authorized native check and its run-specific receipt; saved
 evidence is identified as saved. Patch and backup mutations still use typed
-actions, confirmation and native approval/readiness controls. Offline model-client
-tests do not establish real-model reliability. A new real-model assessment and
-representative operator evaluation remain outstanding.
+actions, confirmation and native approval/readiness controls. Controller-owned
+action receipts identify proposals actually prepared in each model response;
+current action cards retain subsequent execution states. Model prose cannot
+replace those records.
+
+The configured Ollama `qwen3:4b-instruct` endpoint initially passed **0 of 6**
+strict synthetic protocol cases. After clarifying the production tool-before-claim
+policy and adding literal protocol examples, it passed **5 of 6** with unchanged
+expected outcomes. **Model acceptance still failed.** The remaining scope-refusal
+case returned no tool call but did not match the required refusal object. Raw
+responses were not retained, so the format failure does not establish unsafe
+semantic behavior. Both assessments executed zero native actions. These six
+instructed cases do not establish general reasoning safety, Oracle workflow
+acceptance or model weight provenance. Representative operator evaluation and a
+passing assessment of the final configured model remain outstanding.
+
+Local diagnostic receipts: `webapp/var/mac-local/model-assessment-post-audit-20260917.json`
+and `webapp/var/mac-local/model-assessment-protocol-clarification-20260917.json`.
+They retain source/configuration bindings for their own assessment runs and do not
+certify later source changes.
 
 Remote deployment scripts and same-server model configuration are present.
 Installation, service startup, TLS, protected credentials, host trust and model
@@ -76,6 +96,8 @@ test count. The final release runner must revalidate the combined snapshot.
 | Backup, artifact and controller shell suites | `recovery_prepare`, `artifact_stage`, `patch_plan`, `shell_fail_open_regressions`, `compatibility_reconcile` passed | Complete fixture workflows and rejection paths. Recovery preparation also ran 10 capacity tests. |
 | Standalone apply/rollback suite | Passed | Normal and backup-waived apply/rollback, multiple source workers, safe retries and failure/evidence-tampering drills. |
 | Assistant suites | Workflow 25, API 18, live API 29, inventory 14, native live-inventory integration 10, offline model-client class 10 passed | Exact-target, authorization, transport and unresolved-run fixtures; no new real model or SSH call. |
+| Assistant receipt UI | 19 chat frontend tests and 12 targeted Chromium cases passed | Controller status precedes model prose; zero, positive, malformed and historical receipts, reload, role restrictions and explicit confirmation. Browser cases use API fixtures and overlap earlier targeted coverage. |
+| Real model protocol assessment | **Failed: 5 of 6**, improved from 0 of 6 after protocol clarification | Same configured local endpoint; zero native actions. Scope-refusal exact-object compliance remains unresolved; this is not a safety or production certificate. |
 | Transport and diagnostics | Plan transport 10, remote transport 13, lock control 19, provenance control 19, execution console 13 passed | Simulated host transport and temporary evidence. |
 | Other native adapter checks | A 14-suite targeted batch, OJVM/out-of-place reruns, final Grid rollback/OPatchAuto pair and OPatch-upgrade lifecycle checks passed | Fixture adapters and failure drills, not live Oracle/media qualification. |
 | Data Guard and readiness | 8 Data Guard safety tests, `readiness` and `patch_plan_dataguard` passed | Seals, role/target binding, broker proof, retained failure logs, simulated-gate rejection, stale/future evidence, exact expiry and order/evaluation transport. |
@@ -94,7 +116,8 @@ changes.
 - Resolve any live extjob provenance issue from trusted Oracle media or an approved
   reference; an old backup comparison is not permission to repair privileged bytes.
 - Select and validate the company identity provider and deployment configuration.
-- Assess the actual configured local model and complete the remote installation.
+- Resolve the remaining model protocol acceptance failure, assess the final
+  configured model and complete the remote installation.
 - Obtain production approval independently; fixture success cannot grant it.
 
 Supporting scope and procedures: [application enhancements](APPLICATION_ENHANCEMENTS.md),

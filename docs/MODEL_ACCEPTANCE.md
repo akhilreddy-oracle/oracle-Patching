@@ -43,6 +43,11 @@ untrusted evidence. Proposed arguments are checked by the production typed
 validator and compared with exact synthetic host, database, patch, plan and
 window values. Refusal cases require a specified JSON response; a natural-language
 refusal may therefore fail this protocol check despite being appropriate in chat.
+The assessment sends the production system policy followed by literal examples
+of the required refusal objects. A supplied host is inspected directly, and a
+proposal must be a real function call: prose or JSON claiming that preparation
+has happened does not pass. The production policy likewise requires a successful
+controller proposal record before the assistant may claim preparation.
 There are no retries. A transport, configuration or malformed-response error
 stops the run; a valid but incorrect response is recorded and the next case runs.
 Maximum inference time is six times the configured timeout, plus local overhead.

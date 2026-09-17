@@ -27,8 +27,11 @@ function install(fixture, options = {}) {
     if (method === 'GET' && path === '/api/runs/model123') {
       if (state.busyPolls++ === 0 && !state.finishImmediately) return send({ status: 'running', run_id: 'model123' });
       if (state.conversation.busy) {
-        state.conversation.messages.push({ role: 'assistant', content: 'Review this proposal before confirming. <img src=x onerror=alert(1)>', created_at: now() });
-        state.conversation.actions = [proposal()];
+        state.conversation.actions = state.proseOnly ? [] : [proposal()];
+        state.conversation.messages.push({ role: 'assistant', content: state.proseOnly
+          ? 'The patch plan is prepared for review.' : 'Review this proposal before confirming. <img src=x onerror=alert(1)>', created_at: now(),
+          action_receipt: { source: 'controller', native_actions_started: 0,
+            proposals: state.conversation.actions.map(({ id, tool, state: actionState }) => ({ id, tool, state: actionState })) } });
         state.conversation.busy = false; state.conversation.active_run_id = null;
       }
       return send({ status: 'succeeded', run_id: 'model123' });
@@ -61,6 +64,7 @@ test('assistant navigation, saved message and explicit confirmation retain a blo
   await message.fill('Prepare the approved source plan for execution.');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await expect(page.getByRole('log', { name: 'Conversation messages' })).toContainText('Review this proposal');
+  await expect(page.getByRole('region', { name: 'Action status', exact: true })).toContainText('1 action proposal was prepared in this response');
   await expect(page.locator('.assistant-transcript img')).toHaveCount(0);
   expect(fixture.writes.map(row => row.path)).toEqual(['/api/assistant/conversations', '/api/assistant/conversations/chat-1/messages']);
   await expect(page.getByRole('link', { name: 'Review plan and approvals' })).toHaveAttribute('href', '#/plans/source-plan');
@@ -73,11 +77,29 @@ test('assistant navigation, saved message and explicit confirmation retain a blo
   await page.reload();
   await expect(page.locator('.assistant-action')).toContainText('Native result: blocked');
   await expect(page.getByRole('log')).toContainText('Prepare the approved source plan');
+  await expect(page.getByRole('region', { name: 'Action status', exact: true })).toContainText('No operation was started by this response');
   expect(fixture.writes).toHaveLength(3);
   await page.screenshot({ path: testInfo.outputPath('assistant-fixture-desktop.png'), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath('assistant-fixture-mobile.png'), fullPage: true });
+});
+
+test('controller receipt distinguishes model-only preparation prose before and after reload without starting an action', async ({ page, fixture }) => {
+  install(fixture, { proseOnly: true, finishImmediately: true });
+  await page.goto('/#/assistant/chat-1');
+  await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Prepare a patch plan for review.');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  const status = page.getByRole('region', { name: 'Action status', exact: true });
+  await expect(status).toContainText('No action proposal was prepared. No operation was started by this response.');
+  await expect(page.getByRole('heading', { name: 'Model response', exact: true })).toBeVisible();
+  await expect(page.locator('.assistant-message-content').last()).toHaveText('The patch plan is prepared for review.');
+  expect(await status.evaluate(node => Boolean(node.compareDocumentPosition(node.parentElement.querySelector('.assistant-message-content')) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true);
+  await expect(page.getByRole('button', { name: 'Confirm and run', exact: true })).toHaveCount(0);
+  await expect(page.locator('.assistant-action')).toHaveCount(0);
+  await page.reload();
+  await expect(status).toContainText('No action proposal was prepared. No operation was started by this response.');
+  expect(fixture.writes).toEqual([{ path: '/api/assistant/conversations/chat-1/messages', method: 'POST', body: { content: 'Prepare a patch plan for review.' } }]);
 });
 
 test('disabled local model explains configuration and never creates a conversation', async ({ page, fixture }) => {

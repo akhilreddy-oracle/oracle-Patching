@@ -20,6 +20,28 @@ const identifier = value => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9
 const endpoint = id => `/api/assistant/conversations/${encodeURIComponent(id)}`;
 const isLiveInventory = action => action?.tool === "refresh_discovery" && action.origin === "live_inventory_query";
 
+function renderActionReceipt(receipt) {
+  const states = ["pending", "executing", "completed", "failed", "unknown", "dismissed", "expired"];
+  const valid = receipt && typeof receipt === "object" && !Array.isArray(receipt)
+    && receipt.source === "controller" && receipt.native_actions_started === 0
+    && Array.isArray(receipt.proposals)
+    && receipt.proposals.every(proposal => proposal && typeof proposal === "object" && !Array.isArray(proposal)
+      && identifier(proposal.id) && typeof proposal.tool === "string"
+      && Object.hasOwn(TOOLS, proposal.tool) && states.includes(proposal.state))
+    && new Set(receipt.proposals.map(proposal => proposal.id)).size === receipt.proposals.length;
+  const count = valid ? receipt.proposals.length : 0;
+  const summary = !valid
+    ? "The controller action record is unavailable or invalid. Review the current action cards before continuing."
+    : count === 0
+      ? "No action proposal was prepared. No operation was started by this response."
+      : `${count} action ${count === 1 ? "proposal was" : "proposals were"} prepared in this response. Review ${count === 1 ? "its current action card" : "their current action cards"} below. No operation was started by this response.`;
+  return el("section", { class: "assistant-action-receipt", "aria-label": "Action status" }, [
+    el("h3", { text: "Action status" }),
+    el("p", { text: summary }),
+    el("p", { class: "helper", text: valid ? "Controller record for this response. Current action states are shown in the action cards." : "Model text is not an execution receipt." }),
+  ]);
+}
+
 export function actionAvailability(action, { canChat = true, allowedTools, busy = false, now = Date.now() } = {}) {
   if (!TOOLS[action?.tool]) return { allowed: false, reason: "This action type is not supported by this application." };
   if (action.state !== "pending") return { allowed: false, reason: action.state === "unknown"
@@ -252,8 +274,10 @@ export async function renderAssistant(mount, conversationId = null) {
     const transcript = el("div", { class: "assistant-transcript", role: "log", "aria-label": "Conversation messages", "aria-live": "polite", "aria-relevant": "additions text" });
     for (const message of conversation.messages || []) {
       if (!["user", "assistant"].includes(message.role)) continue;
+      const hasReceipt = message.role === "assistant" && Object.hasOwn(message, "action_receipt");
       transcript.appendChild(el("article", { class: `assistant-message assistant-message-${message.role}`, "aria-label": message.role === "user" ? "Your message" : "Assistant response" }, [
         el("p", { class: "assistant-message-author", text: message.role === "user" ? "You" : "Patching assistant" }),
+        ...(hasReceipt ? [renderActionReceipt(message.action_receipt), el("h3", { text: "Model response" })] : []),
         el("div", { class: "assistant-message-content", text: message.content || "" }),
         el("time", { datetime: message.created_at || "", text: message.created_at || "" }),
       ]));
