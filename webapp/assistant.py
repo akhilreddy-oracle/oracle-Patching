@@ -128,8 +128,9 @@ def _inventory_question(content):
     words = set(re.findall(r"[a-z]+", content.lower()))
     return bool(words & {"what", "which", "show", "list", "check", "inspect", "get", "tell"}
                 and words & {"patch", "patches", "version", "versions", "inventory"}
-                and not words & {"apply", "rollback", "execute", "approve", "authorize", "prepare", "create", "backup",
-                                 "restart", "stop", "shutdown", "install", "remove", "upgrade", "delete", "patching"})
+                and not words & {"apply", "applying", "rollback", "execute", "executing", "execution", "approve", "authorize", "prepare", "create", "backup",
+                                 "restart", "stop", "shutdown", "install", "remove", "upgrade", "delete", "patching",
+                                 "plan", "plans", "task", "tasks", "propose", "proposing", "proposal", "dispatch", "dispatching"})
 
 
 def _live_inventory_question(content):

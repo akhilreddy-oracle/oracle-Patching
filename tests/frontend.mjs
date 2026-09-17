@@ -33,6 +33,7 @@ class Element {
   set textContent(value) { this.replaceChildren(); this._text = String(value ?? ''); }
   set innerHTML(value) { assert.equal(value, '', 'The UI must render data as text'); this.replaceChildren(); }
   appendChild(child) { if (child.parentElement) child.parentElement.children = child.parentElement.children.filter(item => item !== child); child.parentElement = this; this.children.push(child); return child; }
+  remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(child => child !== this); this.parentElement = null; }
   replaceChildren(...children) { for (const child of this.children) child.parentElement = null; this.children = []; this._text = ''; children.forEach(child => this.appendChild(child)); }
   addEventListener(name, listener) { const handlers = this.listeners.get(name) || []; handlers.push(listener); this.listeners.set(name, handlers); }
   async fire(name) { for (const listener of this.listeners.get(name) || []) await listener({ target: this, preventDefault() {} }); }
@@ -83,6 +84,7 @@ const { renderReadinessStage } = await import('../webapp/static/stages/readiness
 const { renderRecoveryStage } = await import('../webapp/static/stages/recovery.js');
 const { hydrateBackupPolicy, policyRecoveryBlock, backupPolicyChooser } = await import('../webapp/static/backup_policy.js');
 const { createPageRenderer } = await import('../webapp/static/navigation.js');
+const { renderValidation } = await import('../webapp/static/validation.js');
 const { startRun, pollRun, runToCompletion } = await import('../webapp/static/runs.js');
 const { reconciliationCard } = await import('../webapp/static/run_reconciliation.js');
 const { refreshSession } = await import('../webapp/static/shell.js');
@@ -180,6 +182,30 @@ test('navigation aborts old reads and prevents stale results or errors replacing
   });
   const first = render(); await render(); assert.equal(firstSignal.aborted, true); release(); await first;
   assert.equal(page.textContent, 'current'); render.cancel();
+});
+
+test('release validation stops loading after its response and retains every evidence level', async () => {
+  let release;
+  fetch = async url => {
+    assert.equal(url, '/api/validation');
+    return new Promise(resolve => { release = () => resolve(response({
+      fixture_tested: { status: 'unknown', reason: 'Source changed after validation.' },
+      live_lab_verified: { status: 'unverified', reason: 'No live lab evidence recorded.' },
+      production_approved: { status: 'unverified', reason: 'No production approval recorded.' },
+    })); });
+  };
+  const page = mount(); const render = createPageRenderer(page, renderValidation);
+  const pending = render();
+  assert.match(page.textContent, /Loading…/);
+  assert.equal(page.querySelector('.route-view').getAttribute('aria-busy'), 'true');
+  release(); await pending;
+  assert.doesNotMatch(page.textContent, /Loading…/);
+  assert.equal(page.querySelector('.route-view').getAttribute('aria-busy'), 'false');
+  assert.deepEqual(page.querySelectorAll('h2').map(node => node.textContent), ['Fixture tests', 'Live lab verification', 'Production approval']);
+  assert.deepEqual(page.querySelectorAll('.badge').map(node => node.textContent), ['unknown', 'unverified', 'unverified']);
+  for (const reason of ['Source changed after validation.', 'No live lab evidence recorded.', 'No production approval recorded.']) assert.ok(page.textContent.includes(reason));
+  assert.equal(page.querySelectorAll('.badge-ok').length, 0);
+  render.cancel();
 });
 
 test('API sends the acting identity only on writes and still joins an active run conflict', async () => {

@@ -360,6 +360,48 @@ class LiveAssistantApiTests(fixture.AssistantApiTests):
                 self.assertEqual(self.conversation(conversation_id)["actions"], [])
         self.assert_no_native_calls()
 
+    def test_live_plan_identifiers_containing_patch_preserve_model_inspection_and_pending_proposals(self):
+        generated_plan_id = f"customer-{random.Random(7139).randrange(100000, 999999)}-patch-cycle"
+        cases = (
+            ("assistant-native-patch", "Inspect assistant-native-patch and propose executing its remaining tasks."),
+            ("assistant-native-patch", "Inspect assistant-native-patch again and propose the current remaining tasks."),
+            (generated_plan_id, f"Inspect {generated_plan_id} and propose executing its remaining tasks."),
+        )
+        for plan_id, content in cases:
+            with self.subTest(plan_id=plan_id, content=content):
+                self.saved_plan["plan_id"] = plan_id
+                saved_before = copy.deepcopy(self.saved_plan)
+                self.model.reset_mock()
+                self.model.side_effect = [
+                    {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": "inspect-current-plan", "type": "function",
+                        "function": {"name": "inspect_plan", "arguments": json.dumps({"plan_id": plan_id})}}]},
+                    {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": "prepare-plan-proposal", "type": "function",
+                        "function": {"name": "execute_plan", "arguments": json.dumps({"plan_id": plan_id})}}]},
+                    {"role": "assistant", "content": "Inspected the saved plan and prepared its execution for review.",
+                     "tool_calls": []},
+                ]
+                conversation_id, response = self.query(content)
+                record = self.finish_query(response)
+                self.assertEqual((record.kind, record.status), ("assistant", "succeeded"))
+                self.assertEqual(self.model.call_count, 3)
+                conversation = self.conversation(conversation_id)
+                self.assertIn("prepared its execution for review", self.answer(conversation))
+                self.assertEqual(len(conversation["actions"]), 1)
+                action = conversation["actions"][0]
+                self.assertEqual((action["tool"], action["arguments"], action["state"]),
+                                 ("execute_plan", {"plan_id": plan_id}, "pending"))
+                self.assertNotIn("run_id", action)
+                self.assertNotEqual(action.get("origin"), "live_inventory_query")
+                final_wire = self.model.call_args.args[0]
+                results = {message["tool_call_id"]: json.loads(message["content"])
+                           for message in final_wire if message["role"] == "tool"}
+                self.assertEqual(results["inspect-current-plan"]["plan_id"], plan_id)
+                self.assertEqual(results["prepare-plan-proposal"]["state"], "pending_human_confirmation")
+                self.assertEqual(self.saved_plan, saved_before)
+                self.assert_no_native_calls()
+
     def test_live_negative_or_hypothetical_inventory_mentions_never_dispatch(self):
         requests = (
             "Do not check the patch version on source.",

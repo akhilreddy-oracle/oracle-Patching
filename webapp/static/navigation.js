@@ -14,7 +14,8 @@ export function createPageRenderer(app, loadPage) {
     const current = ++generation;
     setReadSignal(signal);
     const view = el("div", { class: "route-view", "aria-busy": "true" });
-    view.appendChild(el("p", { class: "empty-state", role: "status", text: "Loading…" }));
+    const loading = el("p", { class: "empty-state", role: "status", text: "Loading…" });
+    view.appendChild(loading);
     app.replaceChildren(view);
     try {
       await loadPage(view, signal);
@@ -30,6 +31,9 @@ export function createPageRenderer(app, loadPage) {
       retry.addEventListener("click", () => render());
       view.appendChild(retry);
     } finally {
+      // Remove this navigation's indicator even when its renderer appends
+      // content. A detached indicator cannot affect a newer page.
+      loading.remove();
       view.setAttribute("aria-busy", "false");
     }
     if (focus && current === generation) {
