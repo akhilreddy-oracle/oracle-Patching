@@ -158,12 +158,14 @@ def step_discovery(host_id: str, host: dict, body: dict) -> dict:
 
     for node_name, payload in captured_nodes:
         evidence.write_evidence(host_id, evidence.node_snapshot_evidence_name(node_name), payload)
-    evidence.write_evidence(host_id, "snapshot", primary_payload)
     evidence.write_evidence(
         host_id,
         "snapshot_nodes",
         {"schema_version": "1.0", "nodes": index_nodes},
     )
+    # Publish the legacy primary view last. A failed index write must not leave
+    # a primary-only fallback that appears to be a complete discovery.
+    evidence.write_evidence(host_id, "snapshot", primary_payload)
     if receipt_requested:
         return live_inventory.build_receipt(host_id=host_id, host=host, run_id=receipt_run_id,
             started_at=receipt_started_at, completed_at=live_inventory.utc_now(),
@@ -225,19 +227,28 @@ def step_compatibility_collect(host_id: str, host: dict, body: dict) -> dict:
     _require(artifact, "opu-opatch-compatibility-collect", "artifact-inspect")
     _require(procedure, "opu-opatch-compatibility-collect", "procedure-validate")
 
-    tools_sync.ensure_host_tools(host)
-    scratch = REMOTE_SCRATCH_DIR.format(host_id=host_id)
-    sudo = bool(host.get("sudo"))
-
     # OPatch prerequisites are node-local (each node has its own home and
     # staged media), so collect on every configured node and merge. The
     # compatibility reconciler flags any node without a result.
     nodes = _configured_nodes(host)
-    merged: dict | None = None
+    indexed_paths = set(evidence.list_snapshot_paths(host_id))
+    snapshots = []
     for node in nodes:
+        path = evidence.evidence_path(host_id, evidence.node_snapshot_evidence_name(node["name"]))
+        if path not in indexed_paths:
+            if len(nodes) == 1 and indexed_paths == {snapshot}:
+                path = snapshot  # A genuine pre-index standalone observation.
+            else:
+                raise localtools.LocalToolError("opu-opatch-compatibility-collect",
+                    f"No indexed discovery snapshot for node {node['name']}; refresh discovery before collecting compatibility.")
+        snapshots.append(path.read_bytes())
+    # Validate the entire node set before installing tools or opening SSH.
+    tools_sync.ensure_host_tools(host)
+    scratch = REMOTE_SCRATCH_DIR.format(host_id=host_id)
+    sudo = bool(host.get("sudo"))
+    merged: dict | None = None
+    for node, snapshot_bytes in zip(nodes, snapshots):
         alias = node["ssh_alias"]
-        node_snapshot = evidence.evidence_path(host_id, evidence.node_snapshot_evidence_name(node["name"]))
-        snapshot_bytes = node_snapshot.read_bytes() if node_snapshot.is_file() else snapshot.read_bytes()
         remote.push_file(alias, f"{scratch}/snapshot.json", snapshot_bytes)
         remote.push_file(alias, f"{scratch}/artifact.json", artifact.read_bytes())
         remote.push_file(alias, f"{scratch}/procedure.json", procedure.read_bytes())
@@ -395,23 +406,26 @@ def step_recovery_collect(host_id: str, host: dict, body: dict) -> dict:
 
 
 def _refresh_procedure_input(host_id: str, procedure_input: dict) -> dict:
-    """Rebind a saved procedure input to the artifact evidence just produced.
+    """Reuse reviewed requirements only while their media and README match.
 
-    Only the digests that opu-artifact-inspect derives (artifact sha, README
-    sha) are refreshed; every operator-chosen field is kept as sealed.
+    A fresh inspection can refresh collection time, but cannot authorize old
+    operator-entered requirements for changed bytes by replacing their hashes.
     """
     artifact = (evidence.read_evidence(host_id, "artifact") or {}).get("artifact") or {}
     out = json.loads(json.dumps(procedure_input))
-    if artifact.get("sha256"):
-        out["artifact_sha256"] = artifact["sha256"]
+    if not artifact.get("sha256") or out.get("artifact_sha256") != artifact["sha256"]:
+        raise localtools.LocalToolError("readiness-chain",
+            "Patch media differs from the reviewed procedure. Review the current README and validate the procedure again.")
     readmes = {r.get("path"): r.get("sha256") for r in artifact.get("readme_files") or [] if isinstance(r, dict)}
-    refs = []
+    matched = False
     for ref in out.get("oracle_references") or []:
-        if isinstance(ref, dict) and ref.get("kind") == "patch_readme" and ref.get("identifier") in readmes:
-            ref = {**ref, "sha256": readmes[ref["identifier"]]}
-        refs.append(ref)
-    if refs:
-        out["oracle_references"] = refs
+        if isinstance(ref, dict) and ref.get("kind") == "patch_readme":
+            if not readmes.get(ref.get("identifier")) or ref.get("sha256") != readmes[ref["identifier"]]:
+                raise localtools.LocalToolError("readiness-chain",
+                    "The reviewed README changed or is missing. Review its requirements and validate the procedure again.")
+            matched = True
+    if not matched:
+        raise localtools.LocalToolError("readiness-chain", "The procedure has no reviewed README binding; validate the procedure first.")
     return out
 
 
@@ -434,8 +448,8 @@ def step_readiness_chain(host_id: str, host: dict, body: dict) -> dict:
     take minutes, so evaluating a hand-run chain often fails snapshot_freshness
     through no fault of the estate. This re-derives every document in one
     sitting using the operator's saved inputs (artifact path, procedure input,
-    policy) unless overridden in the body, refreshing only tool-derived
-    digests. Stops at the first blocked/failed step; every step's evidence is
+    policy) unless overridden in the body. Changed artifact/README bytes
+    require renewed operator review. Stops at the first blocked/failed step; every step's evidence is
     still written, so the stage cards show exactly where it stopped.
     """
     record = body.get("_record")

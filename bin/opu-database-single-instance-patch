@@ -256,6 +256,7 @@ set pages 0 heading off feedback off verify off echo off trimspool on lines 3276
 select 'INSTANCE_NAME=' || instance_name from v$instance;
 select 'INSTANCE_STATUS=' || status from v$instance;
 select 'DATABASE_UNIQUE_NAME=' || db_unique_name from v$database;
+select 'CDB=' || cdb from v$database;
 select 'DATABASE_ROLE=' || database_role from v$database;
 select 'OPEN_MODE=' || open_mode from v$database;
 select 'LOG_MODE=' || log_mode from v$database;
@@ -268,6 +269,7 @@ probe_value() { sed -n "s/^$1=//p" "$2" | tail -n1 | sed -E 's/^[[:space:]]+|[[:
 
 healthy_probe() {
   local file=$1
+  opu_require_non_cdb_probe "$file" || return $?
   [ "$(probe_value DATABASE_UNIQUE_NAME "$file")" = "$DATABASE" ] &&
     [ "$(probe_value INSTANCE_STATUS "$file")" = OPEN ] &&
     [ "$(probe_value DATABASE_ROLE "$file")" = PRIMARY ] &&

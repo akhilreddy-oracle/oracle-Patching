@@ -31,7 +31,7 @@ class RecoveryCapabilityTests(unittest.TestCase):
             "oracle_homes": [{"path": "/u01/db", "owner": "oracle"}],
             "databases": [{"db_unique_name": "ORCL", "oracle_home": "/u01/db", "runtime": {
                 "status": "complete", "instance": "ORCL", "database_role": "PRIMARY",
-                "open_mode": "READ WRITE", "instance_state": "OPEN", "log_mode": "NOARCHIVELOG"}}],
+                "open_mode": "READ WRITE", "instance_state": "OPEN", "log_mode": "NOARCHIVELOG", "cdb": "NO"}}],
         }
         self.policy = {"schema_version": "1.0", "maximum_snapshot_age_seconds": 1800,
                        "require_xml_inventory": True, "database": {}, "recovery": {"require_backup": True}}
@@ -51,7 +51,7 @@ class RecoveryCapabilityTests(unittest.TestCase):
 
     def test_archivelog_standby_and_unknown_modes_fail_closed(self):
         for field, value in (("log_mode", "ARCHIVELOG"), ("log_mode", None), ("database_role", "PHYSICAL STANDBY"),
-                             ("open_mode", "MOUNTED"), ("status", "partial")):
+                             ("open_mode", "MOUNTED"), ("status", "partial"), ("cdb", "YES"), ("cdb", None)):
             with self.subTest(field=field, value=value):
                 snapshot = copy.deepcopy(self.snapshot)
                 snapshot["databases"][0]["runtime"][field] = value

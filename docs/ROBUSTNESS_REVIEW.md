@@ -1,11 +1,23 @@
 # Robustness review — 17 September 2026
 
 This review covers the application and native execution code, confirmed fixes
-and regression evidence. **The complete Linux fixture release gate passed on
-code revision `63f032f`.** [Retained GitHub run](https://github.com/akhilreddy-oracle/oracle-Patching/actions/runs/35209437448)
-contains the command receipts and logs. The installed Mac has its own exact-source
-receipt, described below. This document is an audit record, not a production
-certificate.
+and regression evidence. The first-pass Linux fixture gate passed on `63f032f`
+([retained run](https://github.com/akhilreddy-oracle/oracle-Patching/actions/runs/35209437448)).
+A second code-first review found additional correctness defects despite that
+passing gate. Its coverage and remaining limits are recorded in the
+[controller](SECOND_REVIEW_CONTROLLER.md), [native](SECOND_REVIEW_NATIVE.md),
+[assistant/transport](SECOND_REVIEW_ASSISTANT_TRANSPORT.md) and
+[browser/deployment](SECOND_REVIEW_UI_DEPLOY.md) reports. Second-pass combined
+validation is pending; the earlier receipt does not validate changed source.
+This document is an audit record, not a production certificate.
+
+The second pass preserves reviewed README/media bindings, rejects incomplete
+node evidence, binds confirmed AI plan creation through native sealing, excludes
+competing HTTP/pull-agent transports, and corrects stale Grid runtime reporting.
+It also fixes fleet readiness bindings, revoked company-session cleanup,
+configuration read/admission races and diagnostic credential exposure. Current
+database adapters now explicitly require **non-CDB** targets. RAC-wide baseline
+compliance remains unknown until an all-node aggregation is implemented.
 
 No new live Oracle operation, SSH connection, remote installation or company
 identity-provider login was performed for this audit. Two authorized assessments
@@ -45,7 +57,7 @@ Oracle procedure; it must not be represented as already completed.
 
 | Enhancement | Implemented scope | Still required for acceptance |
 | --- | --- | --- |
-| 1. Backup → validation → approval → patch → health verification | Host Recovery/Readiness/Plan/Execute pages connect sealed backup requests, separate approval/authorization, native preparation, backup selection, patch tasks and database/listener checks. Initial preparation supports standalone PRIMARY, READ WRITE, NOARCHIVELOG databases using an SPFILE. | Run and retain a complete approved live cycle for each supported configuration. RMAN restore validation proves backup readability/selection; it does **not** restore and open another database. An actual restore drill remains a separate acceptance task. |
+| 1. Backup → validation → approval → patch → health verification | Host Recovery/Readiness/Plan/Execute pages connect sealed backup requests, separate approval/authorization, native preparation, backup selection, patch tasks and database/listener checks. Initial preparation supports standalone non-CDB PRIMARY, READ WRITE, NOARCHIVELOG databases using an SPFILE. | Run and retain a complete approved live cycle for each supported configuration. RMAN restore validation proves backup readability/selection; it does **not** restore and open another database. An actual restore drill remains a separate acceptance task. |
 | 2. Actionable readiness blockers | Cards identify the affected target, observed evidence, required condition and relevant next action. Missing measurements remain unknown. Refresh actions rebuild evidence and derived readiness. | Verify representative real backup, inventory, FRA, compatibility and stale-evidence failures against the deployed hosts, including successful remediation through the UI. |
 | 3. Guided patch wizard | Database/patch selection, bound README procedure requirements, maintenance-window review, plan inspection and Advanced settings are implemented. Calendar validation and request-identity races have regressions. | Review the real patch README, artifact/platform/OPatch requirements and supported rollback procedure; complete usability acceptance with the intended operators and host configurations. |
 | 4. Live execution dashboard | Persistent task timeline, elapsed time, controller contact, observed worker lease, bounded native logs and reconciliation instructions are implemented. Navigating away stops browser polling without cancelling native work. | Validate real network loss, controller restart, slow native stages and reconnection. Connectivity and a lease observation are not proof that a task succeeded. Unknown outcomes must reconcile the existing launch. |
@@ -82,14 +94,14 @@ Installation, service startup, TLS, protected credentials, host trust and model
 capacity on the intended patching server still require deployment acceptance.
 This review did not move or launch the application on that server.
 
-## Validation evidence
+## First-pass validation evidence
 
-The full Linux run executes `make -j4 check` and `npm run test:browser`. The
-individual rows below provide additional detail; their counts must not be added
+The full Linux run executes `make -j4 check` and `npm run test:browser`. These
+historical first-pass rows do not validate second-pass edits. Their counts must not be added
 together because some suites overlap. The Mac runtime record is independent of
 the Linux artifact because source file metadata and runtime differ.
 
-| Check | Latest targeted result | Evidence boundary |
+| Check | First-pass result | Evidence boundary |
 | --- | --- | --- |
 | Frontend Node suites | 95 tests passed | DOM fixtures and application behavior; no Oracle operations. |
 | Chromium browser cases | Full Linux browser scope passed | Isolated browser-to-controller/native fixtures, including managed backup selection/readiness/patching and response receipts. No live Oracle or SSH. |

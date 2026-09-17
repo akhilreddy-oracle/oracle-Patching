@@ -213,6 +213,10 @@ class AssistantApiTests(unittest.TestCase):
                     self.native[native].return_value = {"plan_state": "succeeded", "task_results": [{"status": "succeeded"}]}
                 previous_runs = set(pipeline_runner.RUNS)
                 conversation_id, action = self.prepare(name, arguments, actor=actor)
+                if name == "create_patch_plan":
+                    approved = assistant._read(assistant._path(actor, conversation_id), actor)["actions"][0]["binding"]
+                    kwargs = {"expected_creation_binding_sha256": approved, "patch_id": arguments["patch_id"],
+                              "database": arguments["database"], "hosts": {"source": self.host}}
                 self.assertEqual(set(pipeline_runner.RUNS), previous_runs, "Preparation must not launch a native command")
                 response = self.execute(conversation_id, action, actor=actor)
                 self.assertEqual(response["status"], 202, response)

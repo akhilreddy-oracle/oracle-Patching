@@ -5,6 +5,12 @@
 actor, and bounded lease. Database name, Oracle home, owner, patch path, patch
 ID, commands, and SQL cannot be supplied by the operator.
 
+The current database adapters support **non-CDB databases only**. Readiness
+and live execution require explicit `CDB=NO` evidence. CDBs and unknown
+container scope block before mutation: root-only SQL patch results do not
+prove that every PDB and the seed were patched. This restriction also applies
+to RAC Database, OJVM, home switching, and their rollback adapters.
+
 ## Ordered stages
 
 The controller materializes and executes these stages serially:

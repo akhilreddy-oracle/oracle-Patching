@@ -30,6 +30,7 @@ _RUN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 _PROCESS_ID = uuid.uuid4().hex
 _CURRENT = threading.local()
 _UNRESOLVED = {"queued", "running", "unknown", "reconciling"}
+_STATUSES = _UNRESOLVED | {"succeeded", "failed"}
 
 
 class RunConflict(Exception):
@@ -143,6 +144,8 @@ def _disk_active(key: str) -> str | None:
             data = json.loads(path.read_text())
             if not isinstance(data, dict) or not isinstance(data.get("key"), str):
                 raise ValueError("missing run key")
+            if not isinstance(data.get("status"), str) or data["status"] not in _STATUSES:
+                raise ValueError("missing or invalid run status")
         except (OSError, ValueError) as exc:
             raise RunConflict(f"Persisted run {path.parent.name} is unreadable; repair/reconcile its state before launching", path.parent.name) from exc
         if data["key"] == key and data.get("status") in _UNRESOLVED:
@@ -229,7 +232,7 @@ def start_run(kind: str, key: str, fn) -> RunRecord:
 
 
 def _load_persisted(run_id: str) -> RunRecord | None:
-    if not _RUN_ID_RE.match(run_id):
+    if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
         return None
     path = RUNS_DIR / run_id / "run.json"
     if not path.is_file():
@@ -241,7 +244,9 @@ def _load_persisted(run_id: str) -> RunRecord | None:
     if not isinstance(data, dict):
         return None
     record = RunRecord(run_id, data.get("kind") or "unknown", data.get("key") or "")
-    record.status = data.get("status") or "failed"
+    raw_status = data.get("status")
+    invalid_status = not isinstance(raw_status, str) or raw_status not in _STATUSES
+    record.status = "unknown" if invalid_status else raw_status
     record.created_at = data.get("created_at") or time.time()
     record.started_at = data.get("started_at")
     record.finished_at = data.get("finished_at")
@@ -254,7 +259,9 @@ def _load_persisted(run_id: str) -> RunRecord | None:
     record.timeline = [redacted(event) for event in data.get('timeline') or [] if isinstance(event, dict) and isinstance(event.get('at'), (int, float))] if isinstance(data.get('timeline'), list) else []
     record.observation = data.get('observation') if isinstance(data.get('observation'), dict) else None
     record.controller_poll = data.get('controller_poll') if isinstance(data.get('controller_poll'), dict) else None
-    if record.status in _UNRESOLVED and record.owner.get("instance") != _PROCESS_ID:
+    if invalid_status:
+        record.error = {"message": "Persisted run status is invalid; repair its record before launching more work"}
+    elif record.status in _UNRESOLVED and record.owner.get("instance") != _PROCESS_ID:
         record.status = "unknown"
         record.error = {"message": "Controller ownership was lost; reconcile the execution before relaunching"}
     return record

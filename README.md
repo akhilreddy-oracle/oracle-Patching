@@ -161,6 +161,10 @@ make check
 
 - Oracle Database 19c Release Updates on Oracle Linux x86-64
 - Standalone and RAC Database / Grid Infrastructure adapters
+- Database patch apply/rollback, OJVM, and home-switch adapters currently admit
+  **non-CDB databases only**. Runtime probes must explicitly observe `CDB=NO`;
+  multitenant and unknown container scope block before mutation. Full PDB and
+  seed SQL validation and open-state restoration are not implemented.
 - Data Guard-aware orchestration after primary workflows are proven
 - Discovery, inventory, patch repository, prechecks, approvals, execution,
   validation, rollback, reporting, and audit

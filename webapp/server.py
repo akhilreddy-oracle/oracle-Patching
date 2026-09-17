@@ -71,8 +71,11 @@ def _configuration_errors(method):
 
 def run_discovery(host: dict) -> dict:
     """Legacy synchronous discovery shares the managed per-host pipeline lock."""
+    def discover(_record):
+        with evidence.host_lock(host["id"]):
+            return pipeline_steps.step_discovery(host["id"], host, {})
     record = pipeline_runner.start_run("pipeline", f"host:{host['id']}:pipeline",
-        lambda _record: pipeline_steps.step_discovery(host["id"], host, {}))
+        discover)
     while record.status in {"queued", "running"}:
         time.sleep(0.05)
     if record.status == "succeeded":
@@ -107,7 +110,7 @@ def _cluster_is_standalone_no_crs(cluster: dict) -> bool:
 
 
 def summarize_discovery(host: dict, payload: dict | None, error: remote.RemoteError | None) -> dict:
-    summary = {"id": host["id"], "label": host["label"]}
+    summary = {"id": host["id"], "label": host.get("label") or host["id"]}
     if error is not None:
         summary["status"] = "error"
         summary["error"] = error.to_json()
@@ -167,7 +170,7 @@ def build_estate(*, live: bool = False) -> list[dict]:
             if cached is None:
                 out.append({
                     "id": host["id"],
-                    "label": host["label"],
+                    "label": host.get("label") or host["id"],
                     "status": "pending",
                     "message": "No live discovery yet — open the host to run SSH topology discovery.",
                 })
@@ -188,7 +191,7 @@ def build_estate(*, live: bool = False) -> list[dict]:
         except Exception as exc:  # noqa: BLE001 - estate must never drop the HTTP connection
             return {
                 "id": host["id"],
-                "label": host["label"],
+                "label": host.get("label") or host["id"],
                 "status": "error",
                 "error": {"error": "discovery_failed", "message": str(exc)},
             }
@@ -668,6 +671,28 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         self.__dict__.pop("_parsed_body", None)
 
+        # Logout only clears this browser's session. A revoked company cookie
+        # must not trap the browser ahead of otherwise valid service credentials.
+        if path == "/api/auth/logout":
+            try:
+                body = self._read_json_body()
+                if body:
+                    raise ValueError("Sign-out does not accept action fields")
+                cookie_header = company_auth.logout(self.headers.get("Cookie"),
+                    csrf=self.headers.get("X-CSRF-Token"), origin=self.headers.get("Origin"))
+            except (ValueError, UnicodeError) as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            except auth.AuthError as exc:
+                self._send_json(exc.status, exc.to_json())
+                return
+            self.send_response(204)
+            self.send_header("Set-Cookie", cookie_header)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         if path.startswith("/api/") and not self._require_api_auth():
             return
 
@@ -734,17 +759,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, result)
             except fleet_metadata.MetadataError as exc:
                 self._send_json(exc.status, exc.to_json())
-            return
-
-        if path == "/api/auth/logout":
-            if not getattr(self, "_company_session", None):
-                self._send_json(400, {"error": "no_company_session"})
-                return
-            cookie_header = company_auth.logout(self.headers.get("Cookie"))
-            self.send_response(204)
-            self.send_header("Set-Cookie", cookie_header)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
             return
 
         if path == "/api/recovery":
@@ -861,7 +875,8 @@ class Handler(BaseHTTPRequestHandler):
             def run(record, host=host, body=body, step_fn=step_fn):
                 if step == "readiness-chain":
                     body["_record"] = record
-                return step_fn(host_id, host, body)
+                with evidence.host_lock(host_id):
+                    return step_fn(host_id, host, body)
 
             # One pipeline run per host at a time: steps share the host's SSH
             # scratch dir and evidence files, and the chain wraps all of them.
@@ -1323,7 +1338,10 @@ class Handler(BaseHTTPRequestHandler):
                 key = f"plan:{plan_id}:create"
 
                 def run(_record, plan_id=plan_id, requester=requester, host_id=host_id, window_start=window_start, window_end=window_end):
-                    return planctl.create(plan_id, requester, host_id, window_start, window_end)
+                    confirmation = {key: body[key] for key in ("expected_creation_binding_sha256", "patch_id", "database") if key in body}
+                    if confirmation:
+                        confirmation["hosts"] = load_hosts()
+                    return planctl.create(plan_id, requester, host_id, window_start, window_end, **confirmation)
 
             elif action == "approve":
                 actor = body["actor"]

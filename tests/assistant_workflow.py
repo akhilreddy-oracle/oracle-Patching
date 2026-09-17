@@ -145,6 +145,29 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(action['result']['outcome']['status'], 'blocked')
         self.assertNotIn('private-run-secret', json.dumps(action))
 
+    def test_plan_creation_carries_reviewed_evidence_binding_and_exact_target(self):
+        arguments = {'host_id': 'fixture', 'plan_id': 'reviewed-plan', 'patch_id': '39034528',
+                     'database': 'ORCL', 'window_start': '2099-01-01T01:00:00Z',
+                     'window_end': '2099-01-01T02:00:00Z'}
+        proposal = self.proposal('create_patch_plan', arguments)
+        approved = self.conversation_data()['actions'][0]['binding']
+        def changed_native_inputs(path, body):
+            self.assertEqual(path, '/api/plans')
+            self.assertEqual(body, {**arguments, 'expected_creation_binding_sha256': approved})
+            # Reproduce the dispatch gap without creating any plan: the native
+            # worker must receive the original digest, not silently adopt these
+            # changed but otherwise valid saved inputs.
+            self.evidence['policy'] = {'maximum_snapshot_age_seconds': 60}
+            current = capabilities.evidence.creation_binding('fixture', self.hosts['fixture'],
+                                                             arguments['patch_id'], arguments['database'])
+            self.assertNotEqual(current, body['expected_creation_binding_sha256'])
+            return 409, {'message': 'Creation inputs changed since review'}
+        self.submit.side_effect = changed_native_inputs
+        with self.assertRaisesRegex(assistant.AssistantError, 'changed since review'):
+            self.confirm(proposal)
+        self.assertEqual(self.conversation_data()['actions'][0]['state'], 'failed')
+        self.assertFalse((capabilities.planctl.PLAN_STATE_DIR / 'plans' / 'reviewed-plan').exists())
+
     def test_concurrent_confirmation_launches_once(self):
         proposal = self.proposal()
         entered, release = threading.Event(), threading.Event()

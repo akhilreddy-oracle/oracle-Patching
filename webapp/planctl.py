@@ -17,6 +17,8 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
+from contextlib import contextmanager
+from functools import wraps
 from datetime import datetime, timezone
 from pathlib import Path
 import runtime_paths
@@ -27,7 +29,7 @@ import remote
 import testmode_fixtures
 import tools_sync
 import pipeline_runner
-from durable import write_json
+from durable import file_lock, write_json
 from adapters import EXECUTOR_PATHS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -103,6 +105,43 @@ def validate_plan_id(plan_id: str) -> str:
     return plan_id
 
 
+@contextmanager
+def transport_lock(plan_id: str):
+    """Serialize controller/queue admission before either can copy task state.
+
+    Native task locks protect an individual store. They cannot protect a remote
+    store while another transport overwrites it from a stale controller copy.
+    This lock is held through controller execution and shared by publication.
+    """
+    validate_plan_id(plan_id)
+    acquired = False
+    try:
+        with file_lock(PLAN_STATE_DIR / ".transport-locks" / f"{plan_id}.lock", timeout=0):
+            acquired = True
+            yield
+    except TimeoutError as exc:
+        if acquired:
+            raise
+        raise PlanError("Another controller operation owns this plan's execution transport; inspect its existing run") from exc
+
+
+def _require_controller_transport(plan_id: str) -> None:
+    import agent_queue
+    try:
+        agent_queue.assert_no_unresolved_plan_tasks(plan_id)
+    except agent_queue.QueueError as exc:
+        raise PlanError(str(exc)) from exc
+
+
+def _controller_plan_operation(fn):
+    @wraps(fn)
+    def guarded(plan_id, *args, **kwargs):
+        with transport_lock(plan_id):
+            _require_controller_transport(plan_id)
+            return fn(plan_id, *args, **kwargs)
+    return guarded
+
+
 def _record_host(plan_id: str, host_id: str | None) -> None:
     validate_plan_id(plan_id)
     if host_id is not None:
@@ -161,8 +200,11 @@ def _run(args: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict | None
 
     if result.stdout.strip():
         try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
+            payload = json.loads(result.stdout)
+            if not isinstance(payload, dict):
+                raise ValueError("plan command result must be an object")
+            return payload
+        except ValueError as exc:
             raise PlanError(
                 f"opu-patch-plan produced unparsable output: {exc}",
                 stderr=result.stdout[-2000:],
@@ -170,7 +212,29 @@ def _run(args: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict | None
     return None
 
 
-def create(plan_id: str, requester: str, host_id: str, window_start: str, window_end: str) -> dict:
+def create(plan_id: str, requester: str, host_id: str, window_start: str, window_end: str, *,
+           expected_creation_binding_sha256: str | None = None, patch_id: str | None = None,
+           database: str | None = None, hosts: dict | None = None) -> dict:
+    validate_plan_id(plan_id)
+    evidence.validate_host_id(host_id)
+    with evidence.host_lock(host_id):
+        active = pipeline_runner.active_run_id(f"host:{host_id}:pipeline")
+        if active:
+            raise PlanError("Host evidence has an active or unresolved pipeline; wait or reconcile before creating a plan")
+        if expected_creation_binding_sha256 is not None:
+            if (not isinstance(expected_creation_binding_sha256, str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", expected_creation_binding_sha256)
+                    or not isinstance(hosts, dict) or host_id not in hosts):
+                raise PlanError("Plan creation confirmation is incomplete; review the proposal again")
+            current = evidence.creation_binding(host_id, hosts[host_id], patch_id, database)
+            if current != expected_creation_binding_sha256:
+                raise PlanError("Host configuration or evidence changed after confirmation; review a new proposal")
+        elif patch_id is not None or database is not None:
+            raise PlanError("An explicit patch/database requires a bound creation confirmation")
+        return _create_from_host_evidence(plan_id, requester, host_id, window_start, window_end)
+
+
+def _create_from_host_evidence(plan_id: str, requester: str, host_id: str, window_start: str, window_end: str) -> dict:
     validate_plan_id(plan_id)
     evidence.validate_host_id(host_id)
     args = [
@@ -206,6 +270,16 @@ def create(plan_id: str, requester: str, host_id: str, window_start: str, window
 
 
 def create_rollback(plan_id: str, requester: str, source_plan_id: str, window_start: str, window_end: str) -> dict:
+    # Live rollback creation mirrors the source plan onto a task node too.
+    with transport_lock(source_plan_id):
+        _require_controller_transport(source_plan_id)
+        active = pipeline_runner.active_run_id(f"plan:{source_plan_id}:execute")
+        if active:
+            raise PlanError("Source plan has an active or unresolved execution; reconcile it before creating rollback")
+        return _create_rollback(plan_id, requester, source_plan_id, window_start, window_end)
+
+
+def _create_rollback(plan_id: str, requester: str, source_plan_id: str, window_start: str, window_end: str) -> dict:
     validate_plan_id(plan_id)
     validate_plan_id(source_plan_id)
     args = [
@@ -296,28 +370,32 @@ def _create_rollback_live(
     return status(plan_id)
 
 
+@_controller_plan_operation
 def approve(plan_id: str, actor: str, approval_ticket: str) -> dict:
     validate_plan_id(plan_id)
     _run(["approve", "--plan-id", plan_id, "--actor", actor, "--approval-ticket", approval_ticket])
     return status(plan_id)
 
 
+@_controller_plan_operation
 def authorize(plan_id: str, actor: str) -> dict:
     validate_plan_id(plan_id)
     _run(["authorize", "--plan-id", plan_id, "--actor", actor])
     return status(plan_id)
 
 
+@_controller_plan_operation
 def dispatch(plan_id: str, actor: str) -> dict:
     validate_plan_id(plan_id)
     _run(["dispatch", "--plan-id", plan_id, "--actor", actor])
     return status(plan_id)
 
 
+@_controller_plan_operation
 def retry_task(plan_id: str, task_id: str, actor: str) -> dict:
     """Re-open a plan paused by this task's failure so it can be executed again."""
     validate_plan_id(plan_id)
-    if not task_id or not _ID_RE.match(task_id):
+    if not isinstance(task_id, str) or not _ID_RE.fullmatch(task_id):
         raise PlanError(f"task_id contains unsupported characters: {task_id!r}")
     plan = status(plan_id)
     task = next((t for t in list_tasks(plan_id) if t.get("task_id") == task_id), None)
@@ -347,7 +425,15 @@ def next_task(plan_id: str) -> dict | None:
         )
     if not result.stdout.strip():
         raise PlanError(f"opu-patch-plan next exited {result.returncode} with no output", stderr=result.stderr.strip())
-    return json.loads(result.stdout)
+    try:
+        task = json.loads(result.stdout)
+        if (not isinstance(task, dict) or task.get("plan_id") != plan_id
+                or not isinstance(task.get("task_id"), str) or not _ID_RE.fullmatch(task["task_id"])
+                or task.get("status") != "pending" or task.get("adapter") not in EXECUTOR_BY_ADAPTER):
+            raise ValueError("next task is not a pending supported task for this plan")
+        return task
+    except ValueError as exc:
+        raise PlanError(f"opu-patch-plan next returned an invalid task: {exc}") from exc
 
 
 def status(plan_id: str) -> dict:
@@ -1085,9 +1171,12 @@ def _parse_executor_result(task_id: str, returncode: int, stdout: str, stderr: s
         )
     if payload is None:
         raise PlanError(f"executor exited 0 with no output for task {task_id}", stderr=stderr.strip())
+    if not isinstance(payload, dict) or payload.get("task_id") != task_id or payload.get("status") != "succeeded":
+        raise PlanError(f"executor output is not a successful result for task {task_id}", stderr=stderr.strip())
     return payload
 
 
+@_controller_plan_operation
 def execute_next_task(plan_id: str, actor: str) -> dict | None:
     """Run the next pending task via TEST_MODE fixture or live SSH executor."""
     validate_plan_id(plan_id)
@@ -1152,12 +1241,17 @@ def publish_agent_queue(plan_id: str) -> list[dict]:
     """Publish pending sealed tasks into the lab pull-agent queue."""
     import agent_queue
 
-    validate_plan_id(plan_id)
-    plan = status(plan_id)
-    if _fixture_dir_for_plan(plan, plan_id) is not None:
-        runtime_paths.require_fixtures_allowed()
-    tasks = list_tasks(plan_id)
-    return agent_queue.publish_plan_tasks(plan, tasks)
+    with transport_lock(plan_id):
+        if pipeline_runner.active_run_id(f"plan:{plan_id}:execute"):
+            raise PlanError("Controller execution is active or unresolved; inspect/reconcile that run before publishing agent work")
+        plan = status(plan_id)
+        if _fixture_dir_for_plan(plan, plan_id) is not None:
+            runtime_paths.require_fixtures_allowed()
+        tasks = list_tasks(plan_id)
+        try:
+            return agent_queue.publish_plan_tasks(plan, tasks)
+        except agent_queue.QueueError as exc:
+            raise PlanError(str(exc)) from exc
 
 
 def list_plans() -> list[dict]:

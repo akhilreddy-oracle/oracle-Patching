@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
 
+# Current database adapters verify one database's SQL registry. They do not
+# restore or validate every PDB and the seed; admitting a CDB would allow a
+# root-only datapatch success to be mistaken for complete patching.
+opu_require_non_cdb_probe() {
+    local file=$1
+    if awk '/^[[:space:]]*CDB=/ { sub(/^[[:space:]]*/, ""); sub(/[[:space:]]*$/, ""); count++; if ($0 == "CDB=NO") valid++ } END { exit !(count == 1 && valid == 1) }' "$file"; then
+        return 0
+    fi
+    printf '%s\n' 'Database patch execution currently supports non-CDB databases only; CDB=NO must be observed. Multitenant or unknown container scope requires a supported per-container procedure.' >&2
+    return 65
+}
+
 # Shared primitives for the Oracle Patching Utility agent.
 # This file is sourced only from code shipped with the agent.
 

@@ -416,6 +416,29 @@ collect_cluster_runtime() {
   CLUSTER_RELEASE_PATCH_LEVEL=$(sed -nE 's/.*\[([0-9]+)\].*/\1/p' <<<"$release_output" | tail -n1)
   [ -n "$CLUSTER_RELEASE_PATCH_LEVEL" ] || CLUSTER_RELEASE_PATCH_LEVEL=$(grep -Eo '[0-9]+' <<<"$release_output" | tail -n1 || true)
   [[ "$CLUSTER_RELEASE_PATCH_LEVEL" =~ ^[0-9]+$ ]] || die 'local Clusterware release patch level output is incomplete'
+  # Stages run in a child process. Persist this attempt's observations so the
+  # parent cannot accidentally report the sealed pre-patch baseline as current.
+  jq -cn --arg version "$CLUSTER_ACTIVE_VERSION" --arg upgrade "$CLUSTER_UPGRADE_STATE" \
+    --arg active "$CLUSTER_ACTIVE_PATCH_LEVEL" --arg release "$CLUSTER_RELEASE_PATCH_LEVEL" \
+    '{active_version:$version,upgrade_state:$upgrade,active_patch_level:$active,release_patch_level:$release}' \
+    >"$TASK_DIR/cluster-runtime.tmp"
+  mv "$TASK_DIR/cluster-runtime.tmp" "$TASK_DIR/cluster-runtime.json"
+}
+
+load_task_cluster_runtime() {
+  CLUSTER_ACTIVE_VERSION=unknown; CLUSTER_UPGRADE_STATE=unknown
+  CLUSTER_ACTIVE_PATCH_LEVEL=unknown; CLUSTER_RELEASE_PATCH_LEVEL=unknown
+  [ -f "$TASK_DIR/cluster-runtime.json" ] || return 0
+  [ ! -L "$TASK_DIR/cluster-runtime.json" ] && jq -e '
+    (.active_version | type == "string" and test("^[0-9]+(\\.[0-9]+){3,4}$")) and
+    .upgrade_state == "NORMAL" and
+    (.active_patch_level | type == "string" and test("^[0-9]+$")) and
+    (.release_patch_level | type == "string" and test("^[0-9]+$"))
+  ' "$TASK_DIR/cluster-runtime.json" >/dev/null || die 'task Clusterware runtime evidence is invalid'
+  CLUSTER_ACTIVE_VERSION=$(jq -r '.active_version' "$TASK_DIR/cluster-runtime.json")
+  CLUSTER_UPGRADE_STATE=$(jq -r '.upgrade_state' "$TASK_DIR/cluster-runtime.json")
+  CLUSTER_ACTIVE_PATCH_LEVEL=$(jq -r '.active_patch_level' "$TASK_DIR/cluster-runtime.json")
+  CLUSTER_RELEASE_PATCH_LEVEL=$(jq -r '.release_patch_level' "$TASK_DIR/cluster-runtime.json")
 }
 
 check_cluster_health() {
@@ -887,9 +910,7 @@ execute_task() {
   if [ "$OPERATION" = rollback ]; then
     verify_source_apply_lineage metadata || die 'source apply lineage became invalid before evidence emission'
   fi
-  if [ -f "$BINDING_FILE" ] && verify_sealed_json "$BINDING_FILE" record_sha256; then
-    CLUSTER_ACTIVE_VERSION=$(jq -r '.baseline.active_version' "$BINDING_FILE"); CLUSTER_UPGRADE_STATE=$(jq -r '.baseline.upgrade_state' "$BINDING_FILE"); CLUSTER_ACTIVE_PATCH_LEVEL=$(jq -r '.baseline.active_patch_level' "$BINDING_FILE"); CLUSTER_RELEASE_PATCH_LEVEL=$(jq -r '.baseline.release_patch_level' "$BINDING_FILE")
-  fi
+  load_task_cluster_runtime
   emit_evidence "$status" "$postcondition" "$stage_rc" "$detail" "$finished" "$outcome"
   set +e
   env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" complete --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --status "$status" --evidence "$TASK_DIR/evidence.json"

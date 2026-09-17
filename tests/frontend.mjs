@@ -87,9 +87,10 @@ const { renderRecoveryStage } = await import('../webapp/static/stages/recovery.j
 const { hydrateBackupPolicy, policyRecoveryBlock, backupPolicyChooser } = await import('../webapp/static/backup_policy.js');
 const { createPageRenderer } = await import('../webapp/static/navigation.js');
 const { renderValidation } = await import('../webapp/static/validation.js');
+const { renderEstate } = await import('../webapp/static/estate.js');
 const { startRun, pollRun, runToCompletion } = await import('../webapp/static/runs.js');
 const { reconciliationCard } = await import('../webapp/static/run_reconciliation.js');
-const { refreshSession } = await import('../webapp/static/shell.js');
+const { refreshSession, refreshHostNav } = await import('../webapp/static/shell.js');
 const { executionWindow } = await import('../webapp/static/plan_window.js');
 const { evidenceReport } = await import('../webapp/static/report_view.js');
 const { executionConsole } = await import('../webapp/static/execution_console.js');
@@ -235,6 +236,63 @@ test('cancelled execution view cannot start a native log refresh from a late sav
   assert.deepEqual(posts, []);
   assert.match(panel.textContent, /Original execution history/);
   assert.doesNotMatch(panel.textContent, /Stale response/);
+});
+
+test('replaced execution panel cannot start native log following while its page remains active', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  let reads = 0, release; const posts = [];
+  const data = { guidance: 'Execution history', runs: [{ run_id: 'native-run', can_observe: true, status: 'running' }] };
+  fetch = async (url, options = {}) => {
+    if (options.method === 'POST') { posts.push(url); return response({ run_id: 'unexpected-observe' }); }
+    assert.equal(url, '/api/plans/P1/execution');
+    return ++reads === 1 ? response(data) : { ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) };
+  };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  panel.querySelector('input').checked = true;
+  const refresh = button(panel, 'Refresh timeline').fire('click');
+  await new Promise(resolve => setImmediate(resolve));
+  panel.remove(); release(data); await refresh;
+  assert.equal(controller.signal.aborted, false, 'a same-page panel refresh does not cancel the route');
+  assert.deepEqual(posts, [], 'a detached follow widget must not start SSH observation');
+  controller.abort();
+});
+
+test('obsolete estate discovery completion cannot clear the new active host or launch new reads', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  const rail = document.body.appendChild(new Element('nav')); rail.setAttribute('id', 'rail-hosts');
+  let release; const calls = [];
+  const hosts = [{ id: 'prod', label: 'Production', status: 'ok' }];
+  fetch = async (url, options = {}) => {
+    calls.push([url, options.method || 'GET']);
+    if (options.method === 'POST') {
+      assert.equal(url, '/api/hosts/prod/pipeline/discovery');
+      return new Promise(resolve => { release = () => resolve(response({ run_id: 'accepted-discovery' }, 202)); });
+    }
+    if (url === '/api/fleet') return response({ databases: [] });
+    assert.equal(url, '/api/estate'); return response({ hosts });
+  };
+  const page = mount(); await renderEstate(page);
+  const refresh = button(page, 'Refresh live SSH').fire('click');
+  controller.abort(); api.setReadSignal(new AbortController().signal); page.remove();
+  await refreshHostNav('prod');
+  const count = calls.length; release(); await refresh;
+  assert.equal(calls.length, count, 'old refresh must not poll or reload data under the new route identity');
+  assert.equal(rail.querySelector('a').getAttribute('aria-current'), 'page');
+});
+
+test('host navigation ignores a cancelled response even when its JSON body completes late', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  const rail = document.body.appendChild(new Element('nav')); rail.setAttribute('id', 'rail-hosts');
+  rail.textContent = 'Current host navigation';
+  let release;
+  fetch = async () => ({ ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) });
+  const pending = refreshHostNav(null);
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); api.setReadSignal(new AbortController().signal);
+  release({ hosts: [{ id: 'obsolete', status: 'ok' }] });
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(rail.textContent, 'Current host navigation');
 });
 
 test('execution timeline retains the newest refresh when older responses arrive later', async () => {
@@ -387,6 +445,7 @@ test('actual readiness form can submit every adapter and does not require a data
     };
     const page = mount(); await renderReadinessStage(page, 'grid-host');
     const card = page.querySelectorAll('.step-card').find(card => card.querySelector('h3')?.textContent === 'Procedure validation');
+    assert.match(card.textContent, /support non-CDB databases only; CDB\/PDB patching is unavailable/);
     const adapter = field(card, 'Adapter'); adapter.value = name; await adapter.fire('change');
     field(card, 'Patch ID').value = '12345678'; field(card, 'Platform ID').value = '226';
     field(card, 'Required OPatch').value = '12.2.0.1.49'; field(card, 'README identifier').value = 'README.html';

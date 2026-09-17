@@ -78,7 +78,7 @@ export function executionConsole(planId) {
     showLog();
   }
   async function native() {
-    if (!selectedRun || pending || signal?.aborted) return;
+    if (!selectedRun || pending || signal?.aborted || !section.isConnected) return;
     pending = true; observe.disabled = true;
     try {
       const result = await runToCompletion(`/api/plans/${encodeURIComponent(planId)}/execution-observe`, { run_id: selectedRun.run_id });

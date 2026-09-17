@@ -47,6 +47,21 @@ class LocalLLMFixture:
 
 
 class LocalLLMTests(LocalLLMFixture, unittest.TestCase):
+    def test_deployment_validator_matches_runtime_contract_without_io(self):
+        expected = llm.load_config()
+        raw = self.path.read_bytes()
+        with patch.object(llm.os, "open", side_effect=AssertionError("validation performed file I/O")), \
+             patch.object(llm.socket, "getaddrinfo", side_effect=AssertionError("validation used network")):
+            self.assertEqual(llm.validate_config(raw), expected)
+            self.assertEqual(llm.validate_config(raw.decode()), expected)
+            for invalid in (b'{"enabled":true,"enabled":false}', '{"enabled":NaN}',
+                            json.dumps({"enabled": True, "model": "ok", "max_tokens": True}),
+                            json.dumps({"enabled": True, "model": "model:cloud"}),
+                            json.dumps({"enabled": True, "model": "ok", "unsupported": 1}),
+                            {}, " " * 65537):
+                with self.subTest(invalid_type=type(invalid).__name__), self.assertRaises(llm.LLMError):
+                    llm.validate_config(invalid)
+
     def test_unconfigured_disabled_and_runtime_state_default(self):
         self.path.unlink()
         self.assertEqual(llm.config_status(), {"enabled": False, "configured": False, "model": None,

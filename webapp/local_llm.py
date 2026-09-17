@@ -122,6 +122,17 @@ def _load_config():
         raise LLMError("Local assistant is not configured") from None
     except (OSError, ValueError):
         raise LLMError("Local assistant configuration is unavailable or invalid") from None
+    return validate_config(raw)
+
+
+def validate_config(raw):
+    """Validate raw configuration JSON without filesystem or network access.
+
+    Deployment uses the same parser and contract as the running controller;
+    configuration file protection remains the responsibility of each loader.
+    """
+    _require(isinstance(raw, (str, bytes)) and len(raw) <= 65536,
+             "Local assistant configuration is invalid or too large")
     c = _json(raw, "Local assistant configuration is invalid JSON", 503)
     allowed = {"enabled", "provider", "base_url", "model", "timeout_seconds", "max_tokens", "api_key_env", "allow_private_endpoint", "allow_insecure_private"}
     _require(isinstance(c, dict) and not set(c) - allowed, "Local assistant configuration has unsupported fields")

@@ -768,7 +768,7 @@ function procedureForm(base, logBox, refresh, errBox, allSteps, presentation) {
 
   form.appendChild(
     helperText(
-      "Select the adapter specified by the patch README. Autofill fills empty fields from unambiguous artifact and discovery evidence, and verifies the selected README for its minimum OPatch version. Existing values are preserved. Enter the exact rollback condition from the README. Required prechecks are always retained."
+      "Database patch adapters currently support non-CDB databases only; CDB/PDB patching is unavailable. Select the adapter specified by the patch README. Autofill fills empty fields from unambiguous artifact and discovery evidence, and verifies the selected README for its minimum OPatch version. Existing values are preserved. Enter the exact rollback condition from the README. Required prechecks are always retained."
     )
   );
   form.appendChild(draftTarget);

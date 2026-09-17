@@ -649,6 +649,10 @@ def action(owner, conversation_id, action_id, *, dismiss=False, digest=None, all
             _save(path, data)
             raise AssistantError(selected["error"], 409)
         route, body = capabilities.route(selected["tool"], selected["arguments"])
+        if selected["tool"] == "create_patch_plan":
+            # Carry the exact reviewed evidence/configuration binding through
+            # native asynchronous creation; never replace it with a later read.
+            body["expected_creation_binding_sha256"] = selected["binding"]
         if selected["tool"] in {"refresh_discovery", "refresh_readiness", "select_backup", "create_backup"}:
             # This exact configuration is covered by the approved aggregate
             # binding checked above. Carry its digest across the dispatch gap

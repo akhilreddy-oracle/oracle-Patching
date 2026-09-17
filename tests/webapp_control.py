@@ -281,7 +281,7 @@ class ControlPlaneTests(unittest.TestCase):
                 with patch.object(stages.tools_sync, "ensure_host_tools", side_effect=RuntimeError("fixture failure")), \
                      patch.object(stages.localtools, "run_tool", side_effect=RuntimeError("fixture failure")):
                     with self.assertRaises(RuntimeError):
-                        function("h", {}, body)
+                        function("h", {"id": "h", "ssh_alias": "fixture", "remote_root": "/fixture"}, body)
                 for name in invalidated:
                     self.assertIsNone(evidence.read_evidence("h", name), name)
 
@@ -575,7 +575,7 @@ sys.stdin.readline()
     def test_remote_reconciliation_inspects_existing_launch_only(self):
         host = {"id": "h", "node_name": "n", "ssh_alias": "alias", "remote_root": "/opt/opu"}
         context = {"plan_id": "p", "task_id": "t", "node": "n", "host_id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu", "remote_run_dir": "/opt/opu/var/webapp-runs/p/t/" + "a" * 32}
-        with patch.object(planctl, "_resolve_node_host", return_value=host), patch.object(planctl.remote, "run_remote_shell", return_value=SimpleNamespace(returncode=0, stdout="RC\n0\n")) as shell, patch.object(planctl.remote, "run_remote_raw", side_effect=[SimpleNamespace(returncode=0, stdout='{"status":"succeeded"}'), SimpleNamespace(returncode=0, stdout="")]), patch.object(planctl, "_sync_plan_from_host") as sync, patch.object(planctl, "status", return_value={"state": "running"}), patch.object(planctl, "_run", return_value={"status": "succeeded"}) as verified:
+        with patch.object(planctl, "_resolve_node_host", return_value=host), patch.object(planctl.remote, "run_remote_shell", return_value=SimpleNamespace(returncode=0, stdout="RC\n0\n")) as shell, patch.object(planctl.remote, "run_remote_raw", side_effect=[SimpleNamespace(returncode=0, stdout='{"status":"succeeded","task_id":"t"}'), SimpleNamespace(returncode=0, stdout="")]), patch.object(planctl, "_sync_plan_from_host") as sync, patch.object(planctl, "status", return_value={"state": "running"}), patch.object(planctl, "_run", return_value={"status": "succeeded"}) as verified:
             result = planctl.reconcile_detached_run({"context": context})
             self.assertEqual(result["status"], "succeeded")
             self.assertNotIn("nohup", shell.call_args.args[1])
@@ -612,12 +612,12 @@ sys.stdin.readline()
         with patch.object(planctl.production, "require_live_mutation_allowed"), \
              patch.object(planctl, "_resolve_live_host_for_task", return_value=host), \
              patch.object(planctl, "_sync_plan_to_host", return_value="/opt/opu/plans"), \
-             patch.object(planctl, "_run_detached_remote", return_value=(0, '{"status":"succeeded"}', "")) as launch, \
+             patch.object(planctl, "_run_detached_remote", return_value=(0, '{"status":"succeeded","task_id":"t"}', "")) as launch, \
              patch.object(planctl, "_sync_plan_from_host"), \
              patch.object(planctl, "_run", return_value={"status": "succeeded"}) as verified, \
              patch.object(planctl, "status", return_value={"state": "running"}), \
              patch.object(pipeline_runner, "set_execution_context") as context:
-            self.assertEqual(planctl._execute_live("p", {}, task, "operator"), {"status": "succeeded"})
+            self.assertEqual(planctl._execute_live("p", {}, task, "operator"), {"status": "succeeded", "task_id": "t"})
             launch.assert_called_once()
             verified.assert_called_once_with(["task-status", "--plan-id", "p", "--task-id", "t"])
             self.assertEqual([item.kwargs for item in context.call_args_list],

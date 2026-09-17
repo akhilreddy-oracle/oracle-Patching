@@ -28,6 +28,7 @@ class DeploymentTests(unittest.TestCase):
         for name in deploy.SOURCE_DIRS:
             (self.source / name).mkdir(parents=True)
         for name, content in {'webapp/server.py': 'pass\n', 'deploy/controller.py': 'pass\n',
+                              'webapp/host_config.py': 'pass\n', 'webapp/local_llm.py': 'pass\n', 'webapp/runtime_paths.py': 'pass\n',
                               'scripts/requirements.txt': '', 'webapp/requirements-sso.txt': ''}.items():
             (self.source / name).write_text(content)
         (self.source / 'deploy/templates').mkdir()
@@ -82,6 +83,44 @@ class DeploymentTests(unittest.TestCase):
         self.package()
         with self.assertRaisesRegex(ValueError, 'checksum'):
             deploy.read_bundle(self.bundle, '0' * 64)
+
+    def test_validly_hashed_bundle_missing_installer_dependencies_is_rejected(self):
+        for name in ('scripts/requirements.txt', 'webapp/host_config.py', 'deploy/templates/nginx.conf'):
+            with self.subTest(name=name):
+                target = self.source / name; original = target.read_bytes(); target.unlink()
+                result = self.package()
+                with self.assertRaisesRegex(ValueError, 'installation dependencies'):
+                    deploy.read_bundle(self.bundle, result['bundle_sha256'])
+                target.write_bytes(original); self.bundle.unlink()
+
+    def test_input_swapped_during_open_is_rejected_without_reading_or_following_it(self):
+        target = self.base / 'checked-input'; replacement = self.base / 'replacement'
+        open_file = deploy.os.open
+        for kind in ('file', 'symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                target.write_bytes(b'checked bytes'); replacement.write_bytes(b'unchecked bytes')
+                def swap(path, flags):
+                    self.assertEqual(Path(path), target)
+                    target.unlink()
+                    if kind == 'file': replacement.rename(target)
+                    elif kind == 'symlink': target.symlink_to(replacement)
+                    else: os.mkfifo(target)
+                    return open_file(path, flags)
+                with patch.object(deploy.os, 'open', side_effect=swap):
+                    with self.assertRaises((ValueError, OSError)):
+                        deploy.regular(target)
+                target.unlink()
+                if replacement.exists(): replacement.unlink()
+
+    def test_administrator_input_parent_directories_must_also_be_protected(self):
+        target = self.base / 'input'; target.write_bytes(b'data')
+        real_stat = Path.stat
+        def metadata(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            return SimpleNamespace(st_uid=0, st_mode=0o40777 if path == self.base else 0o40755)
+        with patch.object(Path, 'stat', autospec=True, side_effect=metadata):
+            with self.assertRaisesRegex(ValueError, 'input directories'):
+                deploy.regular(target, admin=True)
 
     def test_archive_traversal_links_and_duplicate_members_are_rejected(self):
         for kind in ('traversal', 'link', 'duplicate'):
@@ -149,6 +188,37 @@ class DeploymentTests(unittest.TestCase):
         assistant.write_text('{"enabled":true,"model":"local-model"}')
         self.assertEqual(deploy.load_config(path, admin=False)['assistant_config_file'], str(assistant))
 
+    def test_admission_matches_runtime_host_principal_and_model_config_types(self):
+        values, path = self.config()
+        hosts = Path(values['hosts_file'])
+        for payload in ({'hosts': [{'id': 'Prod'}, {'id': 'prod'}]}, {'hosts': [{'id': 'prod', 'sudo': 'false'}]}):
+            hosts.write_text(json.dumps(payload))
+            with self.assertRaises(ValueError): deploy.load_config(path, admin=False)
+        hosts.write_text('{"hosts":[]}')
+        people = Path(values['principals_file']); original = people.read_text()
+        for field, invalid in (('disabled', 0), ('disabled', ''), ('expires_at', 0), ('expires_at', ''), ('roles', [[]])):
+            payload = json.loads(original); payload['principals'][0][field] = invalid
+            people.write_text(json.dumps(payload))
+            with self.assertRaises(ValueError): deploy.load_config(path, admin=False)
+        people.write_text(original)
+        assistant = self.base / 'assistant.json'; values['assistant_config_file'] = str(assistant)
+        path.write_text(json.dumps(values))
+        for fields in ({'timeout_seconds': '30'}, {'max_tokens': True}, {'allow_private_endpoint': 0},
+                       {'unsupported': True}, {'model': 'model with spaces'}):
+            assistant.write_text(json.dumps({'enabled': True, 'model': 'local-model', **fields}))
+            with self.assertRaises(ValueError): deploy.load_config(path, admin=False)
+
+    def test_configuration_parses_validated_bytes_without_reopening_paths(self):
+        values, path = self.config()
+        original = deploy.regular
+        def inspected(target, **kwargs):
+            raw = original(target, **kwargs)
+            if target == Path(values['hosts_file']): target.write_text('{"hosts":[{"id":"prod","sudo":"false"}]}')
+            if target == Path(values['principals_file']): target.write_text('{}')
+            return raw
+        with patch.object(deploy, 'regular', side_effect=inspected), patch.object(Path, 'read_text', side_effect=AssertionError('Unchecked input reopen')):
+            self.assertEqual(deploy.load_config(path, admin=False)['public_hostname'], values['public_hostname'])
+
     def test_existing_install_or_state_refuses_all_mutation(self):
         values, _ = self.config()
         result = self.package()
@@ -163,6 +233,23 @@ class DeploymentTests(unittest.TestCase):
                 deploy.install_fresh(manifest, contents, values)
             run.assert_not_called()
         self.assertEqual(sealed.read_text(), 'sealed absolute paths must not move')
+
+    def test_install_revalidates_inputs_before_any_filesystem_or_command_mutation(self):
+        values, path = self.config()
+        deploy.load_config(path, admin=False)
+        result = self.package()
+        manifest, contents = deploy.read_bundle(self.bundle, result['bundle_sha256'])
+        Path(values['hosts_file']).write_text('{"hosts":[{"id":"prod","sudo":"false"}]}')
+        install = self.base / 'must-not-exist'
+        regular = deploy.regular
+        with patch.object(deploy, 'INSTALL', install), patch.object(deploy.os, 'geteuid', return_value=0), \
+             patch.object(deploy, 'preflight', return_value={'blockers': []}), \
+             patch.object(deploy, 'regular', side_effect=lambda target, **kwargs: regular(target, maximum=kwargs.get('maximum', deploy.MAX_BUNDLE))), \
+             patch.object(deploy.subprocess, 'run') as command:
+            with self.assertRaisesRegex(ValueError, 'sudo must be a boolean'):
+                deploy.install_fresh(manifest, contents, values)
+            command.assert_not_called()
+        self.assertFalse(install.exists())
 
     def test_python_39_is_rejected_before_creating_installation_paths(self):
         values, _ = self.config()
@@ -191,8 +278,13 @@ class DeploymentTests(unittest.TestCase):
             self.enterContext(patch.object(deploy, name, self.base / name.lower()))
         self.enterContext(patch.object(deploy, 'STATE', deploy.STATE_PARENT / 'controller'))
         commands = []
+        validated_hosts = Path(values['hosts_file']).read_bytes()
         def command(argv, **kwargs):
             commands.append(argv)
+            # The administrator's source file may change after admission. The
+            # copied config must remain the exact validated snapshot.
+            if argv[0] == sys.executable:
+                Path(values['hosts_file']).write_text('{"hosts":[{"id":"prod","sudo":"false"}]}')
             if argv[0] == 'useradd':
                 deploy.SSH_HOME.mkdir()
             return SimpleNamespace(returncode=0)
@@ -212,6 +304,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertFalse(any(cmd[0] in {'ssh', 'scp', 'chown', 'chmod'} for cmd in commands))
         self.assertEqual(list(deploy.STATE.iterdir()), [])
         self.assertEqual((deploy.CONFIG / 'principals.json').stat().st_mode & 0o777, 0o640)
+        self.assertEqual((deploy.CONFIG / 'hosts.json').read_bytes(), validated_hosts)
 
     def test_template_network_and_credential_boundaries(self):
         nginx = (ROOT / 'deploy/templates/nginx.conf').read_text()

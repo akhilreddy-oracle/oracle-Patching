@@ -5,7 +5,10 @@ and `opu-recovery-evidence-collect`. It creates a new recovery set; the
 collector remains the independent read-only validator.
 
 The first supported preparation adapter is a standalone `PRIMARY`, `READ
-WRITE`, `NOARCHIVELOG` database using an SPFILE. Oracle requires a
+WRITE`, `NOARCHIVELOG`, **non-CDB** database using an SPFILE. Live analysis and
+execution require explicit `CDB=NO` before downtime. CDB and unknown scope are
+blocked because this adapter does not capture and restore each PDB's open
+state. Oracle requires a
 `NOARCHIVELOG` whole-database backup to follow a consistent shutdown and run
 while the database is mounted. The utility therefore treats preparation as a
 separately approved maintenance-window operation, not as an online check.

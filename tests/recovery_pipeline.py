@@ -124,6 +124,10 @@ class RecoveryPipelineTests(unittest.TestCase):
 
     def test_chain_revalidates_selected_backup_before_readiness(self):
         evidence.write_evidence('source','recovery_selection',{'request_id':'request','host_id':'source'})
+        procedure = {'artifact_sha256': 'a' * 64,
+                     'oracle_references': [{'kind': 'patch_readme', 'identifier': 'README.html', 'sha256': 'b' * 64}]}
+        evidence.write_evidence('source', 'artifact', {'artifact': {'sha256': 'a' * 64,
+            'readme_files': [{'path': 'README.html', 'sha256': 'b' * 64}]}})
         policy={'recovery':{'require_backup':True,'storage_mode':'filesystem'}}
         order=[]
         functions=[('discovery',{}),('reconcile',{'status':'consistent'}),('artifact_inspect',{'artifact':{'status':'ready_for_catalog'}}),('procedure_validate',{'status':'ready_for_planning'}),('compatibility_collect',{'status':'passed'}),('compatibility_reconcile',{'status':'passed'}),('recovery_collect',{'status':'passed'}),('readiness_evaluate',{'status':'ready_for_approval'})]
@@ -132,7 +136,7 @@ class RecoveryPipelineTests(unittest.TestCase):
             for name,result in functions:
                 def fake(*args,_name=name,_result=result,**kwargs): order.append(_name); return _result
                 h=patch.object(pipeline,'step_'+name,side_effect=fake);h.start();handles.append(h)
-            result=pipeline.step_readiness_chain('source',self.host,{'policy':policy,'procedure':{},'artifact_dir':'/stage/patch'})
+            result=pipeline.step_readiness_chain('source',self.host,{'policy':policy,'procedure':procedure,'artifact_dir':'/stage/patch'})
         finally:
             for h in handles: h.stop()
         self.assertEqual(result['status'],'ready_for_approval')

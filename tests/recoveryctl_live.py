@@ -39,7 +39,7 @@ class LiveRecoveryTests(unittest.TestCase):
                          "cluster": {"status": "unavailable", "nodes": []},
                          "oracle_homes": [{"path": "/u01/db", "owner": "oracle"}],
                          "databases": [{"db_unique_name": "ORCL", "oracle_home": "/u01/db", "runtime": {"instance": "ORCL",
-                             "status": "complete", "database_role": "PRIMARY", "open_mode": "READ WRITE", "instance_state": "OPEN", "log_mode": "NOARCHIVELOG"}}]}
+                             "status": "complete", "database_role": "PRIMARY", "open_mode": "READ WRITE", "instance_state": "OPEN", "log_mode": "NOARCHIVELOG", "cdb": "NO"}}]}
         evidence.write_evidence("sourcedb", "snapshot", self.snapshot)
         evidence.write_evidence("sourcedb", "policy", self.policy)
         self.sync = self.enterContext(patch.object(recoveryctl.tools_sync, "ensure_tools"))

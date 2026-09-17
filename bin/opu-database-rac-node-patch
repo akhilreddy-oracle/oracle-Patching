@@ -312,6 +312,7 @@ set pages 0 heading off feedback off verify off echo off trimspool on lines 3276
 select 'INSTANCE_NAME=' || instance_name from v$instance;
 select 'INSTANCE_STATUS=' || status from v$instance;
 select 'DATABASE_UNIQUE_NAME=' || db_unique_name from v$database;
+select 'CDB=' || cdb from v$database;
 select 'DATABASE_ROLE=' || database_role from v$database;
 select 'OPEN_MODE=' || open_mode from v$database;
 select 'INVALID_OBJECTS=' || count(*) from dba_objects where status = 'INVALID';
@@ -325,6 +326,7 @@ probe_value() {
 
 healthy_probe() {
   local probe_path=$1 expected_sid=$2
+  opu_require_non_cdb_probe "$probe_path" || return $?
   [ "$(probe_value DATABASE_UNIQUE_NAME "$probe_path")" = "$DATABASE" ] &&
     [ "$(probe_value INSTANCE_NAME "$probe_path")" = "$expected_sid" ] &&
     [ "$(probe_value INSTANCE_STATUS "$probe_path")" = OPEN ] &&

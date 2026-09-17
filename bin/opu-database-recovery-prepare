@@ -274,14 +274,15 @@ set pages 0 heading off feedback off verify off echo off trimspool on lines 3276
 select d.db_unique_name || '|' || i.instance_name || '|' || d.database_role || '|' ||
        d.open_mode || '|' || d.log_mode || '|' || i.status || '|' || d.dbid || '|' ||
        nvl((select value from v$parameter where name='spfile'),'') || '|' ||
-       (select nvl(sum(bytes),0) from v$datafile)
+       (select nvl(sum(bytes),0) from v$datafile) || '|' || d.cdb
   from v$database d cross join v$instance i;
 exit;
 SQL
   run_sql_file "$ORACLE_HOME_TARGET" "$ORACLE_OWNER" "$ORACLE_SID" "$sql_file" "$output" || return 1
   line=$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' "$output" | sed '/^$/d' | tail -n1)
-  IFS='|' read -r LIVE_DATABASE LIVE_SID LIVE_ROLE LIVE_OPEN_MODE LIVE_LOG_MODE LIVE_INSTANCE_STATUS LIVE_DBID LIVE_SPFILE LIVE_DATABASE_BYTES extra <<<"$line"
+  IFS='|' read -r LIVE_DATABASE LIVE_SID LIVE_ROLE LIVE_OPEN_MODE LIVE_LOG_MODE LIVE_INSTANCE_STATUS LIVE_DBID LIVE_SPFILE LIVE_DATABASE_BYTES LIVE_CDB extra <<<"$line"
   [ -z "${extra:-}" ] || return 1
+  [ "$LIVE_CDB" = NO ] || die 'recovery preparation supports non-CDB databases only; live CDB=NO is required before any downtime'
   valid_id "$LIVE_DATABASE" database || return 1
   valid_id "$LIVE_SID" oracle-sid || return 1
   [[ "$LIVE_DBID" =~ ^[0-9]+$ ]] || return 1

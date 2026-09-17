@@ -52,8 +52,8 @@ database_sha=$(jq -r '.artifact.sha256' "$TMP/database-artifact.json")
 jq -n --arg sha "$database_sha" '{schema_version:"1.0",status:"ready_for_planning",procedure:{patch_id:"12345678",artifact_sha256:$sha,required_opatch_version:"12.2.0.1",target:{family:"database",method:"opatch",topology:"single_instance",database_unique_name:"ORCL",platform_id:"226"},execution:{adapter:"database_single_instance_opatch",operations:["database_shutdown","database_opatch_apply","database_startup","database_datapatch"]}}}' >"$TMP/database-procedure.json"
 "$ROOT/bin/opu-opatch-compatibility-collect" --snapshot "$TMP/database-snapshot.json" --artifact "$staged_path" --artifact-manifest "$TMP/database-artifact.json" --procedure-validation "$TMP/database-procedure.json" --evidence-dir "$TMP/database-evidence" --output "$TMP/database-result.json" >/dev/null
 jq -e '.status == "passed" and .checks[0].home == $home and .checks[0].conflict_check.patch_option == "-ph" and .checks[0].conflict_check.patch_source == $source' --arg home "$TMP/database" --arg source "$staged_path" "$TMP/database-result.json" >/dev/null
-grep -F -- "CheckPatchApplicableOnCurrentPlatform -ph $staged_path" "$TMP/database-evidence/standalone-database-opatch-platform-12345678.log" >/dev/null
-grep -F -- "CheckConflictAgainstOHWithDetail -ph $staged_path" "$TMP/database-evidence/standalone-database-opatch-conflict-12345678.log" >/dev/null
+grep -F -- "CheckPatchApplicableOnCurrentPlatform -ph $staged_path" "$(jq -r '.checks[0].applicability_check.evidence_path' "$TMP/database-result.json")" >/dev/null
+grep -F -- "CheckConflictAgainstOHWithDetail -ph $staged_path" "$(jq -r '.checks[0].conflict_check.evidence_path' "$TMP/database-result.json")" >/dev/null
 jq -e '.findings == [] and (.checks[0].applicability_check | has("detail") | not)' "$TMP/database-result.json" >/dev/null
 
 # A failed prerequisite must carry OPatch's own reason in the evidence

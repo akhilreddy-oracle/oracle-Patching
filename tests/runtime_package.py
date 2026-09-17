@@ -1,5 +1,6 @@
 """Run discovery and queue tools using only an extracted sync payload."""
 import io
+import fcntl
 import json
 import os
 from contextlib import contextmanager
@@ -30,7 +31,8 @@ def local_installer(commands):
 
     def run(_alias, script, **_kwargs):
         result = subprocess.run([shutil.which('bash'), '-c', script], capture_output=True,
-                                text=True, env={**os.environ, 'PATH': str(commands)}, timeout=60)
+                                text=True, env={**os.environ, 'PATH': str(commands),
+                                    'OPU_EXECUTION_LOCK_DIR': str(commands.parent / 'host-locks')}, timeout=60)
         executions.append(result)
         return result
 
@@ -54,14 +56,17 @@ def installer_commands(base, supported):
     utilities = ['rm']
     if supported:
         (commands / 'python3.9').symlink_to(sys.executable)
-        utilities += ['mkdir', 'mktemp', 'tar', 'gzip', 'mv', 'chmod']
+        utilities += ['mkdir', 'mktemp', 'tar', 'gzip', 'mv', 'chmod', 'dirname']
         # macOS has no flock CLI. Lock the actual inherited descriptor using
         # fcntl, preserving the shell installer's locking and command boundary.
         flock = commands / 'flock'
         flock.write_text('#!/usr/bin/env python3.9\n'
                          'import fcntl, sys\n'
-                         'assert sys.argv[1:3] == ["-w", "120"]\n'
-                         'fcntl.flock(int(sys.argv[3]), fcntl.LOCK_EX)\n')
+                         'assert sys.argv[1] == "-w" and sys.argv[2] in {"120", "0"}\n'
+                         'try:\n'
+                         '    fcntl.flock(int(sys.argv[3]), fcntl.LOCK_EX | (fcntl.LOCK_NB if sys.argv[2] == "0" else 0))\n'
+                         'except BlockingIOError:\n'
+                         '    raise SystemExit(1)\n')
         flock.chmod(0o755)
     for name in utilities:
         (commands / name).symlink_to(shutil.which(name))
@@ -206,6 +211,30 @@ class RuntimePackage(unittest.TestCase):
             self.assertEqual(sentinel.read_text(), 'original runtime')
             self.assertEqual(stamp.read_text(), 'original fingerprint\n')
             self.assertEqual(list(target.glob('.opu-tools-new.*')), [])
+
+    def test_active_native_host_lock_prevents_runtime_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            target = base / 'managed-runtime'
+            for directory in ('bin', 'lib', 'operations'):
+                (target / directory).mkdir(parents=True)
+                (target / directory / 'sentinel').write_bytes(('old-' + directory).encode())
+            stamp = target / tools_sync.STAMP_NAME
+            stamp.write_bytes(b'old-generation\n')
+            originals = {path: path.read_bytes() for path in target.rglob('*') if path.is_file()}
+            commands = installer_commands(base, supported=True)
+            lock_directory = base / 'host-locks'
+            lock_directory.mkdir()
+            with (lock_directory / 'host-mutation.lock').open('w') as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                with local_installer(commands) as (uploads, executions):
+                    with self.assertRaises(tools_sync.remote.RemoteError) as caught:
+                        tools_sync.ensure_tools('busy-native-host-fixture', str(target), False, force=True)
+                    self.assertIn('host execution exclusion', str(caught.exception))
+                    self.assertEqual(executions[0].returncode, 75)
+                    self.assertFalse(uploads[0].exists())
+                self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+                self.assertEqual(list(target.glob('.opu-tools-new.*')), [])
 
     def test_silent_installer_failure_reports_exit_code(self):
         with patch.object(tools_sync.remote, 'push_file'), \

@@ -23,7 +23,7 @@ import remote
 
 ROOT = Path(__file__).resolve().parent.parent
 SYNC_DIRS = ("bin", "lib", "operations")
-RUNTIME_MODULES = ("adapters.py", "durable.py", "runtime_paths.py", "agent_queue.py", "agent_enroll.py", "agent_worker.py")
+RUNTIME_MODULES = ("adapters.py", "durable.py", "runtime_paths.py", "diagnostics.py", "agent_queue.py", "agent_enroll.py", "agent_worker.py")
 STAMP_NAME = ".opu-tools-fingerprint"
 # Re-verify a host at most this often per webapp process; the stamp check is
 # one SSH round-trip, so this only trims chatter within a burst of steps.
@@ -142,6 +142,14 @@ def _ensure_tools(ssh_alias: str, remote_root: str, sudo: bool, force: bool = Fa
         "stage='validating Python runtime imports'; "
         "\"$runtime_python\" -B -c 'import sys; sys.path.insert(0, sys.argv[1]); "
         "import agent_worker, agent_queue, agent_enroll' \"$work/webapp\"; "
+        # Replacing scripts beneath an executor that already owns the host
+        # mutation lock can change its later library reads. Use the exact native
+        # lock implementation from this staged package, holding fd 7 until exit.
+        # This is active-executor exclusion, not atomic runtime generations:
+        # startup before the native lock and read-only collectors remain distinct.
+        "stage='checking host execution exclusion'; "
+        ". \"$work/lib/opu/common.sh\"; . \"$work/lib/opu/execution.sh\"; "
+        "TEST_MODE=0 opu_execution_host_lock; "
         "stage='installing runtime'; test ! -L webapp; "
         f"rm -f {q_stamp}; "
         f"for d in {directories}; do "

@@ -124,9 +124,11 @@ export async function refreshHostNav(activeHostId) {
   if (!mount) return hostsCache;
 
   const request = ++hostRequest;
+  const signal = getReadSignal();
   try {
-    const res = await apiFetch("/api/estate");
+    const res = await apiFetch("/api/estate", { signal });
     const data = await res.json();
+    signal?.throwIfAborted();
     if (request !== hostRequest) return hostsCache;
     if (res.ok && Array.isArray(data.hosts)) {
       hostsCache = data.hosts;

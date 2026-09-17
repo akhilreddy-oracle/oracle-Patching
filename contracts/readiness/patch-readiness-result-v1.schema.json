@@ -54,6 +54,7 @@
           "enum": [
             "opatch",
             "opatchauto",
+            "switch_home",
             "switch_grid_home",
             "fpp"
           ]

@@ -97,7 +97,7 @@ def build(base_dir: Path, request_id: str) -> dict:
             "db_unique_name": "ORCL", "oracle_home": str(oracle_home),
             "runtime": {
                 "status": "complete", "instance": "ORCL", "database_role": "PRIMARY",
-                "open_mode": "READ WRITE", "log_mode": "NOARCHIVELOG", "instance_state": "OPEN",
+                "open_mode": "READ WRITE", "log_mode": "NOARCHIVELOG", "instance_state": "OPEN", "cdb": "NO",
             },
         }],
         "warnings": [],

@@ -138,6 +138,10 @@ check_snapshots() {
     while IFS=$'\t' read -r db runtime; do
       [ -n "$db" ] || continue
       [ "$runtime" = complete ] || { gate database_runtime blocker "$host database $db runtime is incomplete."; continue; }
+      if [ "$TARGET_FAMILY" = database ]; then
+        jq -e --arg d "$db" '.databases[] | select(.db_unique_name == $d and .runtime.cdb == "NO")' "$snapshot" >/dev/null ||
+          gate database_container_scope blocker "$host database $db: patch execution currently supports non-CDB databases only. Refresh evidence and require CDB=NO; multitenant or unknown container scope is unsupported."
+      fi
       role=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.database_role // "unknown"' "$snapshot")
       case "$role" in
         'PHYSICAL STANDBY'|'LOGICAL STANDBY'|'SNAPSHOT STANDBY')

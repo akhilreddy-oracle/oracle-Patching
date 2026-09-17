@@ -13,6 +13,7 @@ import re
 import subprocess
 import json
 import os
+import stat
 import time
 from pathlib import Path
 import runtime_paths
@@ -57,16 +58,52 @@ def _write_job(path: Path, payload: dict) -> None:
 
 
 def _read_job(path: Path) -> dict:
-    if path.is_symlink() or not path.is_file():
-        raise QueueError("job is missing or symbolic link", 404)
     try:
-        job = json.loads(path.read_text(encoding="utf-8"))
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            info = os.fstat(source.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o022):
+                raise ValueError("unsafe job record")
+            raw = source.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            raise ValueError("oversized job record")
+        job = json.loads(raw)
         if not isinstance(job, dict) or job.get("job_id") != path.stem:
             raise ValueError("invalid job binding")
-        if job.get("status") not in {"queued", "claimed", "running", "completed", "reconciliation_required"}:
+        if not isinstance(job.get("status"), str) or job["status"] not in {"queued", "claimed", "running", "completed", "reconciliation_required"}:
             raise ValueError("invalid job state")
+        for field in ("plan_id", "task_id", "node"):
+            if not isinstance(job.get(field), str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", job[field]):
+                raise ValueError("invalid job identity")
+        if job["job_id"] != f"{job['plan_id']}__{job['task_id']}":
+            raise ValueError("invalid job scope")
+        if not isinstance(job.get("adapter"), str) or job["adapter"] not in EXECUTOR_PATHS:
+            raise ValueError("invalid job adapter")
+        for field in ("attempt", "claim_generation", "created_at_epoch", "updated_at_epoch"):
+            if type(job.get(field)) is not int or job[field] < 0:
+                raise ValueError("invalid job generation or time")
+        if (job.get("lease_expires_epoch") is not None
+                and (type(job["lease_expires_epoch"]) is not int or job["lease_expires_epoch"] < 0)):
+            raise ValueError("invalid job lease")
+        if not isinstance(job.get("payload"), dict) or not isinstance(job["payload"].get("task", {}), dict):
+            raise ValueError("invalid job payload")
+        if job.get("result") is not None and not isinstance(job["result"], dict):
+            raise ValueError("invalid job result")
+        result_status = (job.get("result") or {}).get("status")
+        if result_status is not None and not isinstance(result_status, str):
+            raise ValueError("invalid job result status")
+        if job["status"] in {"claimed", "running"} and (
+                not isinstance(job.get("claimed_by"), str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", job["claimed_by"])
+                or type(job.get("lease_expires_epoch")) is not int
+                or not isinstance(job.get("claim_token_sha256"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", job["claim_token_sha256"])):
+            raise ValueError("invalid job ownership")
         return job
-    except (ValueError, OSError) as exc:
+    except FileNotFoundError as exc:
+        raise QueueError("job is missing", 404) from exc
+    except (ValueError, OSError, TypeError, RecursionError) as exc:
         raise QueueError("queue record is unreadable", 409) from exc
 
 
@@ -91,9 +128,9 @@ def _public(job: dict) -> dict:
 def publish_task(*, plan_id: str, task_id: str, node: str, adapter: str, payload: dict | None = None) -> dict:
     for value, label in ((plan_id, "plan_id"), (task_id, "task_id"), (node, "node")):
         _identifier(value, label)
-    if adapter not in EXECUTOR_PATHS:
+    if not isinstance(adapter, str) or adapter not in EXECUTOR_PATHS:
         raise QueueError(f"unsupported executor adapter: {adapter}")
-    payload = payload or {}
+    payload = {} if payload is None else payload
     if not isinstance(payload, dict) or not isinstance(payload.get("task", {}), dict):
         raise QueueError("payload and payload.task must be objects")
     attempt = (payload.get("task") or {}).get("retry_count", 0)
@@ -127,6 +164,34 @@ def publish_task(*, plan_id: str, task_id: str, node: str, adapter: str, payload
 def list_jobs(status: str | None = None) -> list[dict]:
     jobs = [_read_job(path) for path in sorted((queue_dir() / "jobs").glob("*.json"))]
     return [_public(job) for job in jobs if not status or job["status"] == status]
+
+
+def assert_no_unresolved_plan_tasks(plan_id: str) -> None:
+    """Fence HTTP state import against published pull-agent work.
+
+    The controller holds its per-plan transport lock around this check and the
+    entire HTTP operation, and around queue publication (transport -> queue).
+    A queued job is already a reservation: a worker may claim it immediately.
+    """
+    _identifier(plan_id, "plan_id")
+    with file_lock(queue_dir() / ".queue.lock"):
+        jobs = [_read_job(path) for path in sorted((queue_dir() / "jobs").glob("*.json"))]
+        for job in jobs:
+            if job["plan_id"] != plan_id:
+                continue
+            result = job.get("result") or {}
+            task = result.get("task")
+            terminal = result.get("status") in ("success", "succeeded", "failed")
+            verified = (isinstance(task, dict) and result.get("source") == "sealed_plan_task"
+                        and task.get("plan_id") == job["plan_id"] and task.get("task_id") == job["task_id"]
+                        and task.get("adapter") == job["adapter"]
+                        and type(task.get("retry_count", 0)) is int
+                        and task.get("retry_count", 0) == job["attempt"]
+                        and task.get("status") in ("succeeded", "failed")
+                        and (task["status"] == "failed") == (result.get("status") == "failed"))
+            fixture = os.environ.get("OPU_AGENT_TEST_MODE") == "1"
+            if job["status"] != "completed" or not terminal or not (verified or fixture):
+                raise QueueError("Pull-agent work reserves this plan; reconcile its queue attempt before HTTP execution", 409)
 
 
 def _expire(job: dict, now: int) -> bool:

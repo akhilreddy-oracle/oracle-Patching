@@ -109,6 +109,33 @@ test('a discovery run with an unreadable refreshed snapshot never displays green
   expect(fixture.writes.map(row => row.path)).toEqual(['/api/hosts/source/pipeline/discovery']);
 });
 
+test('leaving estate during an accepted discovery keeps the new host selected without obsolete reads', async ({ page, fixture }) => {
+  let releaseDiscovery;
+  const reads = [];
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'GET') reads.push(url.pathname);
+    if (method === 'POST' && url.pathname === '/api/hosts/source/pipeline/discovery') {
+      await new Promise(resolve => { releaseDiscovery = resolve; });
+      await send({ run_id: 'late-estate-discovery' }, 202); return true;
+    }
+    return false;
+  };
+  await page.goto('/#/estate');
+  await main(page).getByRole('button', { name: 'Refresh live SSH', exact: true }).click();
+  await expect.poll(() => Boolean(releaseDiscovery)).toBe(true);
+  await page.locator('#rail-hosts').getByRole('link', { name: /Source lab fixture/ }).click();
+  await expect(main(page).locator('#discover-status')).toHaveText('complete');
+  await expect(main(page).locator('.route-view')).toHaveAttribute('aria-busy', 'false');
+  const count = reads.length;
+  const finished = page.waitForEvent('requestfinished', request => request.method() === 'POST'
+    && request.url().endsWith('/api/hosts/source/pipeline/discovery'));
+  releaseDiscovery(); await finished;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  expect(reads.length).toBe(count);
+  await expect(page.locator('#rail-hosts').getByRole('link', { name: /Source lab fixture/ })).toHaveAttribute('aria-current', 'page');
+  expect(fixture.writes.map(row => row.path)).toEqual(['/api/hosts/source/pipeline/discovery']);
+});
+
 test('reconnecting to an active backup analysis does not offer another analysis launch', async ({ page, fixture }) => {
   fixture.recoveries.push({ request_id: 'active-analysis', state: 'awaiting_approval', mode: 'live',
     analysis: { status: 'passed' }, latest_run: { run_id: 'existing-analysis', status: 'running' } });

@@ -448,26 +448,25 @@ def read(name, args, hosts):
 def binding(name, args, hosts):
     """Bind confirmation to exact saved target/config/evidence, without sending it to the model."""
     validate(name, args, hosts)
+    if name == "create_patch_plan":
+        if (planctl.PLAN_STATE_DIR / "plans" / args["plan_id"]).exists():
+            raise ToolError("Plan ID already exists")
+        try:
+            return evidence.creation_binding(args["host_id"], hosts[args["host_id"]], args["patch_id"], args["database"])
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
     state = {}
     if "host_id" in args:
         host_id = args["host_id"]
         state["host"] = hosts[host_id]
         state["evidence"] = {key: evidence.read_evidence(host_id, key) for key in (
             "snapshot", "snapshot_nodes", "artifact", "procedure_input", "procedure", "policy", "readiness", "recovery", "recovery_selection", "compatibility_reconciliation", "reconciliation")}
-        if name == "create_patch_plan":
-            procedure = state["evidence"]["procedure_input"] or {}
-            if procedure.get("patch_id") != args["patch_id"] or (procedure.get("target") or {}).get("database_unique_name") != args["database"]:
-                raise ToolError("Requested patch/database does not match the saved procedure. Review requirements in the host wizard first.")
     if "plan_id" in args:
-        if name == "create_patch_plan":
-            if (planctl.PLAN_STATE_DIR / "plans" / args["plan_id"]).exists():
-                raise ToolError("Plan ID already exists")
-        else:
-            state["plan"] = planctl.status(args["plan_id"])
-            state["tasks"] = planctl.list_tasks(args["plan_id"])
-            host_id = planctl._host_id_for_plan(state["plan"])
-            state["host"] = hosts.get(host_id) if host_id else None
-            # Native commands verify sealed documents again at execution.
+        state["plan"] = planctl.status(args["plan_id"])
+        state["tasks"] = planctl.list_tasks(args["plan_id"])
+        host_id = planctl._host_id_for_plan(state["plan"])
+        state["host"] = hosts.get(host_id) if host_id else None
+        # Native commands verify sealed documents again at execution.
     if "request_id" in args:
         if name == "create_backup":
             if recoveryctl._live_path(args["request_id"]).exists() or recoveryctl._fixture_path(args["request_id"]).exists():
@@ -486,7 +485,7 @@ def route(name, args):
         step = {"refresh_discovery": "discovery", "refresh_readiness": "readiness-chain", "select_backup": "recovery-collect"}[name]
         return f"/api/hosts/{args['host_id']}/pipeline/{step}", ({"request_id": args["request_id"]} if name == "select_backup" else {})
     if name == "create_patch_plan":
-        return "/api/plans", {key: value for key, value in args.items() if key not in {"patch_id", "database"}}
+        return "/api/plans", dict(args)
     if name == "create_backup":
         return "/api/recovery", dict(args)
     if name in {"analyze_backup", "execute_backup"}:

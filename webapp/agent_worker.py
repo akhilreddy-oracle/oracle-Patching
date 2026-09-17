@@ -8,6 +8,7 @@ import subprocess
 
 import agent_queue
 from adapters import EXECUTOR_PATHS
+from diagnostics import redact_text
 
 
 def run_once(node: str, agent: str, lease: int = 120, token: str | None = None) -> tuple[dict, int]:
@@ -65,7 +66,7 @@ def run_once(node: str, agent: str, lease: int = 120, token: str | None = None) 
         result = {"status": "success" if proc.returncode == 0 else "failed", "executor": executor,
                   "exit_code": proc.returncode, "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest()}
         if proc.returncode:
-            result["stderr_tail"] = stderr[-2000:]
+            result["stderr_tail"] = redact_text(stderr, 2000)
     if not test_mode:
         try:
             task = agent_queue.native_task(job)

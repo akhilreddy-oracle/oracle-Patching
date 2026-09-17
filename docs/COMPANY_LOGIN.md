@@ -58,7 +58,11 @@ provider signature, issuer, audience, authorized party, expiry and nonce, with
 one-use state bound to the browser and PKCE. Session lifetime is the shorter of
 the ID token's remaining life or 60–900 configured seconds. API writes require
 the session CSRF token and reject a mismatched Origin. Logout deletes the local
-session; provider-wide logout is not performed.
+session; provider-wide logout is not performed. If its provider binding changes
+or local roles are revoked, Sign out can still remove the unusable cookie and
+session record, but only from the configured application origin. Active-session
+sign-out retains the CSRF check. This cleanup does not authorize any patching
+or recovery operation.
 
 Roles come from approved group IDs. Local role-mapping edits apply on every
 request. Changes to a person's IdP group membership take effect at the next

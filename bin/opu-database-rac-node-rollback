@@ -284,6 +284,7 @@ set pages 0 heading off feedback off verify off echo off trimspool on lines 3276
 select 'INSTANCE_NAME=' || instance_name from v$instance;
 select 'INSTANCE_STATUS=' || status from v$instance;
 select 'DATABASE_UNIQUE_NAME=' || db_unique_name from v$database;
+select 'CDB=' || cdb from v$database;
 select 'DATABASE_ROLE=' || database_role from v$database;
 select 'OPEN_MODE=' || open_mode from v$database;
 select 'INVALID_OBJECTS=' || count(*) from dba_objects where status = 'INVALID';
@@ -297,6 +298,7 @@ probe_value() {
 
 healthy_probe() {
   local probe_path=$1 expected_sid=$2
+  opu_require_non_cdb_probe "$probe_path" || return $?
   [ "$(probe_value DATABASE_UNIQUE_NAME "$probe_path")" = "$DATABASE" ] &&
     [ "$(probe_value INSTANCE_NAME "$probe_path")" = "$expected_sid" ] &&
     [ "$(probe_value INSTANCE_STATUS "$probe_path")" = OPEN ] &&
@@ -768,7 +770,7 @@ verify_prior_node_validations() {
 }
 
 stage_rac_rollback_precheck() {
-  local actual_version
+  local actual_version patch_storage
   verify_source_apply_lineage full; verify_source_documents; verify_recovery full; verify_artifact; verify_readme_procedure
   [ -x "$GRID_HOME_TARGET/bin/srvctl" ] || die 'sealed Grid home has no executable srvctl'
   [ -x "$ORACLE_HOME_TARGET/bin/sqlplus" ] && [ -x "$ORACLE_HOME_TARGET/OPatch/opatch" ] &&
@@ -780,7 +782,8 @@ stage_rac_rollback_precheck() {
     die "OPatch $actual_version is below required $REQUIRED_OPATCH"
   require_inventory_state installed "$TASK_DIR/rollback-precheck-lspatches.log"
   require_sqlpatch_apply_success "$TASK_DIR/rollback-precheck-sqlpatch.log"
-  [ -d "$ORACLE_HOME_TARGET/.patch_storage/$PATCH_ID" ] || [ "$TEST_MODE" = 1 ] ||
+  patch_storage=$(find "$ORACLE_HOME_TARGET/.patch_storage" -maxdepth 1 -type d -name "${PATCH_ID}_*" -print -quit 2>/dev/null || true)
+  [ -n "$patch_storage" ] || [ "$TEST_MODE" = 1 ] ||
     die 'OPatch rollback metadata is absent from the target Oracle home'
   require_surviving_instance
   verify_services_available any

@@ -83,10 +83,10 @@ or a configured internal wheel repository is required.
 The controller's pinned jsonschema dependency requires Python 3.10+; this
 minimum is separate from the native managed-host tools' Python requirement.
 
-Prepare root-owned input files that are not group/world writable, then adapt
+Prepare root-owned input files and parent directories that are not group/world writable, then adapt
 `deploy/templates/deployment.json.example`. Input paths must be absolute and
 contain no symlinks. Store secrets with mode 0600. The installer copies the
-reviewed inventory and separate principal credential digests into protected
+exact inventory and separate principal credential bytes admitted by validation into protected
 configuration files. It requires distinct active requester, approver and
 operator identities so the backup/patch approval chain can function. Provision
 random credentials privately; do not put raw tokens in JSON, shell history,
@@ -122,8 +122,9 @@ sudo python3 -B deploy/controller.py preflight \
   --config /root/opu-install-inputs/deployment.json
 ```
 
-Preflight verifies archive integrity, rejects unsafe/duplicate archive members,
-validates credentials, checks prerequisites, TLS and occupied loopback ports,
+Preflight verifies archive integrity, rejects unsafe/duplicate archive members or
+missing installation dependencies, validates inventory/model configuration with
+the runtime parsers, validates credentials, checks prerequisites, TLS and occupied loopback ports,
 and refuses existing installation/state paths or service accounts. It creates
 no files and does not contact Oracle hosts. Inspect its result before the
 separate installation step:

@@ -137,6 +137,40 @@ class CompanyApiTests(unittest.TestCase):
         self.assertEqual(self.request("/api/session", cookie=cookie)["status"],401)
         self.assert_no_mutation()
 
+    def test_active_logout_still_requires_csrf_and_does_not_accept_action_fields(self):
+        cookie, session = self.session()
+        for headers in ({'Origin': 'https://patching.example'},
+                        {**self.mutation_headers(session), 'Origin': 'https://other.example'}):
+            reply = self.request('/api/auth/logout', cookie=cookie, method='POST', headers=headers)
+            self.assertEqual(reply['status'], 403)
+            self.assertFalse(any(name == 'Set-Cookie' for name, _ in reply['headers']))
+            self.assertEqual(self.request('/api/session', cookie=cookie)['status'], 200)
+        reply = self.request('/api/auth/logout', cookie=cookie, method='POST',
+            body={'actor': 'forged', 'operation': 'execute'}, headers=self.mutation_headers(session))
+        self.assertEqual(reply['status'], 400)
+        self.assertEqual(self.request('/api/session', cookie=cookie)['status'], 200)
+        self.assert_no_mutation()
+
+    def test_revoked_or_changed_provider_session_can_only_be_cleared_from_exact_origin(self):
+        for change in ({'group_roles': {'other-group': ['viewer']}}, {'client_id': 'different-client'}):
+            with self.subTest(change=change):
+                original = dict(self.fx.settings)
+                cookie, _ = self.session()
+                self.fx.settings.update(change); self.fx.save()
+                self.assertIn(self.request('/api/session', cookie=cookie)['status'], (401, 403))
+                for origin in (None, 'null', 'https://other.example', 'https://patching.example.attacker.invalid'):
+                    headers = {'Origin': origin} if origin is not None else {}
+                    reply = self.request('/api/auth/logout', cookie=cookie, method='POST', headers=headers)
+                    self.assertEqual(reply['status'], 403)
+                    self.assertFalse(any(name == 'Set-Cookie' for name, _ in reply['headers']))
+                reply = self.request('/api/auth/logout', cookie=cookie, method='POST',
+                    headers={'Origin': 'https://patching.example'})
+                self.assertEqual(reply['status'], 204)
+                self.assertTrue(any(name == 'Set-Cookie' and 'Max-Age=0' in value for name, value in reply['headers']))
+                self.fx.settings = original; self.fx.save()
+                self.assertEqual(self.request('/api/session', cookie=cookie)['status'], 401, 'cleanup revoked the durable session')
+        self.assert_no_mutation()
+
     def test_login_callback_uses_signed_token_without_logging_code_or_tokens(self):
         begin = self.request("/auth/login")
         self.assertEqual(begin["status"],303)

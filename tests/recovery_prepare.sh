@@ -32,9 +32,9 @@ case "$input" in
   *OPU_RECOVERY_PREP_PROBE*)
     state=$(cat "$state_file")
     if [ "$state" = OPEN ]; then
-      printf 'ORCL|ORCL|PRIMARY|READ WRITE|NOARCHIVELOG|OPEN|12345|%s/spfileORCL.ora|1024\n' "$OPU_TEST_RUNTIME"
+      printf 'ORCL|ORCL|PRIMARY|READ WRITE|NOARCHIVELOG|OPEN|12345|%s/spfileORCL.ora|1024|%s\n' "$OPU_TEST_RUNTIME" "${OPU_TEST_CDB-NO}"
     else
-      printf 'ORCL|ORCL|PRIMARY|MOUNTED|NOARCHIVELOG|MOUNTED|12345|%s/spfileORCL.ora|1024\n' "$OPU_TEST_RUNTIME"
+      printf 'ORCL|ORCL|PRIMARY|MOUNTED|NOARCHIVELOG|MOUNTED|12345|%s/spfileORCL.ora|1024|%s\n' "$OPU_TEST_RUNTIME" "${OPU_TEST_CDB-NO}"
     fi
     ;;
   *OPU_RECOVERY_PREP_CAPACITY*)
@@ -213,6 +213,13 @@ tool status --request-id recovery-inventory-overlap | jq -e '.state == "awaiting
 [ "$(cat "$RUNTIME/database.state")" = OPEN ]
 
 create_request recovery-ok
+for scope in YES ''; do
+  if OPU_TEST_CDB="$scope" tool analyze --request-id recovery-ok >"$TMP/cdb-analysis.json"; then
+    echo 'recovery analysis accepted CDB or unknown container scope' >&2; exit 1
+  fi
+  jq -e '.status == "blocked" and (.reason | contains("non-CDB databases only"))' "$TMP/cdb-analysis.json" >/dev/null
+  [ "$(cat "$RUNTIME/database.state")" = OPEN ]
+done
 find "$STATE_ROOT/recovery-ok" -type f -exec sha256sum {} \; | sort >"$TMP/request-before.sha256"
 tool analyze --request-id recovery-ok | jq -e '.status == "passed" and .capacity.capacity_basis == "allocated" and .capacity.allocated_database_bytes == 1024 and .capacity.database_budget_bytes == 1024 and .capacity.admitted == true' >/dev/null
 find "$STATE_ROOT/recovery-ok" -type f -exec sha256sum {} \; | sort >"$TMP/request-after.sha256"

@@ -298,6 +298,26 @@ class CompanyHttpTests(unittest.TestCase):
         self.assertNotIn(("POST", "/token"), self.provider_calls)
         self.assertEqual(self.request("/api/session")["status"], 401)
 
+    def test_http_revoked_cookie_signout_recovers_service_login_without_authorizing_work(self):
+        self.session()
+        token = 'isolated-service-token'
+        people = self.root / 'no-service-principals.json'
+        people.write_text(json.dumps({'principals': [{'actor': 'fixture-service', 'roles': ['viewer'],
+            'token_sha256': hashlib.sha256(token.encode()).hexdigest()}]}))
+        people.chmod(0o600)
+        bearer = {'Authorization': 'Bearer ' + token}
+        self.settings['group_roles'] = {'other-group': ['viewer']}; self.save_config()
+        self.assertEqual(self.request('/api/session', headers=bearer)['status'], 403)
+        self.assertEqual(self.request('/api/auth/logout', body={}, headers={
+            'Origin': 'https://unrelated.example'})['status'], 403)
+        self.assertTrue(any(cookie.name == company_auth.SESSION_COOKIE for cookie in self.cookies))
+        self.assertEqual(self.request('/api/auth/logout', body={}, headers={'Origin': self.origin})['status'], 204)
+        self.assertFalse(any(cookie.name == company_auth.SESSION_COOKIE for cookie in self.cookies))
+        session = self.request('/api/session', headers=bearer)
+        self.assertEqual(session['status'], 200)
+        self.assertEqual(session['body']['actor'], 'fixture-service')
+        self.assertEqual(session['body']['roles'], ['viewer'])
+
     def test_http_signed_wrong_nonce_never_creates_a_session(self):
         self.claim_changes = {"nonce": "different-login"}
         result, _ = self.finish()

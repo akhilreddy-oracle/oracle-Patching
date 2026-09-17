@@ -104,6 +104,7 @@ else
     'INSTANCE_NAME=ORCL' \
     'INSTANCE_STATUS=OPEN' \
     'DATABASE_UNIQUE_NAME=ORCL' \
+    "CDB=${OPU_TEST_CDB-NO}" \
     'DATABASE_ROLE=PRIMARY' \
     'OPEN_MODE=READ WRITE' \
     'LOG_MODE=ARCHIVELOG' \
@@ -343,6 +344,20 @@ execute_rollback() {
   OPU_TEST_SQLPATCH_ACTION_STATE="$SQLPATCH_ACTION_STATE" \
     "$ROOT/bin/opu-database-single-instance-rollback" execute --plan-id "$plan_id" --task-id "$task_id" --actor rollback-worker --lease-seconds 30
 }
+
+# Current adapters cannot verify every PDB and seed SQL state. Prove the real
+# precheck rejects CDB/unknown scope while leaving database and binaries alone.
+for scope in YES ''; do
+  scope_plan=standalone-cdb-${scope:-unknown}
+  create_plan "$scope_plan"
+  scope_task=$(plan next --plan-id "$scope_plan" | jq -r '.task_id')
+  if OPU_TEST_CDB="$scope" execute "$scope_plan" "$scope_task" >"$TMP/$scope_plan.out" 2>&1; then
+    echo 'unsupported or unknown CDB scope passed native precheck' >&2; exit 1
+  fi
+  grep -F 'non-CDB databases only' "$EXECUTION_STATE/plans/$scope_plan/tasks/$scope_task/stderr.log" >/dev/null
+  [ "$(cat "$DATABASE_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
+  plan status --plan-id "$scope_plan" | jq -e '.state == "paused"' >/dev/null
+done
 
 # Artifact tampering must fail before any database mutation.
 create_plan standalone-tamper

@@ -53,6 +53,54 @@ class QueueSafety(unittest.TestCase):
         self.assertNotIn(claim['claim_token'], json.dumps(queue.list_jobs()))
         self.assertNotIn(claim['claim_token'], queue._job_path(claim['job_id']).read_text())
 
+    def test_http_transport_is_fenced_by_every_unresolved_queue_state(self):
+        job = self.publish()
+        path = queue._job_path(job['job_id'])
+        original = json.loads(path.read_text())
+        for status in ('queued', 'claimed', 'running', 'reconciliation_required', 'unknown'):
+            value = {**original, 'status': status}
+            if status in ('claimed', 'running'):
+                value.update(claimed_by='agent1', claim_token_sha256='a' * 64, lease_expires_epoch=2000000000)
+            path.write_text(json.dumps(value))
+            with self.subTest(status=status), self.assertRaises(queue.QueueError) as caught:
+                queue.assert_no_unresolved_plan_tasks('plan1')
+            self.assertEqual(caught.exception.status, 409)
+        path.write_text(json.dumps(original))
+        queue.assert_no_unresolved_plan_tasks('different-plan')
+
+    def test_http_transport_requires_verified_terminal_attempt_outside_fixture_mode(self):
+        job = self.publish()
+        path = queue._job_path(job['job_id'])
+        value = {**json.loads(path.read_text()), 'status': 'completed', 'result': {'status': 'success'}}
+        path.write_text(json.dumps(value))
+        with patch.dict(os.environ, {'OPU_AGENT_TEST_MODE': '0'}):
+            with self.assertRaises(queue.QueueError):
+                queue.assert_no_unresolved_plan_tasks('plan1')
+            for outcome in ('succeeded', 'failed'):
+                task = self.native_fixture(status=outcome)
+                value['result'] = {'status': outcome, 'source': 'sealed_plan_task', 'task': task}
+                path.write_text(json.dumps(value))
+                queue.assert_no_unresolved_plan_tasks('plan1')
+                task['retry_count'] = 1
+                path.write_text(json.dumps(value))
+                with self.assertRaises(queue.QueueError):
+                    queue.assert_no_unresolved_plan_tasks('plan1')
+
+    def test_malformed_queue_cannot_bypass_transport_fence_or_crash_claim(self):
+        job = self.publish()
+        path = queue._job_path(job['job_id'])
+        original = json.loads(path.read_text())
+        for changes in ({'status': []}, {'node': []}, {'plan_id': 'other'}, {'attempt': '../escape'},
+                        {'lease_expires_epoch': 'never'}, {'result': []}, {'result': {'status': []}}, {'adapter': 'unknown'}):
+            path.write_text(json.dumps({**original, **changes}))
+            for operation in (lambda: queue.assert_no_unresolved_plan_tasks('plan1'),
+                              lambda: queue.claim('node1', 'agent1')):
+                with self.subTest(changes=changes), self.assertRaises(queue.QueueError):
+                    operation()
+        path.unlink(); os.mkfifo(path)
+        with self.assertRaises(queue.QueueError):
+            queue.assert_no_unresolved_plan_tasks('plan1')
+
     def test_retry_fences_old_claim_and_terminal_replay(self):
         self.publish()
         old = queue.claim('node1', 'agent1')
@@ -127,6 +175,20 @@ class QueueSafety(unittest.TestCase):
         self.assertEqual(job['status'], 'completed')
         self.assertEqual(renew.call_count, 3)
         self.assertTrue(all(c.kwargs['claim_token'] for c in renew.call_args_list))
+
+    def test_worker_redacts_failed_executor_diagnostics_before_persistence(self):
+        self.publish()
+        class Process:
+            returncode = 1
+            def communicate(self, timeout):
+                return 'unpublished stdout', 'password=fixture-secret\nAuthorization: Bearer private-token\nfailed task'
+        with patch.object(agent_worker.subprocess, 'Popen', return_value=Process()):
+            job, code = agent_worker.run_once('node1', 'agent1')
+        self.assertEqual(code, 1)
+        self.assertIn('failed task', job['result']['stderr_tail'])
+        persisted = queue._job_path(job['job_id']).read_text()
+        for secret in ('fixture-secret', 'private-token', 'unpublished stdout'):
+            self.assertNotIn(secret, persisted)
 
     def test_worker_never_reports_success_after_lost_ownership(self):
         self.publish()

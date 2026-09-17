@@ -100,13 +100,15 @@ def _target_capability(snapshot, database, maximum_age, *, now=None, window_star
     runtime = selected.get("runtime") if isinstance(selected.get("runtime"), dict) else {}
     for key, label, expected in (("status", "Runtime evidence", "complete"), ("database_role", "Database role", "PRIMARY"),
                                   ("open_mode", "Open mode", "READ WRITE"), ("instance_state", "Instance state", "OPEN"),
-                                  ("log_mode", "Log mode", "NOARCHIVELOG")):
+                                  ("log_mode", "Log mode", "NOARCHIVELOG"), ("cdb", "CDB status", "NO")):
         actual = runtime.get(key)
         known = isinstance(actual, str) and bool(actual.strip()) and actual.lower() not in {"unknown", "unavailable", "uncollected"}
         action = "Refresh Discover for this database"
         if known and actual != expected:
             action = ("Select a NOARCHIVELOG test database; this adapter does not support ARCHIVELOG backup preparation"
-                      if key == "log_mode" else "Review the database state with its operator, then refresh Discover")
+                      if key == "log_mode" else
+                      "Select a non-CDB database; multitenant recovery preparation is not supported"
+                      if key == "cdb" else "Review the database state with its operator, then refresh Discover")
         check(key, label, actual if known else "Unknown", expected,
               "passed" if actual == expected else "blocked" if known else "unknown", action)
     home = selected.get("oracle_home")

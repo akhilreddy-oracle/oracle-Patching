@@ -64,12 +64,26 @@ def sha(data):
 def regular(path: Path, *, admin=False, maximum=MAX_BUNDLE):
     require(path.is_absolute(), 'Input paths must be absolute')
     require(not any(part.is_symlink() for part in (path, *path.parents)), 'Input path cannot contain symbolic links')
-    info = path.lstat()
-    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'Input must be a regular file with one link')
-    require(info.st_size <= maximum, 'Input exceeds size limit')
     if admin:
-        require(info.st_uid == 0 and info.st_mode & 0o022 == 0, 'Installation inputs must be root-owned and not group/world writable')
-    return path.read_bytes()
+        require(all(parent.stat().st_uid == 0 and parent.stat().st_mode & 0o022 == 0 for parent in path.parents),
+                'Installation input directories must be root-owned and not group/world writable')
+    expected = path.lstat()
+    # Inspect and read the same nonblocking descriptor. A path swap must neither
+    # bypass ownership checks nor turn admission into a blocking FIFO read.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        require((info.st_dev, info.st_ino) == (expected.st_dev, expected.st_ino), 'Input changed while opening')
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'Input must be a regular file with one link')
+        require(info.st_size <= maximum, 'Input exceeds size limit')
+        if admin:
+            require(info.st_uid == 0 and info.st_mode & 0o022 == 0, 'Installation inputs must be root-owned and not group/world writable')
+        raw = stream.read(maximum + 1)
+        after = os.fstat(stream.fileno())
+        require((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns), 'Input changed while reading')
+    require(len(raw) <= maximum, 'Input exceeds size limit')
+    return raw
 
 
 def safe_name(name):
@@ -139,7 +153,10 @@ def read_bundle(path: Path, expected_sha: str):
         require(row['mode'] in (0o644, 0o755) and row['size'] == len(payloads[row['path']]) and row['sha256'] == sha(payloads[row['path']]), 'Manifest file verification failed')
         require(PurePosixPath(row['path']).parts[0] in SOURCE_DIRS and not any(part in EXCLUDE for part in PurePosixPath(row['path']).parts), 'Package includes excluded state or dependencies')
         require(not (PurePosixPath(row['path']).parent == PurePosixPath('webapp') and row['path'].endswith('.json')), 'Package includes deployment inventory')
-    require('webapp/server.py' in payloads and 'deploy/controller.py' in payloads, 'Incomplete controller bundle')
+    required = {'webapp/server.py', 'deploy/controller.py', 'webapp/host_config.py', 'webapp/local_llm.py',
+                'webapp/runtime_paths.py', 'scripts/requirements.txt', 'webapp/requirements-sso.txt',
+                *('deploy/templates/' + name for name in ('controller.env', 'oracle-patching.service', 'nginx.conf', 'opu-ollama.service'))}
+    require(required <= payloads.keys(), 'Incomplete controller bundle: installation dependencies are missing')
     return manifest, payloads
 
 
@@ -154,12 +171,28 @@ def load_config(path: Path, *, admin=True):
     for name in (*INPUT_FILES, 'tls_certificate', 'tls_private_key'):
         value = config.get(name)
         require(isinstance(value, str) and re.fullmatch(r'/[A-Za-z0-9_./-]+', value) and '..' not in Path(value).parts, 'Invalid absolute input path: ' + name)
+    _validated_inputs(config, admin=admin)
+    return config
+
+
+def _validated_inputs(config, *, admin):
+    # Use the runtime parsers for application configuration, and retain exactly
+    # these validated bytes when copying inputs into a fresh installation.
+    module_path = str(ROOT / 'webapp')
+    if module_path not in sys.path:
+        sys.path.insert(0, module_path)
+    import host_config
+    import local_llm
+    inputs = {}
     for name in (*INPUT_FILES, 'assistant_config_file'):
         if name in config:
-            regular(Path(config[name]), admin=admin, maximum=1024 * 1024)
+            inputs[name] = regular(Path(config[name]), admin=admin, maximum=65536 if name == 'assistant_config_file' else 1024 * 1024)
     if config.get('assistant_config_file'):
-        assistant = json.loads(Path(config['assistant_config_file']).read_text())
-        require(isinstance(assistant, dict) and assistant.get('enabled') is True, 'Supplied assistant configuration must be explicitly enabled')
+        try:
+            assistant = local_llm.validate_config(inputs['assistant_config_file'])
+        except local_llm.LLMError as error:
+            raise ValueError(str(error)) from None
+        require(assistant.get('enabled') is True, 'Supplied assistant configuration must be explicitly enabled')
         require(assistant.get('provider', 'ollama') == 'ollama'
                 and assistant.get('base_url', 'http://127.0.0.1:11434/v1') == 'http://127.0.0.1:11434/v1'
                 and not assistant.get('allow_private_endpoint') and not assistant.get('allow_insecure_private'),
@@ -167,9 +200,8 @@ def load_config(path: Path, *, admin=True):
         model = assistant.get('model')
         require(isinstance(model, str) and model.strip() and not model.startswith('REPLACE_')
                 and 'cloud' not in model.lower(), 'Choose an installed local model; cloud and placeholder models are not accepted')
-    hosts = json.loads(Path(config['hosts_file']).read_text())
-    require(isinstance(hosts, dict) and isinstance(hosts.get('hosts'), list), 'Hosts inventory requires a hosts array')
-    principals = json.loads(Path(config['principals_file']).read_text())
+    host_config.validate(json.loads(inputs['hosts_file']))
+    principals = json.loads(inputs['principals_file'])
     entries = principals.get('principals') if isinstance(principals, dict) else None
     require(isinstance(entries, list) and entries, 'Separate principal credentials are required; no lab token bootstrap')
     actors, digests, roles = set(), set(), {}
@@ -178,11 +210,13 @@ def load_config(path: Path, *, admin=True):
         actor, digest, assigned = entry.get('actor'), entry.get('token_sha256'), entry.get('roles')
         require(isinstance(actor, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', actor) and actor not in actors, 'Invalid or duplicate principal')
         require(isinstance(digest, str) and re.fullmatch(r'[a-f0-9]{64}', digest) and digest not in digests, 'Distinct hashed credentials are required')
-        require(isinstance(assigned, list) and assigned and set(assigned) <= {'viewer', 'requester', 'approver', 'operator', 'admin'}, 'Invalid principal roles')
+        require(isinstance(assigned, list) and assigned and all(isinstance(role, str) and role in {'viewer', 'requester', 'approver', 'operator', 'admin'} for role in assigned), 'Invalid principal roles')
         actors.add(actor); digests.add(digest)
         expiry = entry.get('expires_at')
+        require(type(entry.get('disabled', False)) is bool, 'Principal disabled must be boolean')
         active = not entry.get('disabled', False)
-        if expiry:
+        if expiry is not None:
+            require(isinstance(expiry, str) and expiry, 'Principal expiry requires a timestamp with timezone')
             expiry = dt.datetime.fromisoformat(expiry.replace('Z', '+00:00'))
             require(expiry.tzinfo is not None, 'Principal expiry requires timezone')
             active = active and expiry > dt.datetime.now(dt.timezone.utc)
@@ -191,7 +225,7 @@ def load_config(path: Path, *, admin=True):
     require(any(a != b and a != c and b != c for a in roles for b in roles for c in roles
                 if 'requester' in roles[a] and 'approver' in roles[b] and 'operator' in roles[c]),
             'Fresh deployment requires distinct active requester, approver and operator identities')
-    return config
+    return inputs
 
 
 def fresh_conflicts(enable_ollama=False):
@@ -266,6 +300,7 @@ def install_fresh(manifest, payloads, config):
     require(os.geteuid() == 0, 'install-fresh must run as the Linux administrator')
     result = preflight(manifest, config)
     require(not result['blockers'], '; '.join(result['blockers']))
+    inputs = _validated_inputs(config, admin=True)
     # No cleanup trap removes an interrupted install: partial paths deliberately
     # block a rerun until an administrator inspects what was created.
     INSTALL.mkdir(mode=0o755)
@@ -293,13 +328,13 @@ def install_fresh(manifest, payloads, config):
     copies = {'hosts_file': CONFIG / 'hosts.json', 'principals_file': CONFIG / 'principals.json',
               'ssh_config_file': ssh / 'config', 'known_hosts_file': ssh / 'known_hosts', 'ssh_private_key_file': ssh / 'id_controller'}
     for name, target in copies.items():
-        target.write_bytes(regular(Path(config[name]), admin=True, maximum=1024 * 1024))
+        target.write_bytes(inputs[name])
         target.chmod(0o600 if name.startswith('ssh_') or name == 'known_hosts_file' else 0o640)
         os.chown(target, account.pw_uid if target.parent == ssh else 0, account.pw_gid)
     environment = payloads['deploy/templates/controller.env'].decode()
     if config.get('assistant_config_file'):
         target = CONFIG / 'assistant-config.json'
-        target.write_bytes(regular(Path(config['assistant_config_file']), admin=True, maximum=65536))
+        target.write_bytes(inputs['assistant_config_file'])
         target.chmod(0o640); os.chown(target, 0, account.pw_gid)
         environment += 'OPU_ASSISTANT_CONFIG=/etc/oracle-patching/assistant-config.json\n'
     (CONFIG / 'controller.env').write_text(environment)

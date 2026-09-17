@@ -144,12 +144,14 @@ def require_api_auth(authorization_header: str | None) -> str | None:
 
 
 def rbac_enabled() -> bool:
+    flag = (os.environ.get(RBAC_ENV) or "").strip().lower()
+    if flag not in {"", "0", "false", "no", "off", "1", "true", "yes", "on"}:
+        raise AuthError("OPU_WEBAPP_RBAC must be a boolean value; refusing ambiguous authentication configuration", status=503)
     if (os.environ.get("OPU_OIDC_CONFIG") or (TOKEN_FILE.parent / "oidc.json").exists()
             or (TOKEN_FILE.parent / "oidc.json").is_symlink()):
         return True
     if (os.environ.get("OPU_PRODUCTION_MODE") or "").strip().lower() in {"1", "true", "yes", "on"}:
         return True
-    flag = (os.environ.get(RBAC_ENV) or "").strip().lower()
     if flag in {"0", "false", "no", "off"}:
         return False
     if flag in {"1", "true", "yes", "on"}:
