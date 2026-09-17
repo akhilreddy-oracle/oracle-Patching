@@ -3,6 +3,9 @@
 # Durable, local control-plane primitives for fixed patch job types.  The job
 # engine creates work; it never receives or executes arbitrary shell text.
 
+# shellcheck source=lib/opu/execution.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/execution.sh"
+
 OPU_JOB_STATE_DIR=${OPU_JOB_STATE_DIR:-/var/lib/oracle-patching-jobs}
 
 opu_job_dir() { printf '%s/jobs/%s' "$OPU_JOB_STATE_DIR" "$1"; }
@@ -33,13 +36,16 @@ opu_job_verify_plan() {
 }
 
 opu_job_lock() {
-    local job_id attempts=0 max_attempts=50
+    local job_id lock_path attempts=0 max_attempts=50
     job_id=$1
+    opu_validate_identifier "$job_id" "job ID" || return
     OPU_JOB_LOCK_MODE=""
     OPU_JOB_LOCK_DIR=""
     if command -v flock >/dev/null 2>&1; then
-        exec 8>"$(opu_job_dir "$job_id")/.lock" || return 73
-        flock -w 5 8 || { opu_error "timed out waiting for job lock: $job_id"; return 75; }
+        lock_path="$(opu_job_dir "$job_id")/.lock"
+        opu_execution_open_lock_file "$lock_path" 8 || return $?
+        flock -w 5 8 || { exec 8>&-; opu_error "timed out waiting for job lock: $job_id"; return 75; }
+        opu_execution_validate_lock "$lock_path" 8 || { exec 8>&-; return 65; }
         OPU_JOB_LOCK_MODE=flock
         return 0
     fi
@@ -74,6 +80,7 @@ opu_job_event() {
 
 opu_job_read_state() {
     local state_file
+    opu_validate_identifier "$1" "job ID" || return
     state_file=$(opu_job_state_file "$1")
     [ -f "$state_file" ] || { opu_error "job does not exist: $1"; return 66; }
     opu_job_verify_plan "$1" || return
@@ -155,15 +162,23 @@ opu_job_create() {
     printf '%s\n' "$job_dir/plan.json"
 }
 
-opu_job_submit() { opu_job_transition "$1" draft prechecking "$2" "prechecks_requested"; }
+opu_job_submit() (
+    opu_job_lock "$1" || exit $?
+    trap 'opu_job_unlock' EXIT
+    opu_job_transition "$1" draft prechecking "$2" "prechecks_requested"
+)
 
-opu_job_ready() {
+opu_job_ready() (
     local job_id actor evidence
     job_id=$1; actor=$2; evidence=$3
-    opu_job_valid_digest "$evidence" || { opu_error "evidence digest must be a SHA-256 hex value"; return 64; }
+    opu_job_valid_digest "$evidence" || { opu_error "evidence digest must be a SHA-256 hex value"; exit 64; }
+    opu_job_lock "$job_id" || exit $?
+    trap 'opu_job_unlock' EXIT
+    opu_job_read_state "$job_id" || exit $?
+    [ "$OPU_JOB_STATE" = prechecking ] || { opu_error "job $job_id is $OPU_JOB_STATE, expected prechecking"; exit 65; }
     printf '%s\n' "$evidence" >"$(opu_job_dir "$job_id")/precheck_evidence.sha256"
     opu_job_transition "$job_id" prechecking awaiting_approval "$actor" "precheck_evidence_sha256=$evidence"
-}
+)
 
 opu_job_approve() (
     local job_id actor requester
@@ -171,6 +186,8 @@ opu_job_approve() (
     opu_validate_identifier "$actor" "approver" || exit $?
     opu_job_lock "$job_id" || exit $?
     trap 'opu_job_unlock' EXIT
+    opu_job_read_state "$job_id" || exit $?
+    [ "$OPU_JOB_STATE" = awaiting_approval ] || { opu_error "job $job_id is $OPU_JOB_STATE, expected awaiting_approval"; exit 65; }
     [ -f "$(opu_job_dir "$job_id")/requester" ] || { opu_error "job does not exist: $job_id"; exit 66; }
     IFS= read -r requester <"$(opu_job_dir "$job_id")/requester" || exit 74
     [ "$actor" != "$requester" ] || { opu_error "requester cannot approve their own job"; exit 77; }

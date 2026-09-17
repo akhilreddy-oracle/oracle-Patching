@@ -95,6 +95,7 @@ if grep -Eiq '^[[:space:]]*whenever([[:space:]]|$)' "$command_file"; then
 fi
 printf 'rman:%s:%s\n' "$check_syntax" "$(printf '%s' "$input" | tr '\n' ' ')" >>"$OPU_TEST_RUNTIME/order.log"
 if [ "$check_syntax" -eq 1 ]; then
+  if [ -n "${OPU_TEST_CLOCK_FILE:-}" ]; then printf '%s\n' "$OPU_TEST_CLOCK_END" >"$OPU_TEST_CLOCK_FILE"; fi
   printf 'The cmdfile has no syntax errors\n'
   exit 0
 fi
@@ -180,7 +181,13 @@ tool() {
   OPU_TEST_RUNTIME="$RUNTIME" \
   OPU_TEST_SUCCESS_ROOT="$BACKUP_PARENT_CANONICAL/recovery-ok" \
   OPU_TEST_SNAPSHOT="$TMP/snapshot.json" \
-    bash "$TOOL" "$@"
+    bash -c '
+      date() {
+        if [ "$*" = "-u +%s" ] && [ -n "${OPU_TEST_CLOCK_FILE:-}" ]; then cat "$OPU_TEST_CLOCK_FILE"
+        else command date "$@"; fi
+      }
+      . "$1" "${@:2}"
+    ' fixture "$TOOL" "$@"
 }
 
 create_request() {
@@ -371,6 +378,23 @@ mv "$TMP/tampered.tmp" "$TMP/tampered-snapshot.json"
 if tool approve --request-id recovery-tamper --actor dba-approver --approval-ticket TAMPER >/dev/null 2>&1; then
   printf '%s\n' 'tampered snapshot was accepted' >&2; exit 1
 fi
+
+# A window that expires during read-only RMAN validation must never admit
+# listener/database shutdown. Advance only the fixture clock, not system time.
+create_request recovery-window-expired
+approve_authorize recovery-window-expired
+printf '%s\n' "$((NOW + 1799))" >"$RUNTIME/window-clock"
+if OPU_TEST_CLOCK_FILE="$RUNTIME/window-clock" OPU_TEST_CLOCK_END="$((NOW + 1800))"   tool execute --request-id recovery-window-expired --actor patch-operator >"$TMP/window.stdout" 2>"$TMP/window.stderr"; then
+  echo 'recovery execution continued after its maintenance window expired' >&2; exit 1
+fi
+grep -q 'maintenance window is not open' "$TMP/window.stderr"
+tool status --request-id recovery-window-expired | jq -e '.state == "blocked" and .failure.phase == "validating_rman" and .failure.services_restored == true' >/dev/null
+[ -s "$STATE_ROOT/recovery-window-expired/evidence/backup-rman-syntax.log" ]
+[ ! -e "$STATE_ROOT/recovery-window-expired/evidence/listener-stop.log" ]
+[ ! -e "$STATE_ROOT/recovery-window-expired/evidence/shutdown.sql" ]
+[ "$(cat "$RUNTIME/database.state")" = OPEN ]
+[ ! -e "$RUNTIME/listener-stopped" ]
+[ -e "$BACKUP_PARENT/recovery-window-expired/INCOMPLETE" ]
 
 python3 -B "$ROOT/tests/recovery_capacity.py"
 printf '%s\n' 'database recovery preparation test passed'

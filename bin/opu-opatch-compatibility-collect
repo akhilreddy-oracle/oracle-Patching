@@ -79,6 +79,8 @@ contract() {
 check_home() {
   local home=$1 owner=$2 host_platform=$3 host_platform_name=$4 host actual status version_status platform_status applicability_status conflict_status applicability_log applicability_rc applicability_sha conflict_log conflict_rc conflict_sha message applicability_detail conflict_detail
   host=$(jq -r '.host.name | split(".")[0]' "$SNAPSHOT")
+  opu_validate_identifier "$host" snapshot-host || exit $?
+  opu_validate_absolute_path "$home" oracle-home || exit $?
   status=passed; version_status=passed; platform_status=passed; applicability_status=passed; conflict_status=passed; message=""
   applicability_log="$EVIDENCE_DIR/${host}-$(basename "$home")-opatch-platform-${PATCH_ID}.log"
   conflict_log="$EVIDENCE_DIR/${host}-$(basename "$home")-opatch-conflict-${PATCH_ID}.log"
@@ -146,8 +148,12 @@ emit() {
 }
 main() {
   parse "$@"; contract
-  [ -n "$EVIDENCE_DIR" ] || EVIDENCE_DIR="${TMPDIR:-/tmp}/opu-opatch-compatibility-${PATCH_ID}"
-  mkdir -p "$EVIDENCE_DIR"; [ ! -L "$EVIDENCE_DIR" ] || { echo 'evidence directory cannot be a symbolic link' >&2; exit 64; }
+  if [ -z "$EVIDENCE_DIR" ]; then
+    EVIDENCE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/opu-opatch-compatibility-${PATCH_ID}.XXXXXXXXXXXX") || exit 73
+  else
+    mkdir -p "$(dirname -- "$EVIDENCE_DIR")"
+    mkdir -- "$EVIDENCE_DIR" || { echo 'evidence directory must be new; refusing to overwrite prior evidence' >&2; exit 73; }
+  fi
   local home owner host_platform host_platform_name target_count=0
   while IFS=$'\t' read -r home owner host_platform host_platform_name; do [ -n "$home" ] || continue; target_count=$((target_count+1)); check_home "$home" "$owner" "$host_platform" "$host_platform_name"; done < <(target_homes)
   [ "$target_count" -gt 0 ] || { echo 'snapshot contains no target Oracle home for this procedure' >&2; exit 65; }

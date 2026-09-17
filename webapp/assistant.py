@@ -105,12 +105,45 @@ def _read(path, owner):
         data = json.loads(path.read_text())
     except FileNotFoundError:
         raise AssistantError("Conversation not found", 404) from None
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         if isinstance(exc, AssistantError):
             raise
         raise AssistantError("Conversation could not be read", 503) from None
+    if not isinstance(data, dict):
+        raise AssistantError("Conversation record is invalid", 503)
     if data.get("owner") != owner:
         raise AssistantError("Conversation not found", 404)
+    if (data.get("id") != path.stem or not isinstance(data.get("title"), str)
+            or not isinstance(data.get("updated_at"), str)
+            or not isinstance(data.get("messages"), list) or not isinstance(data.get("actions"), list)):
+        raise AssistantError("Conversation record is invalid", 503)
+    active = data.get("active_run_id")
+    if (active is not None and (not isinstance(active, str) or not re.fullmatch(r"[a-f0-9]{12}", active))
+            or data.get("active_run_key") is not None and not isinstance(data["active_run_key"], str)):
+        raise AssistantError("Conversation run record is invalid", 503)
+    for message in data["messages"]:
+        if (not isinstance(message, dict) or not isinstance(message.get("role"), str)
+                or message["role"] not in {"user", "assistant"}
+                or not isinstance(message.get("content"), str) or not isinstance(message.get("created_at"), str)):
+            raise AssistantError("Conversation message record is invalid", 503)
+    for item in data["actions"]:
+        if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                or not re.fullmatch(r"[a-f0-9]{24}", item["id"])
+                or not isinstance(item.get("tool"), str) or item["tool"] not in capabilities.SPECS
+                or not isinstance(item.get("state"), str)
+                or item["state"] not in {"pending", "executing", "completed", "failed", "unknown", "expired", "dismissed"}
+                or not isinstance(item.get("arguments"), dict)):
+            raise AssistantError("Conversation action record is invalid", 503)
+        if (set(item["arguments"]) != set(capabilities.SPECS[item["tool"]][1])
+                or not all(isinstance(value, str) and value for value in item["arguments"].values())):
+            raise AssistantError("Conversation action arguments are invalid", 503)
+        if item["state"] == "pending":
+            try:
+                expiry = datetime.fromisoformat(item["expires_at"])
+                if expiry.tzinfo is None or not all(isinstance(item.get(key), str) for key in ("binding", "digest")):
+                    raise ValueError()
+            except (KeyError, ValueError, TypeError):
+                raise AssistantError("Conversation proposal record is invalid", 503) from None
     return data
 
 
@@ -384,9 +417,10 @@ def _live_inventory(owner, path, data, content, allowed, load_hosts, submit):
         return _text_reply(owner, path, data, "Live discovery dispatch is unavailable in this session. No current inventory was collected.")
     if len(data["actions"]) >= MAX_ACTIONS:
         raise AssistantError("Action limit reached; start a new conversation", 409)
-    if any(a["state"] == "unknown" and a.get("arguments", {}).get("host_id") == host_id for a in data["actions"]):
+    if any(a["state"] == "unknown" for a in data["actions"]):
         return _text_reply(owner, path, data,
-            f"A previous operation on {host_id} has an unknown outcome. Inspect and reconcile its native run before another live check.")
+            "A previous native operation in this conversation has an unknown outcome. "
+            "Inspect and reconcile its native run before another live check.")
     selected = {"id": uuid.uuid4().hex[:24], "tool": "refresh_discovery", "arguments": {"host_id": host_id},
         "summary": f"Live patch inventory for {host_id}", "origin": "live_inventory_query", "state": "executing",
         "configuration_sha256": live_inventory.configuration_digest(hosts[host_id]),
@@ -578,18 +612,27 @@ def action(owner, conversation_id, action_id, *, dismiss=False, digest=None, all
             selected["state"] = "dismissed"
             _save(path, data)
             return _public(data)
+        if any(item["state"] == "unknown" for item in data["actions"]):
+            raise AssistantError("Inspect and reconcile the unknown native operation before confirming more actions", 409)
         if _public(data)["busy"]:
             raise AssistantError("Wait for the current operation to finish", 409)
         if not isinstance(digest, str) or digest != selected["digest"] or digest != _digest(selected):
             raise AssistantError("Action confirmation does not match the prepared proposal", 409)
         if capabilities.SPECS[selected["tool"]][2] not in allowed:
             raise AssistantError("Your current role does not permit this action", 403)
-        current_binding = capabilities.binding(selected["tool"], selected["arguments"], load_hosts())
+        verified_hosts = load_hosts()
+        current_binding = capabilities.binding(selected["tool"], selected["arguments"], verified_hosts)
         if current_binding != selected["binding"]:
             selected.update(state="expired", error="Target or saved evidence changed. Inspect it and prepare a new proposal.")
             _save(path, data)
             raise AssistantError(selected["error"], 409)
         route, body = capabilities.route(selected["tool"], selected["arguments"])
+        if selected["tool"] in {"refresh_discovery", "refresh_readiness", "select_backup", "create_backup"}:
+            # This exact configuration is covered by the approved aggregate
+            # binding checked above. Carry its digest across the dispatch gap
+            # so the native handler cannot silently resolve a different host.
+            body["expected_configuration_sha256"] = live_inventory.configuration_digest(
+                verified_hosts[selected["arguments"]["host_id"]])
         # Persist before launching. A crash in the launch gap becomes unknown,
         # never a pending proposal that could repeat a native side effect.
         selected["state"] = "executing"

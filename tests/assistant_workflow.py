@@ -121,7 +121,8 @@ class AssistantTests(unittest.TestCase):
     def test_exact_confirmation_is_durable_and_replay_cannot_repeat_native_command(self):
         proposal = self.proposal()
         def launch(path, body):
-            self.assertEqual((path, body), ('/api/hosts/fixture/pipeline/discovery', {}))
+            self.assertEqual((path, body), ('/api/hosts/fixture/pipeline/discovery', {
+                'expected_configuration_sha256': assistant.live_inventory.configuration_digest(self.hosts['fixture'])}))
             saved = self.conversation_data()['actions'][0]
             self.assertEqual(saved['state'], 'executing')
             self.assertEqual(saved['confirmed_by'], self.owner)
@@ -204,6 +205,24 @@ class AssistantTests(unittest.TestCase):
         action = assistant.get(self.owner, self.conversation)['actions'][0]
         self.assertEqual(action['state'], 'unknown')
         self.assertNotIn('foreign result', json.dumps(action))
+
+    def test_unknown_native_operation_blocks_confirmation_of_a_different_pending_action(self):
+        original = self.proposal()
+        self.submit.side_effect = RuntimeError('Native submission outcome unavailable')
+        with self.assertRaises(assistant.AssistantError):
+            self.confirm(original)
+        self.submit.reset_mock()
+        pending = self.proposal('refresh_readiness')
+        with self.assertRaisesRegex(assistant.AssistantError, 'reconcile') as caught:
+            self.confirm(pending)
+        self.assertEqual(caught.exception.status, 409)
+        self.submit.assert_not_called()
+        current = assistant.get(self.owner, self.conversation)
+        self.assertEqual([item['state'] for item in current['actions']], ['unknown', 'pending'])
+        # Dismissing a proposal cannot start native work and remains available.
+        self.confirm(pending, dismiss=True)
+        self.assertEqual(assistant.get(self.owner, self.conversation)['actions'][-1]['state'], 'dismissed')
+        self.submit.assert_not_called()
 
     def test_malicious_tool_names_actor_fields_and_targets_are_rejected(self):
         examples = [('run_shell', {'command': 'ssh target rm -rf /'}),
@@ -499,6 +518,34 @@ class AssistantTests(unittest.TestCase):
         path.chmod(0o644)
         with self.assertRaisesRegex(assistant.AssistantError, 'unsafe'):
             assistant.get(self.owner, self.conversation)
+
+    def test_corrupt_or_misattributed_conversation_records_fail_closed_before_dispatch(self):
+        self.proposal()
+        path = assistant._path(self.owner, self.conversation)
+        original = json.loads(path.read_text())
+        invalid = [None, [], {**original, 'id': 'b' * 24}, {**original, 'messages': None},
+                   {**original, 'actions': {}}, {**original, 'active_run_id': []},
+                   {**original, 'messages': [{'role': 'system', 'content': 'unexpected'}]},
+                   {**original, 'messages': [{'role': [], 'content': 'unexpected'}]}]
+        for changes in ({'state': []}, {'tool': []}, {'arguments': None}, {'expires_at': 'not-a-time'},
+                        {'expires_at': '2099-01-01T01:00:00'}, {'arguments': {}},
+                        {'arguments': {'host_id': []}}):
+            record = json.loads(json.dumps(original))
+            record['actions'][0].update(changes)
+            invalid.append(record)
+        with patch.object(assistant.local_llm, 'complete') as model:
+            for value in invalid:
+                with self.subTest(value_type=type(value).__name__):
+                    path.write_text(json.dumps(value))
+                    for operation in (lambda: assistant.get(self.owner, self.conversation),
+                                      lambda: assistant.send(self.owner, self.conversation, 'Inspect the host',
+                                          {'read', 'execute'}, lambda: self.hosts, submit=self.submit)):
+                        with self.assertRaises(assistant.AssistantError) as caught:
+                            operation()
+                        self.assertEqual(caught.exception.status, 503)
+        model.assert_not_called()
+        self.submit.assert_not_called()
+        path.write_text(json.dumps(original))
 
     def test_interrupted_model_turn_can_retry_without_reviving_old_response(self):
         entered, release = threading.Event(), threading.Event()

@@ -121,7 +121,8 @@ export async function renderPlanNew(mount, hostId) {
   btn.addEventListener("click", async () => {
     clearFormError(errBox);
     if (!requireToken(errBox)) return;
-    if (!requireNonEmpty(planId, errBox, "Plan ID")) return;
+    const submittedId = requireNonEmpty(planId, errBox, "Plan ID");
+    if (!submittedId) return;
     const actor = requireActor(requester, errBox, "Requester");
     if (!actor) return;
     btn.disabled = true;
@@ -130,7 +131,7 @@ export async function renderPlanNew(mount, hostId) {
     logBox.textContent = "creating…";
     try {
       const record = await runToCompletion("/api/plans", {
-        plan_id: planId.value.trim(),
+        plan_id: submittedId,
         requester: actor,
         host_id: hostId,
         window_start: windowStart.value,
@@ -140,7 +141,7 @@ export async function renderPlanNew(mount, hostId) {
         logBox.classList.add("run-log-error");
         logBox.textContent = formatRunFailure(record);
       } else {
-        location.hash = `#/plans/${encodeURIComponent(planId.value.trim())}`;
+        location.hash = `#/plans/${encodeURIComponent(submittedId)}`;
       }
     } catch (err) {
       logBox.classList.add("run-log-error");
@@ -196,7 +197,8 @@ export async function renderPlanDemoNew(mount) {
   btn.addEventListener("click", async () => {
     clearFormError(errBox);
     if (!requireToken(errBox)) return;
-    if (!requireNonEmpty(planId, errBox, "Plan ID")) return;
+    const submittedId = requireNonEmpty(planId, errBox, "Plan ID");
+    if (!submittedId) return;
     const actor = requireActor(requester, errBox, "Requester");
     if (!actor) return;
     btn.disabled = true;
@@ -205,7 +207,7 @@ export async function renderPlanDemoNew(mount) {
     logBox.textContent = "building fixture…";
     try {
       const record = await runToCompletion("/api/plans/testmode-demo", {
-        plan_id: planId.value.trim(),
+        plan_id: submittedId,
         requester: actor,
         adapter: adapter.value,
         window_start: windowStart.value,
@@ -215,7 +217,7 @@ export async function renderPlanDemoNew(mount) {
         logBox.classList.add("run-log-error");
         logBox.textContent = formatRunFailure(record);
       } else {
-        location.hash = `#/plans/${encodeURIComponent(planId.value.trim())}`;
+        location.hash = `#/plans/${encodeURIComponent(submittedId)}`;
       }
     } catch (err) {
       logBox.classList.add("run-log-error");
@@ -286,7 +288,8 @@ export async function renderRollbackNew(mount, sourcePlanId) {
   btn.addEventListener("click", async () => {
     clearFormError(errBox);
     if (!requireToken(errBox)) return;
-    if (!requireNonEmpty(planId, errBox, "Rollback plan ID")) return;
+    const submittedId = requireNonEmpty(planId, errBox, "Rollback plan ID");
+    if (!submittedId) return;
     const actor = requireActor(requester, errBox, "Requester");
     if (!actor) return;
     btn.disabled = true;
@@ -295,7 +298,7 @@ export async function renderRollbackNew(mount, sourcePlanId) {
     logBox.textContent = "creating…";
     try {
       const record = await runToCompletion(`/api/plans/${encodeURIComponent(sourcePlanId)}/create-rollback`, {
-        plan_id: planId.value.trim(),
+        plan_id: submittedId,
         requester: actor,
         source_plan_id: sourcePlanId,
         window_start: windowStart.value,
@@ -305,7 +308,7 @@ export async function renderRollbackNew(mount, sourcePlanId) {
         logBox.classList.add("run-log-error");
         logBox.textContent = formatRunFailure(record);
       } else {
-        location.hash = `#/plans/${encodeURIComponent(planId.value.trim())}`;
+        location.hash = `#/plans/${encodeURIComponent(submittedId)}`;
       }
     } catch (err) {
       logBox.classList.add("run-log-error");

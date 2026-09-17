@@ -7,6 +7,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
 . "$ROOT/lib/opu/recovery_evidence.sh"
+. "$ROOT/lib/opu/dataguard.sh"
 
 RECONCILIATION=""; ARTIFACT=""; PROCEDURE=""; COMPATIBILITY=""; POLICY=""; OUT=""; DATAGUARD=""; RECOVERY=""
 declare -a SNAPSHOTS=() GATES=()
@@ -33,6 +34,17 @@ iso_from_epoch() { date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u 
 gate_json() { local item first=1; printf '['; for item in "${GATES[@]}"; do [ "$first" -eq 1 ] || printf ','; jq -cn --arg name "${item%%|*}" --arg status "$(cut -d'|' -f2 <<<"$item")" --arg detail "$(cut -d'|' -f3- <<<"$item")" '{name:$name,status:$status,detail:$detail}'; first=0; done; printf ']'; }
 has_blocker() { local item; for item in "${GATES[@]}"; do [ "$(cut -d'|' -f2 <<<"$item")" = blocker ] && return 0; done; return 1; }
 check_contracts() {
+  if [ -n "$DATAGUARD" ]; then
+    opu_dataguard_verify_document "$DATAGUARD" || exit 65
+    opu_dataguard_require_recent "$DATAGUARD" evaluated_at || exit 65
+    opu_dataguard_require_recent "$DATAGUARD" observed_at || exit 65
+    jq -e '.schema_version == "1.0" and (.status | IN("ready_for_standby_first","blocked")) and
+      (.gates | type == "array") and
+      (.evidence.observe_sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
+      (.evidence.policy_sha256 | type == "string" and test("^[a-f0-9]{64}$"))' "$DATAGUARD" >/dev/null || {
+      echo 'Data Guard evaluation has an invalid status or evidence contract' >&2; exit 65;
+    }
+  fi
   jq -e '.schema_version == "1.0" and (.maximum_snapshot_age_seconds | type == "number" and . > 0) and (.require_xml_inventory | type == "boolean") and (.recovery.require_backup | type == "boolean") and (.recovery.max_backup_age_minutes | type == "number" and . >= 0) and (.recovery.minimum_fra_free_bytes | type == "number" and . >= 0) and (.recovery.require_guaranteed_restore_point | type == "boolean") and (.database.require_primary_read_write | type == "boolean") and (.database.maximum_invalid_objects | type == "number" and . >= 0)' "$POLICY" >/dev/null || { echo 'readiness policy violates the v1 contract' >&2; exit 65; }
   jq -e '.schema_version == "1.0" and (.status == "ready_for_planning") and (.procedure.patch_id | test("^[0-9]{1,20}$")) and (.procedure.artifact_sha256 | test("^[a-f0-9]{64}$")) and (.procedure.target.platform_id | test("^[0-9]+$"))' "$PROCEDURE" >/dev/null || { echo 'procedure validation result is not ready or lacks a sealed platform' >&2; exit 65; }
   jq -e '.recovery |
@@ -48,6 +60,17 @@ check_contracts() {
   fi
 }
 target_homes() { local snapshot=$1; if [ "$TARGET_FAMILY" = grid ]; then jq -r '[.cluster.grid_home] | .[] | select(type == "string" and length > 0) | [. , "grid"] | @tsv' "$snapshot"; else jq -r '.databases[] | [.oracle_home, .db_unique_name] | @tsv' "$snapshot"; fi; }
+dataguard_ready_for() {
+  local snapshot=$1 database=$2
+  [ -n "$DATAGUARD" ] || return 1
+  jq -e --arg db "$database" --slurpfile snapshot "$snapshot" '
+    . as $evaluation | .status == "ready_for_standby_first" and
+    (.target.db_unique_name == $db) and
+    any($snapshot[0].databases[];
+      .db_unique_name == $db and .oracle_home == $evaluation.target.oracle_home and
+      .runtime.database_role == $evaluation.target.database_role)
+  ' "$DATAGUARD" >/dev/null
+}
 check_recovery() {
   local snapshot=$1 host=$2 db=$3 require_backup max_age min_free require_grp age limit used free grp mode home owner detail
   require_backup=$(jq -r '.recovery.require_backup' "$POLICY"); max_age=$(jq -r '.recovery.max_backup_age_minutes' "$POLICY"); min_free=$(jq -r '.recovery.minimum_fra_free_bytes' "$POLICY"); require_grp=$(jq -r '.recovery.require_guaranteed_restore_point' "$POLICY")
@@ -118,17 +141,19 @@ check_snapshots() {
       role=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.database_role // "unknown"' "$snapshot")
       case "$role" in
         'PHYSICAL STANDBY'|'LOGICAL STANDBY'|'SNAPSHOT STANDBY')
-          if [ -n "$DATAGUARD" ] && jq -e '.status == "ready_for_standby_first"' "$DATAGUARD" >/dev/null; then
+          if dataguard_ready_for "$snapshot" "$db"; then
             gate dataguard_standby_first pass "$host database $db role is $role; sealed Data Guard evaluation permits standby-first orchestration."
           else
-            gate dataguard_unsupported blocker "$host database $db role is $role; supply a ready_for_standby_first Data Guard evaluation (--dataguard) before standby work."
+            gate dataguard_unsupported blocker "$host database $db role is $role; refresh a sealed ready Data Guard evaluation for this exact database, home and role before standby work."
           fi
           ;;
         PRIMARY)
           if [ -n "$DATAGUARD" ]; then
-            jq -e '.status == "ready_for_standby_first"' "$DATAGUARD" >/dev/null \
-              || gate dataguard_primary blocker "$host database $db is PRIMARY but Data Guard evaluation is not ready_for_standby_first."
-            gate dataguard_standby_first pass "$host PRIMARY is bound to a ready Data Guard standby-first evaluation."
+            if dataguard_ready_for "$snapshot" "$db"; then
+              gate dataguard_standby_first pass "$host PRIMARY is bound to a sealed recent Data Guard evaluation for this database and home."
+            else
+              gate dataguard_primary blocker "$host database $db needs a refreshed ready Data Guard evaluation for this exact database, home and role."
+            fi
           fi
           if [ "$(jq -r '.database.require_primary_read_write' "$POLICY")" = true ]; then
             jq -e --arg d "$db" '.databases[] | select(.db_unique_name == $d and .runtime.database_role == "PRIMARY" and .runtime.open_mode == "READ WRITE" and .runtime.instance_state == "OPEN")' "$snapshot" >/dev/null || gate database_open blocker "$host database $db is not PRIMARY/READ WRITE/OPEN."
@@ -142,7 +167,7 @@ check_snapshots() {
       esac
       # Primary-shaped SQL/FRA checks do not apply to standbys that are already
       # approved for standby-first orchestration via sealed Data Guard evidence.
-      if [[ "$role" == *STANDBY* ]] && [ -n "$DATAGUARD" ] && jq -e '.status == "ready_for_standby_first"' "$DATAGUARD" >/dev/null; then
+      if [[ "$role" == *STANDBY* ]] && dataguard_ready_for "$snapshot" "$db"; then
         continue
       fi
       invalid=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.invalid_objects | if type == "number" and . >= 0 and floor == . then . else -1 end' "$snapshot"); sqlpatch=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.sqlpatch_non_success // -1' "$snapshot"); pdb=$(jq -r --arg d "$db" '.databases[] | select(.db_unique_name == $d) | .runtime.pdb_not_read_write // -1' "$snapshot")
@@ -195,13 +220,22 @@ emit() {
     if [ "$earliest_valid" -eq 0 ] || [ "$valid_epoch" -lt "$earliest_valid" ]; then earliest_valid=$valid_epoch; fi
   done
   snapshot_json=$(jq -cS 'sort_by(.path)' <<<"$snapshot_json")
+  if [ -n "$DATAGUARD" ]; then
+    local dataguard_valid dataguard_binding
+    dataguard_valid=$(jq -r '([.evaluated_at,.observed_at] | map(fromdateiso8601) | min) + (env.OPU_DATAGUARD_MAX_EXECUTION_AGE_SECONDS // "300" | tonumber)' "$DATAGUARD")
+    dataguard_binding=$(jq -c --arg path "$DATAGUARD" --arg sha "$(opu_hash_file "$DATAGUARD")" \
+      --arg valid "$(iso_from_epoch "$dataguard_valid")" --argjson maximum "${OPU_DATAGUARD_MAX_EXECUTION_AGE_SECONDS:-300}" \
+      '{path:$path,sha256:$sha,record_sha256,evaluated_at,observed_at,maximum_age_seconds:$maximum,valid_until:$valid}' "$DATAGUARD")
+    [ "$dataguard_valid" -ge "$earliest_valid" ] || earliest_valid=$dataguard_valid
+  fi
   valid_at=$(iso_from_epoch "$earliest_valid") || valid_at=1970-01-01T00:00:00Z
   hashes=$(jq -cn --arg reconciliation "$(opu_hash_file "$RECONCILIATION")" --arg artifact "$(opu_hash_file "$ARTIFACT")" --arg procedure_validation "$(opu_hash_file "$PROCEDURE")" --arg compatibility "$(opu_hash_file "$COMPATIBILITY")" --arg policy "$(opu_hash_file "$POLICY")" '{reconciliation_sha256:$reconciliation,artifact_manifest_sha256:$artifact,procedure_validation_sha256:$procedure_validation,compatibility_sha256:$compatibility,policy_sha256:$policy}')
   if [ -n "$RECOVERY" ]; then hashes=$(jq --arg sha "$(opu_hash_file "$RECOVERY")" '. + {recovery_sha256:$sha}' <<<"$hashes"); fi
+  if [ -n "$DATAGUARD" ]; then hashes=$(jq --arg sha "$(opu_hash_file "$DATAGUARD")" '. + {dataguard_sha256:$sha}' <<<"$hashes"); fi
   jq -cn --arg status "$status" --arg patch "$PATCH_ID" --arg family "$TARGET_FAMILY" --arg method "$TARGET_METHOD" --arg platform "$TARGET_PLATFORM" \
     --arg evaluated_at "$evaluated_at" --arg valid_until "$valid_at" --argjson snapshots "$snapshot_json" \
-    --argjson gates "$(gate_json)" --argjson evidence "$hashes" \
-    '{schema_version:"1.0",status:$status,patch_id:$patch,target:{family:$family,method:$method,platform_id:$platform},evaluated_at:$evaluated_at,valid_until:$valid_until,snapshot_evidence:$snapshots,gates:$gates,evidence:$evidence}' >"$file"
+    --argjson gates "$(gate_json)" --argjson evidence "$hashes" --argjson dataguard "${dataguard_binding:-null}" \
+    '{schema_version:"1.0",status:$status,patch_id:$patch,target:{family:$family,method:$method,platform_id:$platform},evaluated_at:$evaluated_at,valid_until:$valid_until,snapshot_evidence:$snapshots,gates:$gates,evidence:$evidence} + (if $dataguard == null then {} else {dataguard_evaluation:$dataguard} end)' >"$file"
 }
 main() {
   parse "$@"; check_contracts

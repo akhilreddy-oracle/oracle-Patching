@@ -28,7 +28,7 @@ export async function refreshSession() {
       ? `Authenticated as ${session.display_name || session.actor}. Roles: ${(session.roles || []).join(", ")}.${session.expires_at ? ` Session expires ${new Date(session.expires_at * 1000).toLocaleTimeString()}.` : ""}`
       : "Lab session: select an actor for separation of duties.";
   } catch (error) {
-    if (error.name !== "AbortError") {
+    if (!signal?.aborted && error.name !== "AbortError") {
       setSessionIdentity(null);
       setSessionCsrf(null);
       if (sessionNote) sessionNote.textContent = error.message;

@@ -76,10 +76,12 @@ const api = await import('../webapp/static/api.js');
 const actor = await import('../webapp/static/actor.js');
 const { classifyStatus } = await import('../webapp/static/dom.js');
 const { belongsToHost, newestFirst } = await import('../webapp/static/host_scope.js');
-const { renderPlanList, renderPlanDetail } = await import('../webapp/static/plans.js');
-const { renderRecoveryList, renderRecoveryDetail } = await import('../webapp/static/recovery_pages.js');
+const { renderPlanList, renderPlanDetail, renderPlanNew, renderPlanDemoNew, renderRollbackNew } = await import('../webapp/static/plans.js');
+const { renderRecoveryList, renderRecoveryDetail, renderRecoveryNew } = await import('../webapp/static/recovery_pages.js');
 const { renderWorkspace } = await import('../webapp/static/workspace.js');
 const { renderExecuteStage } = await import('../webapp/static/stages/execute.js');
+const { renderDiscoverStage } = await import('../webapp/static/stages/discover.js');
+const { renderPlanStage } = await import('../webapp/static/stages/plan.js');
 const { renderReadinessStage } = await import('../webapp/static/stages/readiness.js');
 const { renderRecoveryStage } = await import('../webapp/static/stages/recovery.js');
 const { hydrateBackupPolicy, policyRecoveryBlock, backupPolicyChooser } = await import('../webapp/static/backup_policy.js');
@@ -90,6 +92,7 @@ const { reconciliationCard } = await import('../webapp/static/run_reconciliation
 const { refreshSession } = await import('../webapp/static/shell.js');
 const { executionWindow } = await import('../webapp/static/plan_window.js');
 const { evidenceReport } = await import('../webapp/static/report_view.js');
+const { executionConsole } = await import('../webapp/static/execution_console.js');
 const { canInspectExtjob, extjobInspection } = await import('../webapp/static/extjob_inspection.js');
 const { buildProcedure, PROCEDURE_ADAPTERS, REQUIRED_PRECHECKS } = await import('../webapp/static/procedure_adapters.js');
 
@@ -146,6 +149,35 @@ test('real list renderers surface authentication failures through the page bound
   }
 });
 
+test('discovery exposes authentication recovery instead of swallowing an expired session', async () => {
+  fetch = async () => response({ message: 'Session expired' }, 401);
+  const page = mount(); const render = createPageRenderer(page, view => renderDiscoverStage(view, 'prod'));
+  await render();
+  assert.match(page.textContent, /Authentication required/);
+  assert.ok(page.querySelector('.auth-recovery-form'));
+  render.cancel();
+});
+
+test('discovery refresh cannot retain green success when its evidence reload is missing or fails', async () => {
+  for (const reload of [response({ steps: [] }), response({ message: 'Evidence read failed' }, 503)]) {
+    let pipelineReads = 0;
+    fetch = async (url, options = {}) => {
+      if (options.method === 'POST') return response({ run_id: 'discover-refresh' }, 202);
+      if (url.startsWith('/api/runs/')) return response({ status: 'succeeded' });
+      assert.equal(url, '/api/hosts/prod/pipeline');
+      return ++pipelineReads === 1 ? response({ steps: [{ step: 'discovery', done: true, status: 'ok', evidence: { host: { name: 'previous-host' } } }] }) : reload;
+    };
+    const page = mount(); await renderDiscoverStage(page, 'prod');
+    assert.equal(page.querySelector('#discover-status').textContent, 'ok');
+    await button(page, 'Run live discovery').fire('click');
+    const status = page.querySelector('#discover-status');
+    assert.equal(status.classList.contains('is-ok'), false);
+    assert.equal(status.textContent, reload.status === 503 ? 'unavailable' : 'no evidence');
+    assert.doesNotMatch(page.textContent, /previous-host/);
+    assert.equal(button(page, 'Run live discovery').disabled, false);
+  }
+});
+
 test('authentication recovery exposes a blank password form and only replaces the credential on explicit sign-in', async () => {
   storage.set('opu-webapp-token', 'old-shared-token');
   fetch = async url => response(url === '/api/auth/config' ? { configured: false } : { message: 'Missing or invalid principal credential' }, url === '/api/auth/config' ? 200 : 401);
@@ -182,6 +214,42 @@ test('navigation aborts old reads and prevents stale results or errors replacing
   });
   const first = render(); await render(); assert.equal(firstSignal.aborted, true); release(); await first;
   assert.equal(page.textContent, 'current'); render.cancel();
+});
+
+test('cancelled execution view cannot start a native log refresh from a late saved response', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  let reads = 0, release; const posts = [];
+  const data = { guidance: 'Original execution history', runs: [{ run_id: 'native-run', can_observe: true, status: 'running' }] };
+  fetch = async (url, options = {}) => {
+    if (options.method === 'POST') { posts.push(url); return response({ run_id: 'unexpected-observe' }); }
+    assert.equal(url, '/api/plans/P1/execution');
+    return ++reads === 1 ? response(data) : { ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) };
+  };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  panel.querySelector('input').checked = true;
+  const refresh = button(panel, 'Refresh timeline').fire('click');
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); api.setReadSignal(new AbortController().signal);
+  release({ ...data, guidance: 'Stale response' }); await refresh;
+  assert.deepEqual(posts, []);
+  assert.match(panel.textContent, /Original execution history/);
+  assert.doesNotMatch(panel.textContent, /Stale response/);
+});
+
+test('execution timeline retains the newest refresh when older responses arrive later', async () => {
+  const pending = []; let reads = 0;
+  fetch = async () => ++reads === 1 ? response({ guidance: 'Initial history' })
+    : { ok: true, status: 200, json: () => new Promise(resolve => pending.push(resolve)) };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  const first = button(panel, 'Refresh timeline').fire('click');
+  const second = button(panel, 'Refresh timeline').fire('click');
+  await new Promise(resolve => setImmediate(resolve));
+  pending[1]({ guidance: 'Current history' }); await second;
+  pending[0]({ guidance: 'Stale history' }); await first;
+  assert.match(panel.textContent, /Current history/);
+  assert.doesNotMatch(panel.textContent, /Stale history/);
 });
 
 test('release validation stops loading after its response and retains every evidence level', async () => {
@@ -227,6 +295,66 @@ test('unknown outcomes and a navigation during launch cannot poll forever or rep
   };
   const run = runToCompletion('/operation', {}); controller.abort(); api.setReadSignal(new AbortController().signal); release();
   await assert.rejects(run, error => error.name === 'AbortError'); assert.equal(reads, 0);
+});
+
+test('a cancelled run response cannot publish completion after another page is opened', async () => {
+  const controller = new AbortController(); let release; const ticks = [];
+  fetch = async () => ({ ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) });
+  const pending = pollRun('previous-page-run', { signal: controller.signal, onTick: record => ticks.push(record) });
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); release({ status: 'succeeded', run_id: 'previous-page-run' });
+  await assert.rejects(pending, error => error.name === 'AbortError');
+  assert.deepEqual(ticks, []);
+});
+
+test('a late authentication failure from cancelled navigation cannot clear the newer identity or CSRF', async () => {
+  const previous = new AbortController(); api.setReadSignal(previous.signal);
+  let release;
+  fetch = async () => new Promise(resolve => { release = resolve; });
+  const oldSession = refreshSession();
+  previous.abort(); api.setReadSignal(new AbortController().signal);
+  fetch = async () => response({ rbac_enabled: true, actor: 'new-operator', roles: ['operator'], csrf_token: 'new-fixture-csrf' });
+  await refreshSession();
+  release(response({ message: 'Old session expired' }, 401));
+  await assert.rejects(oldSession, error => error.status === 401);
+  assert.equal(actor.authenticatedActor(), 'new-operator');
+  let headers;
+  fetch = async (_url, options) => { headers = options.headers; return response({}); };
+  await api.apiFetch('/fixture-write', { method: 'POST', body: '{}' });
+  assert.equal(headers['X-CSRF-Token'], 'new-fixture-csrf');
+  assert.equal(headers['X-OPU-Actor'], 'new-operator');
+});
+
+test('creation pages open the submitted record even if its editable ID changes while the run finishes', async () => {
+  const cases = [
+    [renderPlanNew, 'source', 'Plan ID', 'Create plan', '/api/plans', 'plan_id', 'plans'],
+    [renderPlanDemoNew, null, 'Plan ID', 'Build fixture and create plan', '/api/plans/testmode-demo', 'plan_id', 'plans'],
+    [renderRollbackNew, 'source-plan', 'Rollback plan ID', 'Create rollback plan', '/api/plans/source-plan/create-rollback', 'plan_id', 'plans'],
+    [renderPlanStage, 'source', 'Plan ID', 'Create plan', '/api/plans', 'plan_id', 'plans'],
+    [renderRecoveryNew, null, 'Request ID', 'Build fixture and create request', '/api/recovery/testmode-demo', 'request_id', 'recovery'],
+  ];
+  const procedure = buildProcedure('database_single_instance_opatch', procedureFields, artifact);
+  for (const [renderer, target, label, action, route, key, index] of cases) {
+    let finish; const posted = []; location.hash = '#/estate';
+    fetch = async (url, options) => {
+      if (options.method === 'POST') { posted.push({ url, body: JSON.parse(options.body) }); return response({ run_id: 'create-run' }, 202); }
+      if (url === '/api/runs/create-run') return new Promise(resolve => { finish = () => resolve(response({ status: 'succeeded' })); });
+      if (url.endsWith('/pipeline')) return response({ steps: [
+        { step: 'artifact-inspect', done: true, evidence: { artifact } },
+        { step: 'procedure-validate', done: true, status: 'ready_for_planning', evidence: { procedure } },
+      ] });
+      return response({ plans: [], tasks: [] });
+    };
+    const page = mount(); await renderer(page, target);
+    const id = field(page, label); id.value = 'submitted-record';
+    const pending = button(page, action).fire('click');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof finish, 'function', `${renderer.name} should have submitted its run`);
+    id.value = 'edited-after-submit'; finish(); await pending;
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].url, route); assert.equal(posted[0].body[key], 'submitted-record');
+    assert.equal(location.hash, `#/${index}/submitted-record`, renderer.name);
+  }
 });
 
 const artifact = { sha256: 'a'.repeat(64), patch_ids: ['12345678'], platforms: [{ id: '226' }], readme_files: [{ path: 'README.html', sha256: 'b'.repeat(64) }] };
@@ -906,6 +1034,26 @@ test('failed recovery analysis refresh clears previously passed approval evidenc
   assert.match(page.textContent, /Run analysis and resolve its findings before approval/);
   await button(page, 'Approve').fire('click');
   assert.equal(calls.filter(url => url.endsWith('/approve')).length, 0);
+});
+
+test('recovery analysis cannot relaunch while a running or unknown operation awaits resolution', async () => {
+  const posts = [];
+  for (const status of ['pending', 'queued', 'running', 'unknown']) {
+    for (const analysis of [null, { status: 'passed' }]) {
+      fetch = async (url, options = {}) => {
+        if (options.method === 'POST') posts.push(url);
+        return response({ request_id: 'live-1', state: 'awaiting_approval', mode: 'live', analysis,
+          latest_run: { run_id: 'existing-run', status } });
+      };
+      const page = mount(); await renderRecoveryDetail(page, 'live-1');
+      const analyze = button(page, analysis ? 'Refresh analysis' : 'Analyze recovery');
+      assert.equal(analyze.disabled, true, status);
+      await analyze.fire('click');
+      assert.match(page.textContent, /Existing operation must finish or be reconciled/);
+      assert.equal(page.querySelectorAll('button').some(node => node.textContent === 'Approve'), false);
+    }
+  }
+  assert.deepEqual(posts, []);
 });
 
 test('live recovery execution describes real downtime and fixtures are never offered as host planning evidence', async () => {

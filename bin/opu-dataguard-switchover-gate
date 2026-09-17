@@ -8,6 +8,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/dataguard.sh"
 
 OBSERVE=""; EVAL=""; OUT=""
 declare -a GATES=()
@@ -45,7 +46,7 @@ parse() {
     opu_validate_absolute_path "${pair%%|*}" "${pair#*|}" || exit $?
     [ -f "${pair%%|*}" ] && [ ! -L "${pair%%|*}" ] || { opu_error "${pair#*|} missing"; exit 66; }
   done
-  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  opu_dataguard_validate_output "$OUT" || exit $?
   command -v jq >/dev/null || die 'jq is required'
 }
 
@@ -85,14 +86,16 @@ evaluate() {
 }
 
 emit() {
-  local file=$1 status evaluated_at evidence
+  local file=$1 status evaluated_at evidence validation_mode=unverified
   if has_blocker; then status=blocked; else status=ready_for_switchover; fi
+  if [ "${OPU_DATAGUARD_TEST_MODE:-0}" = 1 ]; then validation_mode=simulated
+  elif [ "${OPU_DATAGUARD_ALLOW_UNVALIDATED_SWITCHOVER:-0}" = 1 ]; then validation_mode=operator_override; fi
   evaluated_at=$(opu_now_utc)
   evidence=$(jq -cn --arg observe "$(opu_hash_file "$OBSERVE")" --arg evaluation "$(opu_hash_file "$EVAL")" \
     '{observe_sha256:$observe,evaluation_sha256:$evaluation}')
-  jq -cn --arg status "$status" --arg evaluated_at "$evaluated_at" \
+  jq -cn --arg status "$status" --arg evaluated_at "$evaluated_at" --arg validation_mode "$validation_mode" \
     --argjson gates "$(gate_json)" --argjson evidence "$evidence" \
-    '{schema_version:"1.0",status:$status,evaluated_at:$evaluated_at,gates:$gates,evidence:$evidence}' >"$file"
+    '{schema_version:"1.0",status:$status,evaluated_at:$evaluated_at,validation_mode:$validation_mode,gates:$gates,evidence:$evidence}' >"$file"
   local canonical hash
   canonical=$(jq -cS . "$file"); hash=$(opu_hash_string "$canonical")
   jq --arg hash "$hash" '.record_sha256=$hash' "$file" >"${file}.hashed"
@@ -101,18 +104,14 @@ emit() {
 
 main() {
   parse "$@"
+  opu_dataguard_verify_document "$OBSERVE" || exit $?
+  opu_dataguard_verify_document "$EVAL" || exit $?
   evaluate
   local tmp
-  if [ -n "$OUT" ]; then
-    mkdir -p "$(dirname "$OUT")"
-    [ ! -L "$OUT" ] || die 'output cannot be a symbolic link'
-    tmp=$OUT
-  else
-    tmp=$(mktemp "${TMPDIR:-/tmp}/opu-dg-sw.XXXXXX")
-    trap 'rm -f "${tmp:-}"' EXIT
-  fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/opu-dg-result.XXXXXX")
+  trap 'rm -f "${tmp:-}" "${tmp:-}.hashed"' EXIT
   emit "$tmp"
-  cat "$tmp"
+  opu_dataguard_publish "$tmp" "$OUT"
   if has_blocker; then exit 2; fi
   exit 0
 }

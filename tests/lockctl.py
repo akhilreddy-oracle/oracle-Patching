@@ -157,6 +157,34 @@ class LockBridgeTests(unittest.TestCase):
         self.assertEqual(persisted["context"]["lock_recovery_run_id"], maintenance.run_id)
         self.assertEqual(self.original.status, "unknown")
 
+    def test_tool_sync_failure_leaves_original_available_for_safe_recovery(self):
+        maintenance = self.ready_recovery()
+        self.sync.side_effect = lockctl.LockError("installation connection failed")
+        with self.assertRaises(lockctl.LockError):
+            lockctl.recover("p", "operator", self.original.run_id, maintenance_run_id=maintenance.run_id)
+        self.assertNotIn("lock_recovery_run_id", self.original.context)
+        self.launch.assert_not_called()
+        self.sync.side_effect = None
+        outcome = lockctl.recover("p", "operator", self.original.run_id, maintenance_run_id=maintenance.run_id)
+        self.assertEqual(outcome["status"], "completed")
+        self.launch.assert_called_once()
+
+    def test_tool_sync_cannot_continue_after_scope_or_maintenance_owner_changes(self):
+        for changed in ("task", "maintenance"):
+            with self.subTest(changed=changed):
+                maintenance = self.ready_recovery()
+                self.native.return_value = {"status": "pending", "stage": "validate"}
+                def alter(_host):
+                    if changed == "task":
+                        self.native.return_value = {"status": "running", "stage": "validate"}
+                    else:
+                        maintenance.status = "failed"
+                self.sync.side_effect = alter
+                with self.assertRaises(lockctl.LockError):
+                    lockctl.recover("p", "operator", self.original.run_id, maintenance_run_id=maintenance.run_id)
+                self.assertNotIn("lock_recovery_run_id", self.original.context)
+                self.launch.assert_not_called()
+
     def test_maintenance_reconcile_after_original_closed_survives_controller_restart(self):
         maintenance = self.maintenance()
         self.original.status = "failed"

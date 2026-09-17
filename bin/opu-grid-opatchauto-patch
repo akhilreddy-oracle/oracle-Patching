@@ -120,8 +120,9 @@ verify_open_window() {
 acquire_executor_lock() {
   local lock_path="$NODE_RUN_DIR/executor.lock"
   if command -v flock >/dev/null 2>&1; then
-    exec 8>"$lock_path"
+    opu_execution_open_lock_file "$lock_path" 8 || die "unsafe executor lock"
     flock -n 8 || die "another Grid OPatchAuto executor owns node $LOCAL_NODE for this plan"
+    opu_execution_validate_lock "$lock_path" 8 || die "unsafe executor lock"
     EXECUTOR_LOCK_USES_FLOCK=1
   elif [ "$TEST_MODE" = 1 ]; then
     EXECUTOR_LOCK_DIR="$lock_path.d"
@@ -427,9 +428,9 @@ check_cluster_health() {
   printf '%s\n' "$voting_output" >"$prefix-votedisk.log"
   grep -Eiq '(^|[[:space:]])ONLINE([[:space:]]|$)' <<<"$voting_output" || die 'voting-disk evidence contains no ONLINE disk'
   asm_output=$({ as_grid "$GRID_HOME_TARGET/bin/srvctl" status asm -node "$LOCAL_NODE"; } 2>&1) || { printf '%s\n' "$asm_output" >"$prefix-asm.log"; die 'ASM is not healthy on the local node'; }
-  printf '%s\n' "$asm_output" >"$prefix-asm.log"; grep -Eiq 'running|online' <<<"$asm_output" || die 'ASM status is not running/online'
+  printf '%s\n' "$asm_output" >"$prefix-asm.log"; opu_service_status_running "$asm_output" || die 'ASM status is not running/online'
   listener_output=$({ as_grid "$GRID_HOME_TARGET/bin/srvctl" status listener -node "$LOCAL_NODE"; } 2>&1) || { printf '%s\n' "$listener_output" >"$prefix-listener.log"; die 'local Grid listener health check failed'; }
-  printf '%s\n' "$listener_output" >"$prefix-listener.log"; grep -Eiq 'running|online' <<<"$listener_output" || die 'local Grid listener status is not running/online'
+  printf '%s\n' "$listener_output" >"$prefix-listener.log"; opu_service_status_running "$listener_output" || die 'local Grid listener status is not running/online'
 }
 
 observe_inventory() {

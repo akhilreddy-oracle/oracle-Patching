@@ -47,6 +47,7 @@ export async function pollRun(runId, { onTick, intervalMs = 1200, signal = getRe
     } catch (err) {
       throw new Error(`run poll returned non-JSON for ${runId}: ${err}`);
     }
+    signal?.throwIfAborted();
     if (!res.ok) {
       throw new Error(record.message || `run poll failed (${res.status}) for ${runId}`);
     }

@@ -419,8 +419,9 @@ def _update_metadata(request_id: str, **values) -> dict:
 
 
 def _configured_host(metadata: dict) -> dict:
+    import host_config
     try:
-        hosts = json.loads(HOSTS_FILE.read_text())["hosts"]
+        hosts = host_config.load(HOSTS_FILE).values()
         matches = [h for h in hosts if h.get("id") == metadata["host_id"]]
         if len(matches) != 1:
             raise ValueError("host not configured uniquely")

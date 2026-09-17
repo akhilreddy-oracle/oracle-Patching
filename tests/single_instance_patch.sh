@@ -302,7 +302,7 @@ create_plan() {
 }
 
 execute() {
-  local plan_id=$1 task_id=$2
+  local plan_id=$1 task_id=$2 actor=${3:-standalone-worker}
   OPU_PLAN_STATE_DIR="$PLAN_STATE" \
   OPU_SINGLE_INSTANCE_STATE_DIR="$EXECUTION_STATE" \
   OPU_SINGLE_INSTANCE_TEST_MODE=1 \
@@ -320,7 +320,7 @@ execute() {
   OPU_TEST_FAIL_ROLLBACK="$FAIL_ROLLBACK" \
   OPU_TEST_SQLPATCH_ACTION_STATE="$SQLPATCH_ACTION_STATE" \
   OPU_SINGLE_INSTANCE_TEST_APPLY_CAPACITY_BYTES="$CAPACITY_BYTES" \
-    "$EXECUTOR" execute --plan-id "$plan_id" --task-id "$task_id" --actor standalone-worker --lease-seconds 30
+    "$EXECUTOR" execute --plan-id "$plan_id" --task-id "$task_id" --actor "$actor" --lease-seconds 30
 }
 
 execute_rollback() {
@@ -470,7 +470,9 @@ for expected_stage in precheck apply validate datapatch final_validate; do
   TASK_JSON=$(plan next --plan-id standalone-success)
   TASK_ID=$(jq -r '.task_id' <<<"$TASK_JSON")
   [ "$(jq -r '.stage' <<<"$TASK_JSON")" = "$expected_stage" ]
-  execute standalone-success "$TASK_ID" >"$TMP/$expected_stage-result.json"
+  source_worker=standalone-worker
+  [ "$expected_stage" != apply ] || source_worker=standalone-apply-worker
+  execute standalone-success "$TASK_ID" "$source_worker" >"$TMP/$expected_stage-result.json"
   jq -e --arg stage "$expected_stage" '.status == "succeeded" and .stage == $stage and .postcondition.status == "passed" and (.outcome_class | IN("no_mutation","binary_state_known")) and (.record_sha256 | test("^[a-f0-9]{64}$"))' "$TMP/$expected_stage-result.json" >/dev/null
 done
 
@@ -502,16 +504,20 @@ create_rollback_plan() {
 # Source apply worker cannot approve or authorize the derived rollback plan.
 plan create-rollback --plan-id standalone-rollback-sod --requester rollback-admin \
   --source-plan-id standalone-success --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
-plan status --plan-id standalone-rollback-sod | jq -e '.source_apply.actors == ["standalone-worker"]' >/dev/null
-if plan approve --plan-id standalone-rollback-sod --actor standalone-worker --approval-ticket TEST-ROLLBACK-SOD >/dev/null 2>&1; then
-  echo 'source apply worker was allowed to approve standalone rollback' >&2
-  exit 1
-fi
+plan status --plan-id standalone-rollback-sod | jq -e '.source_apply.actors == ["standalone-apply-worker","standalone-worker"]' >/dev/null
+for source_worker in standalone-apply-worker standalone-worker; do
+  if plan approve --plan-id standalone-rollback-sod --actor "$source_worker" --approval-ticket TEST-ROLLBACK-SOD >/dev/null 2>&1; then
+    echo "source apply worker $source_worker was allowed to approve standalone rollback" >&2
+    exit 1
+  fi
+done
 plan approve --plan-id standalone-rollback-sod --actor rollback-approver --approval-ticket TEST-ROLLBACK-SOD >/dev/null
-if plan authorize --plan-id standalone-rollback-sod --actor standalone-worker >/dev/null 2>&1; then
-  echo 'source apply worker was allowed to authorize standalone rollback' >&2
-  exit 1
-fi
+for source_worker in standalone-apply-worker standalone-worker; do
+  if plan authorize --plan-id standalone-rollback-sod --actor "$source_worker" >/dev/null 2>&1; then
+    echo "source apply worker $source_worker was allowed to authorize standalone rollback" >&2
+    exit 1
+  fi
+done
 
 # A failed OPatch rollback is an unknown binary outcome and cannot be retried.
 create_rollback_plan standalone-rollback-failure

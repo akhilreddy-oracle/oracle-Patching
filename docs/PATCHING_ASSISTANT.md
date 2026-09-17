@@ -80,6 +80,9 @@ Only this narrow live inventory request dispatches directly. Backup and patch
 actions remain proposals requiring confirmation and all native authorization,
 approval, readiness and maintenance-window gates. A restart or unknown launch
 outcome never automatically replays an operation.
+An unresolved native action also blocks confirmation of another proposal or a
+new live inventory check in the same conversation until its outcome is
+reconciled; dismissing unused proposals remains available.
 
 Conversations are private to their authenticated owner and stored under
 `OPU_WEBAPP_STATE_DIR/assistant` (development default: `webapp/var/assistant`).

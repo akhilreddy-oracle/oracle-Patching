@@ -7,6 +7,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/dataguard.sh"
 
 OBSERVE=""; EVAL=""; OUT=""
 
@@ -30,13 +31,15 @@ parse() {
     opu_validate_absolute_path "${pair%%|*}" "${pair#*|}" || exit $?
     [ -f "${pair%%|*}" ] && [ ! -L "${pair%%|*}" ] || { opu_error "${pair#*|} missing"; exit 66; }
   done
-  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  opu_dataguard_validate_output "$OUT" || exit $?
   command -v jq >/dev/null || die 'jq is required'
 }
 
 main() {
   local order tmp canonical hash
   parse "$@"
+  opu_dataguard_verify_document "$OBSERVE" || exit $?
+  opu_dataguard_verify_document "$EVAL" || exit $?
   jq -e '.status == "ready_for_standby_first"' "$EVAL" >/dev/null || die 'Data Guard evaluation is not ready_for_standby_first'
   jq -e --arg sha "$(opu_hash_file "$OBSERVE")" '.evidence.observe_sha256 == $sha' "$EVAL" >/dev/null \
     || die 'evaluation does not bind the supplied observe evidence'
@@ -65,7 +68,7 @@ main() {
       {
         schema_version:"1.0",
         strategy:"standby_first",
-        order: [{db_unique_name:$local_name,role:$role,apply_lag_seconds:0}]
+        order: [{db_unique_name:$local_name,role:"STANDBY",observed_role:$role,apply_lag_seconds:0}]
       }
     else
       error("unsupported role for plan order")
@@ -76,12 +79,9 @@ main() {
   jq -cn --argjson order "$order" --arg eval_sha "$(opu_hash_file "$EVAL")" --arg observe_sha "$(opu_hash_file "$OBSERVE")" \
     '$order + {evidence:{evaluation_sha256:$eval_sha,observe_sha256:$observe_sha}}' >"$tmp"
   canonical=$(jq -cS . "$tmp"); hash=$(opu_hash_string "$canonical")
-  if [ -n "$OUT" ]; then
-    jq --arg hash "$hash" '.record_sha256=$hash' "$tmp" >"$OUT"
-    cat "$OUT"
-  else
-    jq --arg hash "$hash" '.record_sha256=$hash' "$tmp"
-  fi
+  jq --arg hash "$hash" '.record_sha256=$hash' "$tmp" >"$tmp.hashed"
+  opu_dataguard_publish "$tmp.hashed" "$OUT"
+  rm -f "$tmp.hashed"
   rm -f "$tmp"
 }
 

@@ -31,7 +31,7 @@ class EvidenceError(ValueError):
 
 
 def validate_host_id(host_id: str) -> str:
-    if not host_id or not _ID_RE.match(host_id):
+    if not isinstance(host_id, str) or not _ID_RE.fullmatch(host_id):
         raise EvidenceError(f"host_id contains unsupported characters: {host_id!r}")
     return host_id
 
@@ -47,11 +47,12 @@ def evidence_dir(host_id: str) -> Path:
 
 
 def evidence_path(host_id: str, name: str) -> Path:
+    validate_evidence_name(name)
     return evidence_dir(host_id) / f"{name}.json"
 
 
 def validate_evidence_name(name: str) -> str:
-    if not name or not _ID_RE.match(name):
+    if not isinstance(name, str) or not _ID_RE.fullmatch(name):
         raise EvidenceError(f"evidence name contains unsupported characters: {name!r}")
     return name
 

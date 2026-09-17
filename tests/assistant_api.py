@@ -209,6 +209,8 @@ class AssistantApiTests(unittest.TestCase):
         ]
         for name, arguments, actor, key, native, args, kwargs, event in cases:
             with self.subTest(tool=name):
+                if name == "execute_plan":
+                    self.native[native].return_value = {"plan_state": "succeeded", "task_results": [{"status": "succeeded"}]}
                 previous_runs = set(pipeline_runner.RUNS)
                 conversation_id, action = self.prepare(name, arguments, actor=actor)
                 self.assertEqual(set(pipeline_runner.RUNS), previous_runs, "Preparation must not launch a native command")
@@ -257,7 +259,8 @@ class AssistantApiTests(unittest.TestCase):
                 self.assertEqual(response["status"], 202, response)
                 record = self.wait_run(response["body"]["run_id"])
                 self.assertEqual((record.kind, record.key, record.status), ("pipeline", "host:source:pipeline", "succeeded"))
-                body = {"actor": "operator", "requester": "operator"}
+                body = {"actor": "operator", "requester": "operator",
+                        "expected_configuration_sha256": assistant.live_inventory.configuration_digest(self.host)}
                 if step == "readiness-chain":
                     body["_record"] = record
                 if step == "recovery-collect":
@@ -305,6 +308,76 @@ class AssistantApiTests(unittest.TestCase):
         self.assertFalse(pipeline_runner.RUNS)
         self.assert_no_native_calls()
 
+    def test_confirmed_host_proposal_rechecks_approved_configuration_before_native_launch(self):
+        windows = {"window_start": "2099-01-01T01:00:00Z", "window_end": "2099-01-01T02:00:00Z"}
+        cases = [("refresh_discovery", {"host_id": self.host["id"]}, "operator"),
+                 ("refresh_readiness", {"host_id": self.host["id"]}, "operator"),
+                 ("select_backup", {"host_id": self.host["id"], "request_id": "backup-a"}, "operator"),
+                 ("create_backup", {"host_id": self.host["id"], "request_id": "new-bound-backup",
+                    "database": "ORCL", "backup_parent": "/fixture/backup", **windows}, "requester")]
+        original_submit = server.Handler._submit_assistant_action
+        def change_config_then_submit(handler, path, body):
+            self.assertEqual(body.get("expected_configuration_sha256"),
+                             assistant.live_inventory.configuration_digest(self.host))
+            changed = {**self.host, "ssh_alias": "changed-after-confirmation.invalid"}
+            self.hosts_file.write_text(json.dumps({"hosts": [changed]}))
+            self.original_hosts = self.hosts_file.read_bytes()
+            return original_submit(handler, path, body)
+        for tool, arguments, actor in cases:
+            with self.subTest(tool=tool):
+                self.hosts_file.write_text(json.dumps({"hosts": [self.host]}))
+                self.original_hosts = self.hosts_file.read_bytes()
+                conversation_id, action = self.prepare(tool, arguments, actor=actor)
+                with patch.object(server.Handler, "_submit_assistant_action", change_config_then_submit):
+                    response = self.execute(conversation_id, action, actor=actor)
+                self.assertEqual(response["status"], 409, response)
+                saved = assistant.get(actor, conversation_id)["actions"][0]
+                self.assertEqual(saved["state"], "failed")
+                self.assertFalse(pipeline_runner.RUNS)
+                self.assert_no_native_calls()
+
+    def test_native_dispatch_reauthenticates_revoked_token_after_binding_check(self):
+        original_binding = assistant.capabilities.binding
+        for change in ({"disabled": True}, {"expires_at": "2000-01-01T00:00:00Z"},
+                       {"token_sha256": hashlib.sha256(b"replacement-fixture-token").hexdigest()}):
+            with self.subTest(change=list(change)):
+                self.write_principals()
+                conversation_id, action = self.prepare("refresh_discovery", {"host_id": self.host["id"]}, actor="operator")
+                def binding_then_revoke(*args, **kwargs):
+                    binding = original_binding(*args, **kwargs)
+                    principals = json.loads(self.principals.read_text())
+                    entry = next(item for item in principals["principals"] if item["actor"] == "operator")
+                    entry.update(change)
+                    self.principals.write_text(json.dumps(principals))
+                    return binding
+                with patch.object(assistant.capabilities, "binding", side_effect=binding_then_revoke):
+                    response = self.execute(conversation_id, action, actor="operator")
+                self.assertEqual(response["status"], 401, response)
+                self.assertEqual(assistant.get("operator", conversation_id)["actions"][0]["state"], "failed")
+                self.assertFalse(pipeline_runner.RUNS)
+                self.assert_no_native_calls()
+
+    def test_native_dispatch_reauthenticates_expired_or_changed_company_session(self):
+        self.company_configured.return_value = True
+        headers = {"Cookie": server.company_auth.SESSION_COOKIE + "=fixture-session",
+                   "X-CSRF-Token": "fixture-csrf", "Origin": "https://controller.fixture.invalid"}
+        session = {"actor": "employee", "roles": ["operator"]}
+        for final, status in ((auth.AuthError("Fixture session expired", status=401), 401),
+                              ({"actor": "different-employee", "roles": ["operator"]}, 403),
+                              ({"actor": "employee", "roles": ["viewer"]}, 403)):
+            with self.subTest(status=status, value_type=type(final).__name__):
+                with patch.object(server.company_auth, "authenticate", side_effect=[session, session, final]) as authenticate:
+                    conversation = self.create(actor=None, headers=headers)
+                    assistant._proposal("employee", conversation["id"], "refresh_discovery",
+                                        {"host_id": self.host["id"]}, server.load_hosts())
+                    action = assistant.get("employee", conversation["id"])["actions"][0]
+                    response = self.execute(conversation["id"], action, actor=None, headers=headers)
+                self.assertEqual(response["status"], status, response)
+                self.assertEqual(authenticate.call_count, 3)
+                self.assertEqual(assistant.get("employee", conversation["id"])["actions"][0]["state"], "failed")
+                self.assertFalse(pipeline_runner.RUNS)
+                self.assert_no_native_calls()
+
     def test_company_session_identity_and_csrf_gate_are_preserved_for_nested_native_dispatch(self):
         self.company_configured.return_value = True
         headers = {"Cookie": server.company_auth.SESSION_COOKIE + "=fixture-session", "X-CSRF-Token": "fixture-csrf", "Origin": "https://controller.fixture.invalid"}
@@ -316,8 +389,9 @@ class AssistantApiTests(unittest.TestCase):
             response = self.execute(conversation["id"], action, actor=None, headers=headers)
             self.assertEqual(response["status"], 202, response)
             self.wait_run(response["body"]["run_id"])
-            self.steps["discovery"].assert_called_once_with("source", self.host, {"actor": "employee", "requester": "employee"})
-            self.assertEqual(authenticate.call_count, 2, "Authenticate each outer request; nested dispatcher retains that session")
+            self.steps["discovery"].assert_called_once_with("source", self.host, {"actor": "employee", "requester": "employee",
+                "expected_configuration_sha256": assistant.live_inventory.configuration_digest(self.host)})
+            self.assertEqual(authenticate.call_count, 3, "Native dispatch must authenticate the company session again")
             authenticate.assert_called_with(headers["Cookie"], method="POST", csrf="fixture-csrf", origin=headers["Origin"])
         with patch.object(server.company_auth, "authenticate", side_effect=auth.AuthError("CSRF verification failed", status=403)):
             self.assertEqual(self.request(method="POST", actor=None, headers={"Cookie": headers["Cookie"]})["status"], 403)

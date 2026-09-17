@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -332,6 +333,31 @@ class RecordTests(unittest.TestCase):
             with self.assertRaises(M.Blocked):
                 M.read_controller_authority(authority, plan_dir)
 
+    def test_authority_replaced_with_fifo_after_validation_never_blocks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            authority = Path(temp) / 'authorization.json'
+            authority.write_text('{}')
+            # Bound the actual file-open regression in a child: a blocking
+            # implementation must fail the test instead of hanging the suite.
+            script = '''
+import importlib.util, os, pathlib, sys
+spec = importlib.util.spec_from_file_location('lock_recovery', sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+def replace_with_fifo(path):
+    original = path.lstat()
+    path.unlink(); os.mkfifo(path)
+    return original
+try:
+    m._read_checked_file(pathlib.Path(sys.argv[2]), replace_with_fifo)
+except m.Blocked as exc:
+    assert 'changed while opening' in str(exc)
+    sys.exit(0)
+sys.exit(1)
+'''
+            result = subprocess.run([sys.executable, '-c', script, str(ROOT / 'lib/opu/lock_recovery.py'),
+                                     str(authority)], capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_installer_oratab_ownership_and_primary_group_are_supported(self):
         account = argparse.Namespace(pw_uid=54321, pw_gid=54321)
         info = argparse.Namespace(st_uid=54321, st_gid=54321, st_mode=stat.S_IFREG | 0o664,
@@ -508,6 +534,10 @@ class RecoveryTests(unittest.TestCase):
         self.runner = MagicMock()
         self.runner.health.return_value = {'dbid': '12345', 'listener_ready': True}
         self.runner.sessions.return_value = session_evidence()
+        self.clock = dt.datetime.now(dt.timezone.utc)
+        self.plan = {'plan_sha256': 'b' * 64, 'maintenance_window': {
+            'start': (self.clock - dt.timedelta(minutes=5)).isoformat(),
+            'end': (self.clock + dt.timedelta(minutes=5)).isoformat()}}
         self.patchers = [
             patch.object(M, 'AUDIT_ROOT', self.audit),
             patch.object(M, 'HOST_LOCK', self.host_lock),
@@ -515,7 +545,7 @@ class RecoveryTests(unittest.TestCase):
             patch.object(M, 'open_lock', side_effect=lambda p: (os.open(p, os.O_RDWR), M.identity(p.stat()))),
             patch.object(M, 'safe_file', side_effect=lambda p: p.stat()),
             patch.object(M, 'inspect', return_value=self.checked),
-            patch.object(M, 'target_context', return_value=({'plan_sha256': 'b' * 64}, {'task_definition_sha256': 'c' * 64}, TARGET)),
+            patch.object(M, 'target_context', return_value=(self.plan, {'task_definition_sha256': 'c' * 64}, TARGET)),
             patch.object(M, 'validate_wrapper', return_value=self.checked['wrapper']),
             patch.object(M, 'lock_held', side_effect=[True, False]),
             patch.object(M, 'holders', side_effect=[[HOLDER], [HOLDER], [], []]),
@@ -606,6 +636,32 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn('session identities changed', result['blockers'][0])
         self.runner.oracle.assert_not_called()
         self.runner.sql.assert_not_called()
+
+    def test_window_expiring_during_session_check_never_stops_services(self):
+        class Clock(dt.datetime):
+            value = self.clock
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.value if tz is not None else cls.value.replace(tzinfo=None)
+
+        def context(*_args):
+            M.require_open_window(self.plan)
+            return self.plan, {'task_definition_sha256': 'c' * 64}, TARGET
+
+        def sessions(*_args):
+            Clock.value += dt.timedelta(minutes=10)
+            return session_evidence()
+
+        M.target_context.side_effect = context
+        self.runner.sessions.side_effect = sessions
+        with patch.object(M.dt, 'datetime', Clock):
+            result = M.recover(self.args, self.runner)
+        self.assertEqual(result['status'], 'recovery_required')
+        self.assertIn('maintenance window is not open', result['blockers'])
+        self.runner.oracle.assert_not_called()
+        self.runner.sql.assert_not_called()
+        self.assertFalse((self.audit / 'p' / self.args.run_id / 'outage-started.json').exists())
 
 
 if __name__ == '__main__':

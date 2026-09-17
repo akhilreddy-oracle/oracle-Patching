@@ -218,7 +218,11 @@ def _named_hosts(content, hosts, *, at_start=False):
                 variants.append(expanded)
         positions = []
         for variant in variants:
-            pattern = (r"^" if at_start else r"(?<![A-Za-z0-9])") + r"[^A-Za-z0-9]*".join(re.escape(c) for c in variant) + r"(?![A-Za-z0-9])"
+            # Configured identifiers may themselves contain punctuation. A
+            # known ID must not select an unconfigured prefix/suffix target
+            # such as finance-east, finance.prod or retired-finance. A final
+            # sentence period remains a valid boundary.
+            pattern = (r"^" if at_start else r"(?<![A-Za-z0-9._:-])") + r"[^A-Za-z0-9]*".join(re.escape(c) for c in variant) + r"(?![A-Za-z0-9]|[._:-]+[A-Za-z0-9])"
             match = re.search(pattern, content, re.I | re.ASCII)
             if match:
                 positions.append(match.start())

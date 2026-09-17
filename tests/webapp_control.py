@@ -51,6 +51,7 @@ class ControlPlaneTests(unittest.TestCase):
 
     def request(self, path, *, actor="operator", body=None, raw=None, length=None, method="POST", extra_headers=None):
         handler = server.Handler.__new__(server.Handler)
+        handler.command = method
         handler.path = path
         handler.headers = Message()
         handler.headers["Authorization"] = "Bearer " + actor + "-token"
@@ -79,6 +80,240 @@ class ControlPlaneTests(unittest.TestCase):
         status, payload = self.request("/api/session", actor="approver", method="GET")
         self.assertEqual((status, payload["actor"], payload["roles"]), (200, "approver", ["approver"]))
 
+    def test_legacy_live_get_routes_require_operator_and_keep_saved_reads_available(self):
+        with patch.object(server, "run_discovery", return_value={"fresh": True}) as discovery, \
+             patch.object(server, "build_estate", return_value=[]) as estate:
+            for route in ("/api/hosts/h/discovery", "/api/estate?live=1", "/api/estate?live=%31"):
+                for role in ("viewer", "requester", "approver"):
+                    self.assertEqual(self.request(route, actor=role, method="GET")[0], 403)
+            discovery.assert_not_called()
+            estate.assert_not_called()
+            self.assertEqual(self.request("/api/estate?live=0", actor="viewer", method="GET")[0], 200)
+            estate.assert_called_once_with(live=False)
+            self.assertEqual(self.request("/api/hosts/h/discovery", method="GET"), (200, {"fresh": True}))
+            self.assertEqual(self.request("/api/estate?live=1", method="GET")[0], 200)
+            estate.assert_called_with(live=True)
+
+    def test_company_live_get_requires_csrf_before_discovery(self):
+        observed = []
+        def authenticate(cookie, *, method, csrf, origin):
+            observed.append(method)
+            if method != "GET" and csrf != "valid-proof":
+                raise auth.AuthError("CSRF required", status=403)
+            return {"actor": "operator", "roles": ["operator"]}
+        with patch.object(server.company_auth, "configured", return_value=True), \
+             patch.object(server.company_auth, "authenticate", side_effect=authenticate), \
+             patch.object(server, "run_discovery", return_value={}) as discovery, \
+             patch.object(server, "build_estate", return_value=[]) as estate:
+            headers = {"Cookie": "opu_company_session=fixture"}
+            for route in ("/api/hosts/h/discovery", "/api/estate?live=1"):
+                self.assertEqual(self.request(route, method="GET", extra_headers=headers)[0], 403)
+            discovery.assert_not_called()
+            estate.assert_not_called()
+            headers["X-CSRF-Token"] = "valid-proof"
+            self.assertEqual(self.request("/api/hosts/h/discovery", method="GET", extra_headers=headers)[0], 200)
+            self.assertEqual(observed, ["POST", "POST", "POST"])
+
+    def test_synchronous_discovery_shares_async_pipeline_reservation(self):
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        def discover(*args):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return {"fresh": True}
+        with patch.object(server.pipeline_steps, "step_discovery", side_effect=discover):
+            worker = threading.Thread(target=lambda: results.append(server.run_discovery({"id": "h"})))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                with self.assertRaises(pipeline_runner.RunConflict):
+                    pipeline_runner.start_run("pipeline", "host:h:pipeline", lambda record: None)
+            finally:
+                release.set()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(results, [{"fresh": True}])
+
+    def test_principal_registry_rejects_writable_linked_and_non_utf8_files(self):
+        self.principals.chmod(0o666)
+        with self.assertRaises(auth.AuthError):
+            auth.require_api_auth("Bearer operator-token")
+        self.principals.chmod(0o600)
+        alias = self.root / "linked-principals"
+        os.link(self.principals, alias)
+        with self.assertRaises(auth.AuthError):
+            auth.require_api_auth("Bearer operator-token")
+        alias.unlink()
+        self.principals.write_bytes(b"\xff")
+        with self.assertRaises(auth.AuthError):
+            auth.require_api_auth("Bearer operator-token")
+
+    def test_lab_token_is_private_rotatable_and_never_follows_a_link(self):
+        path = self.root / "api-token"
+        with patch.object(auth, "TOKEN_FILE", path), patch.dict(os.environ, {"OPU_WEBAPP_TOKEN": ""}):
+            first = auth.ensure_token()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            path.write_text("rotated-token\n")
+            self.assertEqual(auth.ensure_token(), "rotated-token")
+            self.assertNotEqual(first, "rotated-token")
+            path.chmod(0o644)
+            with self.assertRaises(auth.AuthError):
+                auth.ensure_token()
+            path.unlink()
+            victim = self.root / "preserved"
+            victim.write_text("do not overwrite")
+            path.symlink_to(victim)
+            with self.assertRaises(auth.AuthError):
+                auth.ensure_token()
+            self.assertEqual(victim.read_text(), "do not overwrite")
+
+    def test_production_flags_cannot_silently_disable_guards(self):
+        certificate = self.root / "missing.cert"
+        with patch.dict(os.environ, {"OPU_PRODUCTION_CERT_FILE": str(certificate)}):
+            for value in ("1", "TRUE", "Yes", " on ", "tru"):
+                with self.subTest(value=value), patch.dict(os.environ, {"OPU_PRODUCTION_MODE": value}):
+                    with self.assertRaises(server.production.ProductionError):
+                        server.production.require_live_mutation_allowed()
+            certificate.write_text("OPU_PRODUCTION_CERTIFIED=1\n")
+            for value in ("TRUE", " yes ", "invalid"):
+                with self.subTest(checklist=value), patch.dict(os.environ, {"OPU_PRODUCTION_MODE": "1", "OPU_PRODUCTION_REQUIRE_CHECKLIST": value}):
+                    with self.assertRaises(server.production.ProductionError):
+                        server.production.require_live_mutation_allowed()
+
+    def test_lab_token_storage_errors_are_controlled(self):
+        with patch.dict(os.environ, {"OPU_WEBAPP_TOKEN": ""}):
+            for error in (OSError("denied"), ValueError("unsafe lock"), TimeoutError("busy")):
+                with self.subTest(error=type(error).__name__), patch.object(auth, "file_lock", side_effect=error):
+                    with self.assertRaises(auth.AuthError) as raised:
+                        auth.ensure_token()
+                    self.assertEqual(raised.exception.status, 503)
+
+    def test_artifact_staging_rejects_ambiguous_types_before_remote_work(self):
+        stages = server.pipeline_steps
+        valid = {"artifact_dir": "/patch", "owner": "oracle", "source": {"zip_path": "/patch.zip"}}
+        with patch.object(stages.tools_sync, "ensure_host_tools") as sync, \
+             patch.object(stages.remote, "run_remote_raw") as run:
+            for update in ({"replace": "false"}, {"replace": 1}, {"owner": []}, {"artifact_dir": {}},
+                           {"source": []}, {"source": {"zip_path": "/patch.zip", "unexpected": True}},
+                           {"source": {"host_id": 7}}):
+                with self.subTest(update=update), self.assertRaises(server.remote.RemoteError):
+                    stages.step_stage_artifact("h", {}, {**valid, **update})
+            sync.assert_not_called()
+            run.assert_not_called()
+
+    def test_failed_media_replacement_invalidates_prior_approval_evidence(self):
+        stages = server.pipeline_steps
+        for name in stages._ARTIFACT_BOUND_EVIDENCE:
+            evidence.write_evidence("h", name, {"status": "passed"})
+        with patch.object(stages.tools_sync, "ensure_host_tools", side_effect=server.remote.RemoteError("install", "fixture failure")):
+            with self.assertRaises(server.remote.RemoteError):
+                stages.step_stage_artifact("h", {}, {"artifact_dir": "/patch", "owner": "oracle",
+                    "source": {"zip_path": "/patch.zip"}, "replace": True})
+        for name in stages._ARTIFACT_BOUND_EVIDENCE:
+            self.assertIsNone(evidence.read_evidence("h", name))
+
+    def test_collector_exit_status_cannot_be_masked_by_json_output(self):
+        for code in (-9, 1, 65, 126, 127, 255):
+            with self.subTest(code=code):
+                result = subprocess.CompletedProcess([], code, '{"status":"passed"}', "failure")
+                with patch.object(server.remote.subprocess, "run", return_value=result):
+                    with self.assertRaises(server.remote.RemoteError):
+                        server.remote.run_remote_json("fixture", ["/fixture/collector"])
+                with patch.object(server.pipeline_steps.localtools.subprocess, "run", return_value=result):
+                    with self.assertRaises(server.pipeline_steps.localtools.LocalToolError):
+                        server.pipeline_steps.localtools.run_tool("opu-readiness-evaluate", [])
+        for payload in ({"status": "blocked"}, {"artifact": {"status": "blocked"}}):
+            result = subprocess.CompletedProcess([], 2, json.dumps(payload), "findings")
+            with patch.object(server.remote.subprocess, "run", return_value=result):
+                self.assertEqual(server.remote.run_remote_json("fixture", ["/fixture/collector"]), payload)
+        for code, payload in ((2, {"status": "passed"}), (0, []), (0, None)):
+            result = subprocess.CompletedProcess([], code, json.dumps(payload), "")
+            with patch.object(server.remote.subprocess, "run", return_value=result):
+                with self.assertRaises(server.remote.RemoteError):
+                    server.remote.run_remote_json("fixture", ["/fixture/collector"])
+        with patch.object(server.remote.subprocess, "run") as run:
+            for alias in ("-oProxyCommand=anything", "has space", "bad\nname", ""):
+                with self.assertRaises(server.remote.RemoteError):
+                    server.remote.run_remote_raw(alias, ["true"])
+            run.assert_not_called()
+
+    def test_evidence_identifiers_cannot_escape_or_include_trailing_newline(self):
+        for name in ("../outside", "a/b", "valid\n", None, []):
+            with self.subTest(name=name):
+                with self.assertRaises(evidence.EvidenceError):
+                    evidence.evidence_path("h", name)
+                with self.assertRaises(evidence.EvidenceError):
+                    evidence.validate_host_id(name)
+                with self.assertRaises(planctl.PlanError):
+                    planctl.validate_plan_id(name)
+
+    def test_inventory_cannot_silently_choose_duplicate_or_malformed_hosts(self):
+        inventory = self.root / "hosts.json"
+        host = {"id": "h", "ssh_alias": "fixture", "remote_root": "/fixture", "sudo": False}
+        with patch.object(server, "HOSTS_FILE", inventory), patch.object(planctl, "HOSTS_FILE", inventory), \
+             patch.object(server.remote, "run_remote_raw") as ssh:
+            for hosts in ([host, {**host, "ssh_alias": "wrong"}], [host, {**host, "id": "H"}],
+                          [{**host, "sudo": "false"}], [{**host, "ssh_alias": "-oProxyCommand=anything"}],
+                          *[[{**host, "remote_root": root}] for root in ("/", "//", "/./", "/opt/./opu")],
+                          [{**host, "nodes": [{"name": "n"}, {"name": "N"}]}]):
+                inventory.write_text(json.dumps({"hosts": hosts}))
+                self.assertEqual(self.request("/api/estate", method="GET")[0], 503)
+                with self.assertRaises(planctl.PlanError):
+                    planctl._load_hosts()
+            inventory.write_text(json.dumps({"hosts": [host]}))
+            self.assertEqual(server.load_hosts(), {"h": host})
+            ssh.assert_not_called()
+
+    def test_failed_pipeline_attempt_invalidates_older_success(self):
+        stages = server.pipeline_steps
+        documents = ("snapshot", "reconciliation", "artifact", "procedure", "compatibility", "compatibility_reconciliation", "readiness")
+        cases = (
+            (stages.step_reconcile, {}, ("reconciliation", "compatibility_reconciliation", "readiness")),
+            (stages.step_artifact_inspect, {"artifact_dir": "/new-artifact"}, ("artifact", "procedure", "compatibility", "compatibility_reconciliation", "readiness")),
+            (stages.step_compatibility_collect, {"artifact_dir": "/new-artifact"}, ("compatibility", "compatibility_reconciliation", "readiness")),
+            (stages.step_compatibility_reconcile, {}, ("compatibility_reconciliation", "readiness")),
+            (stages.step_readiness_evaluate, {"policy": {}}, ("readiness",)),
+        )
+        for function, body, invalidated in cases:
+            with self.subTest(stage=function.__name__):
+                for name in documents:
+                    evidence.write_evidence("h", name, {"status": "passed", "old": True})
+                with patch.object(stages.tools_sync, "ensure_host_tools", side_effect=RuntimeError("fixture failure")), \
+                     patch.object(stages.localtools, "run_tool", side_effect=RuntimeError("fixture failure")):
+                    with self.assertRaises(RuntimeError):
+                        function("h", {}, body)
+                for name in invalidated:
+                    self.assertIsNone(evidence.read_evidence("h", name), name)
+
+    def test_partial_multinode_refresh_cannot_publish_mixed_or_previous_inventory(self):
+        stages = server.pipeline_steps
+        host = {"id": "h", "ssh_alias": "n1", "remote_root": "/fixture", "nodes": [
+            {"name": "n1", "ssh_alias": "n1"}, {"name": "n2", "ssh_alias": "n2"}]}
+        for name in ("snapshot", "snapshot_nodes", "snapshot_n1", "readiness"):
+            evidence.write_evidence("h", name, {"old": True})
+        with patch.object(stages.tools_sync, "ensure_host_tools"), \
+             patch.object(stages.remote, "run_remote_json", side_effect=[{"host": {"name": "n1"}}, server.remote.RemoteError("ssh_timeout", "n2 failed")]):
+            with self.assertRaises(server.remote.RemoteError):
+                stages.step_discovery("h", host, {})
+        self.assertEqual(evidence.read_evidence("h", "snapshot_n1"), {"old": True})
+        self.assertEqual(evidence.list_snapshot_paths("h"), [])
+        self.assertIsNone(evidence.read_evidence("h", "readiness"))
+        host["nodes"][1]["name"] = "n1.other-domain"
+        with self.assertRaises(server.remote.RemoteError):
+            stages._configured_nodes(host)
+
+    def test_execution_limits_and_notifications_do_not_claim_completion(self):
+        with patch.object(planctl, "status", return_value={"state": "running"}), \
+             patch.object(planctl, "execute_next_task", return_value={"status": "succeeded"}) as execute:
+            result = planctl.execute_remaining_tasks("p", "operator", max_tasks=1)
+            self.assertEqual(result["stopped_reason"], "max_tasks_reached")
+            execute.assert_called_once()
+        cases = ((result, "progress"), ({"plan_state": "paused", "task_results": [{"status": "failed"}]}, "failed"),
+                 ({"plan_state": "succeeded", "task_results": [{"status": "succeeded"}]}, "succeeded"))
+        with patch.object(server.notifications, "emit") as emit:
+            for payload, event in cases:
+                server._notify_execution("p", "operator", payload, remaining=True)
+                self.assertEqual(emit.call_args.args[0], "plan.execute." + event)
     def test_procedure_hints_route_reads_selected_readme_without_starting_work(self):
         hint = {"required_opatch_version": "12.2.0.1.49", "readme_identifier": "README notes.html"}
         with patch.object(server.procedure_hints, "get_hints", return_value=hint) as read, \
@@ -466,7 +701,8 @@ sys.stdin.readline()
             entry = tarfile.TarInfo("../../escaped")
             entry.size = 6
             archive.addfile(entry, io.BytesIO(b"unsafe"))
-        with patch.object(planctl.remote, "run_remote_checked"), patch.object(planctl.remote, "pull_file", return_value=buffer.getvalue()):
+        with patch.object(planctl, "_temporary_remote_archive", return_value="/tmp/opu-plan-transfer.ABCDEFGHIJKL"), \
+             patch.object(planctl.remote, "run_remote_checked"), patch.object(planctl.remote, "pull_file", return_value=buffer.getvalue()):
             with self.assertRaises(planctl.PlanError):
                 planctl._sync_plan_from_host({"ssh_alias": "fixture"}, "p", "/fixture")
         self.assertFalse((self.root / "escaped").exists())

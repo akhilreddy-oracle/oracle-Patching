@@ -27,7 +27,16 @@ class ProductionError(Exception):
 
 
 def production_mode_enabled() -> bool:
-    return (os.environ.get(MODE_ENV) or "").strip() in {"1", "true", "yes", "on"}
+    return _enabled(MODE_ENV)
+
+
+def _enabled(name: str) -> bool:
+    value = (os.environ.get(name) or "").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ProductionError(f"{name} must be a boolean value; refusing ambiguous production configuration")
 
 
 def cert_file() -> Path:
@@ -51,9 +60,7 @@ def _cert_text() -> str | None:
 
 
 def checklist_required() -> bool:
-    return (os.environ.get("OPU_PRODUCTION_REQUIRE_CHECKLIST") or "").strip() in {
-        "1", "true", "yes", "on",
-    }
+    return _enabled("OPU_PRODUCTION_REQUIRE_CHECKLIST")
 
 
 def _has_exact_marker(text: str, key: str) -> bool:

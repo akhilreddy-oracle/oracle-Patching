@@ -39,15 +39,16 @@ def run_tool(name: str, args: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         raise LocalToolError(name, f"{name} timed out after {timeout}s") from None
 
-    # Several opu-* tools exit nonzero (commonly 2) to signal a valid, fully
-    # formed "blocked"/has-findings JSON result, not a crash (see
-    # docs/HIGH_ASSURANCE_ACCEPTANCE.md: "blocked" is a correct safety
-    # outcome). Only treat this as a real failure when there's no stdout to
-    # parse.
-    if not result.stdout.strip():
-        raise LocalToolError(name, f"{name} exited {result.returncode} with no output", stderr=result.stderr.strip())
+    # Only exit 2 with a blocked result is a completed negative evaluation.
+    if result.returncode not in {0, 2} or not result.stdout.strip():
+        raise LocalToolError(name, f"{name} exited {result.returncode} without a verified result", stderr=result.stderr.strip())
 
     try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, dict):
+            raise ValueError("tool response must be a JSON object")
+        if result.returncode == 2 and payload.get("status") != "blocked":
+            raise ValueError("exit 2 requires a blocked result")
+        return payload
+    except ValueError as exc:
         raise LocalToolError(name, f"{name} produced unparsable output: {exc}", stderr=result.stdout[-2000:]) from exc

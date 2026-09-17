@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# Reuse the same non-truncating inode checks as Oracle execution locks.
+# shellcheck source=lib/opu/execution.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/execution.sh"
+
 OPU_LOCK_MODE=""
 OPU_LOCK_DIR=""
 
@@ -29,11 +33,15 @@ opu_acquire_lock() {
     lock_file="$OPU_STATE_DIR/locks/${key}.lock"
 
     if command -v flock >/dev/null 2>&1; then
-        exec 9>"$lock_file" || return 73
+        opu_execution_open_lock_file "$lock_file" 9 || return $?
         if ! flock -w "$OPU_LOCK_WAIT_SECONDS" 9; then
             opu_error "timed out waiting for idempotency lock: $key"
             exec 9>&-
             return 75
+        fi
+        if ! opu_execution_validate_lock "$lock_file" 9; then
+            exec 9>&-
+            return 65
         fi
         OPU_LOCK_MODE="flock"
         return 0

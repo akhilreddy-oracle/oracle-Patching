@@ -8,6 +8,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/dataguard.sh"
 
 TEST_MODE=${OPU_DATAGUARD_TEST_MODE:-0}
 GATE=""; OBSERVE=""; TARGET=""; ACTOR=""; OUT=""
@@ -39,12 +40,18 @@ parse() {
   done
   opu_validate_identifier "$TARGET" target-standby || exit $?
   opu_validate_identifier "$ACTOR" actor || exit $?
-  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  opu_dataguard_validate_output "$OUT" || exit $?
   command -v jq >/dev/null || die 'jq is required'
 }
 
 verify_gate() {
   local sealed recomputed
+  if [ "$TEST_MODE" != 1 ]; then
+    jq -e '.validation_mode == "operator_override"' "$GATE" >/dev/null || die 'live execution requires an explicit operator-override gate; simulated or legacy gates cannot authorize DGMGRL'
+  fi
+  opu_dataguard_verify_document "$OBSERVE" || exit $?
+  opu_dataguard_require_recent "$OBSERVE" collected_at || exit $?
+  opu_dataguard_require_recent "$GATE" evaluated_at || exit $?
   jq -e '.status == "ready_for_switchover"' "$GATE" >/dev/null || die 'gate is not ready_for_switchover'
   sealed=$(jq -r '.record_sha256 // ""' "$GATE")
   [ -n "$sealed" ] || die 'gate is not sealed with record_sha256'
@@ -57,25 +64,7 @@ verify_gate() {
 }
 
 run_live() {
-  local dgmgrl_bin rc
-  if command -v dgmgrl >/dev/null 2>&1; then
-    dgmgrl_bin=dgmgrl
-  elif [ -n "${ORACLE_HOME:-}" ] && [ -x "$ORACLE_HOME/bin/dgmgrl" ]; then
-    dgmgrl_bin="$ORACLE_HOME/bin/dgmgrl"
-  else
-    opu_error 'live switchover requires dgmgrl on PATH or at $ORACLE_HOME/bin/dgmgrl'
-    exit 69
-  fi
-  if [ -n "$OUT" ]; then
-    EXEC_LOG="${OUT}.dgmgrl.log"
-  else
-    EXEC_LOG=$(mktemp "${TMPDIR:-/tmp}/opu-dg-swx-log.XXXXXX")
-  fi
-  rc=0
-  "$dgmgrl_bin" -silent / "SWITCHOVER TO '$TARGET'" >"$EXEC_LOG" 2>&1 || rc=$?
-  EXEC_STATUS=succeeded
-  [ "$rc" -eq 0 ] || EXEC_STATUS=failed
-  if grep -Eiq 'ORA-|error' "$EXEC_LOG"; then EXEC_STATUS=failed; fi
+  opu_dataguard_broker_execute "SWITCHOVER TO" "$TARGET"
 }
 
 emit() {
@@ -108,16 +97,10 @@ main() {
     run_live
     status=$EXEC_STATUS
   fi
-  if [ -n "$OUT" ]; then
-    mkdir -p "$(dirname "$OUT")"
-    [ ! -L "$OUT" ] || die 'output cannot be a symbolic link'
-    tmp=$OUT
-  else
-    tmp=$(mktemp "${TMPDIR:-/tmp}/opu-dg-swx.XXXXXX")
-    trap 'rm -f "${tmp:-}"' EXIT
-  fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/opu-dg-result.XXXXXX")
+  trap 'rm -f "${tmp:-}" "${tmp:-}.hashed"' EXIT
   emit "$tmp" "$status" "$simulated" "$EXEC_LOG"
-  cat "$tmp"
+  opu_dataguard_publish "$tmp" "$OUT"
   [ "$status" = succeeded ] || exit 2
   exit 0
 }

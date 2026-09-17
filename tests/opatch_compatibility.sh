@@ -17,6 +17,26 @@ sha=$(jq -r '.artifact.sha256' "$TMP/artifact.json")
 jq -n --arg sha "$sha" '{schema_version:"1.0",status:"ready_for_planning",procedure:{patch_id:"12345678",artifact_sha256:$sha,required_opatch_version:"12.2.0.1",target:{family:"grid",method:"opatch",platform_id:"226"},execution:{adapter:"grid_rolling_opatch",operations:["grid_rootcrs_prepatch","grid_opatch_apply","grid_rootadd_rdbms","grid_rootcrs_postpatch"]}}}' >"$TMP/procedure.json"
 "$ROOT/bin/opu-opatch-compatibility-collect" --snapshot "$TMP/snapshot.json" --artifact "$artifact_path" --artifact-manifest "$TMP/artifact.json" --procedure-validation "$TMP/procedure.json" --evidence-dir "$TMP/evidence" --output "$TMP/result.json" >/dev/null
 jq -e '.status == "passed" and .target.platform_id == "226" and .checks[0].platform.status == "passed" and .checks[0].applicability_check.name == "CheckPatchApplicableOnCurrentPlatform" and .checks[0].applicability_check.status == "passed" and .checks[0].applicability_check.exit_code == 0 and (.checks[0].applicability_check.evidence_sha256 | test("^[a-f0-9]{64}$")) and .checks[0].conflict_check.name == "CheckConflictAgainstOHWithDetail" and .checks[0].conflict_check.status == "passed" and .checks[0].conflict_check.exit_code == 0 and (.checks[0].conflict_check.evidence_sha256 | test("^[a-f0-9]{64}$"))' "$TMP/result.json" >/dev/null
+# A preexisting evidence path must never redirect root collector logs.
+mkdir "$TMP/planted"
+printf 'unrelated original' >"$TMP/victim"
+ln -s "$TMP/victim" "$TMP/planted/node1-grid-opatch-platform-12345678.log"
+if "$ROOT/bin/opu-opatch-compatibility-collect" --snapshot "$TMP/snapshot.json" --artifact "$artifact_path" --artifact-manifest "$TMP/artifact.json" --procedure-validation "$TMP/procedure.json" --evidence-dir "$TMP/planted" >/dev/null 2>&1; then
+  echo 'preexisting compatibility log directory accepted' >&2; exit 1
+fi
+[ "$(cat "$TMP/victim")" = 'unrelated original' ]
+# The old predictable default is ignored; each collection preserves its own logs.
+mkdir "$TMP/opu-opatch-compatibility-12345678"
+ln -s "$TMP/victim" "$TMP/opu-opatch-compatibility-12345678/node1-grid-opatch-platform-12345678.log"
+for attempt in one two; do
+  TMPDIR="$TMP" "$ROOT/bin/opu-opatch-compatibility-collect" --snapshot "$TMP/snapshot.json" --artifact "$artifact_path" --artifact-manifest "$TMP/artifact.json" --procedure-validation "$TMP/procedure.json" >"$TMP/default-$attempt.json"
+done
+first_log=$(jq -r '.checks[0].applicability_check.evidence_path' "$TMP/default-one.json")
+second_log=$(jq -r '.checks[0].applicability_check.evidence_path' "$TMP/default-two.json")
+[ "$first_log" != "$second_log" ]
+[ -f "$first_log" ] && [ -f "$second_log" ]
+[ "$(sha256sum "$first_log" | awk '{print $1}')" = "$(jq -r '.checks[0].applicability_check.evidence_sha256' "$TMP/default-one.json")" ]
+[ "$(cat "$TMP/victim")" = 'unrelated original' ]
 mkdir -p "$TMP/database/OPatch"
 cp "$ROOT/tests/fixtures/opatch-compatibility/opatch" "$TMP/database/OPatch/opatch"
 chmod 700 "$TMP/database/OPatch/opatch"

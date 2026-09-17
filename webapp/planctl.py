@@ -98,7 +98,7 @@ def _unverified_remote_terminal(returncode: int, verified, stderr: str) -> PlanE
 
 
 def validate_plan_id(plan_id: str) -> str:
-    if not plan_id or not _ID_RE.match(plan_id):
+    if not isinstance(plan_id, str) or not _ID_RE.fullmatch(plan_id):
         raise PlanError(f"plan_id contains unsupported characters: {plan_id!r}")
     return plan_id
 
@@ -603,8 +603,11 @@ def _short_host(name: str) -> str:
 
 
 def _load_hosts() -> dict[str, dict]:
-    data = json.loads(HOSTS_FILE.read_text())
-    return {host["id"]: host for host in data["hosts"]}
+    import host_config
+    try:
+        return host_config.load(HOSTS_FILE)
+    except host_config.HostConfigError as exc:
+        raise PlanError(str(exc)) from exc
 
 
 def _iter_host_nodes() -> list[tuple[dict, dict]]:
@@ -619,34 +622,36 @@ def _iter_host_nodes() -> list[tuple[dict, dict]]:
 
 def _resolve_node_host(node_name: str) -> dict:
     """Map a sealed plan/task node name to a hosts.json entry with ssh_alias."""
-    want = _short_host(node_name)
+    want = str(node_name or "").lower()
     if not want:
         raise PlanError("task/plan node name is empty")
-    for host, node in _iter_host_nodes():
-        name = _short_host(node.get("name") or "")
-        # Explicit null means "not wired for SSH" (fail closed). Missing key
-        # inherits the host-level ssh_alias.
-        if "ssh_alias" in node:
-            alias = node.get("ssh_alias")
-        else:
-            alias = host.get("ssh_alias")
-        if name == want:
-            if not alias:
-                raise PlanError(
-                    f"hosts.json node {node.get('name')!r} has no ssh_alias; "
-                    "multi-node live execute requires SSH to every plan node"
-                )
-            resolved = dict(host)
-            resolved["ssh_alias"] = alias
-            resolved["node_name"] = name
-            return resolved
-    # Fall back to host id match (standalone estates).
-    for host in _load_hosts().values():
-        if _short_host(host.get("id") or "") == want and host.get("ssh_alias"):
-            resolved = dict(host)
-            resolved["node_name"] = want
-            return resolved
-    raise PlanError(f"No hosts.json SSH mapping for node {node_name!r}")
+    pairs = _iter_host_nodes()
+    host_pairs = [(host, {"name": host["id"], "ssh_alias": host.get("ssh_alias")})
+                  for host in {host["id"]: host for host, _ in pairs}.values()]
+    # Prefer the complete configured identity. A short DNS alias is usable
+    # only when unique; never let configuration ordering choose the target.
+    matches = [(host, node) for host, node in pairs if str(node.get("name") or "").lower() == want]
+    if not matches:
+        matches = [(host, node) for host, node in host_pairs if str(node["name"]).lower() == want]
+    if not matches:
+        matches = [(host, node) for host, node in pairs
+                   if _short_host(node.get("name")) == _short_host(want)
+                   and ("." not in want or "." not in str(node.get("name") or ""))]
+    if not matches:
+        matches = [(host, node) for host, node in host_pairs
+                   if _short_host(node["name"]) == _short_host(want)
+                   and ("." not in want or "." not in str(node["name"]))]
+    if len(matches) > 1:
+        raise PlanError(f"Ambiguous hosts.json SSH mapping for node {node_name!r}; use its complete configured identity")
+    if not matches:
+        raise PlanError(f"No hosts.json SSH mapping for node {node_name!r}")
+    host, node = matches[0]
+    # Explicit null means "not wired for SSH"; only a missing key inherits.
+    alias = node.get("ssh_alias") if "ssh_alias" in node else host.get("ssh_alias")
+    if not alias:
+        raise PlanError(f"hosts.json node {node.get('name')!r} has no ssh_alias; "
+                        "multi-node live execute requires SSH to every plan node")
+    return {**host, "ssh_alias": alias, "node_name": str(node["name"]).lower()}
 
 
 def preflight_live_plan_nodes(plan: dict) -> None:
@@ -667,7 +672,7 @@ def preflight_live_plan_nodes(plan: dict) -> None:
 def _task_execution_node(plan: dict, task: dict) -> str:
     """Pick the hostname the executor must run on for this sealed task."""
     node = task.get("node")
-    if node and _short_host(node) not in {"", "local", "cluster"}:
+    if node and str(node).lower() not in {"", "local", "cluster"}:
         return str(node)
     target = plan.get("target") or {}
     coordinator = target.get("coordinator_node")
@@ -736,6 +741,29 @@ def _sync_sealed_inputs_to_host(host: dict, plan_id: str) -> None:
             ) from exc
 
 
+def _temporary_remote_archive(host: dict) -> str:
+    """Reserve private transfer storage without opening predictable /tmp files."""
+    response = remote.run_remote_shell(host["ssh_alias"],
+        "umask 077; mktemp -d /tmp/opu-plan-transfer.XXXXXXXXXXXX",
+        timeout=60, sudo=bool(host.get("sudo")))
+    directory = response.stdout.strip()
+    if response.returncode != 0 or not re.fullmatch(r"/tmp/opu-plan-transfer\.[A-Za-z0-9]{12}", directory):
+        raise PlanError("could not allocate a private remote plan transfer directory", stderr=response.stderr)
+    return directory
+
+
+def _remove_remote_archive(host: dict, directory: str) -> None:
+    # Remove only the known file and its empty private directory. A failed
+    # cleanup must not hide a verified result or the original transfer error.
+    try:
+        remote.run_remote_checked(host["ssh_alias"], ["rm", "-f", "--", directory + "/plan.tar"],
+                                  timeout=30, sudo=bool(host.get("sudo")))
+        remote.run_remote_checked(host["ssh_alias"], ["rmdir", "--", directory],
+                                  timeout=30, sudo=bool(host.get("sudo")))
+    except remote.RemoteError:
+        pass
+
+
 def _sync_plan_to_host(host: dict, plan_id: str) -> str:
     local_plan = PLAN_STATE_DIR / "plans" / plan_id
     if not local_plan.is_dir():
@@ -749,41 +777,45 @@ def _sync_plan_to_host(host: dict, plan_id: str) -> str:
     remote.run_remote_checked(
         host["ssh_alias"], ["mkdir", "-p", f"{remote_root}/plans"], timeout=60, sudo=sudo,
     )
-    with tempfile.NamedTemporaryFile(suffix=".tar") as handle:
-        with tarfile.open(fileobj=handle, mode="w") as archive:
-            archive.add(local_plan, arcname=plan_id)
-        handle.flush()
-        handle.seek(0)
-        remote_tar = f"/tmp/opu-plan-{plan_id}.tar"
-        remote.push_file(host["ssh_alias"], remote_tar, Path(handle.name).read_bytes(), timeout=120)
-    remote.run_remote_checked(
-        host["ssh_alias"],
-        ["tar", "-xf", remote_tar, "-C", f"{remote_root}/plans"],
-        timeout=120,
-        sudo=sudo,
-    )
-    remote.run_remote_checked(host["ssh_alias"], ["rm", "-f", remote_tar], timeout=30, sudo=sudo)
+    directory = _temporary_remote_archive(host)
+    remote_tar = directory + "/plan.tar"
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".tar") as handle:
+            with tarfile.open(fileobj=handle, mode="w") as archive:
+                archive.add(local_plan, arcname=plan_id,
+                            filter=lambda member: None if Path(member.name).name == ".task-lock" else member)
+            handle.flush()
+            handle.seek(0)
+            remote.push_file(host["ssh_alias"], remote_tar, Path(handle.name).read_bytes(), timeout=120, sudo=sudo)
+        remote.run_remote_checked(
+            host["ssh_alias"], ["tar", "-xf", remote_tar, "-C", f"{remote_root}/plans"],
+            timeout=120, sudo=sudo,
+        )
+    finally:
+        _remove_remote_archive(host, directory)
     _sync_sealed_inputs_to_host(host, plan_id)
     return remote_root
 
 
 def _sync_plan_from_host(host: dict, plan_id: str, remote_root: str) -> None:
-    remote_tar = f"/tmp/opu-plan-{plan_id}-back.tar"
     sudo = bool(host.get("sudo"))
-    # Executor (sudo/root) writes task JSON with mode 0600 root:root; pull must use sudo.
-    remote.run_remote_checked(
-        host["ssh_alias"],
-        ["tar", "-cf", remote_tar, "-C", f"{remote_root}/plans", plan_id],
-        timeout=120,
-        sudo=sudo,
-    )
+    directory = _temporary_remote_archive(host)
+    remote_tar = directory + "/plan.tar"
     try:
+        # Executor writes task JSON with mode 0600 root:root; tar and pull
+        # use the same privilege as the private directory reservation.
+        remote.run_remote_checked(
+            host["ssh_alias"], ["tar", "--exclude", f"{plan_id}/.task-lock", "-cf", remote_tar, "-C", f"{remote_root}/plans", plan_id],
+            timeout=120, sudo=sudo,
+        )
         payload = remote.pull_file(host["ssh_alias"], remote_tar, timeout=120, sudo=sudo)
     except remote.RemoteError as exc:
         raise PlanError(
             f"failed to pull plan state from {host['ssh_alias']}",
             stderr=exc.stderr,
         ) from exc
+    finally:
+        _remove_remote_archive(host, directory)
     local_plans = PLAN_STATE_DIR / "plans"
     local_plans.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=".tar") as handle:
@@ -795,10 +827,9 @@ def _sync_plan_from_host(host: dict, plan_id: str, remote_root: str) -> None:
             for member in members:
                 parts = Path(member.name).parts
                 target = (local_plans / member.name).resolve()
-                if not parts or parts[0] != plan_id or ".." in parts or root not in target.parents or not (member.isfile() or member.isdir()):
+                if not parts or parts[0] != plan_id or ".." in parts or ".task-lock" in parts or root not in target.parents or not (member.isfile() or member.isdir()):
                     raise PlanError("remote plan archive contains an unsafe or unrelated member")
             archive.extractall(local_plans, members=members)
-    remote.run_remote_checked(host["ssh_alias"], ["rm", "-f", remote_tar], timeout=30, sudo=sudo)
 
 
 def _execute_testmode(plan_id: str, task: dict, actor: str, fixture_dir: Path) -> dict:
@@ -898,9 +929,10 @@ def _run_detached_remote(host: dict, plan_id: str, task_id: str, remote_argv: li
     q_cmd = " ".join(shlex.quote(a) for a in remote_argv)
     # The wrapper records its own PID (setsid may fork), and rc is written
     # last, so its presence means stdout/stderr are complete.
-    wrapper = f"echo $$ >pid; {q_cmd} >stdout 2>stderr </dev/null; echo $? >rc.tmp && mv rc.tmp rc"
+    wrapper = f"umask 077; echo $$ >pid.tmp && mv pid.tmp pid || exit 1; {q_cmd} >stdout 2>stderr </dev/null; echo $? >rc.tmp && mv rc.tmp rc"
+    q_parent = shlex.quote(str(Path(run_dir).parent))
     launch = (
-        f"mkdir -p {q_run} && cd {q_run} && "
+        f"set -eu; umask 077; mkdir -p {q_parent}; mkdir {q_run}; cd {q_run}; "
         f"if command -v setsid >/dev/null 2>&1; then SETSID=setsid; else SETSID=; fi; "
         f"nohup $SETSID bash -c {shlex.quote(wrapper)} >/dev/null 2>&1 </dev/null & "
         f"for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s {q_run}/pid ] && break; sleep 1; done; cat {q_run}/pid"
@@ -1102,7 +1134,11 @@ def execute_remaining_tasks(plan_id: str, actor: str, *, max_tasks: int = 200) -
         if str(task_status).lower() in {"failed", "blocked", "error"}:
             stopped_reason = f"task_{task_status}"
             break
+    else:
+        stopped_reason = "max_tasks_reached"
     final = status(plan_id)
+    if final.get("state") == "succeeded":
+        stopped_reason = "succeeded"
     return {
         "plan_id": plan_id,
         "executed_count": len(results),

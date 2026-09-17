@@ -62,8 +62,9 @@ acquire_executor_lock() {
     [ -x "$flock_command" ] || die 'OJVM test flock command is not executable'
   fi
   if [ "$flock_command" != flock ] || command -v flock >/dev/null 2>&1; then
-    exec 8>"$RUN_DIR/executor.lock"
+    opu_execution_open_lock_file "$RUN_DIR/executor.lock" 8 || die "unsafe executor lock"
     "$flock_command" -n 8 || die 'another OJVM executor owns this plan'
+    opu_execution_validate_lock "$RUN_DIR/executor.lock" 8 || die "unsafe executor lock"
     EXECUTOR_LOCK_USES_FLOCK=1
   elif [ "$TEST_MODE" = 1 ]; then
     EXECUTOR_LOCK_DIR="$RUN_DIR/executor.lock.d"
@@ -342,7 +343,11 @@ wait_for_pmon_state() {
 listener_action() {
   local action=$1
   [ -n "$LISTENER_NAME" ] || { printf '%s\n' 'No listener was bound to this plan.'; return 0; }
-  as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" "$action" "$LISTENER_NAME"
+  if [ "$action" = start ]; then
+    as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" "$action" "$LISTENER_NAME" 7>&-
+  else
+    as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" "$action" "$LISTENER_NAME"
+  fi
 }
 
 listener_ready() {
@@ -494,7 +499,7 @@ SQL
 }
 
 startup_upgrade_database() {
-  cat <<'SQL' | sqlplus_fixed "$ORACLE_SID"
+  cat <<'SQL' | sqlplus_fixed "$ORACLE_SID" 7>&-
 whenever sqlerror exit failure
 startup upgrade;
 exit;
@@ -503,7 +508,7 @@ SQL
 }
 
 startup_normal_database() {
-  cat <<'SQL' | sqlplus_fixed "$ORACLE_SID"
+  cat <<'SQL' | sqlplus_fixed "$ORACLE_SID" 7>&-
 whenever sqlerror exit failure
 startup;
 exit;
@@ -613,7 +618,7 @@ stage_ojvm_restart_normal() {
 }
 
 stage_ojvm_final_validate() {
-  local invalid maximum_invalid success non_success
+  local invalid maximum_invalid
   load_binding
   require_marker restart-complete 'OJVM final validation requires a succeeded sealed normal restart task'
   inventory_has_patch "$TASK_DIR/final-lspatches.log" || die "patch $PATCH_ID is absent from final binary inventory"
@@ -621,15 +626,7 @@ stage_ojvm_final_validate() {
   wait_for_listener_ready || die 'listener final validation failed'
   invalid=$(probe_value INVALID_OBJECTS "$TASK_DIR/final-health.log"); maximum_invalid=$(jq -r '.database.maximum_invalid_objects' "$(jq -r '.source_documents.policy.path' "$PLAN_FILE")")
   [[ "$invalid" =~ ^[0-9]+$ ]] && [ "$invalid" -le "$maximum_invalid" ] || die 'invalid-object count exceeds the sealed policy'
-  cat <<SQL | sqlplus_fixed "$ORACLE_SID" >"$TASK_DIR/sqlpatch-final.log"
-whenever sqlerror exit failure
-set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
-select 'SQLPATCH_SUCCESS=' || count(*) from dba_registry_sqlpatch where patch_id=$PATCH_ID and action='APPLY' and status='SUCCESS';
-select 'SQLPATCH_NON_SUCCESS=' || count(*) from dba_registry_sqlpatch where patch_id=$PATCH_ID and status<>'SUCCESS';
-exit;
-SQL
-  success=$(probe_value SQLPATCH_SUCCESS "$TASK_DIR/sqlpatch-final.log"); non_success=$(probe_value SQLPATCH_NON_SUCCESS "$TASK_DIR/sqlpatch-final.log")
-  [[ "$success" =~ ^[0-9]+$ ]] && [ "$success" -gt 0 ] && [ "$non_success" = 0 ] || die "SQL patch registry does not show a clean SUCCESS for patch $PATCH_ID"
+  require_latest_sqlpatch APPLY "$TASK_DIR/sqlpatch-final.log"
   : >"$TASK_DIR/binary-state-known"
 }
 

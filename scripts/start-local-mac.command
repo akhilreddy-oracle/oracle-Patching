@@ -49,7 +49,7 @@ def protected_file(path, *, private=False):
 
 
 def private_output(path, flags):
-    descriptor = os.open(path, flags | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    descriptor = os.open(path, flags | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     value = os.fstat(descriptor)
     if not stat.S_ISREG(value.st_mode) or value.st_nlink != 1 or value.st_uid != os.getuid() or value.st_mode & 0o077:
         os.close(descriptor)

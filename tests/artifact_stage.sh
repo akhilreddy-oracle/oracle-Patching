@@ -74,4 +74,25 @@ jq -e '.status == "staged" and .patch_id == "12345678"' "$TMP/stage6.json" >/dev
 if "$TOOL" --artifact "$TMP/dst/12345678" --owner no-such-user-xyz --from-tar-stdin </dev/null >/dev/null 2>&1; then echo 'unknown owner accepted' >&2; exit 1; fi
 if "$TOOL" --artifact relative/12345678 --owner "$me" --from-tar-stdin </dev/null >/dev/null 2>&1; then echo 'relative path accepted' >&2; exit 1; fi
 
+# Unsafe report paths are rejected before installing media or altering a target.
+mkdir "$TMP/output-test"
+printf 'preserve this file\n' >"$TMP/report-victim"
+ln -s "$TMP/report-victim" "$TMP/report-link"
+mkfifo "$TMP/report-fifo"
+for output in "$TMP/report-link" "$TMP/report-fifo" "$TMP/output-test"; do
+  if "$TOOL" --artifact "$TMP/output-test/12345678" --owner "$me" --from-tar-stdin --output "$output" </dev/null >"$TMP/output.stdout" 2>"$TMP/output.stderr"; then
+    echo 'unsafe output report was accepted' >&2; exit 1
+  fi
+  grep -q 'output must be a regular file' "$TMP/output.stderr"
+  [ ! -e "$TMP/output-test/12345678" ]
+  [ "$(cat "$TMP/report-victim")" = 'preserve this file' ]
+done
+# Replacing a regular report must not truncate another hardlink to its inode.
+ln "$TMP/report-victim" "$TMP/existing-report.json"
+tar -C "$TMP/src" -cf - 12345678 | "$TOOL" --artifact "$TMP/output-test/12345678" --owner "$me" --from-tar-stdin --output "$TMP/existing-report.json" >"$TMP/output.stdout"
+[ "$(cat "$TMP/report-victim")" = 'preserve this file' ]
+cmp "$TMP/existing-report.json" "$TMP/output.stdout"
+jq -e '.status == "staged"' "$TMP/existing-report.json" >/dev/null
+[ -z "$(ls -d "$TMP"/.opu-stage-report-* 2>/dev/null)" ]
+
 printf '%s\n' 'artifact stage test passed'

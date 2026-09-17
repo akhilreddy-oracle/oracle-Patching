@@ -35,6 +35,7 @@ export function executionConsole(planId) {
   let selectedRun = null;
   let lastNative = 0;
   let pending = false;
+  let loadRevision = 0;
   let timer;
   const signal = getReadSignal();
   controls.appendChild(refresh); controls.appendChild(observe);
@@ -77,7 +78,7 @@ export function executionConsole(planId) {
     showLog();
   }
   async function native() {
-    if (!selectedRun || pending) return;
+    if (!selectedRun || pending || signal?.aborted) return;
     pending = true; observe.disabled = true;
     try {
       const result = await runToCompletion(`/api/plans/${encodeURIComponent(planId)}/execution-observe`, { run_id: selectedRun.run_id });
@@ -91,10 +92,13 @@ export function executionConsole(planId) {
   }
   async function load(schedule = true) {
     if (signal?.aborted) return;
+    const revision = ++loadRevision;
     clearTimeout(timer);
     try {
       const response = await apiFetch(`/api/plans/${encodeURIComponent(planId)}/execution`, { signal });
-      const data = await response.json(); draw(data);
+      const data = await response.json();
+      if (signal?.aborted || revision !== loadRevision) return;
+      draw(data);
       const active = selectedRun && ["queued", "running"].includes(selectedRun.status);
       if (active && follow.checked && !pending && Date.now() - lastNative > 15000) await native();
       if (schedule && section.isConnected) {
@@ -102,7 +106,7 @@ export function executionConsole(planId) {
         timer?.unref?.();
       }
     } catch (error) {
-      if (error.name !== "AbortError") status.textContent = `Saved execution view unavailable: ${error.message}`;
+      if (!signal?.aborted && revision === loadRevision && error.name !== "AbortError") status.textContent = `Saved execution view unavailable: ${error.message}`;
     }
   }
   refresh.addEventListener("click", () => load());

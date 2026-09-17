@@ -49,6 +49,13 @@ epoch() {
   date -u -d "$1" +%s 2>/dev/null ||
     date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || return 1
 }
+valid_window_time() {
+  local parsed canonical
+  [[ ${1:-} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+  parsed=$(epoch "$1") || return 1
+  canonical=$(date -u -r "$parsed" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$parsed" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || return 1
+  [ "$canonical" = "$1" ]
+}
 request_dir() { printf '%s/%s' "$STATE_ROOT" "$1"; }
 request_file() { printf '%s/request.json' "$(request_dir "$1")"; }
 sha_file() { opu_hash_file "$1"; }
@@ -153,18 +160,22 @@ set_execution_phase() {
 
 verify_window_shape() {
   local start=$1 end=$2 start_epoch end_epoch
-  start_epoch=$(epoch "$start") || die 'window-start must be UTC in YYYY-MM-DDTHH:MM:SSZ format'
-  end_epoch=$(epoch "$end") || die 'window-end must be UTC in YYYY-MM-DDTHH:MM:SSZ format'
+  valid_window_time "$start" || die 'window-start must be a valid UTC calendar time in YYYY-MM-DDTHH:MM:SSZ format'
+  valid_window_time "$end" || die 'window-end must be a valid UTC calendar time in YYYY-MM-DDTHH:MM:SSZ format'
+  start_epoch=$(epoch "$start"); end_epoch=$(epoch "$end")
   [ "$start_epoch" -lt "$end_epoch" ] || die 'maintenance window end must be after start'
   [ $((end_epoch - start_epoch)) -le "$MAX_WINDOW_SECONDS" ] || die 'maintenance window cannot exceed 24 hours'
 }
 
 verify_open_window() {
-  local now start end
+  local now start end start_time end_time
+  start_time=$(jq -r '.maintenance_window.start' "$REQUEST_FILE")
+  end_time=$(jq -r '.maintenance_window.end' "$REQUEST_FILE")
+  verify_window_shape "$start_time" "$end_time"
   now=$(date -u +%s)
-  start=$(epoch "$(jq -r '.maintenance_window.start' "$REQUEST_FILE")") || die 'request window start is invalid'
-  end=$(epoch "$(jq -r '.maintenance_window.end' "$REQUEST_FILE")") || die 'request window end is invalid'
-  [ "$now" -ge "$start" ] && [ "$now" -le "$end" ] || die 'maintenance window is not open'
+  start=$(epoch "$start_time") || die 'request window start is invalid'
+  end=$(epoch "$end_time") || die 'request window end is invalid'
+  [ "$now" -ge "$start" ] && [ "$now" -lt "$end" ] || die 'maintenance window is not open'
 }
 
 verify_bound_inputs() {
@@ -701,6 +712,9 @@ EOF
   fi
   ! grep -Eq 'RMAN-00569|RMAN-00558|RMAN-0100[6-9]' "$REQUEST_DIR/evidence/backup-rman-syntax.log" ||
     die 'generated RMAN command file reported a syntax error'
+  # Inventory, capacity checks and RMAN syntax validation may outlive the
+  # approved window. Recheck immediately before the first service mutation.
+  verify_open_window
   MUTATION_STARTED=1; set_execution_phase quiesce
   if [ "$LISTENER_WAS_RUNNING" -eq 1 ]; then
     as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" stop "$LISTENER_NAME" >"$REQUEST_DIR/evidence/listener-stop.log" 2>&1

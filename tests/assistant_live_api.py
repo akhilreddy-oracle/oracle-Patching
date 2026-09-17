@@ -337,6 +337,23 @@ class LiveAssistantApiTests(fixture.AssistantApiTests):
         self.model.assert_not_called()
         self.assert_no_native_calls()
 
+    def test_live_unknown_punctuated_identifier_cannot_select_its_configured_prefix_or_suffix(self):
+        configured = self.host["id"]
+        unknown_hosts = [configured + suffix for suffix in ("-east", ".prod", "_retired", ":1521", "..extra")]
+        unknown_hosts.append("retired-" + configured)
+        for host_id in unknown_hosts:
+            with self.subTest(host_id=host_id):
+                conversation_id = self.create(actor="operator")["id"]
+                self.seed_messages(conversation_id, [("user", f"We are investigating {configured}."),
+                                                     ("assistant", "Understood.")])
+                _, response = self.query(f"Check current patches on {host_id}", conversation_id=conversation_id)
+                record = self.finish_query(response)
+                self.assertEqual(record.kind, "assistant")
+                conversation = self.conversation(conversation_id)
+                self.assertEqual(conversation["actions"], [])
+        self.model.assert_not_called()
+        self.assert_no_native_calls()
+
     def test_live_explicit_unknown_target_is_not_replaced_by_an_incidental_known_host_mention(self):
         for content in (
             "What is the current patch version on unknown-host? Source was the earlier target.",
@@ -508,6 +525,24 @@ class LiveAssistantApiTests(fixture.AssistantApiTests):
         self.assertEqual(self.conversation(conversation_id)["messages"], first["messages"])
         self.steps["discovery"].assert_called_once()
         self.model.assert_not_called()
+
+    def test_live_unknown_plan_without_host_argument_blocks_a_new_live_check(self):
+        conversation_id = self.create(actor="operator")["id"]
+        path = assistant._path("operator", conversation_id)
+        data = assistant._read(path, "operator")
+        data["actions"].append({"id": "a" * 24, "tool": "execute_plan",
+            "arguments": {"plan_id": "unresolved-fixture-plan"}, "state": "unknown",
+            "run_id": "b" * 12, "confirmed_at": live_inventory.utc_now()})
+        assistant._save(path, data)
+        _, response = self.query(conversation_id=conversation_id)
+        record = self.finish_query(response)
+        self.assertEqual(record.kind, "assistant")
+        conversation = self.conversation(conversation_id)
+        self.assertEqual(len(conversation["actions"]), 1)
+        self.assertEqual(conversation["actions"][0]["state"], "unknown")
+        self.assertIn("reconcile", conversation["messages"][-1]["content"].lower())
+        self.model.assert_not_called()
+        self.assert_no_native_calls()
 
     def test_live_reconciled_unknown_run_publishes_terminal_receipt_once(self):
         conversation_id, response = self.query()

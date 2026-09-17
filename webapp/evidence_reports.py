@@ -20,6 +20,16 @@ _METRICS = {'binary_inventory': 'Binary patch inventory', 'sql_patch_status': 'T
             'invalid_objects': 'Invalid objects', 'components': 'Database components',
             'listener_ready': 'Listener exposes target as READY', 'database_state': 'Database state'}
 
+# These are the native dispatch stages, not labels invented by the report.
+_FINAL_STAGES = {
+    'final_validate', 'rollback_final_validate',
+    'cluster_final_validate', 'rac_rollback_final_validate',
+    'grid_cluster_final_validate', 'grid_rollback_cluster_final_validate',
+    'opatchauto_cluster_final_validate', 'opatchauto_rollback_cluster_final_validate',
+    'ojvm_final_validate', 'ojvm_rollback_final_validate',
+    'oop_final_validate', 'oop_switchback_final_validate',
+}
+
 
 def _checked(path, expected, maximum=64 * 1024 * 1024):
     path = Path(path)
@@ -141,14 +151,17 @@ def build(plan_id):
             native = json.loads(_checked(directory / 'evidence.json', task.get('evidence_sha256')))
             if not isinstance(manifest, dict) or not isinstance(native, dict):
                 raise ValueError('native evidence and custody must be objects')
-            if native.get('plan_id') != plan_id or native.get('plan_sha256') != plan['plan_sha256'] or native.get('task_id') != task['task_id'] or native.get('status') != task.get('status'):
+            if (native.get('plan_id') != plan_id or native.get('plan_sha256') != plan['plan_sha256']
+                    or native.get('task_id') != task['task_id'] or native.get('status') != task.get('status')
+                    or native.get('stage') != task.get('stage')):
                 raise ValueError('native evidence scope differs from its verified task')
             native_target = native.get('target') or {}
-            if not isinstance(native_target, dict) or any(target.get(key) and native_target.get(key) != target[key] for key in ('database_unique_name', 'oracle_home')):
+            if not isinstance(native_target, dict) or any(target.get(key) and native_target.get(key) != target[key] for key in ('database_unique_name', 'oracle_home', 'grid_home')):
                 raise ValueError('native evidence targets another database/home')
             # Failed tasks retain diagnostics but cannot overwrite healthy facts
             # with incomplete checks or pre-failure console output.
-            destination = before if task.get('stage') in {'precheck', 'rollback_precheck'} else after
+            stage = task.get('stage') or ''
+            destination = before if stage == 'precheck' or stage.endswith('_precheck') else after
             task_facts, task_sources, failure_diagnostics = dict(destination), [], []
             for item in manifest.get('files') or []:
                 if not isinstance(item, dict):
@@ -188,7 +201,7 @@ def build(plan_id):
             checked_tasks.add(task['task_id'])
         except (OSError, ValueError, TypeError, KeyError) as exc:
             gaps.append({'source': task.get('task_id'), 'reason': redact_text(str(exc), 400)})
-    final = [task for task in task_rows if task.get('stage') in {'final_validate', 'rollback_final_validate'}]
+    final = [task for task in task_rows if task.get('stage') in _FINAL_STAGES]
     source_complete = plan.get('state') == 'succeeded' and len(final) == 1 and final[0].get('status') == 'succeeded' and final[0].get('evidence_verified') is True and final[0].get('task_id') in checked_tasks
     rollback = {'status': 'requires_native_validation' if source_complete and plan.get('intent', 'patch_apply') == 'patch_apply' else 'not_available',
                 'approved': False, 'native_validation': 'not_run',

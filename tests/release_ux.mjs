@@ -144,6 +144,10 @@ test('wizard places recovery before plan and rejects expired or ambiguous UTC wi
   assert.match(maintenanceWindowError('2030-01-01T01:00:00', '2030-01-01T02:00:00Z'), /UTC/);
   assert.match(maintenanceWindowError('2030-01-01T02:00:00Z', '2030-01-01T01:00:00Z'), /after/);
   assert.match(maintenanceWindowError('2020-01-01T01:00:00Z', '2020-01-01T02:00:00Z'), /expired/);
+  assert.match(maintenanceWindowError('2030-02-30T01:00:00Z', '2030-03-03T02:00:00Z'), /valid UTC calendar/);
+  assert.match(maintenanceWindowError('2030-02-28T01:00:00Z', '2030-02-29T02:00:00Z'), /valid UTC calendar/);
+  assert.match(maintenanceWindowError('2030-01-01T24:00:00Z', '2030-01-02T02:00:00Z'), /valid UTC calendar/);
+  assert.equal(maintenanceWindowError('2032-02-29T01:00:00Z', '2032-02-29T02:00:00Z'), null);
   assert.equal(maintenanceWindowError('2030-01-01T01:00:00Z', '2030-01-01T02:00:00Z'), null);
 });
 

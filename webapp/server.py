@@ -17,8 +17,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 import os
 import time
+from functools import wraps
 
 import auth
+import host_config
 import assistant
 import local_llm
 import live_inventory
@@ -54,13 +56,45 @@ STATIC_CONTENT_TYPES = {
 
 
 def load_hosts() -> dict[str, dict]:
-    data = json.loads(HOSTS_FILE.read_text())
-    return {host["id"]: host for host in data["hosts"]}
+    return host_config.load(HOSTS_FILE)
+
+
+def _configuration_errors(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except host_config.HostConfigError as exc:
+            self._send_json(503, {"error": "invalid_host_config", "message": str(exc)})
+    return guarded
 
 
 def run_discovery(host: dict) -> dict:
-    """Run opu-topology-discover on a host over SSH. Raises remote.RemoteError."""
-    return pipeline_steps.step_discovery(host["id"], host, {})
+    """Legacy synchronous discovery shares the managed per-host pipeline lock."""
+    record = pipeline_runner.start_run("pipeline", f"host:{host['id']}:pipeline",
+        lambda _record: pipeline_steps.step_discovery(host["id"], host, {}))
+    while record.status in {"queued", "running"}:
+        time.sleep(0.05)
+    if record.status == "succeeded":
+        return record.result
+    error = record.error if isinstance(record.error, dict) else {}
+    raise remote.RemoteError(error.get("error") or "discovery_failed",
+                            error.get("message") or "Discovery did not complete", error.get("stderr") or "")
+
+
+def _notify_execution(plan_id: str, actor: str, result, *, remaining: bool) -> None:
+    """Report the native outcome, not just successful completion of an HTTP call."""
+    payload = result if isinstance(result, dict) else {}
+    state = payload.get("plan_state" if remaining else "status")
+    state = state if isinstance(state, str) else None
+    failure = state in {"failed", "blocked", "error", "paused", "unknown"}
+    if remaining:
+        tasks = payload.get("task_results")
+        failure = failure or any(isinstance(task, dict) and task.get("status") in ("failed", "blocked", "error", "unknown")
+                                 for task in (tasks if isinstance(tasks, list) else []))
+    event = "failed" if failure else "succeeded" if state == "succeeded" else "idle" if result is None else "progress"
+    notifications.emit(f"plan.execute.{event}", {"plan_id": plan_id, "actor": actor,
+        "state": state, "stopped_reason": payload.get("stopped_reason"), "no_pending_task": result is None})
 
 
 def _cluster_is_standalone_no_crs(cluster: dict) -> bool:
@@ -159,7 +193,7 @@ def build_estate(*, live: bool = False) -> list[dict]:
                 "error": {"error": "discovery_failed", "message": str(exc)},
             }
 
-    with ThreadPoolExecutor(max_workers=max(len(hosts), 1)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(hosts), 8)) as pool:
         return list(pool.map(probe, hosts))
 
 
@@ -236,12 +270,19 @@ class Handler(BaseHTTPRequestHandler):
         hosts = load_hosts()
         return hosts.get(host_id)
 
+    def _live_discovery_get(self, path: str) -> bool:
+        return ((path.startswith("/api/hosts/") and path.endswith("/discovery"))
+                or (path == "/api/estate" and "1" in parse_qs(urlparse(self.path).query).get("live", [])))
+
     def _require_api_auth(self) -> bool:
         try:
             self._company_session = None
             if company_auth.configured() and (company_auth.cookie_value(self.headers.get("Cookie"), company_auth.SESSION_COOKIE)
                                                or not self.headers.get("Authorization")):
-                self._company_session = company_auth.authenticate(self.headers.get("Cookie"), method=self.command,
+                # Legacy GET discovery changes host tools and saved evidence.
+                # Cookie-authenticated calls require the same CSRF proof as POST.
+                method = "POST" if self.command == "GET" and self._live_discovery_get(urlparse(self.path).path) else self.command
+                self._company_session = company_auth.authenticate(self.headers.get("Cookie"), method=method,
                     csrf=self.headers.get("X-CSRF-Token"), origin=self.headers.get("Origin"))
                 self._principal = self._company_session["actor"]
             else:
@@ -282,7 +323,7 @@ class Handler(BaseHTTPRequestHandler):
         """Default-deny role selection shared by every API route family."""
         actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
         if method == "GET":
-            action = "agent" if path == "/api/agent/jobs" else "read"
+            action = "execute" if self._live_discovery_get(path) else "agent" if path == "/api/agent/jobs" else "read"
         elif path.startswith("/api/assistant/"):
             action = "read"
         elif path.startswith("/api/agent/"):
@@ -319,6 +360,7 @@ class Handler(BaseHTTPRequestHandler):
         except auth.AuthError:
             return False
 
+    @_configuration_errors
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         path = urlparse(self.path).path
 
@@ -470,20 +512,17 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_role(self.headers.get("X-OPU-Actor"), "read"):
                 return
             hosts = load_hosts()
-            self._send_json(200, {"hosts": [{"id": h["id"], "label": h["label"]} for h in hosts.values()]})
+            self._send_json(200, {"hosts": [{"id": h["id"], "label": h.get("label") or h["id"]} for h in hosts.values()]})
             return
 
         if path == "/api/estate":
             if not self._require_role(self.headers.get("X-OPU-Actor"), "read"):
                 return
-            query = urlparse(self.path).query
-            live = any(
-                part.split("=", 1)[0] == "live" and part.split("=", 1)[-1] == "1"
-                for part in query.split("&")
-                if part
-            )
+            live = self._live_discovery_get(path)
             try:
                 self._send_json(200, {"hosts": build_estate(live=live), "live": live})
+            except host_config.HostConfigError:
+                raise
             except Exception as exc:  # noqa: BLE001 - never abort the socket mid-response
                 self._send_json(500, {"error": "estate_failed", "message": str(exc)})
             return
@@ -501,6 +540,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload = run_discovery(host)
                 print(f"[webapp] live discovery ok host={host_id}", flush=True)
                 self._send_json(200, payload)
+            except pipeline_runner.RunConflict as exc:
+                self._send_run_conflict(exc)
             except remote.RemoteError as exc:
                 print(f"[webapp] live discovery remote error host={host_id}: {exc.error}", flush=True)
                 status = 504 if exc.error == "ssh_timeout" else 502
@@ -622,6 +663,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_static(path.lstrip("/"))
 
+    @_configuration_errors
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         self.__dict__.pop("_parsed_body", None)
@@ -706,7 +748,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/recovery":
-            allowed = {"request_id", "requester", "actor", "host_id", "database", "backup_parent", "window_start", "window_end", "policy"}
+            allowed = {"request_id", "requester", "actor", "host_id", "database", "backup_parent", "window_start", "window_end", "policy", "expected_configuration_sha256"}
             if set(body) - allowed:
                 self._send_json(400, {"error": "invalid_body", "message": "Unexpected live recovery fields"})
                 return
@@ -717,6 +759,10 @@ class Handler(BaseHTTPRequestHandler):
                 host = self._resolved_host(body["host_id"])
                 if host is None:
                     raise ValueError("Unknown configured recovery host")
+                if ("expected_configuration_sha256" in body
+                        and body["expected_configuration_sha256"] != live_inventory.configuration_digest(host)):
+                    self._send_json(409, {"error": "target_changed", "message": "Host configuration changed before backup creation. Review a new proposal."})
+                    return
                 recoveryctl._identifier(body["request_id"], "request_id")
                 def create(_record):
                     return recoveryctl.create_live(body["request_id"], body["requester"], host=host, host_id=body["host_id"],
@@ -805,9 +851,9 @@ class Handler(BaseHTTPRequestHandler):
             # Server-side host inventory for cross-host actions; never trust the client's copy.
             body.pop("_hosts", None)
             body.pop("_record", None)
-            if step == "discovery" and body.get("inventory_receipt") is True:
+            if "expected_configuration_sha256" in body or step == "discovery" and body.get("inventory_receipt") is True:
                 if body.get("expected_configuration_sha256") != live_inventory.configuration_digest(host):
-                    self._send_json(409, {"error": "target_changed", "message": "Host configuration changed before live discovery. Select the host and ask again."})
+                    self._send_json(409, {"error": "target_changed", "message": "Host configuration changed before execution. Select the host and review the request again."})
                     return
             if step == "stage-artifact":
                 body["_hosts"] = load_hosts()
@@ -978,7 +1024,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     notifications.emit("plan.execute.failed", {"plan_id": plan_id, "actor": actor})
                     raise
-                notifications.emit("plan.execute.succeeded", {"plan_id": plan_id, "actor": actor, "no_pending_task": result is None})
+                _notify_execution(plan_id, actor, result, remaining=False)
                 return {"task_result": result, "no_pending_task": result is None}
 
             try:
@@ -1011,7 +1057,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     notifications.emit("plan.execute.failed", {"plan_id": plan_id, "actor": actor})
                     raise
-                notifications.emit("plan.execute.succeeded", {"plan_id": plan_id, "actor": actor})
+                _notify_execution(plan_id, actor, result, remaining=True)
                 return result
 
             try:
@@ -1192,8 +1238,21 @@ class Handler(BaseHTTPRequestHandler):
         previous_body = getattr(self, "_parsed_body", None)
         self._response_sink = responses
         try:
+            # The model/native preparation may outlive a token or session.
+            # Authenticate again immediately before crossing the native boundary.
+            if getattr(self, "_company_session", None):
+                current = company_auth.authenticate(self.headers.get("Cookie"), method="POST",
+                    csrf=self.headers.get("X-CSRF-Token"), origin=self.headers.get("Origin"))
+                owner = current["actor"]
+                self._company_session = current
+            else:
+                owner = auth.require_api_auth(self.headers.get("Authorization"))
+            if not owner or owner != getattr(self, "_principal", None):
+                raise auth.AuthError("Assistant identity changed before execution", status=403)
             if self._authorize_path("POST", path):
                 self._dispatch_post(path, dict(body))
+        except auth.AuthError as exc:
+            self._send_json(exc.status, exc.to_json())
         finally:
             self._response_sink = None
             self._parsed_body = previous_body

@@ -36,6 +36,10 @@ parse() {
   opu_find_python >/dev/null || exit $?
   opu_validate_absolute_path "$ARTIFACT" artifact || exit $?
   [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  if [ -n "$OUT" ]; then
+    [ ! -L "$OUT" ] && { [ ! -e "$OUT" ] || [ -f "$OUT" ]; } || die 'output must be a regular file and cannot be a symbolic link' 65
+    [ -d "$(dirname -- "$OUT")" ] || die 'output parent directory does not exist' 66
+  fi
   [ -n "$MODE" ] || { usage >&2; exit 64; }
   case "$ARTIFACT" in */) ARTIFACT=${ARTIFACT%/};; esac
   PARENT=$(dirname -- "$ARTIFACT"); NAME=$(basename -- "$ARTIFACT")
@@ -63,6 +67,38 @@ is_complete() {
   [ -d "$dir/files" ] && [ ! -L "$dir/files" ] || return 1
   count=$(find "$dir/files" -xdev -type f 2>/dev/null | wc -l | tr -d ' ')
   [ "${count:-0}" -gt 0 ]
+}
+publish_result() {
+  local result=$1
+  if [ -n "$OUT" ]; then
+    # Atomic replacement never opens/truncates the destination: even a link
+    # substituted after parse cannot redirect a root-owned report write.
+    opu_python - "$result" "$OUT" <<'PY_OUTPUT'
+import os
+import stat
+import sys
+import tempfile
+source, destination = sys.argv[1:]
+staged = None
+try:
+    if os.path.lexists(destination) and not stat.S_ISREG(os.lstat(destination).st_mode):
+        raise ValueError("output must be a regular file and cannot be a symbolic link")
+    descriptor, staged = tempfile.mkstemp(prefix=".opu-stage-report-", dir=os.path.dirname(destination))
+    with os.fdopen(descriptor, "wb") as target, open(source, "rb") as result:
+        target.write(result.read())
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(staged, destination)
+    staged = None
+except (OSError, ValueError) as error:
+    print("opu-artifact-stage: cannot publish output: " + str(error), file=sys.stderr)
+    sys.exit(74)
+finally:
+    if staged is not None:
+        os.unlink(staged)
+PY_OUTPUT
+  fi
+  cat "$result"
 }
 main() {
   parse "$@"
@@ -112,6 +148,7 @@ main() {
   jq -cn --arg artifact "$ARTIFACT" --arg owner "$OWNER" --arg group "$GROUP" --arg patch "$patch_id" --arg host "$(hostname -s 2>/dev/null || hostname)" \
     --arg previous "$previous" --argjson files "$count" --argjson bytes "$bytes" --argjson source "$source_json" --arg at "$(opu_now_utc)" \
     '{schema_version:"1.0",status:"staged",host:$host,artifact:$artifact,patch_id:$patch,owner:$owner,group:$group,files:$files,bytes:$bytes,source:$source,previous:(if ($previous|length) > 0 then $previous else null end),staged_at:$at}' \
-    | if [ -n "$OUT" ]; then tee "$OUT"; else cat; fi
+    >"$work/result.json"
+  publish_result "$work/result.json"
 }
 main "$@"

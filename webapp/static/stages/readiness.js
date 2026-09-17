@@ -355,6 +355,7 @@ function buildControls(hostId, step, controls, logBox, refresh, allSteps, eviden
     const input = el("input", {
       type: "text",
       placeholder: "/absolute/path/to/staged/patch",
+      "aria-label": "Staged patch path",
       value: cachedPath,
     });
     const btn = runButton("Run", async () => {

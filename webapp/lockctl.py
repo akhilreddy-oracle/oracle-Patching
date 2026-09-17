@@ -138,13 +138,22 @@ def recover(plan_id, actor, run_id=None, *, maintenance_run_id):
     original = pipeline_runner.get_run(scope["app_run_id"])
     with original._lock:
         _require(not original.context.get("lock_recovery_run_id"), "a lock recovery was already submitted; inspect its existing outcome")
+    # Synchronization cannot launch recovery. Keep failures here retryable;
+    # reserve the original launch only immediately before a possible worker.
+    tools_sync.ensure_host_tools(scope["host"])
+    scope = _scope(plan_id, actor, run_id)
+    current = pipeline_runner.get_run(maintenance_run_id)
+    _require(current is not None and current.key == f"plan:{plan_id}:lock-recovery" and current.status == "running",
+             "maintenance run ownership changed during tool synchronization")
+    original = pipeline_runner.get_run(scope["app_run_id"])
+    with original._lock:
+        _require(not original.context.get("lock_recovery_run_id"), "a lock recovery was already submitted; inspect its existing outcome")
         original.context["lock_recovery_run_id"] = maintenance_run_id
         original._persist()
     host = scope["host"]
     pipeline_runner.set_execution_context(lock_recovery=True, actor=actor, original_run_id=scope["app_run_id"],
                                           original_task_id=scope["task_id"], original_remote_run_id=scope["run_id"],
                                           original_plan_sha256=scope["plan_sha256"])
-    tools_sync.ensure_host_tools(host)
     rc, stdout, stderr = planctl._run_detached_remote(host, plan_id, "lock-recover-" + scope["task_id"], _argv(scope, "recover"))
     if rc != 0:
         try:

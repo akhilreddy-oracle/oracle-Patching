@@ -93,6 +93,23 @@ class QueueSafety(unittest.TestCase):
         with self.assertRaises(queue.QueueError):
             queue.complete(owned['job_id'], 'agent1', agent_token=token, claim_token=owned['claim_token'])
 
+    def test_malformed_or_unsafe_enrollment_registry_fails_without_authentication(self):
+        enrolled = agent_enroll.enroll(node='node1', agent_id='agent1')
+        registry = agent_enroll.registry_path()
+        original = json.loads(registry.read_text())
+        for entry in ([], None, {**original['agents']['agent1'], 'revoked': 'false'},
+                      {**original['agents']['agent1'], 'token_sha256': 'invalid'}):
+            registry.write_text(json.dumps({'agents': {'agent1': entry}}))
+            self.assertFalse(agent_enroll.verify('agent1', enrolled['agent_token']))
+            with self.assertRaises(agent_enroll.EnrollError):
+                agent_enroll.list_agents()
+        registry.write_bytes(b'\xff')
+        self.assertFalse(agent_enroll.verify('agent1', enrolled['agent_token']))
+        registry.unlink(); os.mkfifo(registry)
+        self.assertFalse(agent_enroll.verify('agent1', enrolled['agent_token']))
+        registry.unlink(); registry.write_text(json.dumps(original)); registry.chmod(0o666)
+        self.assertFalse(agent_enroll.verify('agent1', enrolled['agent_token']))
+
     def test_worker_renews_during_long_executor(self):
         self.publish()
         class Process:

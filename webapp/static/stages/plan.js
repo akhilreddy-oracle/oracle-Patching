@@ -122,7 +122,8 @@ function mountCreateForm(panel, hostId, context) {
     if (!context.bound) { showFormError(errBox, "Validate the selected artifact and README procedure before creating a plan."); return; }
     const windowError = maintenanceWindowError(windowStart.value.trim(), windowEnd.value.trim());
     if (windowError) { showFormError(errBox, windowError); return; }
-    if (!requireNonEmpty(planId, errBox, "Plan ID")) return;
+    const submittedId = requireNonEmpty(planId, errBox, "Plan ID");
+    if (!submittedId) return;
     const actor = requireActor(requester, errBox, "Requester");
     if (!actor) return;
     btn.disabled = true;
@@ -131,7 +132,7 @@ function mountCreateForm(panel, hostId, context) {
     logBox.textContent = "creating…";
     try {
       const record = await runToCompletion("/api/plans", {
-        plan_id: planId.value.trim(),
+        plan_id: submittedId,
         requester: actor,
         host_id: hostId,
         window_start: windowStart.value,
@@ -141,7 +142,7 @@ function mountCreateForm(panel, hostId, context) {
         logBox.classList.add("run-log-error");
         logBox.textContent = formatRunFailure(record);
       } else {
-        location.hash = `#/plans/${encodeURIComponent(planId.value.trim())}`;
+        location.hash = `#/plans/${encodeURIComponent(submittedId)}`;
       }
     } catch (err) {
       logBox.classList.add("run-log-error");

@@ -60,8 +60,9 @@ acquire_executor_lock() {
     [ -x "$flock_command" ] || die 'standalone test flock command is not executable'
   fi
   if [ "$flock_command" != flock ] || command -v flock >/dev/null 2>&1; then
-    exec 8>"$RUN_DIR/executor.lock"
+    opu_execution_open_lock_file "$RUN_DIR/executor.lock" 8 || die "unsafe executor lock"
     "$flock_command" -n 8 || die 'another standalone executor owns this plan'
+    opu_execution_validate_lock "$RUN_DIR/executor.lock" 8 || die "unsafe executor lock"
     EXECUTOR_LOCK_USES_FLOCK=1
   elif [ "$TEST_MODE" = 1 ]; then
     EXECUTOR_LOCK_DIR="$RUN_DIR/executor.lock.d"

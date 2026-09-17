@@ -55,6 +55,24 @@ opu_now_utc() {
     date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
+# SSH passes its command through the remote login shell. Quote each argument
+# with POSIX single quotes before crossing that boundary, including empty args.
+opu_shell_join() {
+    local argument separator=""
+    for argument in "$@"; do
+        printf "%s'%s'" "$separator" "${argument//\'/\'\\\'\'}"
+        separator=" "
+    done
+}
+
+# A status command can exit successfully while reporting stopped resources.
+# Require positive state text and reject mixed/explicitly unhealthy output.
+opu_service_status_running() {
+    local output=${1:-}
+    grep -qiE '(^|[^[:alnum:]_])(online|running)([^[:alnum:]_]|$)' <<<"$output" &&
+        ! grep -qiE '(^|[^[:alnum:]_])(offline|not[[:space:]]+(running|online)|fail(ed|ure)?|cannot)([^[:alnum:]_]|$)' <<<"$output"
+}
+
 opu_json_escape() {
     local value
     value=${1-}
@@ -289,16 +307,27 @@ opu_cert_marker_line() {
     grep -Eq "^${key}$" "$file"
 }
 
+opu_boolean_value() {
+    local value label
+    value=${1-}
+    label=${2:-boolean flag}
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$value" in
+        1|[tT][rR][uU][eE]|[yY][eE][sS]|[oO][nN]) printf '1';;
+        ''|0|[fF][aA][lL][sS][eE]|[nN][oO]|[oO][fF][fF]) printf '0';;
+        *) opu_error "$label must be a boolean (1/0, true/false, yes/no, on/off)"; return 64;;
+    esac
+}
+
 # S13 starter gate: when OPU_PRODUCTION_MODE is enabled, mutation authority
 # requires an explicit local certification marker. Lab/default builds leave
 # production mode off and are unaffected.
 opu_require_production_certified() {
-    local mode cert
-    mode=${OPU_PRODUCTION_MODE:-0}
-    case "$mode" in
-        1|true|yes|on) ;;
-        *) return 0 ;;
-    esac
+    local mode cert checklist
+    mode=$(opu_boolean_value "${OPU_PRODUCTION_MODE:-0}" OPU_PRODUCTION_MODE) || return $?
+    [ "$mode" = 1 ] || return 0
+    checklist=$(opu_boolean_value "${OPU_PRODUCTION_REQUIRE_CHECKLIST:-0}" OPU_PRODUCTION_REQUIRE_CHECKLIST) || return $?
     cert=${OPU_PRODUCTION_CERT_FILE:-/etc/oracle-patching/production.cert}
     [ -f "$cert" ] && [ ! -L "$cert" ] || {
         opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is missing: $cert"
@@ -308,8 +337,8 @@ opu_require_production_certified() {
         opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is invalid: $cert"
         return 77
     }
-    case "${OPU_PRODUCTION_REQUIRE_CHECKLIST:-0}" in
-        1|true|yes|on)
+    case "$checklist" in
+        1)
             for key in OPU_SBOM_VERIFIED=1 OPU_RELEASE_SIGNED=1 OPU_THREAT_MODEL_SIGNED=1; do
                 opu_cert_marker_line "$cert" "$key" || {
                     opu_error "OPU_PRODUCTION_MODE checklist incomplete; missing $key in $cert"

@@ -75,9 +75,13 @@ def safe_file(path, *, root_owned=True):
 
 def _read_checked_file(path, validator):
     before = validator(path)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    # An allowed controller-owned authority path can change after lstat. A
+    # substituted FIFO must not block before the descriptor can be verified.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        require(identity(before) == identity(os.fstat(fd)), f'file changed while opening: {path}')
+        opened = os.fstat(fd)
+        require(stat.S_ISREG(opened.st_mode) and identity(before) == identity(opened),
+                f'file changed while opening: {path}')
         with os.fdopen(fd, 'rb', closefd=False) as stream:
             data = stream.read(8 * 1024 * 1024 + 1)
         require(len(data) <= 8 * 1024 * 1024, 'record exceeds size limit')
@@ -490,6 +494,21 @@ select 'OPU_RMAN|' || count(*) from v$rman_status where status like 'RUNNING%';
                 'listener_ready': True, 'observed_at': now()}
 
 
+def require_open_window(plan):
+    window = plan.get('maintenance_window')
+    require(isinstance(window, dict) and isinstance(window.get('start'), str)
+            and isinstance(window.get('end'), str), 'maintenance window is missing or invalid')
+    try:
+        start = dt.datetime.fromisoformat(window['start'].replace('Z', '+00:00'))
+        end = dt.datetime.fromisoformat(window['end'].replace('Z', '+00:00'))
+    except ValueError as exc:
+        raise Blocked('maintenance window is invalid') from exc
+    require(start.tzinfo is not None and end.tzinfo is not None
+            and start.utcoffset() == end.utcoffset() == dt.timedelta(0),
+            'maintenance window must use UTC timestamps')
+    require(start <= dt.datetime.now(dt.timezone.utc) < end, 'maintenance window is not open')
+
+
 def target_context(args, runner):
     plan_root = Path(os.environ.get('OPU_PLAN_STATE_DIR', str(ROOT / 'var/webapp-plans')))
     require(plan_root == ROOT / 'var/webapp-plans', 'plan state directory must be this deployed tool root/var/webapp-plans')
@@ -500,10 +519,7 @@ def target_context(args, runner):
     require(plan.get('state') == 'running' and plan.get('intent', 'patch_apply') == 'patch_apply', 'plan must be running patch_apply')
     require(plan['procedure']['adapter'] == 'database_single_instance_opatch' and len(plan['nodes']) == 1,
             'only standalone single-node OPatch apply plans are supported')
-    window = plan['maintenance_window']
-    epoch = dt.datetime.now(dt.timezone.utc)
-    require(dt.datetime.fromisoformat(window['start'].replace('Z', '+00:00')) <= epoch < dt.datetime.fromisoformat(window['end'].replace('Z', '+00:00')),
-            'maintenance window is not open')
+    require_open_window(plan)
     auth_bytes = read_controller_authority(plan_dir / 'authorization.json', plan_dir)
     auth = sealed(json.loads(auth_bytes))
     require(auth.get('actor') == args.actor and auth.get('decision') == 'execution_authorized'
@@ -664,6 +680,9 @@ def recover(args, runner):
             require(fresh_eligible == checked['holders'], 'lock holder or session identities changed before recovery')
             result['session_checks_before_outage'] = fresh_sessions
             require_no_executor()
+            # Session queries and process scans may consume the remainder of
+            # the approved window. Recheck before the first service mutation.
+            require_open_window(plan)
             write_once(audit / 'outage-started.json', {'started_at': now(), 'target': target})
             # Stop only the exact sealed listener and SID. Never signal PIDs.
             stopped = True

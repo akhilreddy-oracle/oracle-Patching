@@ -17,6 +17,46 @@ epoch() { date -u -d "$1" +%s 2>/dev/null || date -j -u -f '%Y-%m-%dT%H:%M:%SZ' 
 iso_from_epoch() { date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || return 1; }
 require_file() { local file=$1 label=$2; opu_validate_absolute_path "$file" "$label" || return; [ -f "$file" ] && [ ! -L "$file" ] || { opu_error "$label is missing or symbolic link: $file"; return 66; }; }
 valid_iso_utc() { [[ ${1:-} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] && epoch "$1" >/dev/null; }
+verify_readiness_dataguard() {
+  local readiness=$1 reference_epoch=$2 file maximum evaluated observed valid snapshot
+  jq -e '
+    .dataguard_evaluation as $dg |
+    ($dg | type == "object") and ($dg.path | type == "string" and startswith("/")) and
+    ($dg.sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
+    ($dg.record_sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
+    ($dg.maximum_age_seconds | type == "number" and floor == . and . >= 1 and . <= 3600) and
+    all([$dg.evaluated_at,$dg.observed_at,$dg.valid_until][];
+      type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    .evidence.dataguard_sha256 == $dg.sha256
+  ' "$readiness" >/dev/null || { opu_error 'readiness lacks a bound Data Guard freshness contract'; return 74; }
+  file=$(jq -r '.dataguard_evaluation.path' "$readiness")
+  require_file "$file" dataguard-evaluation || return
+  [ "$(opu_hash_file "$file")" = "$(jq -r '.dataguard_evaluation.sha256' "$readiness")" ] || {
+    opu_error 'bound Data Guard evaluation changed'; return 74;
+  }
+  verify_sealed_record "$file" dataguard-evaluation || return
+  jq -e --slurpfile readiness "$readiness" '
+    $readiness[0].dataguard_evaluation as $dg |
+    .schema_version == "1.0" and .status == "ready_for_standby_first" and
+    .record_sha256 == $dg.record_sha256 and .evaluated_at == $dg.evaluated_at and .observed_at == $dg.observed_at
+  ' "$file" >/dev/null || { opu_error 'Data Guard evaluation differs from readiness'; return 74; }
+  maximum=$(jq -r '.dataguard_evaluation.maximum_age_seconds' "$readiness")
+  evaluated=$(epoch "$(jq -r '.dataguard_evaluation.evaluated_at' "$readiness")") || return 74
+  observed=$(epoch "$(jq -r '.dataguard_evaluation.observed_at' "$readiness")") || return 74
+  valid=$(epoch "$(jq -r '.dataguard_evaluation.valid_until' "$readiness")") || return 74
+  [ "$observed" -le "$evaluated" ] && [ "$evaluated" -le "$reference_epoch" ] &&
+    [ "$reference_epoch" -le "$valid" ] && [ "$valid" -eq "$((observed + maximum))" ] || {
+      opu_error 'Data Guard evidence is expired, future-dated or has an invalid expiry'; return 65;
+    }
+  while IFS= read -r snapshot; do
+    jq -e --slurpfile snapshot "$snapshot" '
+      .target as $target | any($snapshot[0].databases[];
+        .db_unique_name == $target.db_unique_name and .oracle_home == $target.oracle_home and
+        .runtime.database_role == $target.database_role)
+    ' "$file" >/dev/null || { opu_error 'Data Guard evaluation does not bind the snapshot database, home and role'; return 74; }
+  done < <(jq -r '.snapshot_evidence[].path' "$readiness")
+  DATAGUARD_VALID_UNTIL_EPOCH=$valid
+}
 verify_readiness_current() {
   local readiness_file=$1 reconciliation_file=$2 policy_file=$3 reference_epoch=${4:-$(date -u +%s)}
   local evaluated_at valid_until evaluated_epoch valid_epoch maximum_age entry snapshot_path expected_sha actual_sha
@@ -69,8 +109,12 @@ verify_readiness_current() {
     }
     if [ "$earliest_valid_epoch" -eq 0 ] || [ "$entry_valid_epoch" -lt "$earliest_valid_epoch" ]; then earliest_valid_epoch=$entry_valid_epoch; fi
   done < <(jq -c '.snapshot_evidence[]' "$readiness_file")
+  if jq -e 'has("dataguard_evaluation") or (.evidence | has("dataguard_sha256"))' "$readiness_file" >/dev/null; then
+    verify_readiness_dataguard "$readiness_file" "$reference_epoch" || return
+    [ "$DATAGUARD_VALID_UNTIL_EPOCH" -ge "$earliest_valid_epoch" ] || earliest_valid_epoch=$DATAGUARD_VALID_UNTIL_EPOCH
+  fi
   [ "$valid_epoch" -eq "$earliest_valid_epoch" ] || {
-    opu_error 'readiness expiry does not equal the earliest snapshot expiry'; return 74;
+    opu_error 'readiness expiry does not equal the earliest bound evidence expiry'; return 74;
   }
   READINESS_VALID_UNTIL_EPOCH=$valid_epoch
   READINESS_VALID_UNTIL=$valid_until
@@ -88,6 +132,9 @@ verify_apply_plan_readiness_current() {
   done
   reference_epoch=$(date -u +%s)
   verify_readiness_current "$readiness_file" "$reconciliation_file" "$policy_file" "$reference_epoch" || return
+  jq -e --slurpfile readiness "$readiness_file" '
+    (.source_documents.dataguard_evaluation // null) == ($readiness[0].dataguard_evaluation // null)
+  ' "$plan_file" >/dev/null || { opu_error 'plan Data Guard evaluation binding differs from readiness'; return 74; }
   [ "$(jq -r '.planning_evidence.readiness_valid_until // empty' "$plan_file")" = "$READINESS_VALID_UNTIL" ] || {
     opu_error 'plan readiness expiry differs from its sealed evidence'; return 74;
   }
@@ -167,36 +214,17 @@ write_task() { local file=$1 task_id=$2 plan_id=$3 plan_sha=$4 stage=$5 node=$6 
 read_state() { verify_plan "$1" || return; IFS= read -r PLAN_STATE <"$(state_file "$1")" || return 74; }
 transition() { local id=$1 expected=$2 next=$3 actor=$4 detail=$5 current; read_state "$id" || return; current=$PLAN_STATE; [ "$current" = "$expected" ] || { opu_error "plan $id is $current, expected $expected"; return 65; }; printf '%s\n' "$next" >"$(state_file "$id").tmp.$$" && mv "$(state_file "$id").tmp.$$" "$(state_file "$id")" || return 74; event "$id" state_changed "$next" "$actor" "$detail"; }
 lock() {
-  local id=$1 tries=0 dir age mtime now holder
+  local id=$1 dir
   dir="$(plan_dir "$id")"
-  [ -d "$dir" ] || { opu_error "plan does not exist or is symbolic link: $id"; return 66; }
-  dir="$dir/.task-lock"
-  while ! mkdir "$dir" 2>/dev/null; do
-    tries=$((tries + 1))
-    # Reclaim only when the holder PID is dead (or never recorded). Never steal
-    # from a live complete()/claim() holder — age alone used to fail open after 60s.
-    if [ -d "$dir" ]; then
-      holder=$(cat "$dir/pid" 2>/dev/null || true)
-      if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-        :
-      else
-        mtime=$(stat -f %m "$dir" 2>/dev/null || stat -c %Y "$dir" 2>/dev/null || echo 0)
-        now=$(date -u +%s)
-        age=$((now - mtime))
-        if [ "$age" -gt 60 ] || [ -z "$holder" ]; then
-          rm -f "$dir/pid" 2>/dev/null || true
-          rmdir "$dir" 2>/dev/null || true
-          continue
-        fi
-      fi
-    fi
-    [ "$tries" -lt 50 ] || { opu_error "timed out waiting for plan task lock: $id"; return 75; }
-    sleep 0.1
-  done
-  printf '%s\n' "$$" >"$dir/pid" || true
-  PLAN_LOCK_DIR=$dir
+  [ -d "$dir" ] && [ ! -L "$dir" ] || { opu_error "plan does not exist or is symbolic link: $id"; return 66; }
+  # Keep one stable inode across holders. A directory/PID lock can be reclaimed
+  # between mkdir and publishing its owner, admitting two controller writers.
+  opu_execution_lock_file "$dir/.task-lock" 8 5 || {
+    opu_error "plan task lock is unsafe or held by another controller: $id"; return 75;
+  }
 }
-unlock() { rm -f "${PLAN_LOCK_DIR:-}/pid" 2>/dev/null || true; rmdir "${PLAN_LOCK_DIR:-}" 2>/dev/null || true; PLAN_LOCK_DIR=""; }
+unlock() { exec 8>&-; }
+
 verify_inputs() {
   local readiness=$1 reconciliation=$2 artifact=$3 procedure=$4 compatibility=$5 policy=$6 recovery=${7:-} rhash ahash phash xhash yhash adapter db count canonical expected actual node normalized_total normalized_unique artifact_platform_id procedure_platform_id compatibility_platform_id readiness_platform_id
   for pair in "$readiness|readiness" "$reconciliation|reconciliation" "$artifact|artifact-manifest" "$procedure|procedure-validation" "$compatibility|compatibility" "$policy|policy"; do require_file "${pair%%|*}" "${pair#*|}" || return; done
@@ -379,6 +407,12 @@ verify_dataguard_order_input() {
   jq -e 'any(.gates[]?; .name == "dataguard_standby_first" and .status == "pass")' "$readiness_file" >/dev/null || {
     opu_error 'readiness result does not carry a passing dataguard_standby_first gate'; return 65;
   }
+  jq -e --slurpfile readiness "$readiness_file" '
+    .evidence.evaluation_sha256 == $readiness[0].dataguard_evaluation.sha256
+  ' "$order_file" >/dev/null || { opu_error 'Data Guard order does not bind the readiness evaluation'; return 74; }
+  jq -e --slurpfile evaluation "$(jq -r '.dataguard_evaluation.path' "$readiness_file")" '
+    .evidence.observe_sha256 == $evaluation[0].evidence.observe_sha256
+  ' "$order_file" >/dev/null || { opu_error 'Data Guard order does not bind the evaluated observation'; return 74; }
   DATAGUARD_ORDER_FILE_SHA=$(opu_hash_file "$order_file") || return
   DATAGUARD_ORDER_RECORD_SHA=$(jq -r '.record_sha256' "$order_file")
   DATAGUARD_STRATEGY=$(jq -r '.strategy' "$order_file")
@@ -417,7 +451,7 @@ create() {
     --argjson recovery_waived "$([ "${RECOVERY_WAIVED:-false}" = true ] && echo true || echo false)" \
     --arg dataguard_order_path "$dataguard_order" --arg dataguard_order_file_sha "$DATAGUARD_ORDER_FILE_SHA" --arg dataguard_order_record_sha "$DATAGUARD_ORDER_RECORD_SHA" --arg dataguard_strategy "$DATAGUARD_STRATEGY" \
     --arg readiness_evaluated_at "$(jq -r '.evaluated_at' "$readiness")" --arg readiness_valid_until "$READINESS_VALID_UNTIL" \
-    '{schema_version:"1.0",intent:"patch_apply",plan_id:$id,requester:$requester,maintenance_window:{start:$window_start,end:$window_end},planning_evidence:{readiness_evaluated_at:$readiness_evaluated_at,readiness_valid_until:$readiness_valid_until},target:(if $adapter == "database_rolling_opatch" then {family:"database",method:$procedure[0].procedure.target.method,topology:$target_topology,database_unique_name:$target_db,oracle_home:$target_home,owner:$target_owner,grid_home:$target_grid_home,coordinator_node:$coordinator,platform_id:$target_platform_id,platform_name:$target_platform_name} elif ($adapter == "grid_rolling_opatch" or $adapter == "grid_rolling_opatchauto") then {family:"grid",method:$procedure[0].procedure.target.method,grid_home:$target_grid_home,owner:$target_owner,coordinator_node:$coordinator,platform_id:$target_platform_id,platform_name:$target_platform_name} else (($readiness[0].target) + {database_unique_name:$target_db,oracle_home:$target_home,owner:$target_owner,platform_id:$target_platform_id,platform_name:$target_platform_name}) end),patch_id:$readiness[0].patch_id,nodes:$reconciliation[0].expected_nodes,artifact:{path:$artifact[0].artifact.path,patch_id:$artifact[0].artifact.patch_ids[0],sha256:$artifact[0].artifact.sha256,platforms:$artifact[0].artifact.platforms},procedure:{adapter:$procedure[0].procedure.execution.adapter,operations:$procedure[0].procedure.execution.operations,method:$procedure[0].procedure.target.method,platform_id:$procedure[0].procedure.target.platform_id,required_opatch_version:$procedure[0].procedure.required_opatch_version,rollback:$procedure[0].procedure.rollback},source_documents:{readiness:{path:$readiness_path,sha256:$readiness_sha},reconciliation:{path:$reconciliation_path,sha256:$reconciliation_sha},artifact_manifest:{path:$artifact_path,sha256:$artifact_sha},procedure_validation:{path:$procedure_path,sha256:$procedure_sha},compatibility:{path:$compatibility_path,sha256:$compatibility_sha},policy:{path:$policy_path,sha256:$policy_sha}},snapshot_evidence:($reconciliation[0].snapshot_evidence // []),evidence:{readiness_sha256:$readiness_sha,reconciliation_sha256:$reconciliation_sha,artifact_manifest_sha256:$artifact_sha,procedure_validation_sha256:$procedure_sha,compatibility_sha256:$compatibility_sha,policy_sha256:$policy_sha}} + (if $recovery_waived then {recovery:{waived:true,require_backup:false}} elif $recovery_path != "" then {recovery:{manifest_path:$recovery_path,manifest_sha256:$recovery_sha,record_sha256:$recovery_record_sha,selected_datafile_backup_completed_at:$recovery_completed_at,valid_until:$recovery_valid_until}} else {} end) + (if $dataguard_order_path != "" then {dataguard:{order_path:$dataguard_order_path,order_file_sha256:$dataguard_order_file_sha,order_sha256:$dataguard_order_record_sha,strategy:$dataguard_strategy}} else {} end)' >"$dir/plan.json.tmp" || return 74
+    '{schema_version:"1.0",intent:"patch_apply",plan_id:$id,requester:$requester,maintenance_window:{start:$window_start,end:$window_end},planning_evidence:{readiness_evaluated_at:$readiness_evaluated_at,readiness_valid_until:$readiness_valid_until},target:(if $adapter == "database_rolling_opatch" then {family:"database",method:$procedure[0].procedure.target.method,topology:$target_topology,database_unique_name:$target_db,oracle_home:$target_home,owner:$target_owner,grid_home:$target_grid_home,coordinator_node:$coordinator,platform_id:$target_platform_id,platform_name:$target_platform_name} elif ($adapter == "grid_rolling_opatch" or $adapter == "grid_rolling_opatchauto") then {family:"grid",method:$procedure[0].procedure.target.method,grid_home:$target_grid_home,owner:$target_owner,coordinator_node:$coordinator,platform_id:$target_platform_id,platform_name:$target_platform_name} else (($readiness[0].target) + {database_unique_name:$target_db,oracle_home:$target_home,owner:$target_owner,platform_id:$target_platform_id,platform_name:$target_platform_name}) end),patch_id:$readiness[0].patch_id,nodes:$reconciliation[0].expected_nodes,artifact:{path:$artifact[0].artifact.path,patch_id:$artifact[0].artifact.patch_ids[0],sha256:$artifact[0].artifact.sha256,platforms:$artifact[0].artifact.platforms},procedure:{adapter:$procedure[0].procedure.execution.adapter,operations:$procedure[0].procedure.execution.operations,method:$procedure[0].procedure.target.method,platform_id:$procedure[0].procedure.target.platform_id,required_opatch_version:$procedure[0].procedure.required_opatch_version,rollback:$procedure[0].procedure.rollback},source_documents:{readiness:{path:$readiness_path,sha256:$readiness_sha},reconciliation:{path:$reconciliation_path,sha256:$reconciliation_sha},artifact_manifest:{path:$artifact_path,sha256:$artifact_sha},procedure_validation:{path:$procedure_path,sha256:$procedure_sha},compatibility:{path:$compatibility_path,sha256:$compatibility_sha},policy:{path:$policy_path,sha256:$policy_sha}},snapshot_evidence:($reconciliation[0].snapshot_evidence // []),evidence:{readiness_sha256:$readiness_sha,reconciliation_sha256:$reconciliation_sha,artifact_manifest_sha256:$artifact_sha,procedure_validation_sha256:$procedure_sha,compatibility_sha256:$compatibility_sha,policy_sha256:$policy_sha}} + (if $recovery_waived then {recovery:{waived:true,require_backup:false}} elif $recovery_path != "" then {recovery:{manifest_path:$recovery_path,manifest_sha256:$recovery_sha,record_sha256:$recovery_record_sha,selected_datafile_backup_completed_at:$recovery_completed_at,valid_until:$recovery_valid_until}} else {} end) + (if $dataguard_order_path != "" then {dataguard:{order_path:$dataguard_order_path,order_file_sha256:$dataguard_order_file_sha,order_sha256:$dataguard_order_record_sha,strategy:$dataguard_strategy}} else {} end) | (if $readiness[0].dataguard_evaluation != null then .source_documents.dataguard_evaluation=$readiness[0].dataguard_evaluation else . end) | (if $dataguard_order_path != "" then .source_documents.dataguard_order={path:$dataguard_order_path,sha256:$dataguard_order_file_sha} else . end)' >"$dir/plan.json.tmp" || return 74
   canonical=$(jq -cS . "$dir/plan.json.tmp") || return 74; hash=$(opu_hash_string "$canonical") || return; jq --arg hash "$hash" '. + {plan_sha256:$hash}' "$dir/plan.json.tmp" >"$dir/plan.json" || return 74; rm -f "$dir/plan.json.tmp"; printf 'awaiting_approval\n' >"$dir/state"; event "$id" plan_created awaiting_approval "$requester" "plan_sha256=$hash"; cat "$dir/plan.json"
 }
 
@@ -825,7 +859,7 @@ create_grid_opatchauto_rollback_plan() {
 
 create_rollback() {
   local id="" requester="" source_id="" start="" end="" start_epoch end_epoch source_dir source_plan source_state source_plan_sha source_plan_file_sha
-  local source_task="" source_task_id source_actor source_evidence source_evidence_sha source_evidence_record procedure_file artifact_dir recovery_file dir canonical hash task_count
+  local source_task="" source_task_id source_actor source_actors source_evidence source_evidence_sha source_evidence_record procedure_file artifact_dir recovery_file dir canonical hash task_count
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --plan-id) id=${2:-}; shift 2 ;;
@@ -887,10 +921,15 @@ create_rollback() {
     )
   ' "$source_plan" >/dev/null || { opu_error 'source plan is not a rollback-capable standalone database apply plan'; return 65; }
   verify_bound_source_documents "$source_plan" || return
-  task_count=0
+  task_count=0; source_actors='[]'
+  verify_task_manifest "$source_id" || return
   for source_task in "$source_dir"/tasks/*.json; do
     [ -e "$source_task" ] || continue
     verify_task "$source_task" || return
+    jq -e '.status == "succeeded"' "$source_task" >/dev/null || { opu_error 'source apply plan has an incomplete task'; return 65; }
+    source_actor=$(jq -r '.claimed_by // empty' "$source_task")
+    opu_validate_identifier "$source_actor" source-apply-actor || return
+    source_actors=$(jq -c --arg actor "$source_actor" '. + [$actor] | unique' <<<"$source_actors") || return 74
     if jq -e --arg stage "$final_stage" '.stage == $stage and .status == "succeeded"' "$source_task" >/dev/null; then task_count=$((task_count + 1)); [ "$task_count" -eq 1 ] || continue; SOURCE_FINAL_TASK=$source_task; fi
   done
   [ "$task_count" -eq 1 ] || { opu_error "source apply plan must have exactly one succeeded $final_stage task, found $task_count"; return 65; }
@@ -919,11 +958,11 @@ create_rollback() {
     --arg id "$id" --arg requester "$requester" --arg window_start "$start" --arg window_end "$end" \
     --arg source_plan_path "$source_plan" --arg source_plan_file_sha "$source_plan_file_sha" --arg source_plan_sha "$source_plan_sha" \
     --arg source_evidence_path "$source_evidence" --arg source_evidence_sha "$source_evidence_sha" --arg source_evidence_record "$source_evidence_record" \
-    --arg source_actor "$source_actor" \
+    --argjson source_actors "$source_actors" \
     --arg readme_path "$ROLLBACK_README_PATH" --arg readme_sha "$ROLLBACK_README_SHA" \
     --arg rollback_adapter "$rollback_adapter" --arg rollback_method "$rollback_method" --argjson rollback_operations "$rollback_operations" \
     --slurpfile source "$source_plan" \
-    '{schema_version:"1.0",intent:"patch_rollback",plan_id:$id,requester:$requester,maintenance_window:{start:$window_start,end:$window_end},target:$source[0].target,patch_id:$source[0].patch_id,nodes:$source[0].nodes,artifact:$source[0].artifact,procedure:{adapter:$rollback_adapter,operations:$rollback_operations,method:$rollback_method,platform_id:$source[0].procedure.platform_id,required_opatch_version:$source[0].procedure.required_opatch_version,rollback:$source[0].procedure.rollback},rollback_procedure:{oracle_reference_path:$readme_path,oracle_reference_sha256:$readme_sha,expected_binary_before:"installed",expected_binary_after:"absent",expected_sql_action_before:"APPLY",expected_sql_action_after:"ROLLBACK",required_opatch_version:$source[0].procedure.required_opatch_version},source_apply:{plan_path:$source_plan_path,plan_file_sha256:$source_plan_file_sha,plan_sha256:$source_plan_sha,final_evidence_path:$source_evidence_path,final_evidence_sha256:$source_evidence_sha,final_evidence_record_sha256:$source_evidence_record,actors:[$source_actor]},source_documents:$source[0].source_documents,snapshot_evidence:$source[0].snapshot_evidence,evidence:$source[0].evidence,recovery:$source[0].recovery}' >"$dir/plan.json.tmp" || return 74
+    '{schema_version:"1.0",intent:"patch_rollback",plan_id:$id,requester:$requester,maintenance_window:{start:$window_start,end:$window_end},target:$source[0].target,patch_id:$source[0].patch_id,nodes:$source[0].nodes,artifact:$source[0].artifact,procedure:{adapter:$rollback_adapter,operations:$rollback_operations,method:$rollback_method,platform_id:$source[0].procedure.platform_id,required_opatch_version:$source[0].procedure.required_opatch_version,rollback:$source[0].procedure.rollback},rollback_procedure:{oracle_reference_path:$readme_path,oracle_reference_sha256:$readme_sha,expected_binary_before:"installed",expected_binary_after:"absent",expected_sql_action_before:"APPLY",expected_sql_action_after:"ROLLBACK",required_opatch_version:$source[0].procedure.required_opatch_version},source_apply:{plan_path:$source_plan_path,plan_file_sha256:$source_plan_file_sha,plan_sha256:$source_plan_sha,final_evidence_path:$source_evidence_path,final_evidence_sha256:$source_evidence_sha,final_evidence_record_sha256:$source_evidence_record,actors:$source_actors},source_documents:$source[0].source_documents,snapshot_evidence:$source[0].snapshot_evidence,evidence:$source[0].evidence,recovery:$source[0].recovery}' >"$dir/plan.json.tmp" || return 74
   canonical=$(jq -cS . "$dir/plan.json.tmp") || return 74; hash=$(opu_hash_string "$canonical") || return
   jq --arg hash "$hash" '. + {plan_sha256:$hash}' "$dir/plan.json.tmp" >"$dir/plan.json" || return 74
   rm -f "$dir/plan.json.tmp"; printf 'awaiting_approval\n' >"$dir/state"
@@ -1570,6 +1609,19 @@ reconcile() (
   [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; now=$(date -u +%s)
   for file in "$(plan_dir "$id")"/tasks/*.json; do verify_task "$file" || exit $?; jq -e '.status == "running"' "$file" >/dev/null 2>&1 || continue; expiry=$(jq -r '.lease_expires_epoch // 0' "$file"); [ "$expiry" -le "$now" ] || continue; task=$(jq -r '.task_id' "$file"); jq --argjson now "$now" '.status="unknown" | .reconciled_at_epoch=$now' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74; seal_task_result "$file" || exit $?; transition "$id" running paused "$actor" "lease_expired_task=$task"; event "$id" task_outcome_unknown paused "$actor" "task_id=$task"; exit 0; done; exit 66
 )
+retry_evidence_safe() {
+  jq -e '
+    .postcondition.status == "failed" and .exit_code != 0 and
+    (.outcome_class == "no_mutation" or
+     (.outcome_class == "binary_state_known" and
+      (.stage | IN("validate","datapatch","final_validate","rollback_binary_validate","rollback_datapatch","rollback_final_validate",
+        "rac_node_validate","cluster_datapatch","cluster_final_validate","rac_rollback_node_validate","rac_rollback_datapatch","rac_rollback_final_validate",
+        "grid_node_validate","grid_cluster_final_validate","grid_rollback_node_validate","grid_rollback_cluster_final_validate",
+        "opatchauto_node_validate","opatchauto_cluster_final_validate","opatchauto_rollback_node_validate","opatchauto_rollback_cluster_final_validate",
+        "ojvm_datapatch_upgrade","ojvm_final_validate","ojvm_rollback_datapatch","ojvm_rollback_final_validate",
+        "oop_validate_clone","oop_datapatch","oop_final_validate","oop_switchback_datapatch","oop_switchback_final_validate"))))
+  ' "$1" >/dev/null
+}
 retry_task() (
   local id="" task_id="" actor="" file last_paused_detail attempt_archive
   while [ "$#" -gt 0 ]; do case "$1" in --plan-id) id=${2:-}; shift 2;; --task-id) task_id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; *) opu_error "unknown retry-task option: $1"; exit 64;; esac; done
@@ -1589,17 +1641,7 @@ retry_task() (
   # Only failure before mutation, or a repeatable validation/datapatch stage
   # with a known binary state, can start another attempt. Heartbeat loss,
   # database-down, recovery-required, and unknown outcomes require recovery.
-  jq -e '
-    .postcondition.status == "failed" and .exit_code != 0 and
-    (.outcome_class == "no_mutation" or
-     (.outcome_class == "binary_state_known" and
-      (.stage | IN("validate","datapatch","final_validate","rollback_binary_validate","rollback_datapatch","rollback_final_validate",
-        "rac_node_validate","cluster_datapatch","cluster_final_validate","rac_rollback_node_validate","cluster_rollback_datapatch","cluster_rollback_final_validate",
-        "grid_node_validate","grid_cluster_final_validate","grid_rollback_node_validate","grid_rollback_cluster_final_validate",
-        "opatchauto_node_validate","opatchauto_cluster_final_validate","opatchauto_rollback_node_validate","opatchauto_rollback_cluster_final_validate",
-        "ojvm_datapatch","ojvm_final_validate","ojvm_rollback_datapatch","ojvm_rollback_final_validate",
-        "oop_validate","oop_datapatch","oop_final_validate","oop_switchback_validate","oop_switchback_datapatch","oop_switchback_final_validate"))))
-  ' "$SOURCE_TASK_EVIDENCE" >/dev/null || { opu_error 'task outcome is not safe for retry; reconcile and recover before further mutation'; exit 65; }
+  retry_evidence_safe "$SOURCE_TASK_EVIDENCE" || { opu_error 'task outcome is not safe for retry; reconcile and recover before further mutation'; exit 65; }
   verify_task_manifest "$id" || exit $?
   target_reservation "$id" verify || exit $?
   attempt_archive="$(plan_dir "$id")/attempts/$task_id/attempt-$(jq -r '.retry_count // 0' "$file").json"

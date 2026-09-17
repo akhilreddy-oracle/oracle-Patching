@@ -20,7 +20,38 @@ tool approve --request-id opatch-001 --actor approver --approval-ticket CHG-001 
 tool apply --request-id opatch-001 --actor executor >"$TMP/applied.json"
 jq -e '.state == "applied" and .apply.backup_path' "$TMP/applied.json" >/dev/null
 "$TMP/home/OPatch/opatch" version | grep -q 12.2.0.1.51
+cp "$TMP/backups/opatch-001-OPatch-before/opatch" "$TMP/approved-backup-opatch"
+printf '\nchanged after approval\n' >>"$TMP/backups/opatch-001-OPatch-before/opatch"
+if tool rollback --request-id opatch-001 --actor executor >"$TMP/changed-backup.out" 2>"$TMP/changed-backup.err"; then
+  echo 'changed backup was accepted for rollback' >&2; exit 1
+fi
+grep -q 'sealed digest' "$TMP/changed-backup.err"
+"$TMP/home/OPatch/opatch" version | grep -q 12.2.0.1.51
+[ ! -e "$TMP/backups/opatch-001-OPatch-before.replaced" ]
+cp "$TMP/approved-backup-opatch" "$TMP/backups/opatch-001-OPatch-before/opatch"
 tool rollback --request-id opatch-001 --actor executor >"$TMP/rollback.json"
 jq -e '.state == "rolled_back"' "$TMP/rollback.json" >/dev/null
 "$TMP/home/OPatch/opatch" version | grep -q 12.2.0.1.17
+# Exercise the actual restoration helper with a partial replacement.
+# shellcheck disable=SC1090
+. <(sed -n '/^restore_original_opatch() {/,/^}/p' "$ROOT/bin/opu-opatch-upgrade")
+# Called by the production helper extracted above.
+# shellcheck disable=SC2329
+as_owner() { shift; "$@"; }
+mkdir -p "$TMP/partial-home/OPatch" "$TMP/original"
+printf 'partial copy' >"$TMP/partial-home/OPatch/partial"
+printf 'original bytes' >"$TMP/original/opatch"
+restore_original_opatch fixture "$TMP/partial-home" "$TMP/original"
+[ "$(cat "$TMP/partial-home/OPatch/opatch")" = 'original bytes' ]
+[ ! -d "$TMP/partial-home/OPatch/OPatch" ]
+[ "$(cat "$TMP/original.failed-replacement/partial")" = 'partial copy' ]
+mkdir -p "$TMP/failed-home/OPatch" "$TMP/failed-original"
+printf 'preserved original' >"$TMP/failed-original/opatch"
+# Called by the production helper extracted above.
+# shellcheck disable=SC2329
+as_owner() { shift; if [ "$3" = "$TMP/failed-original" ]; then return 1; fi; "$@"; }
+if restore_original_opatch fixture "$TMP/failed-home" "$TMP/failed-original"; then
+  echo 'failed original restoration was reported as successful' >&2; exit 1
+fi
+[ "$(cat "$TMP/failed-original/opatch")" = 'preserved original' ]
 printf '%s\n' 'opatch upgrade test passed'

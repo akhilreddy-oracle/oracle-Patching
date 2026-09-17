@@ -71,9 +71,9 @@ except (OSError, ValueError) as exc:
 PY
 }
 
-opu_execution_lock_file() {
-  local path=$1 descriptor=$2 timeout=${3:-0} result
-  case "$descriptor" in 6|7) ;; *) opu_error 'unsupported execution lock descriptor'; return 64;; esac
+opu_execution_open_lock_file() {
+  local path=$1 descriptor=$2 result
+  case "$descriptor" in 6|7|8|9) ;; *) opu_error 'unsupported execution lock descriptor'; return 64;; esac
   opu_execution_validate_lock "$path" || return $?
   # O_RDWR without O_TRUNC preserves any existing contents. Opening a raced
   # FIFO read/write also cannot block waiting for another endpoint. No data is
@@ -81,14 +81,27 @@ opu_execution_lock_file() {
   case "$descriptor" in
     6) exec 6<>"$path" || return 73 ;;
     7) exec 7<>"$path" || return 73 ;;
+    8) exec 8<>"$path" || return 73 ;;
+    9) exec 9<>"$path" || return 73 ;;
   esac
-  if opu_execution_validate_lock "$path" "$descriptor" &&
-     opu_execution_flock "$descriptor" "$timeout" &&
+  if opu_execution_validate_lock "$path" "$descriptor"; then
+    return 0
+  else
+    result=$?
+    case "$descriptor" in 6) exec 6>&- ;; 7) exec 7>&- ;; 8) exec 8>&- ;; 9) exec 9>&- ;; esac
+    return "$result"
+  fi
+}
+
+opu_execution_lock_file() {
+  local path=$1 descriptor=$2 timeout=${3:-0} result
+  opu_execution_open_lock_file "$path" "$descriptor" || return $?
+  if opu_execution_flock "$descriptor" "$timeout" &&
      opu_execution_validate_lock "$path" "$descriptor"; then
     return 0
   else
     result=$?
-    case "$descriptor" in 6) exec 6>&- ;; 7) exec 7>&- ;; esac
+    case "$descriptor" in 6) exec 6>&- ;; 7) exec 7>&- ;; 8) exec 8>&- ;; 9) exec 9>&- ;; esac
     return "$result"
   fi
 }

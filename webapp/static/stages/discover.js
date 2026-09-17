@@ -50,19 +50,25 @@ export async function renderDiscoverStage(mount, hostId) {
 
   async function showCached() {
     body.innerHTML = "";
+    const statusEl = toolbar.querySelector("#discover-status");
     try {
       const res = await apiFetch(`/api/hosts/${encodeURIComponent(hostId)}/pipeline`);
       const pipe = await res.json();
       const disc = (pipe.steps || []).find((s) => s.step === "discovery");
       if (!disc?.done || !disc.evidence) {
+        statusEl.textContent = "no evidence";
+        statusEl.className = "status-chip is-warn";
         body.appendChild(helperText("No live discovery evidence yet. Run live discovery (30–90s).", "warn"));
         return;
       }
       renderTopology(body, disc.evidence, disc.phases || [], hostId);
-      const statusEl = toolbar.querySelector("#discover-status");
       statusEl.textContent = disc.phases_status || disc.status || "cached";
-      statusEl.className = `status-chip is-${classifyStatus(disc.phases_status || disc.status) === "ok" ? "ok" : "warn"}`;
+      const kind = classifyStatus(disc.phases_status || disc.status);
+      statusEl.className = `status-chip is-${kind === "neutral" ? "warn" : kind}`;
     } catch (err) {
+      if (err.name === "AbortError" || err.status === 401) throw err;
+      statusEl.textContent = "unavailable";
+      statusEl.className = "status-chip is-bad";
       body.appendChild(helperText(`Could not load pipeline state: ${err}`, "error"));
     }
   }

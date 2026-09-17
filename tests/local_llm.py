@@ -106,7 +106,7 @@ class LocalLLMTests(LocalLLMFixture, unittest.TestCase):
         invalid = ["https://8.8.8.8/v1", "http://169.254.169.254/v1", "https://100.64.0.1/v1", "http://[fe80::1]/v1",
             "https://[::ffff:127.0.0.1]/v1", "http://name:password@127.0.0.1/v1", "http://127.0.0.1/v1?key=secret",
             "http://127.0.0.1/v1#secret", "file:///v1", "http://127.0.0.1/v1/../v1", "http://127.0.0.1/%76%31",
-            "http://10.0.0.2/v1", "https://internal.example/v1"]
+            "http://10.0.0.2/v1", "https://internal.example/v1", "http://127.0.0.1:0/v1", "https://localhost:0/v1"]
         for url in invalid:
             with self.subTest(url=url):
                 self.settings = {"enabled": True, "model": "fixture", "base_url": url}; self.save()

@@ -82,7 +82,8 @@ def _endpoint(c):
     _require(isinstance(url, str) and 0 < len(url) <= 2048 and not re.search(r"[\s%\\]", url), "Local model endpoint is invalid")
     try:
         parsed = urlsplit(url)
-        host, port = parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+        host = parsed.hostname
+        port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
     except ValueError:
         raise LLMError("Local model endpoint is invalid") from None
     _require(parsed.scheme in {"http", "https"} and host and not parsed.username and not parsed.password

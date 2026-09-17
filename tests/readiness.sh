@@ -67,6 +67,29 @@ set -e
 [ "$standby_rc" -eq 2 ]
 jq -e '.status == "blocked" and any(.gates[]; .name == "dataguard_unsupported" and .status == "blocker")' "$TMP/standalone-standby-result.json" >/dev/null
 
+# A standby waiver requires current sealed DG evidence for its exact target.
+jq -n --arg now "$now" --arg digest "$digest" '{schema_version:"1.0",status:"ready_for_standby_first",evaluated_at:$now,observed_at:$now,gates:[],target:{db_unique_name:"ORCL",oracle_home:"/u01/db",database_role:"PHYSICAL STANDBY"},evidence:{observe_sha256:$digest,policy_sha256:$digest}}' >"$TMP/dg-base.json"
+seal_dataguard() {
+  local canonical hash
+  canonical=$(jq -cS 'del(.record_sha256)' "$1")
+  hash=$(printf '%s' "$canonical" | sha256sum | awk '{print $1}')
+  jq --arg hash "$hash" '.record_sha256=$hash' "$1" >"$2"
+}
+standby_eval() {
+  "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/standalone-standby-reconciliation.json" --snapshot "$TMP/standalone-standby.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/policy.json" --dataguard "$1"
+}
+seal_dataguard "$TMP/dg-base.json" "$TMP/dg-ready.json"
+standby_eval "$TMP/dg-ready.json" >"$TMP/dg-result.json"
+jq -e --arg now "$now" '.status == "ready_for_approval" and (.evidence.dataguard_sha256 | test("^[a-f0-9]{64}$")) and ((.valid_until | fromdateiso8601) <= (($now | fromdateiso8601) + 300))' "$TMP/dg-result.json" >/dev/null
+if standby_eval "$TMP/dg-base.json" >/dev/null 2>&1; then echo 'unsealed DG evaluation granted a standby waiver' >&2; exit 1; fi
+for mutation in '.target.db_unique_name="OTHER"' '.target.oracle_home="/other/home"' '.target.database_role="PRIMARY"' 'del(.target)' '.evaluated_at="2000-01-01T00:00:00Z"' '.evaluated_at="2099-01-01T00:00:00Z"' '.status="unknown"' '.observed_at="2000-01-01T00:00:00Z"' 'del(.observed_at)'; do
+  jq "$mutation" "$TMP/dg-base.json" >"$TMP/dg-mutated.json"
+  seal_dataguard "$TMP/dg-mutated.json" "$TMP/dg-mutated-sealed.json"
+  if standby_eval "$TMP/dg-mutated-sealed.json" >/dev/null 2>&1; then echo "unsafe DG waiver accepted: $mutation" >&2; exit 1; fi
+done
+jq '.target.oracle_home="/tampered"' "$TMP/dg-ready.json" >"$TMP/dg-tampered.json"
+if standby_eval "$TMP/dg-tampered.json" >/dev/null 2>&1; then echo 'tampered DG evaluation was accepted' >&2; exit 1; fi
+
 # Stale reconciliation digests must fail closed with an actionable binding detail.
 jq '.oracle_homes[0].patches += ["99999999"]' "$TMP/standalone.json" >"$TMP/standalone-drift.json"
 set +e

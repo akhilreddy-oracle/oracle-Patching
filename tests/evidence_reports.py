@@ -141,6 +141,46 @@ class ReportTests(unittest.TestCase):
         report = reports.build('p')
         self.assertFalse(report['completion_verified']); self.assertEqual(report['rollback']['status'], 'not_available')
 
+    def test_native_prechecks_populate_only_the_before_column(self):
+        for stage in ('rac_precheck', 'rac_rollback_precheck', 'grid_precheck', 'grid_rollback_precheck',
+                      'opatchauto_precheck', 'opatchauto_rollback_precheck', 'ojvm_precheck',
+                      'ojvm_rollback_precheck', 'oop_precheck', 'oop_switchback_precheck'):
+            with self.subTest(stage=stage):
+                self.tasks.clear()
+                self.task('before-' + stage, stage, files={'precheck-lspatches.log': '123;baseline\n'})
+                row = self.comparison(reports.build('p'), 'binary_inventory')
+                self.assertEqual(row['before']['value'], ['123'])
+                self.assertEqual(row['after']['status'], 'unknown')
+
+    def test_stage_and_grid_home_mismatch_cannot_establish_completion(self):
+        self.plan['state'] = 'succeeded'
+        self.task('final', 'grid_cluster_final_validate')
+        self.tasks[0]['stage'] = 'final_validate'
+        self.assertFalse(reports.build('p')['completion_verified'])
+        self.tasks[0]['stage'] = 'grid_cluster_final_validate'
+        self.plan['target'] = {'grid_home': '/other-grid'}
+        self.assertFalse(reports.build('p')['completion_verified'])
+
+    def test_all_native_adapter_final_stages_report_completion_without_inventing_metrics(self):
+        self.plan['state'] = 'succeeded'
+        for stage in ('cluster_final_validate', 'rac_rollback_final_validate',
+                      'grid_cluster_final_validate', 'grid_rollback_cluster_final_validate',
+                      'opatchauto_cluster_final_validate', 'opatchauto_rollback_cluster_final_validate',
+                      'ojvm_final_validate', 'ojvm_rollback_final_validate',
+                      'oop_final_validate', 'oop_switchback_final_validate'):
+            with self.subTest(stage=stage):
+                self.tasks.clear()
+                self.plan['intent'] = 'patch_rollback' if 'rollback' in stage or 'switchback' in stage else 'patch_apply'
+                self.task('final-' + stage, stage)
+                report = reports.build('p')
+                self.assertTrue(report['completion_verified'])
+                self.assertTrue(all(row['after']['status'] == 'unknown' for row in report['comparison']))
+                self.assertFalse(report['rollback']['approved'])
+                self.assertEqual(report['rollback']['status'], 'requires_native_validation'
+                                 if self.plan['intent'] == 'patch_apply' else 'not_available')
+                self.tasks[0]['evidence_verified'] = False
+                self.assertFalse(reports.build('p')['completion_verified'])
+
     def test_safe_source_read_rejects_symlinks_and_hardlinks(self):
         path = self.root / 'file'; digest = write(path, 'data')
         link = self.root / 'symlink'; link.symlink_to(path)

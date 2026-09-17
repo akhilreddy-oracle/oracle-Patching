@@ -28,4 +28,11 @@ grep -q 'required_opatch_version must be a dotted OPatch version' "$TMP/incomple
 grep -q 'database_unique_name is required' "$TMP/incomplete.err" || { echo 'missing database_unique_name diagnostic' >&2; cat "$TMP/incomplete.err" >&2; exit 1; }
 grep -q 'backup_or_restore' "$TMP/incomplete.err" || { echo 'missing backup_or_restore diagnostic' >&2; cat "$TMP/incomplete.err" >&2; exit 1; }
 grep -q 'rollback.precondition must be a non-empty' "$TMP/incomplete.err" || { echo 'missing rollback.precondition diagnostic' >&2; cat "$TMP/incomplete.err" >&2; exit 1; }
+for malformed in '.execution.operations = {}' '.required_opatch_version = {}' '.mandatory_prechecks = 1' '.rollback = []'; do
+  jq "$malformed" "$TMP/procedure.json" >"$TMP/malformed.json"
+  if "$ROOT/bin/opu-procedure-validate" --procedure "$TMP/malformed.json" --artifact "$TMP/artifact.json" >"$TMP/malformed.out" 2>"$TMP/malformed.err"; then
+    echo "malformed contract was accepted: $malformed" >&2; exit 1
+  fi
+  [ ! -s "$TMP/malformed.out" ] || { echo 'invalid procedure emitted successful evidence' >&2; exit 1; }
+done
 printf '%s\n' 'procedure validation test passed'

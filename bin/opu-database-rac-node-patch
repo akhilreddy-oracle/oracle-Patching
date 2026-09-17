@@ -930,8 +930,9 @@ run_typed_stage() {
 
 acquire_executor_lock() {
   if command -v flock >/dev/null 2>&1; then
-    exec 8>"$NODE_RUN_DIR/executor.lock"
+    opu_execution_open_lock_file "$NODE_RUN_DIR/executor.lock" 8 || die "unsafe executor lock"
     flock -n 8 || die 'another RAC executor owns this node and plan'
+    opu_execution_validate_lock "$NODE_RUN_DIR/executor.lock" 8 || die "unsafe executor lock"
     EXECUTOR_LOCK_USES_FLOCK=1
   elif [ "$TEST_MODE" = 1 ]; then
     EXECUTOR_LOCK_DIR="$NODE_RUN_DIR/executor.lock.d"

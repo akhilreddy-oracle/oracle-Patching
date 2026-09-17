@@ -41,6 +41,11 @@ def _require(path, tool: str, label: str) -> None:
         raise localtools.LocalToolError(tool, f"Run {label} first — no cached evidence for this host yet.")
 
 
+def _invalidate(host_id: str, *names: str) -> None:
+    for name in names:
+        evidence.clear_evidence(host_id, name)
+
+
 def _configured_nodes(host: dict) -> list[dict]:
     """Return [{name, ssh_alias}] for live per-node discovery.
 
@@ -59,10 +64,10 @@ def _configured_nodes(host: dict) -> list[dict]:
         if not isinstance(entry, dict):
             raise remote.RemoteError("invalid_host_config", "hosts.json nodes entries must be objects")
         name = str(entry.get("name") or "").split(".", 1)[0]
-        if not name or not _NODE_NAME_RE.match(name):
+        if not name or not _NODE_NAME_RE.fullmatch(name) or any(node["name"] == name for node in nodes):
             raise remote.RemoteError(
                 "invalid_host_config",
-                f"hosts.json node name is missing or unsupported: {entry.get('name')!r}",
+                f"hosts.json node name is missing, duplicated or unsupported: {entry.get('name')!r}",
             )
         if "ssh_alias" in entry:
             alias = entry.get("ssh_alias")
@@ -106,6 +111,8 @@ def step_discovery(host_id: str, host: dict, body: dict) -> dict:
     receipt_started_at = live_inventory.utc_now() if receipt_requested else None
     captured_nodes: list[tuple[str, dict]] = []
     nodes = _configured_nodes(host)
+    _invalidate(host_id, "snapshot", "snapshot_nodes", "reconciliation", "compatibility",
+                "compatibility_reconciliation", "readiness", "recovery")
     tools_sync.ensure_host_tools(host)
     argv = [f"{host['remote_root']}/bin/opu-topology-discover", "--pretty"]
     sudo = bool(host.get("sudo"))
@@ -131,12 +138,9 @@ def step_discovery(host_id: str, host: dict, body: dict) -> dict:
                 stderr=exc.stderr,
             ) from exc
 
-        if receipt_requested:
-            # Keep this worker's actual returned payloads, never reread shared
-            # snapshots after another discovery might have replaced them.
-            captured_nodes.append((node["name"], payload))
+        # Publish the node set only after every configured collector returns.
+        captured_nodes.append((node["name"], payload))
         evidence_name = evidence.node_snapshot_evidence_name(node["name"])
-        evidence.write_evidence(host_id, evidence_name, payload)
         index_nodes.append(
             {
                 "name": node["name"],
@@ -152,23 +156,14 @@ def step_discovery(host_id: str, host: dict, body: dict) -> dict:
     if primary_payload is None:
         raise remote.RemoteError("discovery_failed", "No topology snapshots were collected")
 
+    for node_name, payload in captured_nodes:
+        evidence.write_evidence(host_id, evidence.node_snapshot_evidence_name(node_name), payload)
     evidence.write_evidence(host_id, "snapshot", primary_payload)
     evidence.write_evidence(
         host_id,
         "snapshot_nodes",
         {"schema_version": "1.0", "nodes": index_nodes},
     )
-    # New topology digests invalidate every digest-bound downstream document.
-    # Leaving stale reconciliation/readiness "done" is what produces
-    # snapshot_binding blockers after a rediscovery.
-    for name in (
-        "reconciliation",
-        "compatibility",
-        "compatibility_reconciliation",
-        "readiness",
-        "recovery",
-    ):
-        evidence.clear_evidence(host_id, name)
     if receipt_requested:
         return live_inventory.build_receipt(host_id=host_id, host=host, run_id=receipt_run_id,
             started_at=receipt_started_at, completed_at=live_inventory.utc_now(),
@@ -177,6 +172,7 @@ def step_discovery(host_id: str, host: dict, body: dict) -> dict:
 
 
 def step_reconcile(host_id: str, host: dict, body: dict) -> dict:
+    _invalidate(host_id, "reconciliation", "compatibility_reconciliation", "readiness")
     args = _snapshot_cli_args(host_id, "opu-snapshot-reconcile")
     result = localtools.run_tool("opu-snapshot-reconcile", args)
     evidence.write_evidence(host_id, "reconciliation", result)
@@ -190,12 +186,12 @@ def step_artifact_inspect(host_id: str, host: dict, body: dict) -> dict:
     artifact_dir = (body.get("artifact_dir") or "").strip()
     if not artifact_dir.startswith("/"):
         raise remote.RemoteError("invalid_input", "artifact_dir must be an absolute path on the target host")
+    _invalidate(host_id, "artifact", "procedure", "compatibility", "compatibility_reconciliation", "readiness")
     tools_sync.ensure_host_tools(host)
     argv = [f"{host['remote_root']}/bin/opu-artifact-inspect", "--artifact", artifact_dir]
-    stdout = remote.run_remote(
+    result = remote.run_remote_json(
         host["ssh_alias"], argv, timeout=ARTIFACT_INSPECT_TIMEOUT_SECONDS, sudo=bool(host.get("sudo")),
     )
-    result = json.loads(stdout)
     evidence.write_evidence(host_id, "artifact", result)
     return result
 
@@ -220,6 +216,7 @@ def step_compatibility_collect(host_id: str, host: dict, body: dict) -> dict:
     artifact_dir = (body.get("artifact_dir") or "").strip()
     if not artifact_dir.startswith("/"):
         raise remote.RemoteError("invalid_input", "artifact_dir must be an absolute path on the target host")
+    _invalidate(host_id, "compatibility", "compatibility_reconciliation", "readiness")
 
     snapshot = evidence.evidence_path(host_id, "snapshot")
     artifact = evidence.evidence_path(host_id, "artifact")
@@ -252,14 +249,13 @@ def step_compatibility_collect(host_id: str, host: dict, body: dict) -> dict:
             "--procedure-validation", f"{scratch}/procedure.json",
         ]
         try:
-            stdout = remote.run_remote(alias, argv, timeout=COMPATIBILITY_COLLECT_TIMEOUT_SECONDS, sudo=sudo)
+            result = remote.run_remote_json(alias, argv, timeout=COMPATIBILITY_COLLECT_TIMEOUT_SECONDS, sudo=sudo)
         except remote.RemoteError as exc:
             raise remote.RemoteError(
                 exc.error,
                 f"OPatch compatibility collection failed on node {node['name']} (ssh_alias={alias}): {exc.message}",
                 stderr=exc.stderr,
             ) from exc
-        result = json.loads(stdout)
         if merged is None:
             merged = result
             if len(nodes) > 1:
@@ -276,6 +272,7 @@ def step_compatibility_collect(host_id: str, host: dict, body: dict) -> dict:
 
 
 def step_compatibility_reconcile(host_id: str, host: dict, body: dict) -> dict:
+    _invalidate(host_id, "compatibility_reconciliation", "readiness")
     reconciliation = evidence.evidence_path(host_id, "reconciliation")
     procedure = evidence.evidence_path(host_id, "procedure")
     compatibility = evidence.evidence_path(host_id, "compatibility")
@@ -299,6 +296,7 @@ def step_readiness_evaluate(host_id: str, host: dict, body: dict) -> dict:
     policy = body.get("policy")
     if not isinstance(policy, dict):
         raise localtools.LocalToolError("opu-readiness-evaluate", "Missing 'policy' document in request body.")
+    _invalidate(host_id, "readiness")
 
     reconciliation = evidence.evidence_path(host_id, "reconciliation")
     artifact = evidence.evidence_path(host_id, "artifact")
@@ -377,7 +375,12 @@ def step_recovery_collect(host_id: str, host: dict, body: dict) -> dict:
     ], timeout=RECOVERY_COLLECT_TIMEOUT_SECONDS, sudo=sudo)
     if result.returncode != 0:
         raise remote.RemoteError("recovery_validation_failed", "Selected recovery set failed native validation", stderr=result.stderr.strip() or result.stdout[-4000:])
-    payload = json.loads(result.stdout)
+    try:
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, dict):
+            raise ValueError("expected an object")
+    except ValueError as exc:
+        raise remote.RemoteError("invalid_recovery", "Native recovery collector returned invalid JSON") from exc
     if payload.get("status") != "passed" or payload.get("source_snapshot") != {"path": str(snapshot_path), "sha256": snapshot_sha}:
         raise remote.RemoteError("invalid_recovery", "Native recovery result is not bound to the supplied snapshot")
     collected_target = payload.get("target") or {}
@@ -586,13 +589,22 @@ def step_stage_artifact(host_id: str, host: dict, body: dict) -> dict:
       holds complete media (tar stream through the control plane).
     - source.zip_path: unzip a patch zip already present on each node.
     """
+    for field in ("artifact_dir", "owner", "transfer"):
+        if field in body and not isinstance(body[field], str):
+            raise remote.RemoteError("invalid_input", f"{field} must be a string")
+    if "replace" in body and type(body["replace"]) is not bool:
+        raise remote.RemoteError("invalid_input", "replace must be a boolean")
+    if not isinstance(body.get("source"), dict) or set(body["source"]) not in ({"host_id"}, {"zip_path"}):
+        raise remote.RemoteError("invalid_input", "source must contain exactly one host_id or zip_path")
+    if any(not isinstance(value, str) for value in body["source"].values()):
+        raise remote.RemoteError("invalid_input", "source host_id or zip_path must be a string")
     artifact_dir = (body.get("artifact_dir") or "").strip().rstrip("/")
     if not artifact_dir.startswith("/") or artifact_dir == "":
         raise remote.RemoteError("invalid_input", "artifact_dir must be an absolute path on the target host")
     owner = (body.get("owner") or "").strip() or _stage_owner_from_snapshot(host_id)
     if not owner:
         raise remote.RemoteError("invalid_input", "owner is required (run discovery first so the Oracle Home owner is known)")
-    if not _OWNER_RE.match(owner):
+    if not _OWNER_RE.fullmatch(owner):
         raise remote.RemoteError("invalid_input", f"owner is not a valid user[:group]: {owner!r}")
     replace = bool(body.get("replace"))
     source = body.get("source") or {}
@@ -620,6 +632,9 @@ def step_stage_artifact(host_id: str, host: dict, body: dict) -> dict:
     if transfer not in ("auto", "direct", "relay"):
         raise remote.RemoteError("invalid_input", "transfer must be auto, direct or relay")
 
+    # A partial multi-node transfer must not leave approval evidence for media
+    # that may already have changed on an earlier node.
+    _invalidate(host_id, *_ARTIFACT_BOUND_EVIDENCE)
     tools_sync.ensure_host_tools(host)
     sudo = bool(host.get("sudo"))
     tool = f"{host['remote_root'].rstrip('/')}/bin/opu-artifact-stage"
@@ -661,7 +676,7 @@ def step_stage_artifact(host_id: str, host: dict, body: dict) -> dict:
                         )
                         path_used = f"direct:{dst_ip}"
                     except remote.RemoteError as exc:
-                        if transfer == "direct":
+                        if transfer == "direct" or exc.error == "transfer_cleanup_failed":
                             raise
                         print(f"[webapp] direct transfer setup failed ({exc.message}); relaying via control plane", flush=True)
                         proc = None
@@ -686,7 +701,9 @@ def step_stage_artifact(host_id: str, host: dict, body: dict) -> dict:
             )
         try:
             payload = json.loads(proc.stdout.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError) as exc:
+            if not isinstance(payload, dict) or payload.get("status") != "staged":
+                raise ValueError("expected a staged artifact result")
+        except (ValueError, IndexError) as exc:
             raise remote.RemoteError("stage_failed", f"opu-artifact-stage on {node['name']} produced unparsable output: {exc}", stderr=proc.stdout[-2000:]) from exc
         results.append({"node": node["name"], "ssh_alias": alias, "status": "staged", "transfer": path_used, **payload})
 
