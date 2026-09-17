@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
+from runtime_fixture import runtime_receipt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "webapp"))
 import evidence
@@ -42,7 +43,7 @@ class LiveRecoveryTests(unittest.TestCase):
                              "status": "complete", "database_role": "PRIMARY", "open_mode": "READ WRITE", "instance_state": "OPEN", "log_mode": "NOARCHIVELOG", "cdb": "NO"}}]}
         evidence.write_evidence("sourcedb", "snapshot", self.snapshot)
         evidence.write_evidence("sourcedb", "policy", self.policy)
-        self.sync = self.enterContext(patch.object(recoveryctl.tools_sync, "ensure_tools"))
+        self.sync = self.enterContext(patch.object(recoveryctl.tools_sync, "ensure_tools", side_effect=runtime_receipt))
         self.shell = self.enterContext(patch.object(recoveryctl.remote, "run_remote_shell", return_value=self.response("")))
         self.raw = self.enterContext(patch.object(recoveryctl.remote, "run_remote_raw", return_value=self.response({"request_id": "r1", "state": "awaiting_approval"})))
         self.push = self.enterContext(patch.object(recoveryctl.remote, "push_file"))
@@ -97,7 +98,7 @@ class LiveRecoveryTests(unittest.TestCase):
         argv = self.raw.call_args.args[1]
         self.assertEqual(argv[:2], ["env", "-i"])
         self.assertFalse(any("TEST_MODE" in arg or "TEST_ALLOW" in arg for arg in argv))
-        self.assertIn("/opt/opu/bin/opu-database-recovery-prepare", argv)
+        self.assertIn(runtime_receipt("source", "/opt/opu")["runtime_root"] + "/bin/opu-database-recovery-prepare", argv)
         self.assertEqual(self.raw.call_args.kwargs["sudo"], True)
         self.assertNotIn("execute", argv)
         self.assertEqual(self.push.call_count, 2)

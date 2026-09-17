@@ -12,6 +12,13 @@ exact-source release receipt and draft PR checks for combined validation;
 the earlier receipt does not validate changed source.
 This document is an audit record, not a production certificate.
 
+The subsequent [third correctness review](THIRD_REVIEW_EXECUTION.md) reproduced
+additional delayed-request authorization, confirmed-target and pre-outage state
+defects after the second pass's full tests passed. It fixes those boundaries and
+replaces in-place remote tool updates with retained, verified code generations.
+The older second-pass runtime-race limitation is superseded by that implementation;
+the separate Oracle/model/environment acceptance limits below remain.
+
 The second pass preserves reviewed README/media bindings, rejects incomplete
 node evidence, binds confirmed AI plan creation through native sealing, excludes
 competing HTTP/pull-agent transports, and corrects stale Grid runtime reporting.

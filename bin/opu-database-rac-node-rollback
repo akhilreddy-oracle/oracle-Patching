@@ -793,6 +793,8 @@ stage_rac_rollback_drain() {
   load_binding; verify_source_apply_lineage; verify_source_documents; verify_recovery; verify_open_window
   require_bound_instance_state running "$TASK_DIR/drain-local-instance.log"
   require_surviving_instance
+  database_probe "$ORACLE_SID" "$TASK_DIR/drain-pre-health.log" &&
+    healthy_probe "$TASK_DIR/drain-pre-health.log" "$ORACLE_SID" || die 'RAC database identity or health changed before rollback service drain'
   drain_services
 }
 
@@ -801,6 +803,8 @@ stage_rac_rollback_stop() {
   require_bound_instance_state running "$TASK_DIR/stop-before-instance.log"
   require_surviving_instance
   verify_services_available away-from-local
+  database_probe "$ORACLE_SID" "$TASK_DIR/stop-pre-health.log" &&
+    healthy_probe "$TASK_DIR/stop-pre-health.log" "$ORACLE_SID" || die 'RAC database identity or health changed before rollback instance shutdown'
   srvctl_run stop instance -db "$DATABASE" -instance "$ORACLE_SID" -stopoption immediate
   wait_bound_instance stopped || die 'local instance did not stop through Clusterware'
   : >"$TASK_DIR/instance-down"

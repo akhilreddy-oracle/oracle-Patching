@@ -436,13 +436,13 @@ def _configured_host(metadata: dict) -> dict:
         raise RecoveryError("Configured recovery host changed or is unavailable; refusing to retarget the request") from exc
 
 
-def _argv(host: dict, action: str, request_id: str, extra: list[str] | None = None) -> list[str]:
+def _argv(host: dict, action: str, request_id: str, extra: list[str] | None = None, *, runtime: dict) -> list[str]:
     # A clean remote environment cannot inherit fixture overrides, arbitrary
     # Oracle command substitutions, or a shell startup file from the webapp.
-    root = _absolute_remote_path(host.get("remote_root"), "configured remote_root")
+    tool = tools_sync.tool_path(host, [runtime], "bin/opu-database-recovery-prepare")
     return ["env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "LC_ALL=C",
             f"OPU_RECOVERY_PREP_STATE_DIR={REMOTE_STATE_DIR}",
-            f"{root}/bin/opu-database-recovery-prepare", action, "--request-id", request_id, *(extra or [])]
+            tool, action, "--request-id", request_id, *(extra or [])]
 
 
 def _parse_native(response, request_id: str) -> dict:
@@ -458,8 +458,10 @@ def _parse_native(response, request_id: str) -> dict:
     return payload
 
 
-def _native(host: dict, request_id: str, action: str, extra: list[str] | None = None) -> dict:
-    response = remote.run_remote_raw(host["ssh_alias"], _argv(host, action, request_id, extra),
+def _native(host: dict, request_id: str, action: str, extra: list[str] | None = None, *, runtime: dict | None = None) -> dict:
+    if runtime is None:
+        runtime = tools_sync.ensure_tools(host["ssh_alias"], host["remote_root"], bool(host.get("sudo")))
+    response = remote.run_remote_raw(host["ssh_alias"], _argv(host, action, request_id, extra, runtime=runtime),
                                      timeout=DEFAULT_TIMEOUT_SECONDS, sudo=True)
     result = _parse_native(response, request_id)
     # The native tool verifies its sealed request. Independently bind transport
@@ -597,7 +599,7 @@ def create_live(request_id: str, requester: str, *, host: dict, host_id: str,
             os.fsync(stream.fileno())
         path.chmod(0o400)
     # Install from trusted local package; no payload-provided host or command.
-    tools_sync.ensure_tools(host["ssh_alias"], host["remote_root"], bool(host.get("sudo")))
+    runtime = tools_sync.ensure_tools(host["ssh_alias"], host["remote_root"], bool(host.get("sudo")))
     _update_metadata(request_id, create_state="remote_create_unknown")
     q = shlex.quote
     prepare = (f"set -eu; umask 077; [ ! -L {q(REMOTE_STATE_DIR)} ]; "
@@ -617,7 +619,7 @@ def create_live(request_id: str, requester: str, *, host: dict, host_id: str,
         raise RecoveryError("Remote immutable recovery input verification failed", sealed.stderr)
     result = _native(host, request_id, "create", ["--requester", requester,
         "--snapshot", metadata["inputs"]["snapshot"]["path"], "--policy", metadata["inputs"]["policy"]["path"],
-        "--database", database, "--backup-parent", backup_parent, "--window-start", window_start, "--window-end", window_end])
+        "--database", database, "--backup-parent", backup_parent, "--window-start", window_start, "--window-end", window_end], runtime=runtime)
     metadata = _update_metadata(request_id, create_state="created", last_status=result)
     return _decorate(result, metadata)
 
@@ -685,7 +687,12 @@ def _import_evidence(request_id: str, host: dict, native: dict) -> dict:
 
 
 def _terminal_result(request_id: str, host: dict, execution: dict, returncode: int) -> dict:
-    native = _native(host, request_id, "status")
+    runtime = None
+    if "runtime_root" in execution or "runtime_fingerprint" in execution:
+        runtime = {"ssh_alias": host["ssh_alias"], "runtime_root": execution.get("runtime_root"),
+                   "fingerprint": execution.get("runtime_fingerprint")}
+        tools_sync.runtime_for_host(host, [runtime])
+    native = _native(host, request_id, "status", runtime=runtime)
     action = execution.get("action", "execute")
     is_reconcile = action == "reconcile"
     if native.get("state") == "running":
@@ -719,7 +726,8 @@ def _execute_live(request_id: str, host: dict, actor: str, action: str = "execut
         field = "reconciliation_execution" if action == "reconcile" else "execution"
         if metadata.get(field):
             raise RecoveryError(f"Recovery {action} was already submitted; inspect or reconcile its run instead of retrying")
-        current = _native(host, request_id, "status")
+        runtime = tools_sync.ensure_tools(host["ssh_alias"], host["remote_root"], bool(host.get("sudo")))
+        current = _native(host, request_id, "status", runtime=runtime)
         required_state = "running" if action == "reconcile" else "authorized"
         if current.get("state") != required_state or (current.get("authorization") or {}).get("actor") != actor:
             raise RecoveryError(f"Recovery must be {required_state} and authorized by this actor before {action}")
@@ -729,15 +737,17 @@ def _execute_live(request_id: str, host: dict, actor: str, action: str = "execut
                 raise RecoveryError("Original recovery wrapper must be proven exited before service reconciliation")
         run_dir = f"{REMOTE_STATE_DIR}/webapp-executions/{request_id}/{uuid.uuid4().hex}"
         execution = {"request_id": request_id, "remote_run_dir": run_dir, "actor": actor, "action": action,
-                     "terminal": False, "submitted_at": time.time()}
+                     "terminal": False, "submitted_at": time.time(),
+                     "runtime_root": runtime["runtime_root"], "runtime_fingerprint": runtime["fingerprint"]}
         # Persist both request ownership and pipeline context before SSH. A lost
         # launch response is unknown, never permission to launch a second job.
         _update_metadata(request_id, **{field: execution})
         pipeline_runner.set_execution_context(detached_execution=True, detached_terminal=False,
             recovery_request_id=request_id, recovery_action=action, host_id=host["id"], ssh_alias=host["ssh_alias"],
-            remote_root=host["remote_root"], remote_run_dir=run_dir)
+            remote_root=host["remote_root"], remote_run_dir=run_dir,
+            runtime_root=runtime["runtime_root"], runtime_fingerprint=runtime["fingerprint"])
         q = shlex.quote
-        command = " ".join(q(a) for a in _argv(host, action, request_id, ["--actor", actor]))
+        command = " ".join(q(a) for a in _argv(host, action, request_id, ["--actor", actor], runtime=runtime))
         wrapper = f"umask 077; echo $$ >pid.tmp; mv pid.tmp pid; {command} >stdout 2>stderr </dev/null; rc=$?; echo $rc >rc.tmp; mv rc.tmp rc"
         parent = str(PurePosixPath(run_dir).parent)
         launch = (f"set -eu; umask 077; mkdir -p {q(parent)}; mkdir {q(run_dir)}; cd {q(run_dir)}; "
@@ -838,6 +848,8 @@ def reconcile_detached_run(record: dict) -> dict:
                 "host_id": host["id"], "ssh_alias": host["ssh_alias"], "remote_root": host["remote_root"],
                 "remote_run_dir": execution.get("remote_run_dir")}.items()):
             raise RecoveryError("Persisted recovery execution context does not match this request")
+        if any(context.get(k) != execution.get(k) for k in ("runtime_root", "runtime_fingerprint")):
+            raise RecoveryError("Persisted recovery runtime differs from its launch")
         if context.get("remote_pid") is not None and context["remote_pid"] != execution.get("pid"):
             raise RecoveryError("Persisted recovery execution PID does not match this request")
         state, rc = _poll_launch(host, execution)

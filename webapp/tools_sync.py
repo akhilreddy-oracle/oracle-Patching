@@ -1,17 +1,17 @@
 """Keep the opu-* tool tree on every managed host identical to this checkout.
 
-Every remote step runs ``<remote_root>/bin/opu-*`` on the host. When that
-copy drifts from the control plane (older collector, missing fail-closed
-check, missing ``-silent`` on rollback) the operator sees an opaque block
-and has to log in to find out why. Before any remote tool runs we compare a
-content fingerprint of the complete agent runtime with a stamp on the host and push
-the tree when they differ. Idempotent, cheap (one short SSH when in sync),
-and preserves host configuration and state under remote_root.
+Managed launches use a retained ``<remote_root>/.opu-runtimes/<digest>``
+generation returned by synchronization. A complete generation is verified and
+published atomically, never overwritten. Legacy code and all mutable state
+remain at their existing paths, so updating cannot change an already-started
+collector or executor. Direct legacy CLI installations are not silently upgraded.
 """
 from __future__ import annotations
 
 import hashlib
 import io
+import json
+import re
 import shlex
 import tarfile
 import threading
@@ -20,10 +20,11 @@ import uuid
 from pathlib import Path
 
 import remote
+import runtime_install
 
 ROOT = Path(__file__).resolve().parent.parent
 SYNC_DIRS = ("bin", "lib", "operations")
-RUNTIME_MODULES = ("adapters.py", "durable.py", "runtime_paths.py", "diagnostics.py", "agent_queue.py", "agent_enroll.py", "agent_worker.py")
+RUNTIME_MODULES = runtime_install.RUNTIME_MODULES
 STAMP_NAME = ".opu-tools-fingerprint"
 # Re-verify a host at most this often per webapp process; the stamp check is
 # one SSH round-trip, so this only trims chatter within a burst of steps.
@@ -38,8 +39,8 @@ def _tree_files() -> list[Path]:
     files: list[Path] = []
     for name in SYNC_DIRS:
         base = ROOT / name
-        if not base.is_dir():
-            continue
+        if not base.is_dir() or base.is_symlink():
+            raise remote.RemoteError("incomplete_runtime", f"required runtime directory is missing: {name}")
         for path in sorted(base.rglob("*")):
             if path.is_file() and not path.is_symlink() and "__pycache__" not in path.parts:
                 files.append(path)
@@ -53,8 +54,11 @@ def _tree_files() -> list[Path]:
 
 def _snapshot_files() -> list[tuple[str, int, bytes]]:
     """Capture each payload once; hashing and packing must use identical bytes."""
-    return [(path.relative_to(ROOT).as_posix(), path.stat().st_mode & 0o777, path.read_bytes())
-            for path in _tree_files()]
+    snapshot = [(path.relative_to(ROOT).as_posix(), path.stat().st_mode & 0o777, path.read_bytes())
+                for path in _tree_files()]
+    if not runtime_install.REQUIRED_FILES <= {path for path, _mode, _data in snapshot}:
+        raise remote.RemoteError("incomplete_runtime", "required runtime source files are missing")
+    return snapshot
 
 
 def local_fingerprint(snapshot=None) -> str:
@@ -80,101 +84,93 @@ def _build_tarball(snapshot=None) -> bytes:
     return buf.getvalue()
 
 
+def _generation_root(remote_root: str, fingerprint: str) -> str:
+    if not isinstance(remote_root, str) or not remote_root.startswith("/") or remote_root.rstrip("/") == "" or ".." in Path(remote_root).parts:
+        raise remote.RemoteError("invalid_host_config", "remote_root must be an absolute deployment directory")
+    if not isinstance(fingerprint, str) or not re.fullmatch(r"[a-f0-9]{64}", fingerprint):
+        raise remote.RemoteError("invalid_runtime", "runtime fingerprint must be a full SHA-256 digest")
+    return f"{remote_root.rstrip('/')}/.opu-runtimes/{fingerprint}"
+
+
+def runtime_for_host(host: dict, receipts: list[dict], ssh_alias: str | None = None) -> dict:
+    """Resolve only the exact generation attested by this operation's sync."""
+    alias = ssh_alias or host["ssh_alias"]
+    if not isinstance(receipts, list):
+        raise remote.RemoteError("invalid_runtime", "missing runtime synchronization receipts")
+    matches = [r for r in receipts if isinstance(r, dict) and r.get("ssh_alias") == alias]
+    if len(matches) != 1:
+        raise remote.RemoteError("invalid_runtime", "missing or ambiguous runtime synchronization receipt")
+    result = matches[0]
+    expected = _generation_root(host["remote_root"], result.get("fingerprint"))
+    if result.get("runtime_root") != expected:
+        raise remote.RemoteError("invalid_runtime", "runtime receipt does not belong to the configured deployment")
+    return result
+
+
+def tool_path(host: dict, receipts: list[dict], relative: str, ssh_alias: str | None = None) -> str:
+    if not isinstance(relative, str) or not re.fullmatch(r"bin/opu-[a-z0-9-]+", relative):
+        raise remote.RemoteError("invalid_runtime", "invalid managed runtime entrypoint")
+    return runtime_for_host(host, receipts, ssh_alias)["runtime_root"] + "/" + relative
+
+
 def _ensure_tools(ssh_alias: str, remote_root: str, sudo: bool, force: bool = False) -> dict:
-    """Make the managed agent runtime match this checkout. Returns a summary."""
-    if not remote_root.startswith("/") or remote_root.rstrip("/") == "" or ".." in Path(remote_root).parts:
-        raise remote.RemoteError("invalid_host_config", f"remote_root must be absolute: {remote_root!r}")
-    key = f"{ssh_alias}:{remote_root}"
+    """Verify/install one immutable generation and return its exact path."""
     snapshot = _snapshot_files()
     want = local_fingerprint(snapshot)
+    generation = _generation_root(remote_root, want)
+    key = f"{ssh_alias}:{bool(sudo)}:{remote_root}"
     now = time.monotonic()
     with _lock:
         last = _verified_at.get(key)
     if not force and last is not None and last[1] == want and now - last[0] < RECHECK_SECONDS:
-        return {"ssh_alias": ssh_alias, "synced": False, "fingerprint": want, "cached": True}
+        return {"ssh_alias": ssh_alias, "synced": False, "fingerprint": want, "runtime_root": generation, "cached": True}
+    captured = {path: content for path, _mode, content in snapshot}
+    try:
+        python_helper = captured["lib/opu/python.sh"].decode("utf-8")
+        installer = captured["webapp/runtime_install.py"].decode("utf-8")
+    except KeyError as error:
+        raise remote.RemoteError("incomplete_runtime", "required runtime installer is missing") from error
 
-    stamp = f"{remote_root.rstrip('/')}/{STAMP_NAME}"
-    have = ""
-    if not force:
+    def invoke(archive=None):
+        cleanup = ""
+        if archive is not None:
+            cleanup = f"archive={shlex.quote(archive)}; trap 'rm -f -- \"$archive\"' EXIT; "
+        command = ['--root', remote_root, '--fingerprint', want]
+        if archive is not None:
+            command += ['--archive', archive]
+        script = ("set -eu; " + cleanup + "\n" + python_helper + "\n"
+                  "runtime_python=$(opu_find_python); "
+                  + '\"$runtime_python\" -B -c ' + shlex.quote(installer) + ' '
+                  + ' '.join(shlex.quote(arg) for arg in command))
+        return remote.run_remote_shell(ssh_alias, script, timeout=180, sudo=sudo)
+
+    def verified_result(response):
+        if response.returncode != 0:
+            detail = (response.stderr or response.stdout).strip()[-2000:]
+            if not detail:
+                detail = f"Installer exited with code {response.returncode} without diagnostic output"
+            raise remote.RemoteError("tools_sync_failed",
+                f"Failed to prepare opu runtime on {ssh_alias} under {remote_root} (exit {response.returncode}): {detail[-700:]}",
+                stderr=detail)
         try:
-            have = remote.pull_file(ssh_alias, stamp, timeout=30, sudo=sudo).decode("utf-8", "replace").strip()
-        except remote.RemoteError:
-            have = ""
-    if have == want:
+            result = json.loads(response.stdout)
+            if (not isinstance(result, dict) or result.get("fingerprint") != want
+                    or result.get("runtime_root") != generation or type(result.get("synced")) is not bool):
+                raise ValueError("runtime receipt mismatch")
+        except (ValueError, TypeError) as error:
+            raise remote.RemoteError("invalid_runtime", "installer did not return the requested generation receipt") from error
         with _lock:
-            _verified_at[key] = (now, want)
-        return {"ssh_alias": ssh_alias, "synced": False, "fingerprint": want, "cached": False}
+            _verified_at[key] = (time.monotonic(), want)
+        return {**result, "ssh_alias": ssh_alias, "cached": False}
 
-    python_helper = next((content.decode("utf-8") for path, _mode, content in snapshot
-                          if path == "lib/opu/python.sh"), None)
-    if python_helper is None:
-        raise remote.RemoteError("incomplete_runtime", "required runtime helper is missing: lib/opu/python.sh")
+    if not force:
+        checked = invoke()
+        if checked.returncode != 66:  # Only a missing generation permits installation.
+            return verified_result(checked)
     payload = _build_tarball(snapshot)
     remote_tar = f"/tmp/opu-tools-{want[:16]}-{uuid.uuid4().hex}.tgz"
     remote.push_file(ssh_alias, remote_tar, payload, timeout=180)
-    q_root = shlex.quote(remote_root.rstrip("/"))
-    q_tar = shlex.quote(remote_tar)
-    q_stamp = shlex.quote(stamp)
-    # Hold a host-side install lock and stage the complete runtime before replacing
-    # directories. Write the fingerprint last; failed installs must be retried.
-    # Python modules are replaced individually so webapp host config/state survive.
-    directories = " ".join(SYNC_DIRS)
-    modules = " ".join(shlex.quote(name) for name in RUNTIME_MODULES)
-    script = (
-        "set -eu; work=''; stage='initializing'; "
-        f"archive={q_tar}; "
-        "cleanup() { result=$?; "
-        "if [ \"$result\" -ne 0 ]; then printf 'opu-tools: %s failed (exit %s)\\n' \"$stage\" \"$result\" >&2; fi; "
-        "if [ -n \"$work\" ]; then rm -rf -- \"$work\"; fi; "
-        "rm -f -- \"$archive\"; exit \"$result\"; }; trap cleanup EXIT;\n"
-        + python_helper + "\n"
-        "stage='checking Python 3.9 or newer'; runtime_python=$(opu_find_python); "
-        f"stage='preparing runtime directory'; mkdir -p {q_root}; cd {q_root}; "
-        "stage='checking install lock'; test ! -L .opu-tools-install.lock; "
-        "[ ! -e .opu-tools-install.lock ] || test -f .opu-tools-install.lock; "
-        "exec 8>>.opu-tools-install.lock; "
-        "\"$runtime_python\" -c 'import os,stat; s=os.fstat(8); assert stat.S_ISREG(s.st_mode) and s.st_nlink == 1'; "
-        "stage='waiting for install lock'; flock -w 120 8; "
-        "stage='staging runtime'; work=$(mktemp -d .opu-tools-new.XXXXXX); "
-        "tar -xzf \"$archive\" -C \"$work\"; "
-        f"for d in {directories}; do test -d \"$work/$d\"; done; "
-        f"for m in {modules}; do test -f \"$work/webapp/$m\"; done; "
-        "stage='validating Python runtime imports'; "
-        "\"$runtime_python\" -B -c 'import sys; sys.path.insert(0, sys.argv[1]); "
-        "import agent_worker, agent_queue, agent_enroll' \"$work/webapp\"; "
-        # Replacing scripts beneath an executor that already owns the host
-        # mutation lock can change its later library reads. Use the exact native
-        # lock implementation from this staged package, holding fd 7 until exit.
-        # This is active-executor exclusion, not atomic runtime generations:
-        # startup before the native lock and read-only collectors remain distinct.
-        "stage='checking host execution exclusion'; "
-        ". \"$work/lib/opu/common.sh\"; . \"$work/lib/opu/execution.sh\"; "
-        "TEST_MODE=0 opu_execution_host_lock; "
-        "stage='installing runtime'; test ! -L webapp; "
-        f"rm -f {q_stamp}; "
-        f"for d in {directories}; do "
-        "if [ -e \"$d\" ] || [ -L \"$d\" ]; then mv \"$d\" \"$work/$d.old\"; fi; "
-        "mv \"$work/$d\" \"$d\" || { [ ! -e \"$work/$d.old\" ] || mv \"$work/$d.old\" \"$d\"; exit 1; }; "
-        "chmod -R a+rX \"$d\"; done; "
-        "test ! -L webapp; mkdir -p webapp; "
-        f"for m in {modules}; do mv \"$work/webapp/$m\" \"webapp/$m\"; chmod a+r \"webapp/$m\"; done; "
-        f"stage='writing runtime fingerprint'; printf '%s\\n' {shlex.quote(want)} > \"$work/stamp\"; "
-        f"chmod a+r \"$work/stamp\"; mv \"$work/stamp\" {q_stamp}"
-    )
-    result = remote.run_remote_shell(ssh_alias, script, timeout=180, sudo=sudo)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()[-2000:]
-        if not detail:
-            detail = f"Installer exited with code {result.returncode} without diagnostic output"
-        raise remote.RemoteError(
-            "tools_sync_failed",
-            f"Failed to install opu tools on {ssh_alias} under {remote_root} "
-            f"(exit {result.returncode}): {detail[-700:]}",
-            stderr=detail,
-        )
-    with _lock:
-        _verified_at[key] = (time.monotonic(), want)
-    return {"ssh_alias": ssh_alias, "synced": True, "fingerprint": want, "bytes": len(payload), "cached": False}
+    return {**verified_result(invoke(remote_tar)), "bytes": len(payload)}
 
 
 def ensure_tools(ssh_alias: str, remote_root: str, sudo: bool, force: bool = False) -> dict:

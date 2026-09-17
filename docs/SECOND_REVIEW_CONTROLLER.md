@@ -1,5 +1,8 @@
 # Second correctness review: controller and evidence
 
+Historical second-pass record. The runtime startup/collector race documented
+below is addressed by the subsequent [third review](THIRD_REVIEW_EXECUTION.md).
+
 This pass followed the user's request to review code independently of passing
 tests. It traced the data consumed by each decision, durable ownership during
 failure, and the boundary between a requested operation and verified execution.

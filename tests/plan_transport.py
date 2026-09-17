@@ -12,6 +12,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from runtime_fixture import runtime_receipt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "webapp"))
 import planctl
@@ -140,13 +141,13 @@ class PlanTransportTests(unittest.TestCase):
             self.assertTrue(kwargs["sudo"])
             self.assertIn(Path(path).parent, allocations)
             return Path(path).read_bytes()
-        with patch.object(planctl.tools_sync, "ensure_tools"), \
+        with patch.object(planctl.tools_sync, "ensure_tools", side_effect=runtime_receipt), \
              patch.object(planctl, "_sync_sealed_inputs_to_host"), \
              patch.object(planctl.remote, "run_remote_shell", side_effect=local_shell), \
              patch.object(planctl.remote, "run_remote_checked", side_effect=local_checked), \
              patch.object(planctl.remote, "push_file", side_effect=local_push), \
              patch.object(planctl.remote, "pull_file", side_effect=local_pull):
-            remote_root = planctl._sync_plan_to_host(self.host, plan)
+            remote_root, runtime = planctl._sync_plan_to_host(self.host, plan)
             remote_document = Path(remote_root) / "plans" / plan / "plan.json"
             self.assertEqual(json.loads(remote_document.read_text()), {"generation": 1})
             remote_lock = remote_document.parent / ".task-lock"
@@ -213,11 +214,11 @@ class PlanTransportTests(unittest.TestCase):
             if response.returncode:
                 raise planctl.remote.RemoteError("fixture", "local archive transfer failed", response.stderr)
             return response.stdout
-        with patch.object(planctl.tools_sync, "ensure_tools"), \
+        with patch.object(planctl.tools_sync, "ensure_tools", side_effect=runtime_receipt), \
              patch.object(planctl, "_temporary_remote_archive", return_value=str(transfer)), \
              patch.object(planctl.remote, "push_file", side_effect=local_push), \
              patch.object(planctl.remote, "run_remote_checked", side_effect=local_checked):
-            remote_root = planctl._sync_plan_to_host(self.host, plan_id)
+            remote_root, runtime = planctl._sync_plan_to_host(self.host, plan_id)
         transferred_plan = json.loads((Path(remote_root) / "plans" / plan_id / "plan.json").read_text())
         self.assertEqual(transferred_plan["source_documents"], bindings)
         self.assertCountEqual(uploaded_documents, [item["path"] for item in bindings.values()])

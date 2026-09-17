@@ -17,6 +17,8 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
+from contextvars import ContextVar
+from copy import deepcopy
 from contextlib import contextmanager
 from functools import wraps
 from datetime import datetime, timezone
@@ -39,6 +41,7 @@ TESTMODE_DIR = runtime_paths.state_dir() / "testmode"
 HOSTS_FILE = runtime_paths.hosts_file()
 DEFAULT_TIMEOUT_SECONDS = 30
 LIVE_EXECUTE_TIMEOUT_SECONDS = 3600
+_PINNED_HOSTS: ContextVar[dict | None] = ContextVar("plan_execution_hosts", default=None)
 
 # Matches lib/opu/common.sh opu_validate_identifier.
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -328,8 +331,8 @@ def _create_rollback_live(
     local_new = PLAN_STATE_DIR / "plans" / plan_id
     if local_new.exists():
         raise PlanError(f"plan already exists locally: {plan_id}")
-    remote_root = _sync_plan_to_host(host, source_plan_id)
-    remote_tool = f"{host['remote_root'].rstrip('/')}/bin/opu-patch-plan"
+    remote_root, runtime = _sync_plan_to_host(host, source_plan_id)
+    remote_tool = tools_sync.tool_path(host, [runtime], "bin/opu-patch-plan")
     remote_argv = [
         "env", f"OPU_PLAN_STATE_DIR={remote_root}", remote_tool,
         "create-rollback",
@@ -696,10 +699,28 @@ def _load_hosts() -> dict[str, dict]:
         raise PlanError(str(exc)) from exc
 
 
+@contextmanager
+def pinned_hosts(hosts: dict | None):
+    """Keep one reviewed inventory snapshot for every task in this worker.
+
+    Context-local storage prevents concurrent runs from sharing target maps.
+    Copy nested node entries too: an inventory refresh or caller mutation must
+    not silently redirect a later task in a confirmed multi-node operation.
+    """
+    token = _PINNED_HOSTS.set(deepcopy(hosts))
+    try:
+        yield
+    finally:
+        _PINNED_HOSTS.reset(token)
+
+
 def _iter_host_nodes() -> list[tuple[dict, dict]]:
-    """Yield (host, node) pairs from hosts.json."""
+    """Yield reviewed worker targets, or current hosts for a native UI action."""
     pairs = []
-    for host in _load_hosts().values():
+    hosts = _PINNED_HOSTS.get()
+    if hosts is None:
+        hosts = _load_hosts()
+    for host in hosts.values():
         nodes = host.get("nodes") or [{"name": host.get("id"), "ssh_alias": host.get("ssh_alias")}]
         for node in nodes:
             pairs.append((host, node))
@@ -850,14 +871,15 @@ def _remove_remote_archive(host: dict, directory: str) -> None:
         pass
 
 
-def _sync_plan_to_host(host: dict, plan_id: str) -> str:
+def _sync_plan_to_host(host: dict, plan_id: str) -> tuple[str, dict]:
     local_plan = PLAN_STATE_DIR / "plans" / plan_id
     if not local_plan.is_dir():
         raise PlanError(f"local plan directory missing for {plan_id}")
     remote_root = _remote_plan_root(host)
     sudo = bool(host.get("sudo"))
     # Executors on the host must match this checkout before any task runs.
-    tools_sync.ensure_tools(host["ssh_alias"], str(host.get("remote_root") or ""), sudo)
+    runtime = tools_sync.ensure_tools(host["ssh_alias"], str(host.get("remote_root") or ""), sudo)
+    tools_sync.runtime_for_host(host, [runtime])
     # mkdir/tar/rm succeed with empty stdout — do not use run_remote (requires output).
     # Use sudo when the host executor runs as root: prior task files are root-owned.
     remote.run_remote_checked(
@@ -880,7 +902,7 @@ def _sync_plan_to_host(host: dict, plan_id: str) -> str:
     finally:
         _remove_remote_archive(host, directory)
     _sync_sealed_inputs_to_host(host, plan_id)
-    return remote_root
+    return remote_root, runtime
 
 
 def _sync_plan_from_host(host: dict, plan_id: str, remote_root: str) -> None:
@@ -959,14 +981,15 @@ def _execute_live(plan_id: str, plan: dict, task: dict, actor: str) -> dict:
         )
     host = _resolve_live_host_for_task(plan, task)
     pipeline_runner.record_event('task_selected', 'Preparing the next sealed task', task_id=task['task_id'], stage=task.get('stage'), node=task.get('node'))
-    remote_root = _sync_plan_to_host(host, plan_id)
-    remote_executor = f"{host['remote_root'].rstrip('/')}/{rel_executor}"
+    remote_root, runtime = _sync_plan_to_host(host, plan_id)
+    remote_executor = tools_sync.tool_path(host, [runtime], rel_executor)
     remote_argv = [
         "env", f"OPU_PLAN_STATE_DIR={remote_root}", "OPU_PLAN_WORKER_SNAPSHOT=1", remote_executor,
         "execute", "--plan-id", plan_id, "--task-id", task["task_id"],
         "--actor", actor, "--lease-seconds", "3600",
     ]
-    pipeline_runner.set_execution_context(task_definition_sha256=task.get('task_definition_sha256'),
+    pipeline_runner.set_execution_context(runtime_root=runtime["runtime_root"], runtime_fingerprint=runtime["fingerprint"],
+                                          task_definition_sha256=task.get('task_definition_sha256'),
                                           task_retry_count=task.get('retry_count', 0))
     returncode, stdout, stderr = _run_detached_remote(host, plan_id, task["task_id"], remote_argv)
 

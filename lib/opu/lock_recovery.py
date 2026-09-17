@@ -21,6 +21,11 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[2]
+# The runtime package carries this module alongside the exact code generation.
+# State is bound to its deployment root; commands still use ROOT below.
+sys.path.insert(0, str(ROOT / 'webapp'))
+from runtime_paths import deployment_root
+
 HOST_LOCK = Path('/var/lib/oracle-patching-utility/locks/host-mutation.lock')
 AUDIT_ROOT = Path('/var/lib/oracle-patching-utility/lock-recovery')
 NATIVE_ROOT = Path('/var/lib/oracle-patching-utility/single-instance/plans')
@@ -510,8 +515,9 @@ def require_open_window(plan):
 
 
 def target_context(args, runner):
-    plan_root = Path(os.environ.get('OPU_PLAN_STATE_DIR', str(ROOT / 'var/webapp-plans')))
-    require(plan_root == ROOT / 'var/webapp-plans', 'plan state directory must be this deployed tool root/var/webapp-plans')
+    expected_root = deployment_root(ROOT) / 'var/webapp-plans'
+    plan_root = Path(os.environ.get('OPU_PLAN_STATE_DIR', str(expected_root)))
+    require(plan_root == expected_root, 'plan state directory must be this deployment root/var/webapp-plans')
     plan_dir = plan_root / 'plans' / args.plan_id
     # Native status verifies plan seal; task-status also verifies definition,
     # result seals and complete custody of the preceding apply evidence.
@@ -587,7 +593,7 @@ def inspect(args, runner):
         plan, task, target = target_context(args, runner)
         result.update(plan_sha256=plan['plan_sha256'], task_definition_sha256=task['task_definition_sha256'],
                       original_task_status=task['status'], target=target)
-        result['wrapper'] = validate_wrapper(ROOT / 'var/webapp-runs' / args.plan_id / args.task_id / args.run_id)
+        result['wrapper'] = validate_wrapper(deployment_root(ROOT) / 'var/webapp-runs' / args.plan_id / args.task_id / args.run_id)
         require_no_executor()
         fd, lock_identity = open_lock(HOST_LOCK)
         try:
@@ -670,7 +676,7 @@ def recover(args, runner):
             plan, task, fresh_target = target_context(args, runner)
             require(plan['plan_sha256'] == checked['plan_sha256'] and fresh_target == target
                     and task['task_definition_sha256'] == checked['task_definition_sha256'], 'sealed recovery scope changed')
-            require(validate_wrapper(ROOT / 'var/webapp-runs' / args.plan_id / args.task_id / args.run_id) == checked['wrapper'], 'launch records changed')
+            require(validate_wrapper(deployment_root(ROOT) / 'var/webapp-runs' / args.plan_id / args.task_id / args.run_id) == checked['wrapper'], 'launch records changed')
             host_fd, lock_identity = open_lock(HOST_LOCK)
             require(lock_identity == checked['lock']['identity'] and lock_held(host_fd), 'host lock changed or became free')
             fresh_holders = holders(lock_identity, target)

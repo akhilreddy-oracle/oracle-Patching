@@ -9,6 +9,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from runtime_fixture import host_runtime_receipts
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'webapp'))
 import evidence
@@ -33,7 +34,7 @@ class RecoveryPipelineTests(unittest.TestCase):
         self.mocks = []
         for target, kwargs in [
             ('recoveryctl.selection_status', {'return_value':self.request}),
-            ('pipeline_steps.tools_sync.ensure_host_tools', {}),
+            ('pipeline_steps.tools_sync.ensure_host_tools', {'side_effect':host_runtime_receipts}),
             ('pipeline_steps.remote.push_file', {}),
             ('pipeline_steps.remote.run_remote_raw', {'side_effect':self.native_response}),
         ]:

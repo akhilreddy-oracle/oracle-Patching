@@ -50,7 +50,7 @@ class CompanyApiTests(unittest.TestCase):
         cookie = self.fx.finish()
         return cookie, company_auth.authenticate(cookie)
 
-    def request(self, path, *, cookie=None, method="GET", body=None, headers=None):
+    def request(self, path, *, cookie=None, method="GET", body=None, headers=None, before_body=None):
         handler = server.Handler.__new__(server.Handler)
         handler.path, handler.command = path, method
         handler.headers = Message()
@@ -60,7 +60,12 @@ class CompanyApiTests(unittest.TestCase):
             handler.headers[key] = value
         raw = json.dumps(body or {}).encode()
         handler.headers["Content-Length"] = str(len(raw))
-        handler.rfile, handler.wfile = io.BytesIO(raw), io.BytesIO()
+        class Body(io.BytesIO):
+            def read(self, length=-1):
+                if before_body:
+                    before_body()
+                return super().read(length)
+        handler.rfile, handler.wfile = Body(raw), io.BytesIO()
         result = {"headers": []}
         def response(status):
             result["status"] = status
@@ -118,6 +123,29 @@ class CompanyApiTests(unittest.TestCase):
         reply = self.request("/api/plans/p/execute-next", cookie=cookie, method="POST", headers=self.mutation_headers(session))
         self.assertEqual(reply["status"], 403)
         self.assert_no_mutation()
+
+    def test_delayed_post_body_rechecks_company_role_session_and_csrf_before_dispatch(self):
+        for change, expected in (("roles", 403), ("logout", 401), ("csrf", 403)):
+            with self.subTest(change=change):
+                self.fx.settings["group_roles"]["operators"] = ["operator"]; self.fx.save()
+                cookie, session = self.session()
+                def revoke():
+                    if change == "roles":
+                        self.fx.settings["group_roles"]["operators"] = ["viewer"]; self.fx.save()
+                    elif change == "logout":
+                        company_auth.logout(cookie, **{"csrf": session["csrf_token"], "origin": "https://patching.example"})
+                    else:
+                        # A rotated server-side proof must not leave this
+                        # already-admitted request using its stale CSRF value.
+                        with company_auth._db() as db:
+                            key = company_auth._hash(company_auth.cookie_value(cookie, company_auth.SESSION_COOKIE))
+                            row = db.execute("SELECT key,value FROM records WHERE kind='session' AND key=?", (key,)).fetchone()
+                            value = json.loads(row[1]); value["csrf_token"] = "rotated-fixture-csrf"
+                            db.execute("UPDATE records SET value=? WHERE key=?", (json.dumps(value), row[0]))
+                reply = self.request("/api/plans/p/execute-next", cookie=cookie, method="POST",
+                    headers=self.mutation_headers(session), before_body=revoke)
+                self.assertEqual(reply["status"], expected)
+                self.assert_no_mutation()
 
     def test_company_discovery_permission_matches_role_and_denies_post_before_work(self):
         self.fx.settings["group_roles"]["requesters"] = ["requester"]

@@ -12,6 +12,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from runtime_fixture import runtime_receipt, host_runtime_receipts
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "webapp"))
 import auth
@@ -67,7 +68,7 @@ class ExtjobBridgeTests(unittest.TestCase):
         self.native = self.enterContext(patch.object(extjobctl.planctl, "_run", side_effect=self.native_status))
         self.host = {"id": "source", "node_name": "source", "ssh_alias": "source", "remote_root": "/opt/opu", "sudo": True}
         self.resolve = self.enterContext(patch.object(extjobctl.planctl, "_resolve_node_host", return_value=self.host))
-        self.sync = self.enterContext(patch.object(extjobctl.tools_sync, "ensure_host_tools"))
+        self.sync = self.enterContext(patch.object(extjobctl.tools_sync, "ensure_host_tools", side_effect=host_runtime_receipts))
         self.ssh = self.enterContext(patch.object(extjobctl.remote, "run_remote_raw"))
         self.detached = self.enterContext(patch.object(extjobctl.planctl, "_run_detached_remote"))
         self.report = seal({"schema_version": "1.0", "collector": {"name": "oracle.extjob.provenance", "version": "1"},
@@ -111,7 +112,7 @@ class ExtjobBridgeTests(unittest.TestCase):
     def test_fixed_argv_reference_and_no_task_or_permission_mutation(self):
         self.assertEqual(self.inspect(), self.report)
         self.ssh.assert_called_once_with("source", ["/usr/bin/env", "OPU_PLAN_STATE_DIR=/opt/opu/var/webapp-plans",
-            "/opt/opu/bin/opu-extjob-provenance-inspect", "--plan-id", "p", "--actor", "operator",
+            runtime_receipt("source", "/opt/opu")["runtime_root"] + "/bin/opu-extjob-provenance-inspect", "--plan-id", "p", "--actor", "operator",
             "--archive", self.reference["archive_path"], "--archive-sha256", "c" * 64], timeout=900, sudo=True)
         self.assertTrue(all(call.args[0][0] in {"status", "task-status"} for call in self.native.call_args_list))
         self.detached.assert_not_called()

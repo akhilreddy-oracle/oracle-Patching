@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,54 @@ class RuntimePathTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(runtime_paths.state_dir(), ROOT / "webapp/var")
             self.assertEqual(runtime_paths.hosts_file(), ROOT / "webapp/hosts.json")
+
+    def test_generations_share_stable_state_without_environment_retargeting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            for digest in ("a" * 64, "b" * 64):
+                code = base / ".opu-runtimes" / digest
+                (code / "webapp").mkdir(parents=True)
+                with self.subTest(digest=digest), patch.object(runtime_paths, "ROOT", code / "webapp"), \
+                        patch.dict(os.environ, {"OPU_DEPLOYMENT_ROOT": "/untrusted"}, clear=True):
+                    self.assertEqual(runtime_paths.deployment_root(), base)
+                    self.assertEqual(runtime_paths.state_dir(), base / "webapp/var")
+                    self.assertEqual(runtime_paths.hosts_file(), base / "webapp/hosts.json")
+                self.assertFalse((code / "webapp/var").exists())
+
+    def test_malformed_or_aliased_generation_cannot_choose_state_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            real = base / ".opu-runtimes" / ("a" * 64)
+            real.mkdir(parents=True)
+            alias = real.parent / ("b" * 64)
+            alias.symlink_to(real, target_is_directory=True)
+            invalid = [Path("relative"), base / ".." / "outside", real.parent,
+                       real.parent / ("A" * 64), real.parent / ("a" * 63), alias,
+                       real / "nested", real / ".opu-runtimes" / ("b" * 64)]
+            for code in invalid:
+                with self.subTest(code=code), self.assertRaises(ValueError):
+                    runtime_paths.deployment_root(code)
+
+    def test_generation_pull_commands_use_existing_deployment_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            code = base / ".opu-runtimes" / ("a" * 64)
+            files = ["bin/opu-agent-work-pull", "bin/opu-agent-work-run", "lib/opu/python.sh"]
+            files += ["webapp/" + name + ".py" for name in
+                      ("agent_worker", "agent_queue", "agent_enroll", "runtime_paths", "adapters", "durable", "diagnostics")]
+            for relative in files:
+                target = code / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, target)
+            env = {key: value for key, value in os.environ.items() if not key.startswith("OPU_")}
+            env.update(OPU_PLAN_STATE_DIR=str(base / "var/webapp-plans"), PYTHONDONTWRITEBYTECODE="1")
+            for command in ("opu-agent-work-pull", "opu-agent-work-run"):
+                result = subprocess.run([str(code / "bin" / command), "--node", "node1", "--agent-id", "worker"],
+                                        env=env, text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["status"], "idle")
+                self.assertTrue((base / "webapp/var/agent-queue/jobs").is_dir())
+                self.assertFalse((code / "webapp/var").exists())
 
     def test_rejects_relative_empty_and_symlink_overrides(self):
         with tempfile.TemporaryDirectory() as tmp:

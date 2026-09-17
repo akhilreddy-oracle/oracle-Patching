@@ -77,9 +77,11 @@ class AssistantApiTests(unittest.TestCase):
         }))
         metadata_file.chmod(0o600)
         self.native = {}
+        self.native_original = {}
         for module, methods in ((server.planctl, ("create", "dispatch", "execute_remaining_tasks", "approve", "authorize")),
                                 (server.recoveryctl, ("create_live", "analyze", "execute", "approve", "authorize", "create_testmode_demo"))):
             for name in methods:
+                self.native_original[module.__name__ + "." + name] = getattr(module, name)
                 self.native[module.__name__ + "." + name] = self.enterContext(patch.object(module, name, return_value={"state": "fixture"}))
         self.steps = {name: Mock(return_value={"status": "fixture"}) for name in ("discovery", "readiness-chain", "recovery-collect")}
         self.enterContext(patch.object(server.pipeline_steps, "STEPS", self.steps))
@@ -340,6 +342,117 @@ class AssistantApiTests(unittest.TestCase):
                 self.assertFalse(pipeline_runner.RUNS)
                 self.assert_no_native_calls()
 
+    def configure_plan_nodes(self):
+        self.host.update(remote_root="/fixture/runtime", nodes=[{"name": "source", "ssh_alias": "reviewed.invalid"}])
+        self.hosts_file.write_text(json.dumps({"hosts": [self.host]}))
+        self.original_hosts = self.hosts_file.read_bytes()
+        self.saved_plan.update(nodes=["source"], host_id="source")
+        self.enterContext(patch.object(server.planctl, "_load_hosts", side_effect=server.load_hosts))
+
+    def change_plan_route(self):
+        changed = {**self.host, "nodes": [{"name": "source", "ssh_alias": "unreviewed.invalid"}]}
+        self.hosts_file.write_text(json.dumps({"hosts": [changed]}))
+        self.original_hosts = self.hosts_file.read_bytes()
+
+    def test_confirmed_plan_rejects_route_drift_between_confirmation_and_native_admission(self):
+        self.configure_plan_nodes()
+        original_submit = server.Handler._submit_assistant_action
+        def drift_then_submit(handler, path, body):
+            self.assertRegex(body.get("expected_action_binding_sha256", ""), r"^[a-f0-9]{64}$")
+            self.change_plan_route()
+            return original_submit(handler, path, body)
+        for tool in ("dispatch_plan", "execute_plan"):
+            self.hosts_file.write_text(json.dumps({"hosts": [self.host]}))
+            self.original_hosts = self.hosts_file.read_bytes()
+            conversation_id, action = self.prepare(tool, {"plan_id": "plan-a"}, actor="operator")
+            with patch.object(server.Handler, "_submit_assistant_action", drift_then_submit):
+                response = self.execute(conversation_id, action, actor="operator")
+            self.assertEqual(response["status"], 409, response)
+            self.assertEqual(assistant.get("operator", conversation_id)["actions"][0]["state"], "failed")
+        self.assertFalse(pipeline_runner.RUNS)
+        self.assert_no_native_calls()
+
+    def test_confirmed_plan_rechecks_route_after_worker_queue_delay(self):
+        self.configure_plan_nodes()
+        original_start = pipeline_runner.start_run
+        for tool in ("dispatch_plan", "execute_plan"):
+            self.hosts_file.write_text(json.dumps({"hosts": [self.host]}))
+            self.original_hosts = self.hosts_file.read_bytes()
+            entered, release = threading.Event(), threading.Event()
+            def delayed_start(kind, key, function):
+                def delayed(record):
+                    entered.set()
+                    if not release.wait(5):
+                        raise AssertionError("Worker barrier timed out")
+                    return function(record)
+                return original_start(kind, key, delayed)
+            conversation_id, action = self.prepare(tool, {"plan_id": "plan-a"}, actor="operator")
+            try:
+                with patch.object(pipeline_runner, "start_run", side_effect=delayed_start):
+                    response = self.execute(conversation_id, action, actor="operator")
+                self.assertEqual(response["status"], 202, response)
+                self.assertTrue(entered.wait(2))
+                self.change_plan_route()
+            finally:
+                release.set()
+            record = self.wait_run(response["body"]["run_id"])
+            self.assertEqual(record.status, "failed", record.error)
+            self.assertIn("changed after confirmation", record.error["message"])
+        self.assert_no_native_calls()
+
+    def test_confirmed_execution_pins_routes_across_native_tasks_and_keeps_other_threads_independent(self):
+        self.configure_plan_nodes()
+        selected = []
+        entered, release = threading.Event(), threading.Event()
+        tasks = [{"task_id": "001-precheck-source", "node": "source", "stage": "precheck"},
+                 {"task_id": "002-apply-source", "node": "source", "stage": "apply"}]
+        self.native["planctl.execute_remaining_tasks"].side_effect = self.native_original["planctl.execute_remaining_tasks"]
+        self.enterContext(patch.object(server.planctl, "next_task", side_effect=tasks))
+        self.enterContext(patch.object(server.planctl, "_require_controller_transport"))
+        def remote_boundary(plan_id, plan, task, actor):
+            target = server.planctl._resolve_live_host_for_task(plan, task)
+            selected.append(target["ssh_alias"])
+            if len(selected) == 1:
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("Executor barrier timed out")
+            else:
+                self.saved_plan["state"] = "succeeded"
+            return {"task_id": task["task_id"], "status": "succeeded"}
+        self.enterContext(patch.object(server.planctl, "_execute_live", side_effect=remote_boundary))
+        conversation_id, action = self.prepare("execute_plan", {"plan_id": "plan-a"}, actor="operator")
+        try:
+            response = self.execute(conversation_id, action, actor="operator")
+            self.assertEqual(response["status"], 202, response)
+            self.assertTrue(entered.wait(2))
+            self.change_plan_route()
+            # This thread must see current inventory while the confirmed worker
+            # continues with the reviewed snapshot, including its second task.
+            current = server.planctl._resolve_live_host_for_task(self.saved_plan, tasks[0])
+            self.assertEqual(current["ssh_alias"], "unreviewed.invalid")
+        finally:
+            release.set()
+        record = self.wait_run(response["body"]["run_id"])
+        self.assertEqual(record.status, "succeeded", record.error)
+        self.assertEqual(record.result["executed_count"], 2)
+        self.assertEqual(selected, ["reviewed.invalid", "reviewed.invalid"])
+
+    def test_plan_proposal_binds_nodes_outside_its_display_host(self):
+        self.configure_plan_nodes()
+        other = {"id": "other", "ssh_alias": "other-reviewed.invalid", "remote_root": "/fixture/other"}
+        self.saved_plan["nodes"].append("other")
+        self.hosts_file.write_text(json.dumps({"hosts": [self.host, other]}))
+        self.original_hosts = self.hosts_file.read_bytes()
+        conversation_id, action = self.prepare("execute_plan", {"plan_id": "plan-a"}, actor="operator")
+        other["ssh_alias"] = "other-unreviewed.invalid"
+        self.hosts_file.write_text(json.dumps({"hosts": [self.host, other]}))
+        self.original_hosts = self.hosts_file.read_bytes()
+        response = self.execute(conversation_id, action, actor="operator")
+        self.assertEqual(response["status"], 409, response)
+        self.assertEqual(assistant.get("operator", conversation_id)["actions"][0]["state"], "expired")
+        self.assertFalse(pipeline_runner.RUNS)
+        self.assert_no_native_calls()
+
     def test_native_dispatch_reauthenticates_revoked_token_after_binding_check(self):
         original_binding = assistant.capabilities.binding
         for change in ({"disabled": True}, {"expires_at": "2000-01-01T00:00:00Z"},
@@ -370,14 +483,16 @@ class AssistantApiTests(unittest.TestCase):
                               ({"actor": "different-employee", "roles": ["operator"]}, 403),
                               ({"actor": "employee", "roles": ["viewer"]}, 403)):
             with self.subTest(status=status, value_type=type(final).__name__):
-                with patch.object(server.company_auth, "authenticate", side_effect=[session, session, final]) as authenticate:
+                # Both HTTP POSTs authenticate before and after their body;
+                # only the final native-dispatch check sees the revocation.
+                with patch.object(server.company_auth, "authenticate", side_effect=[session] * 4 + [final]) as authenticate:
                     conversation = self.create(actor=None, headers=headers)
                     assistant._proposal("employee", conversation["id"], "refresh_discovery",
                                         {"host_id": self.host["id"]}, server.load_hosts())
                     action = assistant.get("employee", conversation["id"])["actions"][0]
                     response = self.execute(conversation["id"], action, actor=None, headers=headers)
                 self.assertEqual(response["status"], status, response)
-                self.assertEqual(authenticate.call_count, 3)
+                self.assertEqual(authenticate.call_count, 5)
                 self.assertEqual(assistant.get("employee", conversation["id"])["actions"][0]["state"], "failed")
                 self.assertFalse(pipeline_runner.RUNS)
                 self.assert_no_native_calls()
@@ -395,7 +510,7 @@ class AssistantApiTests(unittest.TestCase):
             self.wait_run(response["body"]["run_id"])
             self.steps["discovery"].assert_called_once_with("source", self.host, {"actor": "employee", "requester": "employee",
                 "expected_configuration_sha256": assistant.live_inventory.configuration_digest(self.host)})
-            self.assertEqual(authenticate.call_count, 3, "Native dispatch must authenticate the company session again")
+            self.assertEqual(authenticate.call_count, 5, "Both POST bodies and native dispatch must reauthenticate the company session")
             authenticate.assert_called_with(headers["Cookie"], method="POST", csrf="fixture-csrf", origin=headers["Origin"])
         with patch.object(server.company_auth, "authenticate", side_effect=auth.AuthError("CSRF verification failed", status=403)):
             self.assertEqual(self.request(method="POST", actor=None, headers={"Cookie": headers["Cookie"]})["status"], 403)

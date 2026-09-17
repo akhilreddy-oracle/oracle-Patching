@@ -141,8 +141,9 @@ def inspect_current(target):
 
 
 def target_context(args, runner):
-    plan_root = Path(os.environ.get('OPU_PLAN_STATE_DIR', str(ROOT / 'var/webapp-plans')))
-    trust.require(plan_root == ROOT / 'var/webapp-plans', 'plan root must belong to this deployed tool')
+    expected_root = trust.deployment_root(ROOT) / 'var/webapp-plans'
+    plan_root = Path(os.environ.get('OPU_PLAN_STATE_DIR', str(expected_root)))
+    trust.require(plan_root == expected_root, 'plan root must belong to this deployment')
     directory = plan_root / 'plans' / args.plan_id
     plan = runner.native(plan_root, 'status', args.plan_id)
     trust.require(plan.get('state') in {'running', 'paused'} and plan.get('intent', 'patch_apply') == 'patch_apply'

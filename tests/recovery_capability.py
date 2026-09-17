@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from runtime_fixture import runtime_receipt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "webapp"))
 import evidence
@@ -109,7 +110,7 @@ class RecoveryCapabilityTests(unittest.TestCase):
         self.assertTrue(recoveryctl.target_capabilities("source")["target_capabilities"][0]["can_create"])
         host = {"id": "source", "ssh_alias": "source", "remote_root": "/opt/opu", "sudo": True}
         with patch.object(recoveryctl, "_configured_host", return_value=host), \
-             patch.object(recoveryctl.tools_sync, "ensure_tools") as sync, \
+             patch.object(recoveryctl.tools_sync, "ensure_tools", side_effect=runtime_receipt) as sync, \
              patch.object(recoveryctl.remote, "run_remote_raw") as remote:
             for log_mode in ("ARCHIVELOG", None):
                 self.snapshot["databases"][0]["runtime"]["log_mode"] = log_mode

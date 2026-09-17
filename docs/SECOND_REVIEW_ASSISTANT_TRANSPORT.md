@@ -1,5 +1,8 @@
 # Second code review: assistant, transport and supporting services
 
+Historical second-pass record. Runtime generations and confirmed plan target
+bindings received further fixes in the [third review](THIRD_REVIEW_EXECUTION.md).
+
 Reviewed on 2026-09-17. This was a code-first review of the final implementations
 and their callers, followed by isolated reproductions. Passing fixtures were not
 used as evidence that Oracle patching, restore, company identity, or remote

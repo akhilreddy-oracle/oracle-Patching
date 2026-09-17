@@ -12,6 +12,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from runtime_fixture import host_runtime_receipts
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'webapp'))
 import agent_queue
@@ -109,7 +110,7 @@ class ControllerEvidenceIntegrity(unittest.TestCase):
     def test_multinode_compatibility_requires_all_per_node_snapshots_before_ssh(self):
         for name in ('snapshot', 'artifact', 'procedure'):
             evidence.write_evidence('cluster', name, {'host': {'name': 'n1'}})
-        with patch.object(pipeline_steps.tools_sync, 'ensure_host_tools') as sync, \
+        with patch.object(pipeline_steps.tools_sync, 'ensure_host_tools', side_effect=host_runtime_receipts) as sync, \
              patch.object(pipeline_steps.remote, 'push_file') as push, \
              patch.object(pipeline_steps.remote, 'run_remote_json') as native:
             with self.assertRaises(pipeline_steps.localtools.LocalToolError):
@@ -121,7 +122,7 @@ class ControllerEvidenceIntegrity(unittest.TestCase):
         def fail_index(host_id, name, payload):
             if name == 'snapshot_nodes': raise OSError('simulated full disk')
             return write(host_id, name, payload)
-        with patch.object(pipeline_steps.tools_sync, 'ensure_host_tools'), \
+        with patch.object(pipeline_steps.tools_sync, 'ensure_host_tools', side_effect=host_runtime_receipts), \
              patch.object(pipeline_steps.remote, 'run_remote_json', return_value={'host': {'name': 'n1'}}), \
              patch.object(evidence, 'write_evidence', side_effect=fail_index):
             with self.assertRaises(OSError): pipeline_steps.step_discovery('cluster', self.host, {})

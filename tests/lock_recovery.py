@@ -464,6 +464,32 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(task['status'], 'pending')
         self.assertEqual(target['oracle_sid'], 'ORCL')
 
+    def test_versioned_code_reconciles_existing_stable_plan(self):
+        if os.geteuid() == 0:
+            self.skipTest('fixture Oracle owner must be non-root')
+        base = self.root.resolve()
+        code = base / '.opu-runtimes' / ('a' * 64)
+        code.mkdir(parents=True)
+        with patch.object(M, 'ROOT', code), patch.dict(os.environ, {'OPU_PLAN_STATE_DIR': str(base / 'var/webapp-plans')}):
+            plan, task, target = M.target_context(self.args, self.runner)
+            self.assertEqual(plan['plan_sha256'], self.plan['plan_sha256'])
+            self.assertEqual(target['oracle_sid'], 'ORCL')
+            self.assertEqual(task['status'], 'pending')
+            self.assertTrue(all(call.args[0] == base / 'var/webapp-plans' for call in self.runner.native.call_args_list))
+            native = M.Runner()
+            with patch.object(native, 'run', return_value='{}') as run:
+                native.native(base / 'var/webapp-plans', 'status', 'p')
+            self.assertEqual(run.call_args.args[0][3], str(code / 'bin/opu-patch-plan'))
+            self.args.run_id = 'f' * 32
+            with patch.object(M, 'validate_wrapper', side_effect=M.Blocked('path verified; stop before process inspection')) as wrapper:
+                inspected = M.inspect(self.args, self.runner)
+            self.assertIn('path verified', inspected['blockers'][0])
+            wrapper.assert_called_once_with(base / 'var/webapp-runs/p/003-validate-node' / self.args.run_id)
+            self.runner.native.reset_mock()
+            with patch.dict(os.environ, {'OPU_PLAN_STATE_DIR': str(code / 'var/webapp-plans')}), self.assertRaises(M.Blocked):
+                M.target_context(self.args, self.runner)
+            self.runner.native.assert_not_called()
+
     def test_other_actor_and_modified_authorization_block(self):
         self.args.actor = 'other'
         with self.assertRaisesRegex(M.Blocked, 'authorizer'):

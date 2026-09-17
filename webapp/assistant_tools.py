@@ -466,6 +466,18 @@ def binding(name, args, hosts):
         state["tasks"] = planctl.list_tasks(args["plan_id"])
         host_id = planctl._host_id_for_plan(state["plan"])
         state["host"] = hosts.get(host_id) if host_id else None
+        # A plan can address nodes configured under several inventory entries.
+        # Bind the effective routes too, not merely its display host attribution.
+        state["execution_hosts"] = {}
+        with planctl.pinned_hosts(hosts):
+            for node in state["plan"].get("nodes") or []:
+                try:
+                    target = planctl._resolve_node_host(str(node))
+                except planctl.PlanError as exc:
+                    # Dispatch can still prepare work for a pull agent when
+                    # SSH is unavailable; live execution retains its preflight.
+                    target = {"error": str(exc)}
+                state["execution_hosts"][str(node)] = target
         # Native commands verify sealed documents again at execution.
     if "request_id" in args:
         if name == "create_backup":

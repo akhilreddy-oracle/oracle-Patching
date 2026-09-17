@@ -13,6 +13,7 @@ import tarfile
 import threading
 import unittest
 from unittest.mock import patch
+from runtime_fixture import runtime_receipt, host_runtime_receipts
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "webapp"))
@@ -49,7 +50,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.enterContext(patch.object(recoveryctl, "RECOVERY_DIR", self.root / "recovery"))
         self.enterContext(patch.object(evidence, "VAR_DIR", self.root / "hosts"))
 
-    def request(self, path, *, actor="operator", body=None, raw=None, length=None, method="POST", extra_headers=None):
+    def request(self, path, *, actor="operator", body=None, raw=None, length=None, method="POST", extra_headers=None, before_body=None):
         handler = server.Handler.__new__(server.Handler)
         handler.command = method
         handler.path = path
@@ -59,7 +60,12 @@ class ControlPlaneTests(unittest.TestCase):
         handler.headers["Content-Length"] = str(len(content) if length is None else length)
         for key, value in (extra_headers or {}).items():
             handler.headers[key] = value
-        handler.rfile = io.BytesIO(content)
+        class Body(io.BytesIO):
+            def read(self, length=-1):
+                if before_body:
+                    before_body()
+                return super().read(length)
+        handler.rfile = Body(content)
         handler.wfile = io.BytesIO()
         result = []
         handler._send_json = lambda status, payload: result.append((status, payload))
@@ -79,6 +85,40 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.request("/api/session", actor="approver", method="GET", extra_headers={"X-OPU-Actor": "operator"})[0], 403)
         status, payload = self.request("/api/session", actor="approver", method="GET")
         self.assertEqual((status, payload["actor"], payload["roles"]), (200, "approver", ["approver"]))
+
+    def test_delayed_body_cannot_submit_after_principal_revocation_or_token_rotation(self):
+        original = self.principals.read_text()
+        for route in ("/api/recovery/r/execute", "/api/plans/p/execute-next", "/api/hosts/h/pipeline/discovery"):
+            for change in ({"disabled": True}, {"roles": ["viewer"]},
+                           {"token_sha256": hashlib.sha256(b"replacement-fixture-token").hexdigest()}):
+                with self.subTest(route=route, change=change):
+                    self.principals.write_text(original)
+                    def revoke():
+                        data = json.loads(original)
+                        next(row for row in data["principals"] if row["actor"] == "operator").update(change)
+                        self.principals.write_text(json.dumps(data))
+                    with patch.object(pipeline_runner, "start_run") as start:
+                        status, _ = self.request(route, before_body=revoke)
+                        self.assertEqual(status, 403 if "roles" in change else 401)
+                        start.assert_not_called()
+
+    def test_delayed_body_cannot_transfer_authority_to_a_reassigned_token_or_lab_mode(self):
+        original = self.principals.read_text()
+        for transition in ("principal", "lab"):
+            with self.subTest(transition=transition), patch.dict(os.environ, {}):
+                self.principals.write_text(original)
+                def transfer():
+                    if transition == "lab":
+                        os.environ.update(OPU_WEBAPP_RBAC="0", OPU_WEBAPP_TOKEN="operator-token")
+                    else:
+                        data = json.loads(original)
+                        next(row for row in data["principals"] if row["actor"] == "operator")["actor"] = "replacement-operator"
+                        self.principals.write_text(json.dumps(data))
+                with patch.object(pipeline_runner, "start_run") as start:
+                    status, payload = self.request("/api/recovery/r/execute", before_body=transfer)
+                    self.assertEqual(status, 403)
+                    self.assertEqual(payload["message"], "Authenticated identity changed before dispatch")
+                    start.assert_not_called()
 
     def test_legacy_live_get_routes_require_operator_and_keep_saved_reads_available(self):
         with patch.object(server, "run_discovery", return_value={"fresh": True}) as discovery, \
@@ -216,7 +256,7 @@ class ControlPlaneTests(unittest.TestCase):
     def test_artifact_staging_rejects_ambiguous_types_before_remote_work(self):
         stages = server.pipeline_steps
         valid = {"artifact_dir": "/patch", "owner": "oracle", "source": {"zip_path": "/patch.zip"}}
-        with patch.object(stages.tools_sync, "ensure_host_tools") as sync, \
+        with patch.object(stages.tools_sync, "ensure_host_tools", side_effect=host_runtime_receipts) as sync, \
              patch.object(stages.remote, "run_remote_raw") as run:
             for update in ({"replace": "false"}, {"replace": 1}, {"owner": []}, {"artifact_dir": {}},
                            {"source": []}, {"source": {"zip_path": "/patch.zip", "unexpected": True}},
@@ -316,7 +356,7 @@ class ControlPlaneTests(unittest.TestCase):
             {"name": "n1", "ssh_alias": "n1"}, {"name": "n2", "ssh_alias": "n2"}]}
         for name in ("snapshot", "snapshot_nodes", "snapshot_n1", "readiness"):
             evidence.write_evidence("h", name, {"old": True})
-        with patch.object(stages.tools_sync, "ensure_host_tools"), \
+        with patch.object(stages.tools_sync, "ensure_host_tools", side_effect=host_runtime_receipts), \
              patch.object(stages.remote, "run_remote_json", side_effect=[{"host": {"name": "n1"}}, server.remote.RemoteError("ssh_timeout", "n2 failed")]):
             with self.assertRaises(server.remote.RemoteError):
                 stages.step_discovery("h", host, {})
@@ -613,7 +653,7 @@ sys.stdin.readline()
         stderr = "x" * 5000 + "\npassword=private-value token='private-token'\nAuthorization: Bearer private-bearer\nanother Oracle executor owns this host\n"
         with patch.object(planctl.production, "require_live_mutation_allowed"), \
              patch.object(planctl, "_resolve_live_host_for_task", return_value=host), \
-             patch.object(planctl, "_sync_plan_to_host", return_value="/opt/opu/plans"), \
+             patch.object(planctl, "_sync_plan_to_host", return_value=("/opt/opu/plans", runtime_receipt(host["ssh_alias"], host["remote_root"]))), \
              patch.object(planctl, "_run_detached_remote", return_value=(75, "private stdout", stderr)) as launch, \
              patch.object(planctl, "_sync_plan_from_host"), \
              patch.object(planctl, "_run", return_value={"status": "pending"}) as verified, \
@@ -629,14 +669,14 @@ sys.stdin.readline()
             self.assertIn("[REDACTED]", error["stderr"])
             launch.assert_called_once()
             verified.assert_called_once_with(["task-status", "--plan-id", "p", "--task-id", "t"])
-            context.assert_called_once_with(task_definition_sha256="a" * 64, task_retry_count=1)
+            context.assert_called_once_with(runtime_root=runtime_receipt("alias", "/opt/opu")["runtime_root"], runtime_fingerprint="a" * 64, task_definition_sha256="a" * 64, task_retry_count=1)
 
     def test_live_verified_terminal_result_is_unchanged(self):
         host = {"id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu"}
         task = {"task_id": "t", "adapter": "database_single_instance_opatch", "task_definition_sha256": "a" * 64, "retry_count": 1}
         with patch.object(planctl.production, "require_live_mutation_allowed"), \
              patch.object(planctl, "_resolve_live_host_for_task", return_value=host), \
-             patch.object(planctl, "_sync_plan_to_host", return_value="/opt/opu/plans"), \
+             patch.object(planctl, "_sync_plan_to_host", return_value=("/opt/opu/plans", runtime_receipt(host["ssh_alias"], host["remote_root"]))), \
              patch.object(planctl, "_run_detached_remote", return_value=(0, '{"status":"succeeded","task_id":"t"}', "")) as launch, \
              patch.object(planctl, "_sync_plan_from_host"), \
              patch.object(planctl, "_run", return_value={"status": "succeeded"}) as verified, \
@@ -646,7 +686,7 @@ sys.stdin.readline()
             launch.assert_called_once()
             verified.assert_called_once_with(["task-status", "--plan-id", "p", "--task-id", "t"])
             self.assertEqual([item.kwargs for item in context.call_args_list],
-                             [{"task_definition_sha256": "a" * 64, "task_retry_count": 1}, {"detached_terminal": True}])
+                             [{"runtime_root":runtime_receipt("alias", "/opt/opu")["runtime_root"], "runtime_fingerprint":"a" * 64, "task_definition_sha256": "a" * 64, "task_retry_count": 1}, {"detached_terminal": True}])
 
     def test_reconciliation_reports_preclaim_error_without_clearing_unknown(self):
         host = {"id": "h", "node_name": "n", "ssh_alias": "alias", "remote_root": "/opt/opu"}

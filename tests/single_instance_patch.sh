@@ -77,6 +77,7 @@ else
   printf 'sql:%s\n' "$fd" >>"$OPU_TEST_FD_CALLS"
 fi
 if grep -q 'shutdown immediate' <<<"$input"; then
+  printf 'shutdown:%s\n' "$fd" >>"$OPU_TEST_FD_CALLS"
   [ "$(cat "$OPU_TEST_DATABASE_STATE")" = up ] || exit 1
   printf 'down\n' >"$OPU_TEST_DATABASE_STATE"
 elif grep -q '^startup;' <<<"$input"; then
@@ -101,11 +102,11 @@ elif grep -q 'alter system register' <<<"$input"; then
 else
   [ "$(cat "$OPU_TEST_DATABASE_STATE")" = up ] || exit 1
   printf '%s\n' \
-    'INSTANCE_NAME=ORCL' \
+    "INSTANCE_NAME=${OPU_TEST_INSTANCE_NAME-ORCL}" \
     'INSTANCE_STATUS=OPEN' \
-    'DATABASE_UNIQUE_NAME=ORCL' \
+    "DATABASE_UNIQUE_NAME=${OPU_TEST_DATABASE_NAME-ORCL}" \
     "CDB=${OPU_TEST_CDB-NO}" \
-    'DATABASE_ROLE=PRIMARY' \
+    "DATABASE_ROLE=${OPU_TEST_DATABASE_ROLE-PRIMARY}" \
     'OPEN_MODE=READ WRITE' \
     'LOG_MODE=ARCHIVELOG' \
     'INVALID_OBJECTS=0'
@@ -438,6 +439,42 @@ APPLY_CALLS_AFTER=$(grep -c '^apply ' "$OPATCH_CALLS" 2>/dev/null || true)
 [ "$APPLY_CALLS_AFTER" -eq "$APPLY_CALLS_BEFORE" ]
 [ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
 rm -f "$FAIL_APPLICABILITY"
+
+# A successful precheck does not authorize a later outage against a changed
+# database, instance, role or unsupported CDB scope. Exercise the real native
+# apply task with changed live SQL observations, then retry its no-mutation
+# failure without replacing any approval or deleting prior attempt evidence.
+create_plan standalone-health-drift
+HEALTH_PRECHECK=$(plan next --plan-id standalone-health-drift | jq -r '.task_id')
+execute standalone-health-drift "$HEALTH_PRECHECK" >/dev/null
+HEALTH_APPLY=$(plan next --plan-id standalone-health-drift | jq -r '.task_id')
+HEALTH_ATTEMPT=0
+for drift in database instance role cdb unknown-cdb; do
+  SHUTDOWNS_BEFORE=$(grep -c '^shutdown:' "$FD_CALLS" || true)
+  LISTENER_STOPS_BEFORE=$(grep -c '^listener-stop:' "$FD_CALLS" || true)
+  APPLY_CALLS_BEFORE=$(grep -c '^apply ' "$OPATCH_CALLS" || true)
+  set +e
+  case "$drift" in
+    database) OPU_TEST_DATABASE_NAME=UNREVIEWED OPU_SINGLE_INSTANCE_WAIT_ATTEMPTS=1 execute standalone-health-drift "$HEALTH_APPLY" >"$TMP/health-$drift.json" 2>"$TMP/health-$drift.stderr" ;;
+    instance) OPU_TEST_INSTANCE_NAME=OTHER OPU_SINGLE_INSTANCE_WAIT_ATTEMPTS=1 execute standalone-health-drift "$HEALTH_APPLY" >"$TMP/health-$drift.json" 2>"$TMP/health-$drift.stderr" ;;
+    role) OPU_TEST_DATABASE_ROLE='PHYSICAL STANDBY' OPU_SINGLE_INSTANCE_WAIT_ATTEMPTS=1 execute standalone-health-drift "$HEALTH_APPLY" >"$TMP/health-$drift.json" 2>"$TMP/health-$drift.stderr" ;;
+    cdb) OPU_TEST_CDB=YES OPU_SINGLE_INSTANCE_WAIT_ATTEMPTS=1 execute standalone-health-drift "$HEALTH_APPLY" >"$TMP/health-$drift.json" 2>"$TMP/health-$drift.stderr" ;;
+    unknown-cdb) OPU_TEST_CDB='' OPU_SINGLE_INSTANCE_WAIT_ATTEMPTS=1 execute standalone-health-drift "$HEALTH_APPLY" >"$TMP/health-$drift.json" 2>"$TMP/health-$drift.stderr" ;;
+  esac
+  HEALTH_RC=$?
+  set -e
+  [ "$HEALTH_RC" -eq 65 ] || { echo "apply accepted changed live $drift" >&2; exit 1; }
+  jq -e --argjson attempt "$HEALTH_ATTEMPT" '.status == "failed" and .outcome_class == "no_mutation" and .retry_count == $attempt' "$TMP/health-$drift.json" >/dev/null
+  [ "$(grep -c '^shutdown:' "$FD_CALLS" || true)" -eq "$SHUTDOWNS_BEFORE" ]
+  [ "$(grep -c '^listener-stop:' "$FD_CALLS" || true)" -eq "$LISTENER_STOPS_BEFORE" ]
+  [ "$(grep -c '^apply ' "$OPATCH_CALLS" || true)" -eq "$APPLY_CALLS_BEFORE" ]
+  [ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
+  plan status --plan-id standalone-health-drift | jq -e '.state == "paused"' >/dev/null
+  if [ "$drift" != unknown-cdb ]; then
+    plan retry-task --plan-id standalone-health-drift --task-id "$HEALTH_APPLY" --actor patch-operator >/dev/null
+    HEALTH_ATTEMPT=$((HEALTH_ATTEMPT+1))
+  fi
+done
 
 # A binary-apply failure must pause without pretending that Oracle recovered.
 create_plan standalone-opatch-failure

@@ -653,6 +653,8 @@ def action(owner, conversation_id, action_id, *, dismiss=False, digest=None, all
             # Carry the exact reviewed evidence/configuration binding through
             # native asynchronous creation; never replace it with a later read.
             body["expected_creation_binding_sha256"] = selected["binding"]
+        if selected["tool"] in {"dispatch_plan", "execute_plan"}:
+            body["expected_action_binding_sha256"] = selected["binding"]
         if selected["tool"] in {"refresh_discovery", "refresh_readiness", "select_backup", "create_backup"}:
             # This exact configuration is covered by the approved aggregate
             # binding checked above. Carry its digest across the dispatch gap

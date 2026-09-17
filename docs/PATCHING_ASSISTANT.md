@@ -92,7 +92,11 @@ bodies and native logs are not supplied as model tool context.
 
 Proposals expire after 15 minutes and bind exact arguments to saved target and
 evidence digests. Confirmation rechecks current permissions and binding. Changed
-state requires a new proposal. A durable launch marker prevents double clicks
+state requires a new proposal. Confirmed plan dispatch/execution checks the
+original binding again when the native worker starts, including every resolved
+node's host configuration. Execution keeps that reviewed inventory snapshot for
+all tasks in the run, so a later inventory edit cannot redirect a queued or
+subsequent task. A durable launch marker prevents double clicks
 and retries from repeating work; a lost launch result becomes unknown and
 requires native inspection/reconciliation. Restart does not auto-confirm or
 auto-resume proposals. Conversations and tool rounds have bounded limits.

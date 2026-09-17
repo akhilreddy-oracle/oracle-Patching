@@ -387,7 +387,8 @@ wait_for_listener_ready() {
 
 current_health() {
   local output_file=$1
-  database_probe "$ORACLE_SID" "$output_file" && healthy_probe "$output_file"
+  database_probe "$ORACLE_SID" "$output_file" && healthy_probe "$output_file" &&
+    [ "$(probe_value INSTANCE_NAME "$output_file")" = "$ORACLE_SID" ]
 }
 
 wait_for_database_health() {
@@ -500,6 +501,7 @@ stage_apply() {
   opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/apply-conflict.log"
   check_apply_capacity
   verify_extjob_permissions
+  current_health "$TASK_DIR/apply-pre-health.log" || die 'database identity or health changed immediately before binary apply'
   cat <<'SQL' | sqlplus_fixed "$ORACLE_SID"
 whenever sqlerror exit failure
 shutdown immediate;

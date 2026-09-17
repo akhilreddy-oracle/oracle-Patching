@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from runtime_fixture import runtime_receipt, host_runtime_receipts
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "webapp"))
 import evidence
@@ -28,7 +29,7 @@ class LiveInventoryTests(unittest.TestCase):
         self.enterContext(patch.object(runner, "RUNS", {}))
         self.enterContext(patch.object(runner, "_ACTIVE_KEYS", {}))
         self.enterContext(patch.object(runner.notifications, "emit"))
-        self.sync = self.enterContext(patch.object(pipeline.tools_sync, "ensure_host_tools"))
+        self.sync = self.enterContext(patch.object(pipeline.tools_sync, "ensure_host_tools", side_effect=host_runtime_receipts))
         self.ssh = self.enterContext(patch.object(pipeline.remote, "run_remote_json",
             side_effect=lambda *_args, **_kwargs: self.snapshot()))
         self.host = {"id": "targetdb", "ssh_alias": "never-connect", "remote_root": "/fixture",
@@ -72,7 +73,7 @@ class LiveInventoryTests(unittest.TestCase):
         self.assertEqual(result["source"], "live_discovery")
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["nodes"][0]["oracle_homes"][0]["patches"], ["29517242", "29585399"])
-        self.ssh.assert_called_once_with("never-connect", ["/fixture/bin/opu-topology-discover", "--pretty"],
+        self.ssh.assert_called_once_with("never-connect", [runtime_receipt("never-connect", "/fixture")["runtime_root"] + "/bin/opu-topology-discover", "--pretty"],
             timeout=pipeline.DISCOVERY_TIMEOUT_SECONDS, sudo=False)
         for secret in ("HOST_SECRET", "HOME_SECRET", "RUNTIME_SECRET", "SQL_SECRET", "LOG_SECRET"):
             self.assertNotIn(secret, json.dumps(result))

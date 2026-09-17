@@ -43,7 +43,9 @@ def install(base: Path, checkout: Path) -> None:
     backup_parent = fixture / "backups"
     backup_parent.mkdir()
     remote_root = base / "simulated-node"
-    (remote_root / "bin").mkdir(parents=True)
+    runtime_fingerprint = "a" * 64
+    runtime_root = remote_root / ".opu-runtimes" / runtime_fingerprint
+    (runtime_root / "bin").mkdir(parents=True)
     remote_state = base / "simulated-native-recovery-state"
 
     # Both workflows mutate the SAME database/listener state and Oracle home.
@@ -83,7 +85,7 @@ def install(base: Path, checkout: Path) -> None:
     # when the managed controller correctly invokes them with env -i.
     native_names = {"opu-database-recovery-prepare", "opu-recovery-evidence-collect", "opu-opatch-compatibility-collect"}
     for name in native_names:
-        wrapper = remote_root / "bin" / name
+        wrapper = runtime_root / "bin" / name
         exports = {key: value for key, value in transport_env.items()
                    if key.startswith("OPU_") or key in {"PATH", "PYTHONDONTWRITEBYTECODE", "TMPDIR"}}
         wrapper.write_text("#!/bin/bash\nset -eu\n" + "\n".join(
@@ -120,7 +122,7 @@ def install(base: Path, checkout: Path) -> None:
             executable = command[6]
         else:
             executable = command[0]
-        if executable not in {str(remote_root / "bin" / name) for name in native_names}:
+        if executable not in {str(runtime_root / "bin" / name) for name in native_names}:
             raise RuntimeError("Unexpected native command at fixture transport boundary")
         for item in command[command.index(executable) + 1:]:
             if item.startswith("/"):
@@ -157,15 +159,16 @@ def install(base: Path, checkout: Path) -> None:
 
     def ensure_tools(ssh_alias, root, sudo=False, **kwargs):
         alias(ssh_alias)
-        if root != str(remote_root) or not all((remote_root / "bin" / n).is_file() for n in native_names):
+        if root != str(remote_root) or not all((runtime_root / "bin" / n).is_file() for n in native_names):
             raise RuntimeError("Fixture package deployment target is not the isolated node")
+        return {"ssh_alias": ssh_alias, "runtime_root": str(runtime_root), "fingerprint": runtime_fingerprint, "synced": False, "cached": False}
 
     remote.run_remote_raw = raw
     remote.run_remote_shell = shell
     remote.push_file = push
     remote.pull_file = pull
     tools_sync.ensure_tools = ensure_tools
-    tools_sync.ensure_host_tools = lambda host, **kwargs: ensure_tools(host["ssh_alias"], host["remote_root"])
+    tools_sync.ensure_host_tools = lambda host, **kwargs: [ensure_tools(host["ssh_alias"], host["remote_root"])]
     recoveryctl.REMOTE_STATE_DIR = str(remote_state)
     pipeline_steps.REMOTE_SCRATCH_DIR = str(base / "scratch" / "{host_id}")
     host = {"id": HOST_ID, "label": "SIMULATED connected Oracle fixture — no live SSH", "ssh_alias": ALIAS,

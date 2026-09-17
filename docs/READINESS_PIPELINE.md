@@ -143,6 +143,13 @@ adapter re-runs both applicability and conflict checks immediately before the
 first service outage and again at the binary-apply boundary. A failure before
 shutdown ends the task as `no_mutation`; it must not stop the database or
 listener.
+Standalone binary apply also probes the bound SID immediately before shutdown:
+the database and instance identities must still match, with an open, primary,
+read-write, non-CDB database. A successful earlier precheck cannot authorize an
+outage after those live conditions change.
+RAC apply and rollback repeat their local database identity, role and non-CDB
+health checks before service drain and again before instance shutdown. Binary
+stages retain their expected stopped-instance checks.
 
 ## Policy example
 

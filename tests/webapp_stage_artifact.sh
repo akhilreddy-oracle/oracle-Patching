@@ -13,6 +13,8 @@ import base64, json, os, subprocess, sys
 from pathlib import Path
 
 sys.path.insert(0, ".")
+sys.path.append(str(Path.cwd().parent / "tests"))
+from runtime_fixture import host_runtime_receipts
 import evidence
 evidence.VAR_DIR = Path(os.environ["OPU_TEST_TMP"]) / "hosts"
 import pipeline_steps, remote, tools_sync
@@ -76,7 +78,7 @@ def fake_push(alias, path, data, timeout=45, private=False):
     calls.append(("push", alias, path))
 remote.push_file = fake_push
 remote.pull_file = lambda alias, path, timeout=45, sudo=False: (_ for _ in ()).throw(remote.RemoteError("x", "no stamp"))
-tools_sync.ensure_host_tools = lambda host, force=False: calls.append(("tools", host["id"])) or []
+tools_sync.ensure_host_tools = lambda host, force=False: calls.append(("tools", host["id"])) or host_runtime_receipts(host)
 
 # Snapshot evidence supplies the Oracle Home owner.
 evidence.write_evidence(HOST_ID, "snapshot", {"oracle_homes": [{"path": "/u01/app/oracle/product/19/dbhome_1", "owner": "oracle"}],

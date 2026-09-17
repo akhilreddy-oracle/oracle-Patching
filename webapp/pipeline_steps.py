@@ -113,14 +113,14 @@ def step_discovery(host_id: str, host: dict, body: dict) -> dict:
     nodes = _configured_nodes(host)
     _invalidate(host_id, "snapshot", "snapshot_nodes", "reconciliation", "compatibility",
                 "compatibility_reconciliation", "readiness", "recovery")
-    tools_sync.ensure_host_tools(host)
-    argv = [f"{host['remote_root']}/bin/opu-topology-discover", "--pretty"]
+    runtimes = tools_sync.ensure_host_tools(host)
     sudo = bool(host.get("sudo"))
     index_nodes: list[dict] = []
     primary_payload: dict | None = None
     primary_alias = str(host.get("ssh_alias") or "")
 
     for node in nodes:
+        argv = [tools_sync.tool_path(host, runtimes, "bin/opu-topology-discover", node["ssh_alias"]), "--pretty"]
         try:
             payload = remote.run_remote_json(
                 node["ssh_alias"],
@@ -189,8 +189,8 @@ def step_artifact_inspect(host_id: str, host: dict, body: dict) -> dict:
     if not artifact_dir.startswith("/"):
         raise remote.RemoteError("invalid_input", "artifact_dir must be an absolute path on the target host")
     _invalidate(host_id, "artifact", "procedure", "compatibility", "compatibility_reconciliation", "readiness")
-    tools_sync.ensure_host_tools(host)
-    argv = [f"{host['remote_root']}/bin/opu-artifact-inspect", "--artifact", artifact_dir]
+    runtimes = tools_sync.ensure_host_tools(host)
+    argv = [tools_sync.tool_path(host, runtimes, "bin/opu-artifact-inspect"), "--artifact", artifact_dir]
     result = remote.run_remote_json(
         host["ssh_alias"], argv, timeout=ARTIFACT_INSPECT_TIMEOUT_SECONDS, sudo=bool(host.get("sudo")),
     )
@@ -243,7 +243,7 @@ def step_compatibility_collect(host_id: str, host: dict, body: dict) -> dict:
                     f"No indexed discovery snapshot for node {node['name']}; refresh discovery before collecting compatibility.")
         snapshots.append(path.read_bytes())
     # Validate the entire node set before installing tools or opening SSH.
-    tools_sync.ensure_host_tools(host)
+    runtimes = tools_sync.ensure_host_tools(host)
     scratch = REMOTE_SCRATCH_DIR.format(host_id=host_id)
     sudo = bool(host.get("sudo"))
     merged: dict | None = None
@@ -253,7 +253,7 @@ def step_compatibility_collect(host_id: str, host: dict, body: dict) -> dict:
         remote.push_file(alias, f"{scratch}/artifact.json", artifact.read_bytes())
         remote.push_file(alias, f"{scratch}/procedure.json", procedure.read_bytes())
         argv = [
-            f"{host['remote_root']}/bin/opu-opatch-compatibility-collect",
+            tools_sync.tool_path(host, runtimes, "bin/opu-opatch-compatibility-collect", alias),
             "--snapshot", f"{scratch}/snapshot.json",
             "--artifact", artifact_dir,
             "--artifact-manifest", f"{scratch}/artifact.json",
@@ -374,13 +374,13 @@ def step_recovery_collect(host_id: str, host: dict, body: dict) -> dict:
     backup_root = (request.get("result") or {}).get("backup_root")
     if not isinstance(backup_root, str) or not backup_root.startswith("/"):
         raise remote.RemoteError("invalid_recovery", "Completed recovery request has no validated backup root")
-    tools_sync.ensure_host_tools(host)
+    runtimes = tools_sync.ensure_host_tools(host)
     alias = nodes[0]["ssh_alias"]
     sudo = bool(host.get("sudo"))
     remote.push_file(alias, str(snapshot_path), snapshot_bytes, sudo=sudo)
     output = f"{REMOTE_SCRATCH_DIR.format(host_id=host_id)}/recovery-{uuid.uuid4().hex}.json"
     result = remote.run_remote_raw(alias, [
-        f"{host['remote_root']}/bin/opu-recovery-evidence-collect",
+        tools_sync.tool_path(host, runtimes, "bin/opu-recovery-evidence-collect", alias),
         "--snapshot", str(snapshot_path), "--database", database,
         "--backup-root", backup_root, "--output", output,
     ], timeout=RECOVERY_COLLECT_TIMEOUT_SECONDS, sudo=sudo)
@@ -649,9 +649,8 @@ def step_stage_artifact(host_id: str, host: dict, body: dict) -> dict:
     # A partial multi-node transfer must not leave approval evidence for media
     # that may already have changed on an earlier node.
     _invalidate(host_id, *_ARTIFACT_BOUND_EVIDENCE)
-    tools_sync.ensure_host_tools(host)
+    runtimes = tools_sync.ensure_host_tools(host)
     sudo = bool(host.get("sudo"))
-    tool = f"{host['remote_root'].rstrip('/')}/bin/opu-artifact-stage"
     src_ips: list[str] = []
     if src_host is not None and transfer != "relay":
         try:
@@ -665,6 +664,7 @@ def step_stage_artifact(host_id: str, host: dict, body: dict) -> dict:
         if current["state"] == "complete" and not replace:
             results.append({"node": node["name"], "ssh_alias": alias, "status": "already_complete", "bytes": current.get("bytes")})
             continue
+        tool = tools_sync.tool_path(host, runtimes, "bin/opu-artifact-stage", alias)
         dst_argv = [tool, "--artifact", artifact_dir, "--owner", owner]
         if replace:
             dst_argv.append("--replace")

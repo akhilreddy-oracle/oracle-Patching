@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 import os
+import re
 import time
 from functools import wraps
 
@@ -57,6 +58,19 @@ STATIC_CONTENT_TYPES = {
 
 def load_hosts() -> dict[str, dict]:
     return host_config.load(HOSTS_FILE)
+
+
+def _confirmed_plan_hosts(tool: str, plan_id: str, expected: str | None) -> dict | None:
+    """Verify the original proposal again at admission and worker startup."""
+    if expected is None:
+        return None
+    if not isinstance(expected, str) or re.fullmatch(r"[a-f0-9]{64}", expected) is None:
+        raise planctl.PlanError("Plan action confirmation is invalid; review a new proposal")
+    hosts = load_hosts()
+    current = assistant.capabilities.binding(tool, {"plan_id": plan_id}, hosts)
+    if current != expected:
+        raise planctl.PlanError("Plan state or host configuration changed after confirmation; review a new proposal")
+    return hosts
 
 
 def _configuration_errors(method):
@@ -702,11 +716,24 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/") and not self._authorize_path("POST", path):
             return
+        admitted_identity = (getattr(self, "_principal", None), bool(getattr(self, "_company_session", None)))
         try:
             body = self._read_json_body()
         except (ValueError, UnicodeError) as exc:
             self._send_json(400, {"error": "invalid_body", "message": str(exc)})
             return
+        if path.startswith("/api/"):
+            # A client can withhold the body after sending valid credentials.
+            # Recheck authority after that blocking read, before admitting any
+            # native work, and never transfer the request to a new identity.
+            if not self._require_api_auth():
+                return
+            current_identity = (getattr(self, "_principal", None), bool(getattr(self, "_company_session", None)))
+            if current_identity != admitted_identity:
+                self._send_json(403, {"error": "unauthorized", "message": "Authenticated identity changed before dispatch"})
+                return
+            if not self._authorize_path("POST", path):
+                return
         self._dispatch_post(path, body)
 
     def _dispatch_post(self, path: str, body: dict) -> None:
@@ -1069,10 +1096,18 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_role(actor, "execute"):
                 return
             max_tasks = int(body.get("max_tasks", 200))
+            expected_binding = body.get("expected_action_binding_sha256")
+            try:
+                _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)
+            except (planctl.PlanError, assistant.capabilities.ToolError) as exc:
+                self._send_json(409, {"error": "confirmation_changed", "message": str(exc)})
+                return
 
-            def run(_record, plan_id=plan_id, actor=actor, max_tasks=max_tasks):
+            def run(_record, plan_id=plan_id, actor=actor, max_tasks=max_tasks, expected_binding=expected_binding):
                 try:
-                    result = planctl.execute_remaining_tasks(plan_id, actor, max_tasks=max_tasks)
+                    hosts = _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)
+                    with planctl.pinned_hosts(hosts):
+                        result = planctl.execute_remaining_tasks(plan_id, actor, max_tasks=max_tasks)
                 except Exception:
                     notifications.emit("plan.execute.failed", {"plan_id": plan_id, "actor": actor})
                     raise
@@ -1378,10 +1413,18 @@ class Handler(BaseHTTPRequestHandler):
                 actor = body["actor"]
                 if not self._require_role(actor, "dispatch"):
                     return
+                expected_binding = body.get("expected_action_binding_sha256")
+                try:
+                    _confirmed_plan_hosts("dispatch_plan", plan_id, expected_binding)
+                except (planctl.PlanError, assistant.capabilities.ToolError) as exc:
+                    self._send_json(409, {"error": "confirmation_changed", "message": str(exc)})
+                    return
                 key = f"plan:{plan_id}:dispatch"
 
-                def run(_record, plan_id=plan_id, actor=actor):
-                    return planctl.dispatch(plan_id, actor)
+                def run(_record, plan_id=plan_id, actor=actor, expected_binding=expected_binding):
+                    hosts = _confirmed_plan_hosts("dispatch_plan", plan_id, expected_binding)
+                    with planctl.pinned_hosts(hosts):
+                        return planctl.dispatch(plan_id, actor)
 
             elif action == "create-rollback":
                 # Path plan_id is the source apply plan; body must agree when present.
