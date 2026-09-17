@@ -18,6 +18,80 @@ def function(source, name):
 
 
 class NativeSecondReviewTests(unittest.TestCase):
+    def test_dictionary_admission_checks_exit_status_and_unambiguous_counters(self):
+        source = (ROOT / "bin/opu-database-single-instance-patch").read_text()
+        definitions = "\n".join(function(source, func) for func in ("probe_value", "dictionary_probe", "require_healthy_dictionary"))
+        rows = "INVALID_OBJECTS=0\nNONVALID_COMPONENTS=0\nENABLED_COMPONENTS=2\nCOMPONENT=CATALOG|VALID\nCOMPONENT=CATPROC|VALID\n"
+        for label, output, rc, accepted in (
+            ("normal multi-row components", rows, 0, True),
+            ("invalid conflict", "INVALID_OBJECTS=3\n" + rows, 0, False),
+            ("duplicate components counter", rows + "NONVALID_COMPONENTS=0\n", 0, False),
+            ("empty count", rows.replace("ENABLED_COMPONENTS=2", "ENABLED_COMPONENTS="), 0, False),
+            ("diagnostic", rows + "SP2-0734: unknown command\n", 0, False),
+            ("nonzero query exit", rows, 1, False),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                (base / "stdout").write_text(output)
+                command = "set -eu; . " + shlex.quote(str(ROOT / "lib/opu/common.sh")) + "; " + definitions
+                command += '\ndie() { echo "$*" >&2; exit 65; }; sqlplus_fixed() { cat >/dev/null; cat "$FIXTURE/stdout"; return "$QUERY_RC"; }; FIXTURE="$1"; QUERY_RC="$2"; ORACLE_SID=fixture; if require_healthy_dictionary "$1/result.log"; then :; else exit 65; fi'
+                result = subprocess.run(["bash", "-c", command, "fixture", temporary, str(rc)], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_database_health_rejects_ambiguous_rows_and_sqlplus_diagnostics(self):
+        for name in ("single-instance-patch", "ojvm-patch", "out-of-place-patch", "rac-node-patch", "rac-node-rollback"):
+            source = (ROOT / ("bin/opu-database-" + name)).read_text()
+            for health in ("healthy_probe", "upgrade_probe") if name == "ojvm-patch" else ("healthy_probe",):
+                status = "OPEN MIGRATE" if health == "upgrade_probe" else "OPEN"
+                rows = "DATABASE_UNIQUE_NAME=fixture\nINSTANCE_NAME=fixture\nINSTANCE_STATUS=" + status + "\nDATABASE_ROLE=PRIMARY\nOPEN_MODE=READ WRITE\nCDB=NO\n"
+                definitions = "\n".join(function(source, func) for func in ("probe_value", health))
+                for label, output, accepted in (
+                    ("normal", rows, True),
+                    ("formatting", "SQL*Plus: fixture\n\n" + rows + "\nDisconnected from Oracle Database\n", True),
+                    ("database conflict", "DATABASE_UNIQUE_NAME=other\n" + rows, False),
+                    ("state conflict", "INSTANCE_STATUS=MOUNTED\n" + rows, False),
+                    ("duplicate success", rows + "INSTANCE_STATUS=" + status + "\n", False),
+                    ("oracle error", rows + "ORA-01034: ORACLE not available\n", False),
+                    ("sqlplus error", "  SP2-0734: unknown command\n" + rows, False),
+                ):
+                    with self.subTest(adapter=name, health=health, case=label), tempfile.TemporaryDirectory() as temporary:
+                        path = Path(temporary) / "probe.log"
+                        path.write_text(output)
+                        command = "set -eu; . " + shlex.quote(str(ROOT / "lib/opu/common.sh")) + "; " + definitions
+                        command += '\nDATABASE=fixture; ' + health + ' "$1" fixture'
+                        result = subprocess.run(["bash", "-c", command, "fixture", str(path)], capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_sqlpatch_admission_rejects_duplicate_rows_and_zero_exit_diagnostics(self):
+        for name in ("single-instance-patch", "ojvm-patch", "out-of-place-patch", "rac-node-patch", "rac-node-rollback"):
+            source = (ROOT / ("bin/opu-database-" + name)).read_text()
+            checks = (("require_sqlpatch_apply_success", "APPLY"), ("require_sqlpatch_rollback_success", "ROLLBACK")) if name == "rac-node-rollback" else (("require_sqlpatch_apply_success", "APPLY"),) if name == "rac-node-patch" else (("require_latest_sqlpatch", "APPLY"), ("require_latest_sqlpatch", "ROLLBACK"))
+            for check, action in checks:
+                definitions = "\n".join(function(source, func) for func in ("probe_value", "sqlpatch_latest", check))
+                rows = "SQLPATCH_LATEST_ACTION=" + action + "\nSQLPATCH_LATEST_STATUS=SUCCESS\n"
+                for label, output, diagnostic, accepted in (
+                    ("normal", rows, "", True),
+                    ("status conflict", "SQLPATCH_LATEST_STATUS=WITH ERRORS\n" + rows, "", False),
+                    ("duplicate action", rows + "SQLPATCH_LATEST_ACTION=" + action + "\n", "", False),
+                    ("missing status", "SQLPATCH_LATEST_ACTION=" + action + "\n", "", False),
+                    ("stdout error", rows + "ORA-00942: table or view does not exist\n", "", False),
+                    ("stderr error", rows, "SP2-0734: unknown command\n", False),
+                ):
+                    with self.subTest(adapter=name, action=action, case=label), tempfile.TemporaryDirectory() as temporary:
+                        base = Path(temporary)
+                        (base / "stdout").write_text(output)
+                        (base / "stderr").write_text(diagnostic)
+                        command = "set -eu; . " + shlex.quote(str(ROOT / "lib/opu/common.sh")) + "; " + definitions
+                        command += '\ndie() { echo "$*" >&2; exit 65; }; sqlplus_fixed() { cat >/dev/null; cat "$FIXTURE/stdout"; cat "$FIXTURE/stderr" >&2; }; FIXTURE="$1"; ORACLE_SID=fixture; PATCH_ID=87654321; '
+                        if name == "out-of-place-patch":
+                            command += check + ' /fixture/home "$2" "$1/result.log"'
+                        elif check == "require_latest_sqlpatch":
+                            command += check + ' "$2" "$1/result.log"'
+                        else:
+                            command += check + ' "$1/result.log"'
+                        result = subprocess.run(["bash", "-c", command, "fixture", temporary, action], capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
     def test_ojvm_and_home_switch_datapatch_use_native_inventory_selection(self):
         for name in ("ojvm", "out-of-place"):
             source = (ROOT / ("bin/opu-database-" + name + "-patch")).read_text()

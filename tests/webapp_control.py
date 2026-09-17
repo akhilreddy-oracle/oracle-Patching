@@ -94,6 +94,31 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertEqual(self.request("/api/estate?live=1", method="GET")[0], 200)
             estate.assert_called_with(live=True)
 
+    def test_discovery_session_hint_matches_principal_policy_and_post_authorization(self):
+        with patch.object(pipeline_runner, "start_run") as start:
+            for role in ("viewer", "requester", "approver", "operator"):
+                status, session = self.request("/api/session", actor=role, method="GET")
+                self.assertEqual(status, 200)
+                self.assertEqual(session["permissions"]["live_discovery"], role == "operator")
+                if role != "operator":
+                    self.assertEqual(self.request("/api/hosts/h/pipeline/discovery", actor=role)[0], 403)
+            start.assert_not_called()
+            start.return_value = SimpleNamespace(run_id="fixture-discovery")
+            self.assertEqual(self.request("/api/hosts/h/pipeline/discovery"), (202, {"run_id": "fixture-discovery"}))
+            start.assert_called_once()
+        # The hint follows the authority policy, rather than a separate role list.
+        with patch.dict(auth.ACTION_ROLES, {"execute": {"requester"}}):
+            self.assertTrue(self.request("/api/session", actor="requester", method="GET")[1]["permissions"]["live_discovery"])
+            self.assertFalse(self.request("/api/session", actor="operator", method="GET")[1]["permissions"]["live_discovery"])
+
+    def test_discovery_session_hint_allows_authenticated_lab_mode_without_roles(self):
+        with patch.dict(os.environ, {"OPU_WEBAPP_RBAC": "0", "OPU_WEBAPP_TOKEN": "operator-token"}):
+            status, session = self.request("/api/session", method="GET")
+        self.assertEqual(status, 200)
+        self.assertEqual(session["mode"], "lab")
+        self.assertEqual(session["roles"], [])
+        self.assertTrue(session["permissions"]["live_discovery"])
+
     def test_company_live_get_requires_csrf_before_discovery(self):
         observed = []
         def authenticate(cookie, *, method, csrf, origin):

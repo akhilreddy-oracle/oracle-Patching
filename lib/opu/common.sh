@@ -1,11 +1,37 @@
 #!/usr/bin/env bash
 
+# SQL*Plus can emit diagnostics with exit status zero (notably SP2 errors).
+# Consume the entire probe before publishing one required scalar: conflicting
+# or repeated rows must never turn into success by selecting the last row.
+# Banners, blank lines and unrelated multi-row results remain permitted.
+opu_sql_probe_value() {
+    local key=$1 file=$2
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 64
+    LC_ALL=C awk -v key="$key" '
+        /^[[:space:]]*(ORA-[0-9][0-9][0-9][0-9][0-9]|SP2-[0-9][0-9][0-9][0-9]):/ { diagnostic = 1 }
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            if (index(line, key "=") == 1) {
+                count++
+                value = substr(line, length(key) + 2)
+                sub(/^[[:space:]]*/, "", value)
+                sub(/[[:space:]]*$/, "", value)
+            }
+        }
+        END {
+            if (diagnostic || count != 1 || value == "") exit 65
+            print value
+        }
+    ' "$file"
+}
+
 # Current database adapters verify one database's SQL registry. They do not
 # restore or validate every PDB and the seed; admitting a CDB would allow a
 # root-only datapatch success to be mistaken for complete patching.
 opu_require_non_cdb_probe() {
     local file=$1
-    if awk '/^[[:space:]]*CDB=/ { sub(/^[[:space:]]*/, ""); sub(/[[:space:]]*$/, ""); count++; if ($0 == "CDB=NO") valid++ } END { exit !(count == 1 && valid == 1) }' "$file"; then
+    if [ "$(opu_sql_probe_value CDB "$file")" = NO ]; then
         return 0
     fi
     printf '%s\n' 'Database patch execution currently supports non-CDB databases only; CDB=NO must be observed. Multitenant or unknown container scope requires a supported per-container procedure.' >&2

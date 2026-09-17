@@ -32,10 +32,21 @@ case "$input" in
   *OPU_RECOVERY_PREP_PROBE*)
     state=$(cat "$state_file")
     if [ "$state" = OPEN ]; then
-      printf 'ORCL|ORCL|PRIMARY|READ WRITE|NOARCHIVELOG|OPEN|12345|%s/spfileORCL.ora|1024|%s\n' "$OPU_TEST_RUNTIME" "${OPU_TEST_CDB-NO}"
+      row="ORCL|ORCL|PRIMARY|READ WRITE|NOARCHIVELOG|OPEN|12345|$OPU_TEST_RUNTIME/spfileORCL.ora|1024|${OPU_TEST_CDB-NO}"
     else
-      printf 'ORCL|ORCL|PRIMARY|MOUNTED|NOARCHIVELOG|MOUNTED|12345|%s/spfileORCL.ora|1024|%s\n' "$OPU_TEST_RUNTIME" "${OPU_TEST_CDB-NO}"
+      row="ORCL|ORCL|PRIMARY|MOUNTED|NOARCHIVELOG|MOUNTED|12345|$OPU_TEST_RUNTIME/spfileORCL.ora|1024|${OPU_TEST_CDB-NO}"
     fi
+    case "${OPU_TEST_RECOVERY_PROBE_OUTPUT:-normal}" in
+      duplicate) printf '%s\n%s\n' "$row" "$row" ;;
+      conflicting) printf '%s|YES\n%s\n' "${row%|*}" "$row" ;;
+      diagnostic) printf 'SP2-0734: unknown command beginning invalid\n%s\n' "$row" ;;
+      truncated) printf '%s\n' "${row%|*}" ;;
+      trailing-delimiter) printf '%s|\n' "$row" ;;
+      extra-field) printf '%s|unexpected\n' "$row" ;;
+      empty) : ;;
+      whitespace) printf '\n  %s  \n \t\n' "$row" ;;
+      *) printf '%s\n' "$row" ;;
+    esac
     ;;
   *OPU_RECOVERY_PREP_CAPACITY*)
     printf 'META|19.0.0|0|12345|1|1024|512\nFILE|1|1024|1024|LOCAL|512|AVAILABLE|ONLINE|ONLINE|%s/oradata/system01.dbf|1\n' "$OPU_TEST_RUNTIME"
@@ -220,6 +231,31 @@ for scope in YES ''; do
   jq -e '.status == "blocked" and (.reason | contains("non-CDB databases only"))' "$TMP/cdb-analysis.json" >/dev/null
   [ "$(cat "$RUNTIME/database.state")" = OPEN ]
 done
+# The same live parser guards read-only analysis and execution after approval.
+# Malformed output must be rejected before any listener/database stop or backup.
+for output_case in duplicate conflicting diagnostic truncated trailing-delimiter extra-field empty; do
+  request_id="recovery-probe-$output_case"
+  create_request "$request_id"
+  order_before=$(wc -l <"$RUNTIME/order.log" | tr -d ' ')
+  if OPU_TEST_RECOVERY_PROBE_OUTPUT="$output_case" tool analyze --request-id "$request_id" >"$TMP/probe-analysis.json"; then
+    echo "recovery analysis accepted $output_case probe output" >&2; exit 1
+  fi
+  jq -e '.status == "blocked" and (.reason | contains("exactly one complete ten-field row"))' "$TMP/probe-analysis.json" >/dev/null
+  approve_authorize "$request_id"
+  if OPU_TEST_RECOVERY_PROBE_OUTPUT="$output_case" tool execute --request-id "$request_id" --actor patch-operator >"$TMP/probe-execute.out" 2>"$TMP/probe-execute.err"; then
+    echo "recovery execution accepted $output_case probe output" >&2; exit 1
+  fi
+  grep -q 'exactly one complete ten-field row' "$TMP/probe-execute.err"
+  tool status --request-id "$request_id" | jq -e '.state == "authorized" and .execution == null' >/dev/null
+  [ "$(cat "$RUNTIME/database.state")" = OPEN ]
+  [ ! -e "$RUNTIME/listener-stopped" ]
+  [ ! -e "$BACKUP_PARENT/$request_id" ]
+  if tail -n "+$((order_before + 1))" "$RUNTIME/order.log" | grep -Eq 'rman:|sql:.*shutdown|listener:stop'; then
+    echo "rejected $output_case probe output allowed Oracle mutation" >&2; exit 1
+  fi
+  grep -q '^whenever oserror exit failure$' "$STATE_ROOT/$request_id/evidence/live-probe.sql"
+done
+OPU_TEST_RECOVERY_PROBE_OUTPUT=whitespace tool analyze --request-id recovery-ok | jq -e '.status == "passed"' >/dev/null
 find "$STATE_ROOT/recovery-ok" -type f -exec sha256sum {} \; | sort >"$TMP/request-before.sha256"
 tool analyze --request-id recovery-ok | jq -e '.status == "passed" and .capacity.capacity_basis == "allocated" and .capacity.allocated_database_bytes == 1024 and .capacity.database_budget_bytes == 1024 and .capacity.admitted == true' >/dev/null
 find "$STATE_ROOT/recovery-ok" -type f -exec sha256sum {} \; | sort >"$TMP/request-after.sha256"

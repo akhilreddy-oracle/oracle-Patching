@@ -18,7 +18,7 @@ export function fixtureState() {
   ];
   return {
     artifact, procedure, policy, steps, writes: [], unexpected: [], pageErrors: [],
-    session: { rbac_enabled: false, actor: 'fixture-operator', roles: ['operator'] },
+    session: { mode: 'lab', rbac_enabled: false, actor: 'fixture-operator', roles: [], permissions: { live_discovery: true } },
     estate: { hosts: [{ id: 'source', label: 'Source lab fixture', status: 'ok', cluster_status: 'not_applicable', databases: [{ db_unique_name: 'ORCL', instance_state: 'OPEN' }], active_version: '19.3', node_count: 1, oracle_home_count: 1 }] },
     fleet: { generated_at: now, databases: [
       { host_id: 'source', database: 'ORCL', oracle_home: '/fixture/oracle/dbhome_1', environment: 'lab', oracle_version: '19.3', patch_baseline: '19.3', desired_patch_baseline: '39034528', baseline_status: 'behind', backup_status: 'missing', readiness: 'blocked', evidence_status: 'fresh', evidence_at: now, blockers: 1 },

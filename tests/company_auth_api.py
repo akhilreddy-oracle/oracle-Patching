@@ -100,6 +100,7 @@ class CompanyApiTests(unittest.TestCase):
         self.assertEqual(reply["body"]["csrf_token"], session["csrf_token"])
         self.assertEqual(reply["body"]["mode"], "company")
         self.assertTrue(reply["body"]["rbac_enabled"])
+        self.assertTrue(reply["body"]["permissions"]["live_discovery"])
         self.assertNotIn("groups", reply["body"])
         self.assertNotIn("id_token", reply["body"])
         self.assertIn(("Cache-Control", "no-store"), reply["headers"])
@@ -117,6 +118,20 @@ class CompanyApiTests(unittest.TestCase):
         reply = self.request("/api/plans/p/execute-next", cookie=cookie, method="POST", headers=self.mutation_headers(session))
         self.assertEqual(reply["status"], 403)
         self.assert_no_mutation()
+
+    def test_company_discovery_permission_matches_role_and_denies_post_before_work(self):
+        self.fx.settings["group_roles"]["requesters"] = ["requester"]
+        self.fx.save()
+        cookie, session = self.session(["requesters"])
+        reply = self.request("/api/session", cookie=cookie)
+        self.assertEqual(reply["status"], 200)
+        self.assertFalse(reply["body"]["permissions"]["live_discovery"])
+        denied = self.request("/api/hosts/h/pipeline/discovery", cookie=cookie, method="POST", headers=self.mutation_headers(session))
+        self.assertEqual(denied["status"], 403)
+        self.assert_no_mutation()
+        # Company capability checks use the same central action policy too.
+        with patch.dict(auth.ACTION_ROLES, {"execute": {"requester"}}):
+            self.assertTrue(self.request("/api/session", cookie=cookie)["body"]["permissions"]["live_discovery"])
 
     def test_forged_actor_requester_and_actor_header_are_rejected(self):
         self.fx.settings["group_roles"]["all-actions"] = ["requester","approver","operator"]

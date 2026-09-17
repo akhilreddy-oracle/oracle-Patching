@@ -160,6 +160,7 @@ test('discovery exposes authentication recovery instead of swallowing an expired
 });
 
 test('discovery refresh cannot retain green success when its evidence reload is missing or fails', async () => {
+  actor.setSessionIdentity({ mode: 'lab', permissions: { live_discovery: true } });
   for (const reload of [response({ steps: [] }), response({ message: 'Evidence read failed' }, 503)]) {
     let pipelineReads = 0;
     fetch = async (url, options = {}) => {
@@ -176,6 +177,53 @@ test('discovery refresh cannot retain green success when its evidence reload is 
     assert.equal(status.textContent, reload.status === 503 ? 'unavailable' : 'no evidence');
     assert.doesNotMatch(page.textContent, /previous-host/);
     assert.equal(button(page, 'Run live discovery').disabled, false);
+  }
+});
+
+test('discovery controls prevent denied or unavailable sessions from issuing a POST', async () => {
+  const identities = [
+    null,
+    { mode: 'principal', actor: 'requester', roles: ['requester'], rbac_enabled: true, permissions: { live_discovery: false } },
+    { mode: 'principal', actor: 'operator', roles: ['operator'], rbac_enabled: true, permissions: { live_discovery: false } },
+    { mode: 'company', actor: 'requester', roles: ['requester'], rbac_enabled: true, csrf_token: 'fixture', expires_at: Date.now() / 1000 + 600, permissions: { live_discovery: false } },
+    { mode: 'company', actor: 'operator', roles: ['operator'], rbac_enabled: true, csrf_token: 'fixture', expires_at: Date.now() / 1000 - 1, permissions: { live_discovery: true } },
+  ];
+  for (const session of identities) {
+    actor.setSessionIdentity(session);
+    const posts = [];
+    fetch = async (url, options = {}) => {
+      if (options.method === 'POST') posts.push(url);
+      return response(url === '/api/estate' ? { hosts: [{ id: 'prod', status: 'pending' }] } : url === '/api/fleet' ? { databases: [] } : { steps: [] });
+    };
+    for (const [render, label] of [[renderEstate, 'Refresh live SSH'], [page => renderDiscoverStage(page, 'prod'), 'Run live discovery']]) {
+      const page = mount(); await render(page); const control = button(page, label);
+      assert.equal(control.disabled, true);
+      const hint = page.querySelector('#' + control.getAttribute('aria-describedby'));
+      assert.ok(hint.textContent); assert.equal(hint.hidden, false);
+      await control.fire('click'); // Even a synthetic event cannot bypass the UI admission guard.
+    }
+    assert.deepEqual(posts, []);
+  }
+});
+
+test('server-admitted discovery works for principal, company and lab sessions', async () => {
+  for (const mode of ['principal', 'company', 'lab']) {
+    actor.setSessionIdentity({ mode, actor: 'fixture-operator', rbac_enabled: mode !== 'lab', permissions: { live_discovery: true },
+      csrf_token: 'fixture-csrf', expires_at: Date.now() / 1000 + 600 });
+    for (const [render, label] of [[renderEstate, 'Refresh live SSH'], [page => renderDiscoverStage(page, 'prod'), 'Run live discovery']]) {
+      const posts = [];
+      fetch = async (url, options = {}) => {
+        if (options.method === 'POST') { posts.push(url); return response({ run_id: 'discovery' }, 202); }
+        if (url.startsWith('/api/runs/')) return response({ status: 'succeeded' });
+        return response(url === '/api/estate' ? { hosts: [{ id: 'prod', status: 'pending' }] } : url === '/api/fleet' ? { databases: [] } : { steps: [] });
+      };
+      const page = mount(); await render(page); const control = button(page, label);
+      assert.equal(control.disabled, false, mode);
+      assert.equal(page.querySelector('#' + control.getAttribute('aria-describedby')).hidden, true);
+      await control.fire('click');
+      assert.deepEqual(posts, ['/api/hosts/prod/pipeline/discovery']);
+      assert.equal(control.disabled, false);
+    }
   }
 });
 
@@ -259,6 +307,7 @@ test('replaced execution panel cannot start native log following while its page 
 });
 
 test('obsolete estate discovery completion cannot clear the new active host or launch new reads', async () => {
+  actor.setSessionIdentity({ mode: 'lab', permissions: { live_discovery: true } });
   const controller = new AbortController(); api.setReadSignal(controller.signal);
   const rail = document.body.appendChild(new Element('nav')); rail.setAttribute('id', 'rail-hosts');
   let release; const calls = [];
@@ -870,21 +919,33 @@ test('host lock operations retain token and actor requirements', async () => {
   assert.match(page.textContent, /actor/i);
 });
 
-test('token changes refresh the real app and authenticated actor inputs cannot impersonate another principal', async () => {
+test('token changes refresh the real app permissions and authenticated actor inputs cannot impersonate another principal', async () => {
   for (const id of ['app', 'rail-session', 'rail-hosts']) { const node = new Element('div'); node.setAttribute('id', id); document.body.appendChild(node); }
   let sessions = 0;
   fetch = async (url, options) => {
-    if (url === '/api/session') { sessions++; const who = options.headers.Authorization === 'Bearer bob-token' ? 'bob' : 'alice'; return response({ actor: who, roles: ['operator'], rbac_enabled: true }); }
-    return response({ hosts: [] });
+    if (url === '/api/session') {
+      sessions++; const who = options.headers.Authorization === 'Bearer bob-token' ? 'bob' : 'alice';
+      return response({ actor: who, mode: 'principal', roles: [who === 'bob' ? 'operator' : 'requester'], rbac_enabled: true,
+        permissions: { live_discovery: who === 'bob' } });
+    }
+    return response(url === '/api/estate' ? { hosts: [{ id: 'prod', status: 'pending' }] } : url === '/api/fleet' ? { databases: [] } : { steps: [] });
   };
   await import('../webapp/static/app.js');
   const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
   await settle(); assert.equal(actor.getActor(), 'alice');
+  assert.equal(button(document.getElementById('app'), 'Refresh live SSH').disabled, true);
   const input = document.getElementById('session-acting-as'); assert.equal(input.readOnly, true);
   actor.setActor('mallory'); assert.equal(actor.getActor(), 'alice');
   api.setApiToken('bob-token'); await settle();
   assert.equal(actor.getActor(), 'bob'); assert.equal(input.value, 'bob'); assert.ok(sessions >= 2);
   assert.match(document.getElementById('rail-session').textContent, /Authenticated as bob/);
+  assert.equal(button(document.getElementById('app'), 'Refresh live SSH').disabled, false);
+  location.hash = '#/hosts/prod/discover'; window.dispatchEvent(new Event('hashchange')); await settle();
+  assert.equal(button(document.getElementById('app'), 'Run live discovery').disabled, false);
+  api.setApiToken('alice-token'); await settle();
+  assert.equal(actor.getActor(), 'alice');
+  assert.equal(button(document.getElementById('app'), 'Run live discovery').disabled, true);
+  location.hash = '#/estate'; window.dispatchEvent(new Event('hashchange')); await settle();
 });
 
 

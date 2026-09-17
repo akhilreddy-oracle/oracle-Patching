@@ -42,6 +42,15 @@ lines are not claimed as reviewed by this slice.
 | Deployment reads protected objects and copies the bytes actually validated. | Input checks were followed by unchecked path reopen operations, and installation reread source inputs after mutation had begun. | Descriptor-bound bounded reads reject substituted files, symlinks, FIFOs and concurrent changes. Administrator input ancestors must also be root-owned and not group/world writable. Installation revalidates before mutation and copies that exact in-memory snapshot. Regression tests substitute inputs at admission and after installation starts. |
 | A correctly hashed archive still needs its installation dependencies. | A bundle containing only the two entry scripts could pass admission and fail after installation had created paths because requirements/templates were absent. | Bundle admission requires the installer-used templates, requirement files and shared validation modules. A valid manifest/hash with missing dependencies is rejected before installation. This is not a claim of arbitrary package semantic equivalence. |
 
+A final check in the running Safari application found another presentation gap:
+requester/viewer sessions still saw enabled estate and host discovery buttons,
+although the server correctly denied their execution. The session response now
+carries a server-derived live-discovery permission. Both controls use that hint
+and recheck it before submission, with guidance when execution access is absent
+or the company session expired. Browser role names do not grant execution rights;
+each POST still passes the existing server authorization. No account roles or
+credentials were changed.
+
 The procedure guide now states the native review's supported database scope:
 **non-CDB databases only**. It does not advertise CDB/PDB patch completeness.
 The native reviewer owns the corresponding runtime/readiness gates. The

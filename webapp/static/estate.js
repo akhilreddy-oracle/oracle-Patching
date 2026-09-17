@@ -3,6 +3,7 @@ import { apiFetch, getReadSignal } from "./api.js";
 import { runToCompletion } from "./runs.js";
 import { helperText } from "./ux.js";
 import { refreshHostNav } from "./shell.js";
+import { liveDiscoveryAccess } from "./actor.js";
 
 import { renderFleet } from "./fleet.js";
 
@@ -28,7 +29,20 @@ export async function renderEstate(mount) {
     el("button", { id: "estate-refresh-btn", type: "button", text: "Refresh live SSH" }),
     el("span", { id: "estate-refresh-status", class: "status-chip", role: "status", "aria-live": "polite", text: "" }),
   ]);
+  const refreshBtn = toolbar.querySelector("#estate-refresh-btn");
+  const permissionHint = helperText("", "warn");
+  permissionHint.setAttribute("id", "estate-discovery-permission");
+  refreshBtn.setAttribute("aria-describedby", "estate-discovery-permission");
+  const updateAccess = () => {
+    const access = liveDiscoveryAccess();
+    refreshBtn.disabled = !access.allowed;
+    permissionHint.textContent = access.reason;
+    permissionHint.hidden = access.allowed;
+    return access.allowed;
+  };
+  updateAccess();
   mount.appendChild(toolbar);
+  mount.appendChild(permissionHint);
   const detail = el("p", { id: "estate-refresh-detail", class: "helper-text", text: "" });
   mount.appendChild(detail);
 
@@ -58,11 +72,10 @@ export async function renderEstate(mount) {
 
   paint(list, data.hosts);
 
-  const refreshBtn = toolbar.querySelector("#estate-refresh-btn");
   const refreshStatus = toolbar.querySelector("#estate-refresh-status");
 
   refreshBtn.addEventListener("click", async () => {
-    if (signal?.aborted) return;
+    if (signal?.aborted || !updateAccess()) return;
     refreshBtn.disabled = true;
     refreshStatus.textContent = "refreshing…";
     refreshStatus.className = "status-chip is-loading";
@@ -128,7 +141,7 @@ export async function renderEstate(mount) {
         .join(" · ");
       detail.className = "helper-text helper-warn";
     }
-    refreshBtn.disabled = false;
+    updateAccess();
   });
 }
 

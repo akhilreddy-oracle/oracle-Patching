@@ -18,6 +18,19 @@ export function companySessionState() {
     && identity.expires_at * 1000 > Date.now() ? "active" : "unavailable";
 }
 
+/** Use server-derived admission; never infer execution rights from role names. */
+export function liveDiscoveryAccess() {
+  if (!identity || typeof identity.permissions?.live_discovery !== "boolean") {
+    return { allowed: false, reason: "Live discovery permissions are unavailable. Sign in or reload this page to refresh your session." };
+  }
+  if (identity.mode === "company" && companySessionState() !== "active") {
+    return { allowed: false, reason: "Company session expired or unavailable. Sign in again before running live discovery." };
+  }
+  return identity.permissions.live_discovery
+    ? { allowed: true, reason: "" }
+    : { allowed: false, reason: "Your account cannot run live discovery. Sign in with an account permitted to execute host operations." };
+}
+
 export function setSessionIdentity(session) {
   identity = session;
   setActor(authenticatedActor() || getActor());

@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory(prefix="opu-postconditions-") as temporary:
                         ("opu-database-out-of-place-patch", "stage_oop_final_validate")):
         script = (ROOT / "bin" / tool).read_text()
         definitions = "\n".join(function(script, name) for name in ("probe_value", "sqlpatch_latest", "require_latest_sqlpatch", stage))
-        command = "set -e; " + definitions + "\n" + DOUBLES
+        command = "set -e; . " + shlex.quote(str(ROOT / "lib/opu/common.sh")) + "; " + definitions + "\n" + DOUBLES
         command += '\nTASK_DIR="$1"; PLAN_FILE="$1/plan.json"; CLONE_HOME=/fixture/clone; ORACLE_HOME_TARGET=/fixture/original; ORACLE_SID=fixture; PATCH_ID=87654321; LATEST_ACTION="$2"; LATEST_STATUS="$3"; QUERY_RC="$4"; ' + stage
         for action, status, query_rc, succeeds in (("ROLLBACK", "SUCCESS", 0, False), ("APPLY", "WITH ERRORS", 0, False),
                                                   ("APPLY", "SUCCESS", 1, False), ("APPLY", "SUCCESS", 0, True)):

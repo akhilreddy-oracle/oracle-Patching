@@ -85,6 +85,28 @@ test('editing a plan ID during creation cannot redirect away from the submitted 
   expect(fixture.writes[0].body.plan_id).toBe('submitted-plan');
 });
 
+test('discovery controls explain permissions and refresh them on navigation', async ({ page, fixture }) => {
+  fixture.session = { mode: 'principal', actor: 'fixture-requester', roles: ['requester'], rbac_enabled: true,
+    permissions: { live_discovery: false } };
+  await page.goto('/#/estate');
+  await expect(main(page).getByRole('button', { name: 'Refresh live SSH', exact: true })).toBeDisabled();
+  await expect(main(page).getByText(/Your account cannot run live discovery/)).toBeVisible();
+  await page.locator('#rail-hosts').getByRole('link', { name: /Source lab fixture/ }).click();
+  await expect(main(page).getByRole('button', { name: 'Run live discovery', exact: true })).toBeDisabled();
+  await expect(main(page).getByText(/Your account cannot run live discovery/)).toBeVisible();
+  fixture.session = { mode: 'principal', actor: 'fixture-operator', roles: ['operator'], rbac_enabled: true,
+    permissions: { live_discovery: true } };
+  await page.reload();
+  await expect(main(page).getByRole('button', { name: 'Run live discovery', exact: true })).toBeEnabled();
+  await page.goto('/#/estate');
+  await expect(main(page).getByRole('button', { name: 'Refresh live SSH', exact: true })).toBeEnabled();
+  delete fixture.session.permissions;
+  await page.reload();
+  await expect(main(page).getByRole('button', { name: 'Refresh live SSH', exact: true })).toBeDisabled();
+  await expect(main(page).getByText(/Live discovery permissions are unavailable/)).toBeVisible();
+  expect(fixture.writes).toEqual([]);
+});
+
 test('a discovery run with an unreadable refreshed snapshot never displays green success', async ({ page, fixture }) => {
   let refreshed = false;
   fixture.custom = async ({ url, method, send }) => {

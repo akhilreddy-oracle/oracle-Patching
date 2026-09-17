@@ -407,7 +407,11 @@ class Handler(BaseHTTPRequestHandler):
         if path in {"/api/auth/whoami", "/api/session"}:
             actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
             company = getattr(self, "_company_session", None)
-            self._send_json(200, {key: value for key, value in company.items() if key != "groups"} if company else auth.whoami(actor))
+            session = {key: value for key, value in company.items() if key != "groups"} if company else auth.whoami(actor)
+            # Presentation only: the same execute policy still authorizes each
+            # discovery request, including principal, company and lab sessions.
+            session["permissions"] = {"live_discovery": self._has_role("execute")}
+            self._send_json(200, session)
             return
 
         if path == "/api/fleet":

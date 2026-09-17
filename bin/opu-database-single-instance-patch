@@ -265,7 +265,7 @@ exit;
 SQL
 }
 
-probe_value() { sed -n "s/^$1=//p" "$2" | tail -n1 | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'; }
+probe_value() { opu_sql_probe_value "$1" "$2"; }
 
 healthy_probe() {
   local file=$1
@@ -572,7 +572,7 @@ SQL
 
 require_healthy_dictionary() {
   local output_file=$1 invalid components enabled
-  dictionary_probe "$output_file"
+  dictionary_probe "$output_file" || die 'could not query the database dictionary'
   invalid=$(probe_value INVALID_OBJECTS "$output_file")
   components=$(probe_value NONVALID_COMPONENTS "$output_file")
   enabled=$(probe_value ENABLED_COMPONENTS "$output_file")
@@ -786,7 +786,7 @@ verify_source_apply() {
 
 sqlpatch_latest() {
   local output_file=$1
-  cat <<SQL | sqlplus_fixed "$ORACLE_SID" >"$output_file"
+  cat <<SQL | sqlplus_fixed "$ORACLE_SID" >"$output_file" 2>&1
 whenever sqlerror exit failure
 whenever oserror exit failure
 set pages 0 heading off feedback off verify off echo off trimspool on lines 32767

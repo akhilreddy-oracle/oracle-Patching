@@ -247,7 +247,7 @@ exit;
 SQL
 }
 
-probe_value() { sed -n "s/^$1=//p" "$2" | tail -n1 | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'; }
+probe_value() { opu_sql_probe_value "$1" "$2"; }
 
 healthy_probe() {
   local file=$1
@@ -507,8 +507,9 @@ verify_source_apply() {
 
 sqlpatch_latest() {
   local target_home=$1 output_file=$2
-  cat <<SQL | sqlplus_fixed "$target_home" "$ORACLE_SID" >"$output_file"
+  cat <<SQL | sqlplus_fixed "$target_home" "$ORACLE_SID" >"$output_file" 2>&1
 whenever sqlerror exit failure
+whenever oserror exit failure
 set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
 select 'SQLPATCH_LATEST_ACTION=' || action from (select action, row_number() over (order by action_time desc, install_id desc) as rn from dba_registry_sqlpatch where patch_id=$PATCH_ID) where rn=1;
 select 'SQLPATCH_LATEST_STATUS=' || status from (select status, row_number() over (order by action_time desc, install_id desc) as rn from dba_registry_sqlpatch where patch_id=$PATCH_ID) where rn=1;

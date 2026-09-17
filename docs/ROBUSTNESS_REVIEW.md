@@ -20,6 +20,13 @@ configuration read/admission races and diagnostic credential exposure. Current
 database adapters now explicitly require **non-CDB** targets. RAC-wide baseline
 compliance remains unknown until an all-node aggregation is implemented.
 
+The final cross-check also reproduced SQL admission defects: recovery discarded
+earlier result rows, while database adapters selected the last duplicate keyed
+value and some registry probes omitted stderr. Recovery now requires one complete
+row; the adapters reject ambiguous required values and SQL diagnostics. Live
+discovery controls also use a server-derived permission so a requester/viewer
+session receives guidance before attempting an operation it cannot execute.
+
 No new live Oracle operation, SSH connection, remote installation or company
 identity-provider login was performed for this audit. Two authorized assessments
 called the configured local model endpoint using synthetic protocol cases and

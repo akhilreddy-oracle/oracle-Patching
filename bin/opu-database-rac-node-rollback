@@ -293,7 +293,7 @@ SQL
 }
 
 probe_value() {
-  sed -n "s/^$1=//p" "$2" | tail -n1 | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'
+  opu_sql_probe_value "$1" "$2"
 }
 
 healthy_probe() {
