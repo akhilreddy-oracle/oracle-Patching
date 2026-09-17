@@ -920,6 +920,7 @@ test('host lock operations retain token and actor requirements', async () => {
 });
 
 test('token changes refresh the real app permissions and authenticated actor inputs cannot impersonate another principal', async () => {
+  location.hash = '#/estate';
   for (const id of ['app', 'rail-session', 'rail-hosts']) { const node = new Element('div'); node.setAttribute('id', id); document.body.appendChild(node); }
   let sessions = 0;
   fetch = async (url, options) => {
