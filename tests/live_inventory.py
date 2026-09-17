@@ -113,12 +113,21 @@ class LiveInventoryTests(unittest.TestCase):
         self.host["nodes"] = [{"name": "rac1", "ssh_alias": "node-one"},
                               {"name": "rac2", "ssh_alias": "node-two"}]
         evidence.write_evidence("targetdb", "snapshot", self.snapshot(["99999999"]))
+        evidence.write_evidence("targetdb", "snapshot_nodes", {"schema_version": "1.0", "nodes": [
+            {"name": "rac1", "evidence": "snapshot_rac1"},
+            {"name": "rac2", "evidence": "snapshot_rac2"}]})
         self.ssh.side_effect = [self.snapshot(["29517242"]), remote.RemoteError("ssh_failed", "fixture unavailable")]
         record = self.run_discovery()
         self.assertEqual(record.status, "failed")
         self.assertIsNone(record.result)
         self.assertIn("rac2", record.error["message"])
-        self.assertTrue(evidence.read_evidence("targetdb", "snapshot_rac1"))
+        # A failed refresh invalidates the published snapshot/index and never
+        # publishes a partial node set or an exact-run inventory receipt.
+        for name in ("snapshot", "snapshot_nodes", "snapshot_rac1", "snapshot_rac2"):
+            with self.subTest(evidence=name):
+                self.assertIsNone(evidence.read_evidence("targetdb", name))
+        self.assertEqual(evidence.list_snapshot_paths("targetdb"), [])
+        self.assertEqual([call.args[0] for call in self.ssh.call_args_list], ["node-one", "node-two"])
         with self.assertRaises(inventory.InventoryError):
             inventory.verify_receipt(record.result, host_id="targetdb", run_id=record.run_id)
 
