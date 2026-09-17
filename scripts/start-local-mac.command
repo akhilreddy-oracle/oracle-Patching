@@ -4,6 +4,8 @@ set -eu
 TASK_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 exec "$TASK_ROOT/.venv/bin/python" -B - "$TASK_ROOT" "$@" <<'PY'
 import argparse
+import importlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -36,6 +38,27 @@ os.umask(0o077)
 
 def fail(message):
     raise SystemExit(message)
+
+
+def check_api_dependencies():
+    # Check the reviewed pins before starting either service. Importing also
+    # catches incompatible/missing native dependencies such as pydantic-core.
+    requirements = ROOT / "webapp/requirements-api.txt"
+    try:
+        for line in requirements.read_text().splitlines():
+            if not line or line.startswith("#"):
+                continue
+            name, separator, version = line.partition("==")
+            if not separator or not name or not version:
+                raise ValueError("Invalid API dependency pin")
+            if importlib.metadata.version(name) != version:
+                raise ValueError("API dependency version differs from the reviewed pin")
+            importlib.import_module(name)
+    except (ImportError, OSError, ValueError):
+        fail("Controller API dependencies are missing or inconsistent. From the repository, run "
+             ".venv/bin/python -m pip install -r scripts/requirements.txt -r webapp/requirements-sso.txt "
+             "-r webapp/requirements-api.txt, then .venv/bin/python -m pip check. "
+             "This launcher does not install software.")
 
 
 def protected_file(path, *, private=False):
@@ -156,6 +179,8 @@ def start_service(executable, arguments, port, pid_file, log_file, environment, 
     else:
         fail(f"Service on port {port} has not become ready. Inspect {log_file}; it was not killed.")
 
+
+check_api_dependencies()
 
 for directory in (VAR, LOCAL, LOCAL / "models", LOCAL / "credentials"):
     if not directory.is_dir() or directory.is_symlink():

@@ -43,7 +43,7 @@ EXCLUDE = {'var', '.git', '.venv', '__pycache__', 'node_modules', 'recovery_fixt
 MAX_BUNDLE = 64 * 1024 * 1024
 INPUT_FILES = ('hosts_file', 'principals_file', 'ssh_config_file', 'known_hosts_file', 'ssh_private_key_file')
 REQUIRED_COMMANDS = ('bash', 'jq', 'xmllint', 'tar', 'gzip', 'ssh', 'sha256sum', 'flock', 'systemctl', 'nginx', 'useradd')
-# The controller installs jsonschema==4.26.0, whose Requires-Python is >=3.10.
+# The pinned jsonschema, FastAPI and Uvicorn releases require Python >=3.10.
 # Managed-host native tools have a separate minimum in lib/opu/python.sh.
 MIN_CONTROLLER_PYTHON = (3, 10)
 
@@ -155,6 +155,8 @@ def read_bundle(path: Path, expected_sha: str):
         require(not (PurePosixPath(row['path']).parent == PurePosixPath('webapp') and row['path'].endswith('.json')), 'Package includes deployment inventory')
     required = {'webapp/server.py', 'deploy/controller.py', 'webapp/host_config.py', 'webapp/local_llm.py',
                 'webapp/runtime_paths.py', 'scripts/requirements.txt', 'webapp/requirements-sso.txt',
+                'webapp/requirements-api.txt', 'webapp/api.py', 'webapp/api_transport.py',
+                'webapp/api_models.py', 'webapp/application_views.py',
                 *('deploy/templates/' + name for name in ('controller.env', 'oracle-patching.service', 'nginx.conf', 'opu-ollama.service'))}
     require(required <= payloads.keys(), 'Incomplete controller bundle: installation dependencies are missing')
     return manifest, payloads
@@ -315,7 +317,9 @@ def install_fresh(manifest, payloads, config):
     (release / 'deployment-manifest.json').write_bytes(canonical(manifest))
     subprocess.run([sys.executable, '-m', 'venv', str(release / '.venv')], check=True)
     subprocess.run([str(release / '.venv/bin/python'), '-m', 'pip', 'install', '--disable-pip-version-check',
-                    '-r', str(release / 'scripts/requirements.txt'), '-r', str(release / 'webapp/requirements-sso.txt')], check=True)
+                    '-r', str(release / 'scripts/requirements.txt'), '-r', str(release / 'webapp/requirements-sso.txt'),
+                    '-r', str(release / 'webapp/requirements-api.txt')], check=True)
+    subprocess.run([str(release / '.venv/bin/python'), '-m', 'pip', 'check'], check=True)
     subprocess.run(['useradd', '--system', '--user-group', '--home-dir', str(SSH_HOME), '--create-home', '--shell', '/usr/sbin/nologin', USER], check=True)
     account = pwd.getpwnam(USER)
     STATE.mkdir(parents=True, mode=0o700)

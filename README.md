@@ -36,6 +36,23 @@ server deployment and live Oracle validation must be verified separately.
 For the configured MacBook installation, use the [local Mac launcher](docs/MAC_LOCAL_SETUP.md)
 to start the application and its dedicated Ollama service.
 
+The controller requires Python 3.10 or later. Install its reviewed direct
+dependencies into the repository virtual environment before starting it or
+running API/browser checks:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r scripts/requirements.txt -r webapp/requirements-sso.txt -r webapp/requirements-api.txt
+.venv/bin/python -m pip check
+```
+
+`requirements-api.txt` pins FastAPI, Pydantic and Uvicorn for the HTTP layer,
+and HTTPX for ASGI tests. Continue using `python -B webapp/server.py` as the
+entry point; startup validation and the single loopback worker remain under
+application control. Managed-host Oracle executors do not require this API
+stack. Installing packages alone does not configure credentials or certify
+live execution.
+
 Architecture and delivery decomposition are complete. The current build has
 read-only discovery, evidence reconciliation, artifact/procedure validation,
 OPatch compatibility, policy readiness, verified recovery evidence, and typed

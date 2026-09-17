@@ -32,25 +32,35 @@ remain unverified here until a separate reviewed evidence integration exists.
 
 ## Run locally
 
-Use Node 22 or later, Python 3, Bash, jq, ShellCheck and `xmllint`
-(`libxml2-utils` on Ubuntu). Install the Python contract
-and optional company-login dependencies in the existing project environment:
+Use Node 22 or later, Python 3.10 or later, Bash, jq, ShellCheck and `xmllint`
+(`libxml2-utils` on Ubuntu). Install the contract, API and company-login test
+dependencies in the project environment:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -r scripts/requirements.txt -r webapp/requirements-sso.txt
+.venv/bin/python -m pip install -r scripts/requirements.txt -r webapp/requirements-sso.txt -r webapp/requirements-api.txt
+.venv/bin/python -m pip check
+source .venv/bin/activate
 npm ci --ignore-scripts
 npx playwright install chromium
 python3 -B tests/browser/release_validation_test.py
 python3 -B scripts/release_validation.py --suite all --output release-validation
 ```
 
-Ensure `python3` used by Make can import the optional company-login dependency,
+Ensure `python3` used by Make can import the API and company-login dependencies,
 for example by activating `.venv` before running the checks. On Linux, install
 browser system dependencies with `npx playwright install --with-deps chromium`.
 The workflow installs these on its disposable runner. For a restricted local
 cache, set `npm_config_cache` and `PLAYWRIGHT_BROWSERS_PATH` to writable test
 locations; no global installation is necessary.
+
+`tests/asgi_api.py` uses HTTPX `AsyncClient` with `ASGITransport`, together with
+direct ASGI messages for malformed framing and delayed-body tests. It does not
+use Starlette's `TestClient`. Starlette 1.6.0 warns that its legacy HTTPX
+`TestClient` compatibility is deprecated in favor of HTTPX2; that warning does
+not require a test-client migration here. The real browser integration harness
+also exercises Uvicorn startup and the application's lifespan hooks, which an
+in-process HTTPX transport does not start automatically.
 
 For one scope, use `--suite check` or `--suite browser` and a new output directory.
 A browser-only bundle explicitly reports scope `browser`; it is not evidence that
@@ -87,8 +97,9 @@ The `backend-chromium` project starts `tests/browser/integration_server.py` on
 **127.0.0.1:18766**. The harness copies source into a temporary directory, excluding
 saved state and deployment configuration. It creates one explicitly simulated
 managed host and separate synthetic requester, approver and operator credentials. Browser API
-responses are **not mocked**: requests use the actual HTTP handler, authentication,
-asynchronous run controller, native recovery/patch shell tools and evidence
+responses are **not mocked**: the harness invokes `server.main()` and requests
+use Uvicorn, FastAPI's ASGI transport, existing controller authentication,
+the asynchronous run controller, native recovery/patch shell tools and evidence
 verification. Oracle binaries are TEST_MODE shims. `connected_fixture.py` permits
 only the single fixture alias, native executable allowlist and paths inside the
 disposable tree at the transport boundary. It executes the controller's actual

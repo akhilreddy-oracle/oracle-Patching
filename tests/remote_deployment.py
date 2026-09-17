@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Disposable deployment packaging/admission tests; no root, systemd or SSH."""
+import ast
 import hashlib
+import importlib.metadata
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tarfile
 import tempfile
 from types import SimpleNamespace
@@ -29,7 +32,10 @@ class DeploymentTests(unittest.TestCase):
             (self.source / name).mkdir(parents=True)
         for name, content in {'webapp/server.py': 'pass\n', 'deploy/controller.py': 'pass\n',
                               'webapp/host_config.py': 'pass\n', 'webapp/local_llm.py': 'pass\n', 'webapp/runtime_paths.py': 'pass\n',
-                              'scripts/requirements.txt': '', 'webapp/requirements-sso.txt': ''}.items():
+                              'webapp/api.py': 'pass\n', 'webapp/api_transport.py': 'pass\n',
+                              'webapp/api_models.py': 'pass\n', 'webapp/application_views.py': 'pass\n',
+                              'scripts/requirements.txt': '', 'webapp/requirements-sso.txt': '',
+                              'webapp/requirements-api.txt': 'fastapi==0.141.1\n'}.items():
             (self.source / name).write_text(content)
         (self.source / 'deploy/templates').mkdir()
         for name in ('oracle-patching.service', 'controller.env', 'nginx.conf', 'opu-ollama.service'):
@@ -85,7 +91,9 @@ class DeploymentTests(unittest.TestCase):
             deploy.read_bundle(self.bundle, '0' * 64)
 
     def test_validly_hashed_bundle_missing_installer_dependencies_is_rejected(self):
-        for name in ('scripts/requirements.txt', 'webapp/host_config.py', 'deploy/templates/nginx.conf'):
+        for name in ('scripts/requirements.txt', 'webapp/requirements-api.txt', 'webapp/host_config.py',
+                     'webapp/api.py', 'webapp/api_transport.py', 'webapp/api_models.py',
+                     'webapp/application_views.py', 'deploy/templates/nginx.conf'):
             with self.subTest(name=name):
                 target = self.source / name; original = target.read_bytes(); target.unlink()
                 result = self.package()
@@ -305,6 +313,13 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(list(deploy.STATE.iterdir()), [])
         self.assertEqual((deploy.CONFIG / 'principals.json').stat().st_mode & 0o777, 0o640)
         self.assertEqual((deploy.CONFIG / 'hosts.json').read_bytes(), validated_hosts)
+        release = deploy.INSTALL / 'releases/fixture-release'
+        pip_install = next(cmd for cmd in commands if cmd[1:4] == ['-m', 'pip', 'install'])
+        requirements = [pip_install[index + 1] for index, argument in enumerate(pip_install) if argument == '-r']
+        self.assertEqual(requirements, [str(release / name) for name in (
+            'scripts/requirements.txt', 'webapp/requirements-sso.txt', 'webapp/requirements-api.txt')])
+        self.assertEqual((release / 'webapp/requirements-api.txt').read_bytes(), contents['webapp/requirements-api.txt'])
+        self.assertLess(commands.index(pip_install), commands.index([str(release / '.venv/bin/python'), '-m', 'pip', 'check']))
 
     def test_template_network_and_credential_boundaries(self):
         nginx = (ROOT / 'deploy/templates/nginx.conf').read_text()
@@ -320,6 +335,48 @@ class DeploymentTests(unittest.TestCase):
         ollama = (ROOT / 'deploy/templates/opu-ollama.service').read_text()
         self.assertIn('OLLAMA_HOST=127.0.0.1:11434', ollama)
         self.assertIn('OLLAMA_NO_CLOUD=1', ollama)
+
+
+class MacDependencyAdmissionTests(unittest.TestCase):
+    """Exercise only admission code; never launch or inspect actual services."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='opu-mac-admission-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'webapp').mkdir()
+        (self.root / 'webapp/requirements-api.txt').write_text('fastapi==0.141.1\n')
+        source = (ROOT / 'scripts/start-local-mac.command').read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+        tree = ast.parse(source)
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in {'fail', 'check_api_dependencies'}]
+        self.assertEqual(len(functions), 2)
+        self.namespace = {'ROOT': self.root, 'importlib': importlib}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), 'mac-launcher-admission', 'exec'), self.namespace)
+
+    def test_missing_or_mismatched_package_blocks_with_install_instruction(self):
+        for outcome in (importlib.metadata.PackageNotFoundError('fastapi'), '0.0.0'):
+            with self.subTest(outcome=type(outcome).__name__), \
+                    patch.object(importlib.metadata, 'version', side_effect=outcome if isinstance(outcome, Exception) else None,
+                                 return_value=outcome), \
+                    patch.object(importlib, 'import_module') as importing:
+                with self.assertRaisesRegex(SystemExit, 'pip install .*requirements-api.txt'):
+                    self.namespace['check_api_dependencies']()
+                importing.assert_not_called()
+
+    def test_broken_dependency_import_blocks_even_when_distribution_version_matches(self):
+        with patch.object(importlib.metadata, 'version', return_value='0.141.1'), \
+                patch.object(importlib, 'import_module', side_effect=ImportError('broken extension')):
+            with self.assertRaisesRegex(SystemExit, 'missing or inconsistent'):
+                self.namespace['check_api_dependencies']()
+
+    def test_pinned_importable_package_passes_without_external_commands(self):
+        with patch.object(importlib.metadata, 'version', return_value='0.141.1'), \
+                patch.object(importlib, 'import_module', return_value=object()) as importing, \
+                patch.object(subprocess, 'run') as command:
+            self.namespace['check_api_dependencies']()
+            importing.assert_called_once_with('fastapi')
+            command.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""Control-plane API for the Oracle Patching Utility estate frontend.
+"""Application controller and supported FastAPI/Uvicorn entry point.
 
-Wraps existing bin/opu-* operations over SSH. Stdlib only — no new
-dependencies. This is a first slice, not the pull-based agent/control-plane
-model described in docs/ARCHITECTURE.md; it exists to give the frontend real
-data and a real (evidence-gated) execution path while that model is built
-out. See /Users/akhilreddy/.claude/plans/nested-humming-eagle.md for the
-phased plan this file implements.
+Controller owns existing authorization and native dispatch semantics. The ASGI
+transport in api_transport.py supplies request/response I/O; new typed routers
+live in api.py. Handler is retained solely for existing transport fixtures.
+Native execution remains in the independent plan/recovery/adapter services.
 """
 from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 import os
@@ -42,6 +40,7 @@ import procedure_hints
 import recoveryctl
 import remote
 import runtime_paths
+import application_views
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
@@ -214,7 +213,12 @@ def build_estate(*, live: bool = False) -> list[dict]:
         return list(pool.map(probe, hosts))
 
 
-class Handler(BaseHTTPRequestHandler):
+class Controller:
+    """Transport-independent request controller during the route migration.
+
+The transport supplies headers/path/command, body reading and response writing.
+No socket, HTTP parser or listener is constructed by this class.
+"""
     server_version = "opu-webapp/0.1"
 
     def log_message(self, fmt, *args):  # keep default access logging, just tagged
@@ -405,7 +409,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/health":
             # Unauthenticated liveness probe for monitoring.
-            self._send_json(200, {"status": "ok", "time": time.time()})
+            self._send_json(200, application_views.health())
             return
 
         if path.startswith("/api/") and not self._require_api_auth():
@@ -421,11 +425,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in {"/api/auth/whoami", "/api/session"}:
             actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
             company = getattr(self, "_company_session", None)
-            session = {key: value for key, value in company.items() if key != "groups"} if company else auth.whoami(actor)
-            # Presentation only: the same execute policy still authorizes each
-            # discovery request, including principal, company and lab sessions.
-            session["permissions"] = {"live_discovery": self._has_role("execute")}
-            self._send_json(200, session)
+            self._send_json(200, application_views.session(actor, company, can_discover=self._has_role("execute")))
             return
 
         if path == "/api/fleet":
@@ -433,23 +433,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/validation":
-            import release_status
-            self._send_json(200, release_status.status())
+            self._send_json(200, application_views.validation())
             return
 
         if path == "/api/approvals":
             actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
-            items = []
-            for kind, records in (("plan", planctl.list_plans()), ("recovery", recoveryctl.list_requests())):
-                for item in records:
-                    if item.get("state") not in {"awaiting_approval", "approved"}:
-                        continue
-                    item_id = item.get("plan_id" if kind == "plan" else "request_id")
-                    items.append({"kind": kind, "id": item_id, "state": item["state"], "requester": item.get("requester"),
-                        "target": item.get("target"), "host_id": item.get("host_id"), "window": item.get("maintenance_window", item.get("window")),
-                        "next_action": "review_approval" if item["state"] == "awaiting_approval" else "review_authorization",
-                        "self_requested": bool(actor and item.get("requester") == actor)})
-            self._send_json(200, {"items": items, "actor": actor})
+            self._send_json(200, application_views.approvals(actor))
             return
 
         if path.startswith("/api/plans/") and path.endswith(("/execution", "/report")):
@@ -1537,16 +1526,30 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(202, {"run_id": record.run_id})
 
 
-def main() -> None:
-    port = int(os.environ.get("OPU_WEBAPP_PORT") or "8765")
+class Handler(Controller, BaseHTTPRequestHandler):
+    """Legacy HTTP fixture adapter. Production startup uses ASGI exclusively."""
+
+
+def validate_startup() -> dict:
+    """Fail before serving when identity or production configuration is invalid."""
     if company_auth.configured():
         company_auth.config()
     elif auth.rbac_enabled():
         auth.validate_configuration()
     else:
         auth.ensure_token()
-    production_state = production.status()
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    return production.status()
+
+
+def main() -> None:
+    # Import only on controller startup: native host tools remain stdlib-only.
+    import uvicorn
+    from api import create_app
+
+    port = int(os.environ.get("OPU_WEBAPP_PORT") or "8765")
+    if not 1 <= port <= 65535:
+        raise SystemExit("OPU_WEBAPP_PORT must be between 1 and 65535")
+    production_state = validate_startup()
 
     cert = (os.environ.get("OPU_WEBAPP_TLS_CERT") or "").strip()
     key = (os.environ.get("OPU_WEBAPP_TLS_KEY") or "").strip()
@@ -1554,11 +1557,6 @@ def main() -> None:
     if cert or key:
         if not cert or not key:
             raise SystemExit("OPU_WEBAPP_TLS_CERT and OPU_WEBAPP_TLS_KEY must both be set")
-        import ssl
-
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(certfile=cert, keyfile=key)
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
     print(f"opu webapp listening on {scheme}://127.0.0.1:{port}", flush=True)
@@ -1570,11 +1568,18 @@ def main() -> None:
         f"certified={production_state['certified']}",
         flush=True,
     )
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    # Multiple API processes are not supported by the current run registry.
+    # Never inherit WEB_CONCURRENCY or forwarded client identity from the shell.
+    # Access logs are disabled because OIDC callback queries contain credentials.
+    uvicorn.run(create_app(), host="127.0.0.1", port=port, workers=1,
+                proxy_headers=False, access_log=False, server_header=False,
+                ssl_certfile=cert or None, ssl_keyfile=key or None,
+                timeout_keep_alive=5, timeout_graceful_shutdown=30)
 
 
 if __name__ == "__main__":
+    # api imports this controller by its stable module name. Reuse this module
+    # when launched as a script so ASGI and startup share one configuration.
+    import sys
+    sys.modules["server"] = sys.modules[__name__]
     main()

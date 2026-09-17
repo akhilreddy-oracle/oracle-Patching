@@ -76,12 +76,23 @@ Install OS packages before running the installer: Python 3.10+ with venv and
 ensurepip, Bash, jq, libxml2 (`xmllint`), tar/gzip, OpenSSH client, coreutils
 (`sha256sum`), util-linux (`flock`), systemd and nginx. Package names differ
 between Oracle Linux and Ubuntu; use the preflight output to choose the matching
-repositories. Python dependencies come from `scripts/requirements.txt` and
-`webapp/requirements-sso.txt` in the verified bundle. The installer uses pip in a
-new release-specific virtual environment; approved package-index connectivity
-or a configured internal wheel repository is required.
-The controller's pinned jsonschema dependency requires Python 3.10+; this
-minimum is separate from the native managed-host tools' Python requirement.
+repositories. Python dependencies come from `scripts/requirements.txt`,
+`webapp/requirements-sso.txt` and `webapp/requirements-api.txt` in the verified
+bundle. The installer uses pip in a new release-specific virtual environment
+and runs `pip check` before creating service accounts; approved package-index
+connectivity or a configured internal wheel repository is required. The API
+file pins FastAPI, Pydantic and Uvicorn, plus HTTPX for ASGI fixture tests.
+It does not enable optional FastAPI or Uvicorn extras. These are controller
+dependencies; managed-host native Oracle tools do not need the ASGI stack.
+The controller's pinned jsonschema, FastAPI and Uvicorn releases require
+Python 3.10+; this minimum is separate from the native managed-host tools'
+Python requirement.
+
+Keep the service entry point `python -B webapp/server.py`. It owns startup
+validation and starts a single Uvicorn worker bound to `127.0.0.1`, behind the
+existing nginx TLS proxy. Do not substitute a multi-worker Uvicorn command:
+the controller's in-process worker registry and filesystem reconciliation
+have not been qualified for a multi-controller deployment.
 
 Prepare root-owned input files and parent directories that are not group/world writable, then adapt
 `deploy/templates/deployment.json.example`. Input paths must be absolute and
