@@ -46,6 +46,24 @@ success. It does not send a model prompt, refresh SSH evidence, approve a plan,
 resume work or patch a database. For the separate model protocol assessment,
 follow [MODEL_ACCEPTANCE.md](MODEL_ACCEPTANCE.md).
 
+## Asking about installed patches
+
+Ask, for example, "What is the current patch version for targetdb?" The controller
+supplies a bounded saved estate summary and discovery inventory for explicitly
+named configured hosts before requesting a model answer. The assistant reports
+binary patch IDs with their Oracle home, collection time and freshness. A saved
+observation is not a live query; missing inventory remains unknown. Base database
+and OPatch tool versions do not identify the installed Release Update.
+
+SQL patch status is separate: a saved `sqlpatch_non_success` count cannot prove
+which individual SQL patches succeeded. Oracle documents the per-patch SQL
+registry in [DBA_REGISTRY_SQLPATCH](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/DBA_REGISTRY_SQLPATCH.html).
+
+For fresh evidence, an operator can use **Refresh live SSH** on the host page.
+An operator's assistant session can prepare the same discovery action for review
+and confirmation. The default requester account can inspect saved evidence but
+cannot execute that refresh. Reading a patch inventory never applies a patch.
+
 ## Mac verification on 2026-09-17
 
 The M1 Pro Mac with 16 GB memory runs `qwen3:4b-instruct` through Ollama 0.34.0.
@@ -59,11 +77,24 @@ did lint and the launcher's read-only readiness check.
 These checks found and fixed a prompt compatibility issue: the assistant now
 places its policy and action context in one initial system message. With the
 previous trailing system message, this model incorrectly reported an empty
-estate. The separate strict single-response protocol assessment still passed
+estate. The earlier strict single-response protocol assessment passed
 only **1 of 6** cases; other responses made additional read-only lookups or
 returned refusals outside the required exact format. Its failed receipts are
 retained under `webapp/var/mac-local/`. Do not treat the model as fully validated
 for autonomous patching. Native authorization and confirmation remain required.
+
+A later inventory check found that tool summaries omitted installed binary
+patch IDs and that Qwen sometimes promised an inspection without issuing a tool
+call. The controller now supplies saved evidence for explicitly named hosts
+before generation; the inspection tool also exposes per-node inventory and
+freshness. The strict model protocol assessment has not been rerun for this
+change; its earlier failed receipts remain historical evidence.
+
+The inventory fix passed 75 targeted tests and lint. A real application replay
+of the original target-database question in an existing conversation returned
+the recorded patch IDs, collection timestamp, stale status and operator refresh
+link. All 278 saved plan and host-evidence files remained byte-identical; no
+action card was created or confirmed during that replay.
 
 ## Local services and files
 

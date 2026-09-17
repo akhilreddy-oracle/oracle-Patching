@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -19,10 +20,10 @@ class ToolError(ValueError):
 # Every argument is required; actors, policies and credentials are deliberately
 # absent. All writes are proposals dispatched through the normal HTTP commands.
 SPECS = {
-    "list_estate": ("Inspect configured hosts and saved database observations.", (), "read"),
+    "list_estate": ("List configured hosts and saved database observations. Use inspect_host for dated installed binary patch IDs and inventory provenance.", (), "read"),
     "list_plans": ("List saved patch plans and their states.", (), "read"),
     "list_backups": ("List saved local recovery summaries for a configured host. No SSH; current native state remains unverified until explicitly inspected.", ("host_id",), "read"),
-    "inspect_host": ("Inspect saved readiness, requirements and backup summaries; does not refresh SSH.", ("host_id",), "read"),
+    "inspect_host": ("Inspect saved installed binary patch inventory, Oracle/OPatch versions, observation dates and freshness, readiness, requirements and backup summaries. SQL counters are aggregate evidence, not per-patch confirmation. Does not refresh SSH.", ("host_id",), "read"),
     "inspect_plan": ("Inspect a saved plan and its tasks.", ("plan_id",), "read"),
     "inspect_backup": ("Inspect a saved local recovery summary without SSH. Use an analyze_backup proposal for explicit native inspection.", ("request_id",), "read"),
     "refresh_discovery": ("Propose live SSH discovery. May synchronize collector tools and replace saved discovery evidence.", ("host_id",), "execute"),
@@ -69,6 +70,216 @@ def validate(name, arguments, hosts):
 
 def _fields(value, names):
     return {key: value[key] for key in names if key in value}
+
+
+_RUNTIME_FIELDS = ("status", "database_version", "instance", "database_role", "open_mode",
+                   "instance_state", "cdb", "invalid_objects", "sqlpatch_non_success",
+                   "pdb_not_read_write", "latest_backup_completed_at", "backup_age_minutes")
+_INVENTORY_LIMITS = {"nodes": 4, "homes_per_node": 6, "databases_per_node": 8, "patches_per_home": 80}
+
+
+def _text(value, limit=256):
+    return value[:limit] if isinstance(value, str) else None
+
+
+def _runtime(value):
+    if not isinstance(value, dict):
+        return {}
+    return {key: _text(item) if isinstance(item, str) else item for key in _RUNTIME_FIELDS
+            if key in value and (item := value[key]) is not None and isinstance(item, (str, int, float, bool))
+            and not (isinstance(item, float) and not math.isfinite(item))}
+
+
+def _saved_document(host_id, name):
+    try:
+        value = evidence.read_evidence(host_id, name)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _snapshot_inventory(snapshot, evidence_name, maximum_age, now):
+    collected_at = _text(snapshot.get("collected_at"), 64)
+    age, freshness = None, "unknown"
+    try:
+        stamp = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+        if stamp.tzinfo is not None:
+            elapsed = (now - stamp).total_seconds()
+            age = math.floor(elapsed)
+            if elapsed >= 0:
+                freshness = "fresh" if elapsed <= maximum_age else "stale"
+    except (AttributeError, ValueError, TypeError, OverflowError):
+        pass
+    homes, databases, omissions = [], [], []
+    raw_homes, raw_databases = snapshot.get("oracle_homes"), snapshot.get("databases")
+    if not isinstance(raw_homes, list):
+        raw_homes = []
+        omissions.append("Oracle home inventory is missing or invalid")
+    if not isinstance(raw_databases, list):
+        raw_databases = []
+        omissions.append("Database observations are missing or invalid")
+    for home in raw_homes[:_INVENTORY_LIMITS["homes_per_node"]]:
+        if not isinstance(home, dict):
+            omissions.append("Invalid Oracle home entry omitted")
+            continue
+        patches = home.get("patches")
+        inventory_valid = (home.get("opatch_inventory_xml_status") == "collected"
+                           and home.get("patch_inventory_source") == "opatch_lsinventory_xml"
+                           and isinstance(patches, list)
+                           and all(isinstance(p, str) and re.fullmatch(r"[0-9]{1,20}", p) for p in patches))
+        homes.append({"path": _text(home.get("path")), "version": _text(home.get("version"), 64),
+            "opatch_version": _text(home.get("opatch_version"), 64),
+            "binary_inventory_status": "collected" if inventory_valid else "unknown",
+            "patch_inventory_source": _text(home.get("patch_inventory_source"), 64),
+            "opatch_inventory_xml_status": _text(home.get("opatch_inventory_xml_status"), 64),
+            "opatch_inventory_xml_sha256": _text(home.get("opatch_inventory_xml_sha256"), 64),
+            "patches": patches[:_INVENTORY_LIMITS["patches_per_home"]] if inventory_valid else None,
+            "total_patches": len(patches) if inventory_valid else None,
+            "patches_truncated": bool(inventory_valid and len(patches) > _INVENTORY_LIMITS["patches_per_home"])})
+    for database in raw_databases[:_INVENTORY_LIMITS["databases_per_node"]]:
+        if not isinstance(database, dict):
+            omissions.append("Invalid database entry omitted")
+            continue
+        runtime = _runtime(database.get("runtime"))
+        count = runtime.get("sqlpatch_non_success")
+        databases.append({"db_unique_name": _text(database.get("db_unique_name"), 128),
+            "oracle_home": _text(database.get("oracle_home")), "runtime": runtime,
+            "sql_patch_evidence": {"scope": "aggregate_only", "per_patch_status": "not_collected",
+                "non_success_count": count if type(count) is int and count >= 0 and runtime.get("status") == "complete" else None}})
+    return {"evidence_name": evidence_name, "collected_at": collected_at, "age_seconds": age,
+            "freshness": freshness, "oracle_homes": homes, "databases": databases,
+            "coverage": {"total_homes": len(raw_homes), "total_databases": len(raw_databases),
+                "homes_truncated": len(raw_homes) > _INVENTORY_LIMITS["homes_per_node"],
+                "databases_truncated": len(raw_databases) > _INVENTORY_LIMITS["databases_per_node"],
+                "omissions": omissions[:8]}}
+
+
+def saved_inventory(host_id):
+    """Bounded observations only; neither current state nor patching authority."""
+    policy = _saved_document(host_id, "policy") or {}
+    maximum_age = policy.get("maximum_snapshot_age_seconds", 1800)
+    try:
+        valid_age = type(maximum_age) in (int, float) and math.isfinite(maximum_age) and maximum_age > 0
+    except OverflowError:
+        valid_age = False
+    if not valid_age:
+        maximum_age = 1800
+    now = datetime.now(timezone.utc)
+    index = _saved_document(host_id, "snapshot_nodes") or {}
+    entries = index.get("nodes")
+    indexed = isinstance(entries, list) and bool(entries)
+    entries = entries if indexed else [{"evidence": "snapshot"}]
+    nodes, omissions, seen = [], [], set()
+    for entry in entries[:_INVENTORY_LIMITS["nodes"]]:
+        if not isinstance(entry, dict):
+            omissions.append("Invalid node index entry omitted")
+            continue
+        name = entry.get("evidence")
+        if not name and isinstance(entry.get("name"), str):
+            try:
+                name = evidence.node_snapshot_evidence_name(entry["name"])
+            except ValueError:
+                pass
+        if not isinstance(name, str) or not re.fullmatch(r"snapshot(?:_[A-Za-z0-9][A-Za-z0-9._:-]{0,118})?", name):
+            omissions.append("Invalid node evidence reference omitted")
+            continue
+        if name in seen:
+            omissions.append("Duplicate node evidence reference omitted")
+            continue
+        seen.add(name)
+        snapshot = _saved_document(host_id, name)
+        if snapshot is None:
+            omissions.append(f"{name}: saved snapshot unavailable")
+            continue
+        nodes.append({"node": _text(entry.get("name"), 128),
+                      **_snapshot_inventory(snapshot, name, maximum_age, now)})
+    return {"source": "saved_discovery_snapshots", "live_state_verified": False,
+            "maximum_snapshot_age_seconds": maximum_age,
+            "interpretation": "Binary inventory is per Oracle home. Base database version is not an RU version. SQL non-success counts do not establish any specific patch applied successfully.",
+            "nodes": nodes, "coverage": {"scope": "indexed_nodes" if indexed else "primary_snapshot_only",
+                "completeness": "not_asserted", "indexed_nodes": len(entries) if indexed else None,
+                "returned_nodes": len(nodes), "nodes_truncated": len(entries) > _INVENTORY_LIMITS["nodes"],
+                "omissions": omissions, "limits": _INVENTORY_LIMITS}}
+
+
+def _named_hosts(content, hosts):
+    """Match only configured IDs, including natural spacing such as target db."""
+    matches = []
+    content = content[:16000] if isinstance(content, str) else ""
+    normalized_ids = {re.sub(r"[^A-Za-z0-9]", "", key).lower() for key in hosts if isinstance(key, str)}
+    for host_id in hosts:
+        if not isinstance(host_id, str) or not evidence._ID_RE.fullmatch(host_id):
+            continue
+        normalized = re.sub(r"[^A-Za-z0-9]", "", host_id).lower()
+        variants = [normalized]
+        if len(normalized) > 2 and normalized.endswith("db"):
+            expanded = normalized[:-2] + "database"
+            if expanded not in normalized_ids:
+                variants.append(expanded)
+        positions = []
+        for variant in variants:
+            pattern = r"(?<![A-Za-z0-9])" + r"[^A-Za-z0-9]*".join(re.escape(c) for c in variant) + r"(?![A-Za-z0-9])"
+            match = re.search(pattern, content, re.I | re.ASCII)
+            if match:
+                positions.append(match.start())
+        if positions:
+            matches.append((min(positions), host_id))
+    return [host_id for _, host_id in sorted(matches)]
+
+
+def grounding(content, hosts):
+    """Preload read-only saved evidence; never infer a target or dispatch a tool."""
+    matched = _named_hosts(content, hosts)
+    result = {"source": "saved_evidence", "live_state_verified": False, "inspected_hosts": [],
+              "matched_hosts_truncated": len(matched) > 3, "context_truncated": False,
+              "estate": {"hosts": [], "total_hosts": len(hosts), "hosts_truncated": len(hosts) > 100}}
+    maximum = 7500
+
+    def size():
+        return len(json.dumps(result, allow_nan=False))
+
+    for host_id in matched[:3]:
+        try:
+            inspected = read("inspect_host", {"host_id": host_id}, hosts)
+            # Inventory comes first; requirements and blockers remain available
+            # through the regular inspect_host tool when the question needs them.
+            row = _fields(inspected, ("host_id", "source", "host_link", "inventory"))
+            if not row.get("inventory", {}).get("nodes"):
+                row["status"] = "unavailable"
+            row["additional_evidence"] = "Use inspect_host for saved requirements, readiness and backup selection."
+        except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+            row = {"host_id": host_id, "status": "unavailable", "host_link": f"#/hosts/{host_id}/discover",
+                   "reason": "Saved host evidence could not be read; other hosts remain available."}
+        result["inspected_hosts"].append(row)
+        if size() > maximum - 800:
+            # Keep valid JSON and the exact named host, never a cut-off evidence
+            # string that might hide an omitted node or collection failure.
+            result["inspected_hosts"].pop()
+            result["matched_hosts_truncated"] = True
+            result["context_truncated"] = True
+            row = {"host_id": host_id, "status": "omitted_for_context_limit",
+                   "next_action": "Call inspect_host for this configured host's saved evidence."}
+            if size() + len(json.dumps(row)) < maximum - 800:
+                result["inspected_hosts"].append(row)
+            break
+    for host_id, host in list(hosts.items())[:100]:
+        try:
+            single = read("list_estate", {}, {host_id: host})
+            original = single["hosts"][0]
+            row = _fields(original, ("host_id", "label", "collected_at", "host_link", "inventory_available", "databases_truncated", "snapshot_status"))
+            row["label"] = _text(row.get("label"), 128)
+            row["collected_at"] = _text(row.get("collected_at"), 64)
+            row["databases"] = [_fields(db, ("db_unique_name", "oracle_home")) for db in original["databases"][:8]]
+            row["databases_truncated"] = original["databases_truncated"] or len(original["databases"]) > 8
+        except (OSError, ValueError, TypeError, AttributeError, OverflowError, IndexError):
+            row = {"host_id": _text(host_id, 128), "status": "unavailable"}
+        result["estate"]["hosts"].append(redacted(row))
+        if size() > maximum:
+            result["estate"]["hosts"].pop()
+            result["estate"]["hosts_truncated"] = True
+            result["context_truncated"] = True
+            break
+    return redacted(result)
 
 
 def _cache_json(path):
@@ -189,10 +400,17 @@ def read(name, args, hosts):
     if name == "list_estate":
         result = []
         for host_id, host in list(hosts.items())[:100]:
-            snap = evidence.read_evidence(host_id, "snapshot") or {}
+            snap = _saved_document(host_id, "snapshot") or {}
+            databases = snap.get("databases") if isinstance(snap.get("databases"), list) else []
             result.append({"host_id": host_id, "label": host.get("label"), "collected_at": snap.get("collected_at"),
-                "databases": [_fields(db, ("db_unique_name", "oracle_home", "runtime")) for db in snap.get("databases", [])[:30]]})
-        return redacted({"hosts": result, "source": "saved_evidence", "total_hosts": len(hosts)})
+                "snapshot_status": "available" if snap else "unavailable",
+                "host_link": f"#/hosts/{host_id}/discover", "inventory_available": bool(snap.get("oracle_homes")),
+                "databases": [{"db_unique_name": _text(db.get("db_unique_name"), 128),
+                    "oracle_home": _text(db.get("oracle_home")), "runtime": _runtime(db.get("runtime"))}
+                    for db in databases[:30] if isinstance(db, dict)],
+                "databases_truncated": len(databases) > 30})
+        return redacted({"hosts": result, "source": "saved_evidence", "total_hosts": len(hosts),
+                         "hosts_truncated": len(hosts) > 100})
     if name == "list_plans":
         plans = planctl.list_plans()
         return redacted({"plans": [_fields(p, ("plan_id", "state", "intent", "host_id", "requester", "patch_id", "patch", "target", "maintenance_window")) for p in plans[:100]], "total_plans": len(plans)})
@@ -205,7 +423,8 @@ def read(name, args, hosts):
         host_id = args["host_id"]
         # Only structured evidence; raw logs, README bodies, host credentials and
         # server configuration never enter the model context.
-        return redacted({"host_id": host_id, "source": "saved_evidence", **{key: evidence.read_evidence(host_id, key)
+        return redacted({"host_id": host_id, "source": "saved_evidence", "host_link": f"#/hosts/{host_id}/discover",
+            "inventory": saved_inventory(host_id), **{key: evidence.read_evidence(host_id, key)
             for key in ("procedure_input", "readiness", "recovery_selection")}})
     if name == "inspect_plan":
         plan = planctl.status(args["plan_id"])

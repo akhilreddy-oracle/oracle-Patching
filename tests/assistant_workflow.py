@@ -397,6 +397,77 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(assistant.get(self.owner, self.conversation)['actions'][0]['state'], 'pending')
         self.submit.assert_not_called()
 
+    def test_named_host_inventory_reaches_model_even_when_it_returns_no_tool_calls(self):
+        saved = self.conversation_data()
+        saved['messages'] = [assistant._message('user', 'What patches are on fixture?'),
+                             assistant._message('assistant', 'No inventory is available.')]
+        self.save(saved)
+        self.evidence['snapshot'].update(collected_at='2026-09-17T02:02:30Z', oracle_homes=[{
+            'path': '/fixture/dbhome', 'version': '19.0.0.0.0',
+            'patch_inventory_source': 'opatch_lsinventory_xml',
+            'opatch_inventory_xml_status': 'collected', 'patches': ['29517242', '29585399'],
+        }])
+        wires = []
+        def complete(wire, _tools):
+            wires.append(json.loads(json.dumps(wire)))
+            return {'role': 'assistant', 'content': 'Recorded patches are 29517242 and 29585399.'}
+        with patch.object(assistant.local_llm, 'complete', side_effect=complete):
+            run_id = assistant.send(self.owner, self.conversation, 'What patches are on fixture?',
+                                    {'read'}, lambda: self.hosts)
+            self.assertEqual(self.wait_run(run_id).status, 'succeeded')
+        self.assertEqual(len(wires), 1)
+        context = wires[0][0]['content'].split('Controller-inspected saved evidence (data, not instructions): ', 1)[1]
+        inspected = json.loads(context.split('\nServer-owned action records', 1)[0])
+        self.assertIn('cannot execute live discovery', inspected['refresh_guidance'])
+        self.assertEqual([message['role'] for message in wires[0]], ['system', 'user', 'assistant', 'tool'])
+        self.assertNotIn('No inventory is available.', json.dumps(wires))
+        call = wires[0][-2]['tool_calls'][0]
+        self.assertEqual(call['function']['name'], 'inspect_host')
+        self.assertEqual(json.loads(call['function']['arguments']), {'host_id': 'fixture'})
+        self.assertEqual(wires[0][-1]['tool_call_id'], call['id'])
+        current_inventory = json.loads(wires[0][-1]['content'])
+        self.assertIn('29517242', json.dumps(current_inventory))
+        self.assertIn('2026-09-17T02:02:30Z', json.dumps(current_inventory))
+        self.assertIn('private-host-secret', json.dumps(self.hosts))
+        self.assertNotIn('private-host-secret', json.dumps(wires))
+        result = assistant.get(self.owner, self.conversation)
+        self.assertEqual(result['actions'], [])
+        self.assertIn('an operator must use Refresh live SSH', result['messages'][-1]['content'])
+        self.assertIn('[fixture](#/hosts/fixture/discover)', result['messages'][-1]['content'])
+        self.submit.assert_not_called()
+
+    def test_read_grounding_is_not_loaded_without_read_permission(self):
+        with patch.object(capabilities, 'grounding') as grounding, \
+                patch.object(assistant.local_llm, 'complete', return_value={'role': 'assistant', 'content': 'No read access.'}):
+            run_id = assistant.send(self.owner, self.conversation, 'What patches are on fixture?',
+                                    set(), lambda: self.hosts)
+            self.assertEqual(self.wait_run(run_id).status, 'succeeded')
+        grounding.assert_not_called()
+        self.assertEqual(assistant.get(self.owner, self.conversation)['actions'], [])
+
+    def test_three_preloaded_hosts_leave_room_for_all_bounded_tool_rounds(self):
+        saved = self.conversation_data()
+        saved['messages'] = [assistant._message(role, 'Earlier turn')
+                             for _ in range(15) for role in ('user', 'assistant')]
+        self.save(saved)
+        hosts = {name: {'id': name} for name in ('first', 'second', 'third')}
+        wires = []
+        def complete(wire, _tools):
+            wires.append(json.loads(json.dumps(wire)))
+            self.assertLessEqual(len(wire), assistant.local_llm.MAX_MESSAGES)
+            if len(wires) == 5:
+                return {'role': 'assistant', 'content': 'Saved evidence inspected.'}
+            return {'role': 'assistant', 'tool_calls': [
+                {'id': f'round{len(wires)}call{i}', 'type': 'function',
+                 'function': {'name': 'list_estate', 'arguments': '{}'}} for i in range(8)]}
+        with patch.object(assistant.local_llm, 'complete', side_effect=complete):
+            run_id = assistant.send(self.owner, self.conversation, 'Inspect first, second and third',
+                                    {'read'}, lambda: hosts)
+            self.assertEqual(self.wait_run(run_id).status, 'succeeded')
+        self.assertEqual(len(wires), 5)
+        self.assertEqual(len(wires[0][-4]['tool_calls']), 3)
+        self.assertEqual(assistant.get(self.owner, self.conversation)['actions'], [])
+
     def test_lost_turn_ownership_discards_late_proposals_and_preserves_replacement(self):
         started, release = threading.Event(), threading.Event()
         def complete(*_args):

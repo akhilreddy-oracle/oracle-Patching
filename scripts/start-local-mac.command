@@ -90,6 +90,9 @@ def verified_listener(port, pid_file, executable, suffix):
     if not listeners:
         # A failed process inventory must not be mistaken for a vacant port.
         with socket.socket() as probe:
+            # Match HTTPServer's reuse setting so recently closed connections
+            # in TIME_WAIT do not make a stopped controller look occupied.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind(("127.0.0.1", port))
             except OSError:
