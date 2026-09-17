@@ -148,8 +148,8 @@ remote.run_remote_shell = fake_run_remote_shell
 fp1 = tools_sync.local_fingerprint(); fp2 = tools_sync.local_fingerprint()
 assert fp1 == fp2 and len(fp1) == 64
 
-# 6. readiness-chain: runs every step in order with saved inputs, refreshes only
-#    tool-derived digests, stops at the first blocked step, logs progress.
+# 6. readiness-chain: changed media requires renewed requirements review;
+#    matching reviewed inputs preserve their bindings and stop at a blocker.
 CH = "chainhost"
 evidence.write_evidence(CH, "artifact", {"artifact": {"path": DIR, "sha256": "a" * 64, "readme_files": [{"path": "README.html", "sha256": "b" * 64}]}})
 evidence.write_evidence(CH, "procedure_input", {"patch_id": "39034528", "artifact_sha256": "old", "oracle_references": [{"kind": "patch_readme", "identifier": "README.html", "sha256": "old"}]})
@@ -172,6 +172,19 @@ class Rec:
     def __init__(self): self.lines = []
     def log(self, line): self.lines.append(line)
 rec = Rec()
+try:
+    pipeline_steps.step_readiness_chain(CH, HOST, {"_record": rec})
+except pipeline_steps.localtools.LocalToolError as exc:
+    assert "reviewed procedure" in str(exc), exc
+else:
+    raise AssertionError("chain rebound old requirements to changed patch media")
+assert order == ["discovery", "reconcile", "artifact-inspect"], order
+assert "procedure-validate" not in seen
+assert evidence.read_evidence(CH, "procedure_input")["artifact_sha256"] == "old"
+# Simulate the operator reviewing this exact media and saving its requirements.
+evidence.write_evidence(CH, "procedure_input", {"patch_id": "39034528", "artifact_sha256": "a" * 64,
+    "oracle_references": [{"kind": "patch_readme", "identifier": "README.html", "sha256": "b" * 64}]})
+order.clear()
 out = pipeline_steps.step_readiness_chain(CH, HOST, {"_record": rec})
 assert order == ["discovery", "reconcile", "artifact-inspect", "procedure-validate", "compatibility-collect"], order
 assert out["status"] == "blocked" and out["stopped_at"] == "compatibility-collect" and out["findings"] == ["n1: Incomplete patch media"], out
