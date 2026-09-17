@@ -412,7 +412,7 @@ class AssistantTests(unittest.TestCase):
             wires.append(json.loads(json.dumps(wire)))
             return {'role': 'assistant', 'content': 'Recorded patches are 29517242 and 29585399.'}
         with patch.object(assistant.local_llm, 'complete', side_effect=complete):
-            run_id = assistant.send(self.owner, self.conversation, 'What patches are on fixture?',
+            run_id = assistant.send(self.owner, self.conversation, 'What saved patches are recorded on fixture?',
                                     {'read'}, lambda: self.hosts)
             self.assertEqual(self.wait_run(run_id).status, 'succeeded')
         self.assertEqual(len(wires), 1)

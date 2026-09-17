@@ -48,21 +48,23 @@ follow [MODEL_ACCEPTANCE.md](MODEL_ACCEPTANCE.md).
 
 ## Asking about installed patches
 
-Ask, for example, "What is the current patch version for targetdb?" The controller
-supplies a bounded saved estate summary and discovery inventory for explicitly
-named configured hosts before requesting a model answer. The assistant reports
-binary patch IDs with their Oracle home, collection time and freshness. A saved
-observation is not a live query; missing inventory remains unknown. Base database
-and OPatch tool versions do not identify the installed Release Update.
+Sign in with the existing `local-operator` identity and ask, for example,
+"What is the current patch version for targetdb?" The controller starts native
+live discovery and answers from the payloads captured by that exact run. It shows
+binary patch IDs, Oracle home, versions, collection time and run ID. Missing or
+failed inventory stays unknown; cached evidence is not used as a fallback. Base
+database and OPatch tool versions do not identify the installed Release Update.
 
 SQL patch status is separate: a saved `sqlpatch_non_success` count cannot prove
 which individual SQL patches succeeded. Oracle documents the per-patch SQL
 registry in [DBA_REGISTRY_SQLPATCH](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/DBA_REGISTRY_SQLPATCH.html).
 
-For fresh evidence, an operator can use **Refresh live SSH** on the host page.
-An operator's assistant session can prepare the same discovery action for review
-and confirmation. The default requester account can inspect saved evidence but
-cannot execute that refresh. Reading a patch inventory never applies a patch.
+The explicit live inventory question authorizes this discovery check without
+another confirmation click. Discovery may sync collectors and invalidate saved
+readiness evidence. The default requester account cannot execute discovery and
+receives operator sign-in guidance. Ask explicitly for saved/historical inventory
+to inspect existing records. Backup and patch operations retain their normal
+confirmation cards and independent native gates.
 
 ## Mac verification on 2026-09-17
 
@@ -95,6 +97,16 @@ of the original target-database question in an existing conversation returned
 the recorded patch IDs, collection timestamp, stale status and operator refresh
 link. All 278 saved plan and host-evidence files remained byte-identical; no
 action card was created or confirmed during that replay.
+
+The subsequent live-inventory implementation was checked through the running
+application's operator chat endpoint. Native discovery run `6bf0699cc315`
+collected `targetdb` at `2026-09-17T05:14:01Z` and returned binary patch IDs
+`29517242`, `29585399`, Oracle base version `19.0.0.0.0` and OPatch version
+`12.2.0.1.51` for `/u01/app/oracle/product/19c/dbhome_1`. The chat answer used
+the exact native receipt, without a model call or cached inventory fallback.
+All 252 saved plan files remained byte-identical. This validates live discovery
+for this lab host, not patch application or per-patch SQL validation. Its receipt
+is retained locally under `webapp/var/mac-local/live-chat-targetdb.json`.
 
 ## Local services and files
 

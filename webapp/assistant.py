@@ -11,6 +11,7 @@ import uuid
 
 import assistant_tools as capabilities
 import local_llm
+import live_inventory
 import pipeline_runner
 import runtime_paths
 from diagnostics import redact_text, redacted
@@ -20,6 +21,9 @@ STATE_DIR = runtime_paths.state_dir() / "assistant"
 MAX_MESSAGES = 60
 MAX_ACTIONS = 40
 SYSTEM = """You are the Oracle Patching Utility assistant, using a local model.
+Current patch inventory questions use the controller's live discovery workflow.
+Its exact-run answer is supplied directly by the controller, not inferred by you.
+Never describe a saved inspection or a proposed refresh as a completed live check.
 Use the controller-inspected saved evidence supplied below to answer directly.
 It has already been read for this turn; do not merely promise to inspect it.
 If more evidence is needed, call list_estate to identify the host, then inspect_host
@@ -120,11 +124,81 @@ def _message(role, content):
 
 
 def _inventory_question(content):
-    """Select fresh context only; this never routes or authorizes an action."""
+    """Recognize inventory requests, excluding requests to change the database."""
     words = set(re.findall(r"[a-z]+", content.lower()))
-    return bool(words & {"what", "which", "show", "list", "check", "inspect"}
-                and words & {"patch", "patches", "version", "inventory"}
-                and not words & {"apply", "rollback", "execute", "approve", "authorize", "prepare", "create", "backup"})
+    return bool(words & {"what", "which", "show", "list", "check", "inspect", "get", "tell"}
+                and words & {"patch", "patches", "version", "versions", "inventory"}
+                and not words & {"apply", "rollback", "execute", "approve", "authorize", "prepare", "create", "backup",
+                                 "restart", "stop", "shutdown", "install", "remove", "upgrade", "delete", "patching"})
+
+
+def _live_inventory_question(content):
+    lower = content.lower()
+    return (_inventory_question(content)
+            and not re.search(r"\b(saved|cached?|recorded|historical|previous|offline|how|explain|instructions|draft)\b", lower)
+            and not _conditional_inventory_text(lower))
+
+
+def _conditional_inventory_text(content):
+    # Requests about commands, hypothetical checks or conditional permission
+    # remain model-assisted proposals, never automatic native observations.
+    return bool(re.search(r"\b(not|no|never|without|don't|dont|only|after|before|if|would|command|commands|example|suppose|imagine|should)\b",
+                          content, re.I) or re.search(r"[\"`“”]", content))
+
+
+def _inventory_target(content, messages, hosts):
+    """Only a user's unambiguous configured selection can select a live target."""
+    for clause in re.findall(r"\b(?:on|for|of)\s+([^?.!;\n]+)", content, re.I):
+        # A known host mentioned elsewhere cannot override an explicit unknown
+        # target (e.g. "on unknown-host? Source was the earlier target").
+        if re.fullmatch(r"(?:it|that|this)(?:\s+(?:host|database|db))?", clause.strip(), re.I):
+            continue
+        target = re.sub(r"^(?:the\s+)?(?:(?:database|host|db)\s+)?", "", clause.strip(), flags=re.I)
+        if not capabilities._named_hosts(target, hosts, at_start=True) or re.search(r"\b(?:and|or)\b", clause, re.I):
+            return None
+    matches = capabilities._named_hosts(content, hosts)
+    if matches:
+        return matches[0] if len(matches) == 1 else None
+    # An explicit unrecognized target must not silently select an earlier host.
+    if re.search(r"\b(?:on|for|of)\s+(?!(?:it|that|this)(?:\s|[?.!]|$))\S+", content, re.I):
+        return None
+    for message in reversed(messages):
+        if message["role"] != "user":
+            continue
+        if _conditional_inventory_text(message["content"]):
+            # A negated or hypothetical target mention ends implicit selection.
+            if capabilities._named_hosts(message["content"], hosts):
+                return None
+            continue
+        matches = capabilities._named_hosts(message["content"], hosts)
+        if matches:
+            return matches[0] if len(matches) == 1 else None
+    return None
+
+
+def _publish_inventory_answer(data, action, record):
+    if action.get("origin") != "live_inventory_query" or action["state"] == "executing":
+        return
+    if action["state"] == "completed":
+        try:
+            receipt = live_inventory.verify_receipt(record.result,
+                host_id=action["arguments"]["host_id"], run_id=action["run_id"],
+                configuration_sha256=action["configuration_sha256"], not_before=action["confirmed_at"])
+            answer = live_inventory.format_receipt(receipt)
+        except (live_inventory.InventoryError, KeyError, TypeError, AttributeError):
+            action.update(state="failed", error="The run did not return a verifiable fresh inventory receipt.")
+    if action["state"] != "completed":
+        host_id = action["arguments"]["host_id"]
+        answer = (f"The live inventory check for {host_id} "
+                  + ("needs native reconciliation" if action["state"] == "unknown" else "failed")
+                  + ". Current patch inventory could not be verified. No cached inventory was used."
+                  + (f" Run: {action['run_id']}." if action.get("run_id") else "")
+                  + f" {action.get('error') or (getattr(record, 'error', None) or '')}"
+                  + f" Inspect the run on [{host_id}](#/hosts/{host_id}/discover) before retrying.")
+    marker = f"{action.get('run_id', '')}:{action['state']}"
+    if action.get("inventory_answer_state") != marker:
+        data["messages"].append(_message("assistant", answer))
+        action["inventory_answer_state"] = marker
 
 
 def _run_matches(action, record):
@@ -173,6 +247,7 @@ def _refresh(data):
             elif record.status in {"unknown", "reconciling"}:
                 action["state"] = "unknown"
                 action["error"] = "Execution needs native reconciliation; this action will not be relaunched."
+            _publish_inventory_answer(data, action, record)
     turn_id = data.get("active_run_id")
     if turn_id:
         record = pipeline_runner.get_run(turn_id)
@@ -266,12 +341,85 @@ def _proposal(owner, conversation_id, name, arguments, hosts, turn_record=None):
     return {"proposal_id": action["id"], "state": "pending_human_confirmation", "summary": action["summary"], "arguments": arguments}
 
 
-def send(owner, conversation_id, content, allowed, load_hosts):
+def _text_reply(owner, path, data, text):
+    """Keep the existing asynchronous chat response contract without a model call."""
+    def reply(record):
+        with file_lock(path.with_suffix(".lock")):
+            current = _read(path, owner)
+            _require_turn(current, owner, record)
+            current["messages"].append(_message("assistant", text))
+            current["active_run_id"] = None
+            current["active_run_key"] = None
+            _save(path, current)
+        return {"conversation_id": data["id"], "status": "response_ready"}
+    key = f"assistant:{hashlib.sha256(owner.encode()).hexdigest()}:{data['id']}:{uuid.uuid4().hex}"
+    record = pipeline_runner.start_run("assistant", key, reply)
+    data["active_run_id"], data["active_run_key"] = record.run_id, key
+    _save(path, data)
+    return record.run_id
+
+
+def _live_inventory(owner, path, data, content, allowed, load_hosts, submit):
+    if "read" not in allowed or "execute" not in allowed:
+        data.pop("awaiting_inventory_host", None)
+        return _text_reply(owner, path, data,
+            "A current patch check runs live discovery through the application's SSH automation. "
+            "Operator access is required for your account to run it. Sign in as an operator, "
+            "start a conversation and ask again. No live check was started and no cached inventory was used.")
+    hosts = load_hosts()
+    host_id = _inventory_target(content, data["messages"][:-1], hosts)
+    if host_id is None:
+        data["awaiting_inventory_host"] = True
+        choices = ", ".join(list(hosts)[:30]) or "none configured"
+        return _text_reply(owner, path, data,
+            f"Which one configured host should I check live? Available hosts: {choices}. "
+            "Choose a host; I will run discovery and report that run's inventory.")
+    data.pop("awaiting_inventory_host", None)
+    if submit is None:
+        return _text_reply(owner, path, data, "Live discovery dispatch is unavailable in this session. No current inventory was collected.")
+    if len(data["actions"]) >= MAX_ACTIONS:
+        raise AssistantError("Action limit reached; start a new conversation", 409)
+    if any(a["state"] == "unknown" and a.get("arguments", {}).get("host_id") == host_id for a in data["actions"]):
+        return _text_reply(owner, path, data,
+            f"A previous operation on {host_id} has an unknown outcome. Inspect and reconcile its native run before another live check.")
+    selected = {"id": uuid.uuid4().hex[:24], "tool": "refresh_discovery", "arguments": {"host_id": host_id},
+        "summary": f"Live patch inventory for {host_id}", "origin": "live_inventory_query", "state": "executing",
+        "configuration_sha256": live_inventory.configuration_digest(hosts[host_id]),
+        "confirmed_at": _stamp(), "confirmed_by": owner, "confirmation_source": "explicit_live_query"}
+    data["actions"].append(selected)
+    # Persist before submitting through the authenticated native dispatcher.
+    # A crash in this gap becomes unknown, never an automatic relaunch.
+    _save(path, data)
+    route, _body = capabilities.route("refresh_discovery", {"host_id": host_id})
+    try:
+        status, result = submit(route, {"inventory_receipt": True,
+                                       "expected_configuration_sha256": selected["configuration_sha256"]})
+    except Exception:
+        selected.update(state="unknown", error="Launch outcome is unknown; inspect native runs before retrying.")
+        _publish_inventory_answer(data, selected, None)
+        _save(path, data)
+        raise AssistantError(selected["error"], 409) from None
+    if not isinstance(result, dict) or status != 202 or not isinstance(result.get("run_id"), str):
+        rejected = isinstance(status, int) and 400 <= status < 500
+        reason = (result.get("message") or result.get("error")) if isinstance(result, dict) else None
+        selected.update(state="failed" if rejected else "unknown",
+                        error=redact_text(reason or "Native discovery did not return a verified launch", 800))
+        _publish_inventory_answer(data, selected, None)
+        _save(path, data)
+        raise AssistantError(selected["error"], status if isinstance(status, int) and status >= 400 else 502)
+    selected["run_id"] = result["run_id"]
+    if not _run_matches(selected, pipeline_runner.get_run(result["run_id"])):
+        selected.update(state="unknown", error="Returned run does not verify this exact new discovery; inspect native runs.")
+        _publish_inventory_answer(data, selected, None)
+        _save(path, data)
+        raise AssistantError(selected["error"], 409)
+    _save(path, data)
+    return result["run_id"]
+
+
+def send(owner, conversation_id, content, allowed, load_hosts, *, submit=None):
     if not isinstance(content, str) or not content.strip() or len(content) > 8000:
         raise AssistantError("Enter a message of 1–8000 characters")
-    config = local_llm.config_status()
-    if not config.get("enabled") or not config.get("configured"):
-        raise AssistantError(config.get("reason") or "Local model is not configured", 503)
     path = _path(owner, conversation_id)
     with file_lock(path.with_suffix(".lock")):
         data = _read(path, owner)
@@ -280,10 +428,25 @@ def send(owner, conversation_id, content, allowed, load_hosts):
             raise AssistantError("Wait for the current operation to finish", 409)
         if len(data["messages"]) >= MAX_MESSAGES:
             raise AssistantError("Conversation limit reached; start a new conversation", 409)
+        live_query = _live_inventory_question(content)
+        if data.get("awaiting_inventory_host"):
+            # Only a bare configured host selection continues a pending question.
+            # Other messages are new requests, not implicit consent to discovery.
+            host_matches = capabilities._named_hosts(content, load_hosts()) if "execute" in allowed else []
+            live_query = live_query or (len(host_matches) == 1 and re.sub(r"[^a-z0-9]", "", content.lower()) in
+                {re.sub(r"[^a-z0-9]", "", host_matches[0].lower()),
+                 re.sub(r"[^a-z0-9]", "", host_matches[0].lower()).removesuffix("db") + "database"})
+            data.pop("awaiting_inventory_host", None)
+        if not live_query:
+            config = local_llm.config_status()
+            if not config.get("enabled") or not config.get("configured"):
+                raise AssistantError(config.get("reason") or "Local model is not configured", 503)
         data["messages"].append(_message("user", content.strip()))
         if len(data["messages"]) == 1:
             data["title"] = redact_text(content.strip(), 8000)[:80]
         _save(path, data)
+        if live_query:
+            return _live_inventory(owner, path, data, content, allowed, load_hosts, submit)
 
         def turn(record):
             try:

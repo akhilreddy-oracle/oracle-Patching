@@ -64,6 +64,53 @@ test('native review links encode exact identifiers and do not create premature a
   assert.equal(actionLinks({ tool: 'create_patch_plan', state: 'pending', arguments: { host_id: 'host:1', plan_id: 'new-plan' } }).length, 1);
   assert.equal(actionLinks({ tool: 'create_patch_plan', state: 'completed', arguments: { plan_id: 'new-plan' } })[0].href, '#/plans/new-plan');
   assert.equal(actionLinks({ arguments: { plan_id: '../../escape', request_id: 'backup:1' } })[0].href, '#/recovery/backup%3A1');
+  assert.equal(actionLinks({ tool: 'refresh_discovery', origin: 'live_inventory_query', arguments: { host_id: 'source' } })[0].href, '#/hosts/source/discover');
+});
+
+test('explicit server capabilities gate confirmations without confusing chat access with operator access', () => {
+  assert.equal(actionAvailability(pending(), { allowedTools: ['execute_plan'] }).allowed, true);
+  for (const allowedTools of [[], ['inspect_host'], null, 'execute_plan']) {
+    const result = actionAvailability(pending(), { allowedTools });
+    assert.equal(result.allowed, false);
+    assert.match(result.reason, /current role does not permit/);
+  }
+});
+
+test('read-only assistant explains live access while keeping chat usable and disallowing native confirmation', async () => {
+  config.allowed_tools = ['inspect_host']; config.can_live_inventory = false;
+  await renderAssistant(mount, 'conversation-1');
+  assert.match(mount.textContent, /Operator access required for live checks/);
+  assert.match(mount.textContent, /Conversations belong to the signed-in account/);
+  assert.equal(button('Send message').disabled, false);
+  assert.equal(button('Confirm and run').disabled, true);
+  await button('Confirm and run').fire('click');
+  assert.deepEqual(writes, []);
+});
+
+test('live check records expose their target and outcome without proposal confirmation controls', async () => {
+  config.allowed_tools = ['inspect_host', 'refresh_discovery']; config.can_live_inventory = true;
+  conversation.actions = [{ ...pending(), tool: 'refresh_discovery', origin: 'live_inventory_query',
+    arguments: { host_id: 'targetdb' }, state: 'completed',
+    run_id: 'native123', configuration_sha256: 'b'.repeat(64),
+    result: { run_status: 'succeeded', outcome: { status: 'incomplete' } } }];
+  await renderAssistant(mount, 'conversation-1');
+  assert.match(mount.textContent, /Live inventory checks available/);
+  assert.match(mount.textContent, /Check finished/);
+  assert.match(mount.textContent, /Native result: incomplete/);
+  assert.doesNotMatch(mount.textContent, /Proposal expires|confirmation digest/);
+  assert.match(mount.textContent, /Run: native123/);
+  assert.match(mount.textContent, new RegExp(`Configuration SHA-256: ${'b'.repeat(64)}`));
+  assert.doesNotMatch(mount.textContent, /Digest:/);
+  assert.equal(button('Confirm and run'), undefined);
+  assert.equal(button('Dismiss proposal'), undefined);
+  assert.equal(mount.all('article')[0].attrs['aria-label'], 'Live inventory check: targetdb');
+  assert.deepEqual(writes, []);
+});
+
+test('an incomplete live check launch cannot become a manually repeatable proposal', () => {
+  const live = { ...pending(), tool: 'refresh_discovery', origin: 'live_inventory_query', arguments: { host_id: 'targetdb' } };
+  assert.equal(actionAvailability(live, { allowedTools: ['refresh_discovery'] }).allowed, false);
+  assert.match(actionAvailability(live).reason, /cannot be manually resubmitted/);
 });
 
 test('configuration and authentication failures disable chat without loading private conversations', async () => {

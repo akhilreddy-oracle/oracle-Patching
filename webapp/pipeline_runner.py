@@ -116,6 +116,12 @@ def set_execution_context(**values) -> None:
             record._persist()
 
 
+def current_run_id() -> str | None:
+    """Return the native worker's identity without exposing its mutable record."""
+    record = getattr(_CURRENT, "record", None)
+    return record.run_id if record is not None else None
+
+
 def record_event(event: str, message: str, **details) -> None:
     record = getattr(_CURRENT, 'record', None)
     if record is not None:

@@ -18,6 +18,8 @@ import uuid
 import discovery_phases
 import evidence
 import localtools
+import live_inventory
+import pipeline_runner
 import remote
 import tools_sync
 
@@ -97,6 +99,12 @@ def step_discovery(host_id: str, host: dict, body: dict) -> dict:
     keeps ``snapshot.json`` as the primary-node view for estate/UI phases, and
     writes ``snapshot_nodes.json`` listing what was captured.
     """
+    receipt_requested = body.get("inventory_receipt") is True
+    receipt_run_id = pipeline_runner.current_run_id() if receipt_requested else None
+    if receipt_requested and receipt_run_id is None:
+        raise live_inventory.InventoryError("Live inventory requires a tracked native discovery run")
+    receipt_started_at = live_inventory.utc_now() if receipt_requested else None
+    captured_nodes: list[tuple[str, dict]] = []
     nodes = _configured_nodes(host)
     tools_sync.ensure_host_tools(host)
     argv = [f"{host['remote_root']}/bin/opu-topology-discover", "--pretty"]
@@ -123,6 +131,10 @@ def step_discovery(host_id: str, host: dict, body: dict) -> dict:
                 stderr=exc.stderr,
             ) from exc
 
+        if receipt_requested:
+            # Keep this worker's actual returned payloads, never reread shared
+            # snapshots after another discovery might have replaced them.
+            captured_nodes.append((node["name"], payload))
         evidence_name = evidence.node_snapshot_evidence_name(node["name"])
         evidence.write_evidence(host_id, evidence_name, payload)
         index_nodes.append(
@@ -157,6 +169,10 @@ def step_discovery(host_id: str, host: dict, body: dict) -> dict:
         "recovery",
     ):
         evidence.clear_evidence(host_id, name)
+    if receipt_requested:
+        return live_inventory.build_receipt(host_id=host_id, host=host, run_id=receipt_run_id,
+            started_at=receipt_started_at, completed_at=live_inventory.utc_now(),
+            node_snapshots=captured_nodes)
     return primary_payload
 
 

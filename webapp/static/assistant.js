@@ -18,13 +18,15 @@ const LABELS = { host_id: "Host", plan_id: "Plan", request_id: "Backup request",
 const text = value => typeof value === "string" ? value : JSON.stringify(value ?? null);
 const identifier = value => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
 const endpoint = id => `/api/assistant/conversations/${encodeURIComponent(id)}`;
+const isLiveInventory = action => action?.tool === "refresh_discovery" && action.origin === "live_inventory_query";
 
-export function actionAvailability(action, { canChat = true, busy = false, now = Date.now() } = {}) {
+export function actionAvailability(action, { canChat = true, allowedTools, busy = false, now = Date.now() } = {}) {
   if (!TOOLS[action?.tool]) return { allowed: false, reason: "This action type is not supported by this application." };
   if (action.state !== "pending") return { allowed: false, reason: action.state === "unknown"
     ? "Outcome unknown. Inspect the existing native workflow before starting more work."
     : action.state === "executing" ? "This action is already running."
     : action.state === "expired" ? "This proposal has expired. Ask for a new proposal using current evidence." : "This action is no longer pending." };
+  if (isLiveInventory(action)) return { allowed: false, reason: "This live check follows your question. Inspect its existing run; it cannot be manually resubmitted." };
   if (!identifier(action.id) || !/^[a-f0-9]{64}$/.test(action.digest || "")) return { allowed: false, reason: "The action identity or confirmation digest is missing or invalid. Refresh this conversation." };
   if (typeof action.expires_at !== "string" || !Number.isFinite(Date.parse(action.expires_at)) || Date.parse(action.expires_at) <= now) {
     return { allowed: false, reason: "This proposal has expired. Ask for a new proposal using current evidence." };
@@ -36,13 +38,16 @@ export function actionAvailability(action, { canChat = true, busy = false, now =
     return { allowed: false, reason: "The proposed action is missing its exact target or required settings." };
   }
   if (!canChat) return { allowed: false, reason: "An authenticated, permitted session is required to confirm an action." };
+  if (allowedTools !== undefined && (!Array.isArray(allowedTools) || !allowedTools.includes(action.tool))) {
+    return { allowed: false, reason: "Your current role does not permit this action. Sign in with a permitted identity and prepare it in that account's conversation." };
+  }
   if (busy) return { allowed: false, reason: "Wait for the current operation or inspect its unresolved outcome." };
   return { allowed: true, reason: "Confirmation runs only the displayed action. Native approval and authorization checks still apply." };
 }
 
 export function actionLinks(action) {
   const args = action?.arguments || {}, links = [];
-  if (identifier(args.host_id)) links.push({ label: "Open host workspace", href: `#/hosts/${encodeURIComponent(args.host_id)}/readiness` });
+  if (identifier(args.host_id)) links.push({ label: "Open host workspace", href: `#/hosts/${encodeURIComponent(args.host_id)}/${isLiveInventory(action) ? "discover" : "readiness"}` });
   if (identifier(args.plan_id) && (action.tool !== "create_patch_plan" || action.state === "completed")) {
     links.push({ label: "Review plan and approvals", href: `#/plans/${encodeURIComponent(args.plan_id)}` });
   }
@@ -57,7 +62,7 @@ export async function renderAssistant(mount, conversationId = null) {
   mount.innerHTML = "";
   mount.appendChild(el("header", { class: "assistant-heading" }, [
     el("h1", { text: "Patching assistant" }),
-    el("p", { text: "Ask about your databases, review readiness and prepare actions to confirm. Patch and backup approvals stay in their native workflows." }),
+    el("p", { text: "Ask for a current patch inventory to run a live check with operator access. Patch and backup changes require confirmation and native approvals." }),
   ]));
   const notice = el("div", { class: "assistant-notice", role: "status", "aria-live": "polite" });
   const configPanel = el("section", { class: "panel assistant-config", "aria-label": "Assistant configuration" });
@@ -85,6 +90,8 @@ export async function renderAssistant(mount, conversationId = null) {
   configPanel.appendChild(el("p", { text: `Provider: ${text(config.provider || "Not configured")} · Model: ${text(config.model || "Not selected")}` }));
   if (config.reason || !canChat) configPanel.appendChild(el("p", { text: config.reason || "Sign in with a permitted account to use the assistant." }));
   if (config.can_chat === false && config.reason) configPanel.appendChild(el("p", { text: "An authenticated, permitted company or service identity is required to use the assistant." }));
+  if (canChat && config.can_live_inventory === true) configPanel.appendChild(el("p", { class: "assistant-live-access", text: "Live inventory checks available. Asking for the current inventory starts discovery on the selected host; the result includes its collection time. Ask for saved evidence when you only want recorded observations." }));
+  if (canChat && config.can_live_inventory === false) configPanel.appendChild(el("p", { class: "assistant-live-access", text: "Operator access required for live checks. Sign in as an operator and ask again. Conversations belong to the signed-in account." }));
   const layout = el("div", { class: "assistant-layout" });
   const sidebar = el("aside", { class: "panel assistant-conversations", "aria-label": "Saved conversations" });
   sidebar.appendChild(el("h2", { text: "Conversations" }));
@@ -147,6 +154,10 @@ export async function renderAssistant(mount, conversationId = null) {
         catch (error) { fail(error); }
       }
       observed.delete(runId);
+      // A question may finish preparing its live check before that native run
+      // completes. Observe the successor without resubmitting either operation.
+      if (!signal?.aborted && conversation?.busy && identifier(conversation.active_run_id)
+          && conversation.active_run_id !== runId) void watchRun(conversation.active_run_id);
     }
   }
 
@@ -171,14 +182,15 @@ export async function renderAssistant(mount, conversationId = null) {
   }
 
   function renderAction(action) {
-    const availability = actionAvailability(action, { canChat, busy: busy() || unresolved() });
-    const card = el("article", { class: "assistant-action panel", "aria-label": `Proposed action: ${TOOLS[action.tool]?.label || text(action.tool)}` });
+    const liveInventory = isLiveInventory(action);
+    const availability = actionAvailability(action, { canChat, allowedTools: config.allowed_tools, busy: busy() || unresolved() });
+    const card = el("article", { class: "assistant-action panel", "aria-label": liveInventory ? `Live inventory check: ${text(action.arguments?.host_id)}` : `Proposed action: ${TOOLS[action.tool]?.label || text(action.tool)}` });
     const title = el("div", { class: "assistant-action-heading" }, [
-      el("h3", { text: TOOLS[action.tool]?.label || "Unsupported action" }),
-      badge(action.state === "completed" ? "Operation finished" : action.state || "unknown", action.state === "completed" ? "neutral" : classifyStatus(action.state)),
+      el("h3", { text: liveInventory ? "Live inventory check" : TOOLS[action.tool]?.label || "Unsupported action" }),
+      badge(action.state === "completed" ? liveInventory ? "Check finished" : "Operation finished" : action.state || "unknown", action.state === "completed" ? "neutral" : classifyStatus(action.state)),
     ]);
     card.appendChild(title);
-    card.appendChild(el("p", { class: "assistant-action-summary", text: action.summary || "Review the exact action settings before confirming." }));
+    card.appendChild(el("p", { class: "assistant-action-summary", text: liveInventory ? "Your question requested live discovery on this host. Its verified inventory and collection time appear in the conversation when the check finishes." : action.summary || "Review the exact action settings before confirming." }));
     const args = action.arguments && typeof action.arguments === "object" && !Array.isArray(action.arguments) ? action.arguments : {};
     const fields = el("dl", { class: "assistant-action-targets" });
     for (const [key, value] of Object.entries(args)) {
@@ -186,7 +198,7 @@ export async function renderAssistant(mount, conversationId = null) {
       fields.appendChild(el("dd", { class: "mono", text: text(value) }));
     }
     card.appendChild(fields);
-    if (action.expires_at) card.appendChild(el("p", { class: "helper", text: `Proposal expires: ${text(action.expires_at)}` }));
+    if (action.expires_at && !liveInventory) card.appendChild(el("p", { class: "helper", text: `Proposal expires: ${text(action.expires_at)}` }));
     const links = actionLinks(action);
     if (links.length) card.appendChild(el("nav", { class: "assistant-action-links", "aria-label": "Native workflow review" },
       links.map(link => el("a", { href: link.href, text: link.label }))));
@@ -198,11 +210,11 @@ export async function renderAssistant(mount, conversationId = null) {
     const actionError = action.error || action.result?.error;
     if (actionError) card.appendChild(el("p", { class: "assistant-action-error", text: typeof actionError === "string" ? actionError : actionError.message || JSON.stringify(actionError) }));
     if (["pending", "unknown", "executing", "expired"].includes(action.state)) card.appendChild(el("p", { class: "helper", text: availability.reason }));
-    if (action.state === "pending") {
+    if (action.state === "pending" && !liveInventory) {
       const confirm = el("button", { type: "button", text: "Confirm and run" });
       confirm.disabled = !availability.allowed;
       confirm.addEventListener("click", async () => {
-        const current = actionAvailability(action, { canChat, busy: busy() || unresolved() });
+        const current = actionAvailability(action, { canChat, allowedTools: config.allowed_tools, busy: busy() || unresolved() });
         if (!current.allowed) { setNotice(current.reason); renderConversation(); return; }
         await runOperation(`${endpoint(conversationId)}/actions/${encodeURIComponent(action.id)}/execute`, { digest: action.digest });
       });
@@ -219,8 +231,11 @@ export async function renderAssistant(mount, conversationId = null) {
       });
       card.appendChild(el("div", { class: "assistant-action-buttons" }, [confirm, dismiss]));
     }
-    card.appendChild(el("details", { class: "assistant-action-identity" }, [el("summary", { text: "Action identity and confirmation digest" }),
-      el("pre", { text: `Action: ${text(action.id)}\nTool: ${text(action.tool)}\nDigest: ${text(action.digest)}` })]));
+    const identity = liveInventory
+      ? `Action: ${text(action.id)}\nTool: ${text(action.tool)}\nRun: ${text(action.run_id || "Not available")}\nConfiguration SHA-256: ${text(action.configuration_sha256 || "Not available")}`
+      : `Action: ${text(action.id)}\nTool: ${text(action.tool)}\nDigest: ${text(action.digest)}`;
+    card.appendChild(el("details", { class: "assistant-action-identity" }, [el("summary", { text: liveInventory ? "Live check identity" : "Action identity and confirmation digest" }),
+      el("pre", { text: identity })]));
     return card;
   }
 
@@ -252,7 +267,7 @@ export async function renderAssistant(mount, conversationId = null) {
       ? "An operation is in progress. Its existing run is being inspected; no action is resubmitted."
       : "An operation is in progress. Refresh this conversation to inspect its saved result." }));
     const form = el("form", { class: "panel assistant-composer", "aria-label": "Send a message" });
-    const input = el("textarea", { rows: "4", value: draft, placeholder: "For example: Explain the readiness blockers for sourcedb", "aria-label": "Message", required: "", maxlength: "8000" });
+    const input = el("textarea", { rows: "4", value: draft, placeholder: "For example: Check the current patch inventory on targetdb", "aria-label": "Message", required: "", maxlength: "8000" });
     input.disabled = !canChat;
     input.addEventListener("input", () => { draft = input.value; });
     const send = el("button", { type: "submit", text: "Send message" });

@@ -202,7 +202,7 @@ def saved_inventory(host_id):
                 "omissions": omissions, "limits": _INVENTORY_LIMITS}}
 
 
-def _named_hosts(content, hosts):
+def _named_hosts(content, hosts, *, at_start=False):
     """Match only configured IDs, including natural spacing such as target db."""
     matches = []
     content = content[:16000] if isinstance(content, str) else ""
@@ -218,7 +218,7 @@ def _named_hosts(content, hosts):
                 variants.append(expanded)
         positions = []
         for variant in variants:
-            pattern = r"(?<![A-Za-z0-9])" + r"[^A-Za-z0-9]*".join(re.escape(c) for c in variant) + r"(?![A-Za-z0-9])"
+            pattern = (r"^" if at_start else r"(?<![A-Za-z0-9])") + r"[^A-Za-z0-9]*".join(re.escape(c) for c in variant) + r"(?![A-Za-z0-9])"
             match = re.search(pattern, content, re.I | re.ASCII)
             if match:
                 positions.append(match.start())

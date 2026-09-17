@@ -26,9 +26,10 @@ inbox. See [application enhancements](docs/APPLICATION_ENHANCEMENTS.md) for the
 supported scope and [release validation](docs/RELEASE_VALIDATION.md) for the
 fixture, live lab and production evidence levels.
 
-The [local-model patching assistant](docs/PATCHING_ASSISTANT.md) inspects saved
-evidence and prepares typed actions for human confirmation through the existing
-workflow. [Linux deployment tooling](docs/REMOTE_DEPLOYMENT.md) provides versioned
+The [local-model patching assistant](docs/PATCHING_ASSISTANT.md) runs live patch
+inventory checks for operators, inspects saved evidence when requested and prepares
+typed patch/backup actions for confirmation through the existing workflow.
+[Linux deployment tooling](docs/REMOTE_DEPLOYMENT.md) provides versioned
 code, persistent state, TLS and optional same-server inference. Model availability,
 server deployment and live Oracle validation must be verified separately.
 

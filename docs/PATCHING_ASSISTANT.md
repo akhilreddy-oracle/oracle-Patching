@@ -1,7 +1,8 @@
 # Patching assistant
 
-The application has a local-model chat page at `#/assistant`. It can inspect
-saved estate evidence and prepare typed backup, readiness and patch actions.
+The application has a local-model chat page at `#/assistant`. It can run live
+patch inventory checks, inspect saved evidence and prepare typed backup,
+readiness and patch actions.
 Confirming a card submits that exact action through the same authenticated
 command handlers, native guards and durable execution registry as the existing
 workflow pages. Model output never becomes shell commands or SQL.
@@ -17,10 +18,14 @@ real response on the deployment server before enabling customer use.
 1. Ask, “Which databases have readiness blockers?” The assistant reads saved
    evidence. It reports observation times where available; this does not perform
    live discovery.
-2. Ask to refresh a specific host. Review the host and effect on the action card,
-   then confirm. Discovery can synchronize tools over SSH and update saved
-   evidence. A readiness refresh uses the requirements and policy already saved
-   in the host wizard; the model cannot change or waive them.
+2. In an operator session, ask "What is the current patch version on targetdb?"
+   This explicit observation request immediately starts native live discovery
+   through the authenticated command handler. It can synchronize collector tools
+   over SSH, update evidence and invalidate previous readiness results. Chat
+   waits for that exact run and reports its collected inventory, times and run ID.
+   Missing/failed evidence stays unknown; saved snapshots are never a fallback.
+   A separate readiness refresh uses requirements and policy saved in the host
+   wizard and retains its confirmation card.
 3. Ask to prepare a backup request, providing its database, host, backup parent
    and explicit maintenance window. Create and analyze the request using cards.
    Use its native page for the independent approval and execution authorization.
@@ -44,6 +49,25 @@ repair executables, force locks or perform rollback. Existing native pages
 provide supported review and recovery operations.
 
 ## Confirmation and storage
+
+Inventory questions use live discovery by default. Explicit saved, cached or
+historical requests use saved evidence. A target must be one configured host in
+the question or the most recent unambiguous user host selection; assistant prose
+cannot select it. Missing or ambiguous targets prompt for a host. Viewer/requester
+accounts receive operator sign-in guidance without dispatching discovery.
+
+The live answer is formatted by the controller from an immutable receipt of
+the actual node payloads returned to that native run. It verifies the run, host,
+configuration, collection interval and XML inventory provenance before showing
+installed binary patch IDs. Later cache writes and model prose cannot replace
+that result. This reports binary inventory per Oracle home; it does not infer
+an RU label from the base Oracle version or claim per-patch SQL status from an
+aggregate failure count. Partial inventory is identified explicitly.
+
+Only this narrow live inventory request dispatches directly. Backup and patch
+actions remain proposals requiring confirmation and all native authorization,
+approval, readiness and maintenance-window gates. A restart or unknown launch
+outcome never automatically replays an operation.
 
 Conversations are private to their authenticated owner and stored under
 `OPU_WEBAPP_STATE_DIR/assistant` (development default: `webapp/var/assistant`).

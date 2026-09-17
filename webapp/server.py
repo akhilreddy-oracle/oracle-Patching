@@ -21,6 +21,7 @@ import time
 import auth
 import assistant
 import local_llm
+import live_inventory
 import company_auth
 import fleet
 import fleet_metadata
@@ -804,6 +805,10 @@ class Handler(BaseHTTPRequestHandler):
             # Server-side host inventory for cross-host actions; never trust the client's copy.
             body.pop("_hosts", None)
             body.pop("_record", None)
+            if step == "discovery" and body.get("inventory_receipt") is True:
+                if body.get("expected_configuration_sha256") != live_inventory.configuration_digest(host):
+                    self._send_json(409, {"error": "target_changed", "message": "Host configuration changed before live discovery. Select the host and ask again."})
+                    return
             if step == "stage-artifact":
                 body["_hosts"] = load_hosts()
 
@@ -1199,12 +1204,14 @@ class Handler(BaseHTTPRequestHandler):
     def _assistant_route(self, method, path, body):
         owner = getattr(self, "_principal", None)
         try:
+            allowed = {action for action in auth.ACTION_ROLES if owner and self._has_role(action)}
             if path == "/api/assistant/config" and method == "GET":
-                self._send_json(200, {**local_llm.config_status(), "can_chat": bool(owner)})
+                self._send_json(200, {**local_llm.config_status(), "can_chat": bool(owner),
+                    "can_live_inventory": "read" in allowed and "execute" in allowed,
+                    "allowed_tools": [name for name, spec in assistant.capabilities.SPECS.items() if spec[2] in allowed]})
                 return
             if not owner:
                 raise assistant.AssistantError("Sign in with an individual identity to use the assistant", 403)
-            allowed = {action for action in auth.ACTION_ROLES if self._has_role(action)}
             parts = path.strip("/").split("/")
             if parts[:3] != ["api", "assistant", "conversations"]:
                 raise assistant.AssistantError("Unknown assistant route", 404)
@@ -1223,7 +1230,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and len(parts) == 5 and parts[4] == "messages":
                 if set(body) != {"content"}:
                     raise assistant.AssistantError("Messages accept only content")
-                run_id = assistant.send(owner, conversation_id, body["content"], allowed, load_hosts)
+                run_id = assistant.send(owner, conversation_id, body["content"], allowed, load_hosts,
+                    submit=self._submit_assistant_action)
                 self._send_json(202, {"run_id": run_id})
                 return
             if method == "POST" and len(parts) == 7 and parts[4] == "actions" and parts[6] in {"execute", "dismiss"}:
