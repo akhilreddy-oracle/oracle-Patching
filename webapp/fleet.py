@@ -120,7 +120,10 @@ def build(hosts, *, now=None, can_manage_metadata=False):
                          and len(home["opatch_inventory_xml_sha256"]) == 64
                          and all(c in "0123456789abcdef" for c in home["opatch_inventory_xml_sha256"]))
             baseline_status = "unknown"
-            multi_node = isinstance(host.get("nodes"), list) and len(host["nodes"]) > 1
+            cluster = snapshot.get("cluster") if isinstance(snapshot.get("cluster"), dict) else {}
+            multi_node = (isinstance(host.get("nodes"), list) and len(host["nodes"]) > 1
+                          or isinstance(cluster.get("nodes"), list) and len(cluster["nodes"]) > 1
+                          or cluster.get("status") == "detected")
             baseline_reason = ("All-node baseline compliance is unavailable: this view contains the primary node's inventory."
                                if multi_node else None)
             if fresh and inventory and desired and not multi_node:

@@ -71,7 +71,7 @@ host execution lock.
    verifies the validated procedure/input relationship, patch ID and all native
    readiness dependency hashes, including optional recovery/Data Guard evidence.
    Changed dependencies yield unknown readiness. Binary compliance also requires
-   XML inventory provenance and a valid checksum. Configured multi-node hosts
+   XML inventory provenance and a valid checksum. Configured or discovered multi-node hosts
    remain unknown for baseline compliance because this view currently holds
    primary-node observations; the API and UI explicitly explain that limitation.
 
@@ -105,7 +105,7 @@ The focused checks completed during this review include:
 - model assessment harness: 13 simulator tests, including rejection of fake
   preparation prose, substituted inspection tools and wrong refusal enums.
 - remote transport: 13; agent queue/worker: 22; extracted runtime package: 9.
-- fleet: 13; fleet metadata: 7; fleet API: 7.
+- fleet: 14 (including discovered clusters without configured nodes); fleet metadata: 7; fleet API: 7.
 - integration shell checks: ITSM ambiguity, credential redaction, actual mocked
   webhook payloads, unsafe log targets and malformed configuration.
 

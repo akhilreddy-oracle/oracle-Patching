@@ -95,6 +95,20 @@ class FleetTests(unittest.TestCase):
         self.assertIn('primary node',row['baseline_reason'])
         self.assertEqual(row['patch_baseline'],'12345', 'Dated primary inventory remains available as an observation')
 
+    def test_observed_cluster_blocks_primary_only_compliance_without_configured_nodes(self):
+        self.assertNotIn('nodes',self.host)
+        for cluster in ({'status':'detected','nodes':[{'name':'node-a'},{'name':'node-b'}]},
+                        {'status':'detected','nodes':[]},
+                        {'status':'detected'},
+                        {'status':'unknown','nodes':[{'name':'node-a'},{'name':'node-b'}]}):
+            with self.subTest(cluster=cluster):
+                self.snapshot['cluster']=cluster
+                self.write()
+                row=self.row()
+                self.assertEqual(row['baseline_status'],'unknown')
+                self.assertIn('primary node',row['baseline_reason'])
+                self.assertEqual(row['patch_baseline'],'12345')
+
     def test_optional_recovery_and_dataguard_changes_invalidate_readiness(self):
         for field,name in (('recovery_sha256','recovery'),('dataguard_sha256','dataguard_evaluation')):
             with self.subTest(field=field):

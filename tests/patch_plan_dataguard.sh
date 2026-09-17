@@ -15,9 +15,9 @@ collected=$(date -u -r "$now" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '@
 oracle_home="$TMP/oracle/dbhome_1"
 owner=$(id -un)
 
-# Single-node standalone database evidence set; real readiness -> plan admission.
+# Single-node non-CDB database evidence set; real readiness -> plan admission.
 jq -n --arg collected "$collected" --arg home "$oracle_home" --arg owner "$owner" --arg digest "$digest" \
-  '{schema_version:"1.0",collector:{name:"oracle.topology.discover",version:"1"},collected_at:$collected,host:{name:"node1.example"},cluster:{status:"unavailable",grid_home:null,runtime:{status:"unavailable"},nodes:[]},oracle_homes:[{path:$home,owner:$owner,version:"19.0.0.0.0",opatch_version:"12.2.0.1.51",platform:{status:"collected",id:"226",name:"Linux x86-64",source:"opatch_lsinventory_xml",source_sha256:$digest},patch_inventory_source:"opatch_lsinventory_xml",opatch_inventory_xml_sha256:$digest,patches:[]}],databases:[{db_unique_name:"ORCL",oracle_home:$home,runtime:{status:"complete",database_role:"PRIMARY",open_mode:"READ WRITE",instance_state:"OPEN",invalid_objects:0,sqlpatch_non_success:0,pdb_not_read_write:0,backup_age_minutes:0,fra_space_limit_bytes:100,fra_space_used_bytes:0,guaranteed_restore_points:0}}],warnings:[]}' >"$TMP/node1-snapshot.json"
+  '{schema_version:"1.0",collector:{name:"oracle.topology.discover",version:"1"},collected_at:$collected,host:{name:"node1.example"},cluster:{status:"unavailable",grid_home:null,runtime:{status:"unavailable"},nodes:[]},oracle_homes:[{path:$home,owner:$owner,version:"19.0.0.0.0",opatch_version:"12.2.0.1.51",platform:{status:"collected",id:"226",name:"Linux x86-64",source:"opatch_lsinventory_xml",source_sha256:$digest},patch_inventory_source:"opatch_lsinventory_xml",opatch_inventory_xml_sha256:$digest,patches:[]}],databases:[{db_unique_name:"ORCL",oracle_home:$home,runtime:{status:"complete",cdb:"NO",database_role:"PRIMARY",open_mode:"READ WRITE",instance_state:"OPEN",invalid_objects:0,sqlpatch_non_success:0,pdb_not_read_write:0,backup_age_minutes:0,fra_space_limit_bytes:100,fra_space_used_bytes:0,guaranteed_restore_points:0}}],warnings:[]}' >"$TMP/node1-snapshot.json"
 snapshot_sha=$(sha256sum "$TMP/node1-snapshot.json" | awk '{print $1}')
 jq -n --arg home "$oracle_home" --arg owner "$owner" --arg snapshot "$TMP/node1-snapshot.json" --arg snapshot_sha "$snapshot_sha" \
   '{schema_version:"1.0",status:"consistent",expected_nodes:["node1"],oracle_homes:[{path:$home,owner:$owner,version:"19.0.0.0.0",opatch_version:"12.2.0.1.51",platform:{status:"collected",id:"226",name:"Linux x86-64",source:"opatch_lsinventory_xml"},patches:[]}],databases:[{db_unique_name:"ORCL",oracle_home:$home}],snapshot_evidence:[{path:$snapshot,sha256:$snapshot_sha}]}' >"$TMP/reconciliation.json"
@@ -72,6 +72,22 @@ order_file_sha=$(sha256sum "$TMP/order.json" | awk '{print $1}')
 jq -e '.status == "ready_for_approval" and .dataguard_evaluation.maximum_age_seconds == 300 and
   .valid_until == .dataguard_evaluation.valid_until and
   (.valid_until | fromdateiso8601) < (.snapshot_evidence[0].valid_until | fromdateiso8601)' "$TMP/readiness-gated.json" >/dev/null
+
+# Passing Data Guard evidence does not waive the database adapter's explicit
+# non-CDB requirement. Bind the changed snapshot correctly so the rejection
+# demonstrates container scope, not a stale reconciliation digest.
+jq '.databases[0].runtime.cdb = "YES"' "$TMP/node1-snapshot.json" >"$TMP/cdb-snapshot.json"
+cdb_sha=$(sha256sum "$TMP/cdb-snapshot.json" | awk '{print $1}')
+jq --arg path "$TMP/cdb-snapshot.json" --arg sha "$cdb_sha" '.snapshot_evidence=[{path:$path,sha256:$sha}]' \
+  "$TMP/reconciliation.json" >"$TMP/cdb-reconciliation.json"
+if "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/cdb-reconciliation.json" --snapshot "$TMP/cdb-snapshot.json" \
+  --artifact "$TMP/artifact.json" --procedure-validation "$TMP/procedure.json" --compatibility "$TMP/compatibility.json" \
+  --policy "$TMP/policy.json" --dataguard "$TMP/dg-eval.json" --output "$TMP/cdb-readiness.json" >/dev/null; then
+  echo 'passing Data Guard evidence admitted an unsupported CDB' >&2; exit 1
+fi
+jq -e '.status == "blocked" and
+  any(.gates[]; .name == "dataguard_standby_first" and .status == "pass") and
+  ([.gates[] | select(.status == "blocker") | .name] == ["database_container_scope"])' "$TMP/cdb-readiness.json" >/dev/null
 
 run() { OPU_PLAN_STATE_DIR="$TMP/state" "$PLAN" "$@"; }
 create_plan() {

@@ -7,8 +7,9 @@ A second code-first review found additional correctness defects despite that
 passing gate. Its coverage and remaining limits are recorded in the
 [controller](SECOND_REVIEW_CONTROLLER.md), [native](SECOND_REVIEW_NATIVE.md),
 [assistant/transport](SECOND_REVIEW_ASSISTANT_TRANSPORT.md) and
-[browser/deployment](SECOND_REVIEW_UI_DEPLOY.md) reports. Second-pass combined
-validation is pending; the earlier receipt does not validate changed source.
+[browser/deployment](SECOND_REVIEW_UI_DEPLOY.md) reports. Consult the retained
+exact-source release receipt and draft PR checks for combined validation;
+the earlier receipt does not validate changed source.
 This document is an audit record, not a production certificate.
 
 The second pass preserves reviewed README/media bindings, rejects incomplete
