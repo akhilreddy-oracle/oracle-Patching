@@ -50,6 +50,15 @@ class ControlPlaneTests(unittest.TestCase):
         self.enterContext(patch.object(planctl, "PLAN_STATE_DIR", self.root / "plans"))
         self.enterContext(patch.object(recoveryctl, "RECOVERY_DIR", self.root / "recovery"))
         self.enterContext(patch.object(evidence, "VAR_DIR", self.root / "hosts"))
+        self.workers = []
+        self.addCleanup(self.finish_workers)
+
+    def finish_workers(self):
+        for worker in self.workers:
+            if worker.ident is not None:
+                worker.join(5)
+        self.assertFalse(any(worker.is_alive() for worker in self.workers),
+                         "Isolated controller worker survived test cleanup")
 
     def request(self, path, *, actor="operator", body=None, raw=None, length=None, method="POST", extra_headers=None, before_body=None):
         handler = server.Handler.__new__(server.Handler)
@@ -580,18 +589,23 @@ class ControlPlaneTests(unittest.TestCase):
         def work(record):
             pipeline_runner.set_execution_context(detached_execution=True, detached_terminal=False)
             raise RuntimeError("contact lost")
-        record = pipeline_runner.start_run("plan", "plan:p:execute", work)
-        # Wait on the actual worker state, without invoking any external service.
-        import time
-        persisted = {}
-        for _ in range(100):
-            persisted = json.loads((pipeline_runner.RUNS_DIR / record.run_id / "run.json").read_text())
-            if persisted.get("status") == "unknown":
-                break
-            time.sleep(0.01)
+        real_thread = threading.Thread
+
+        def make_worker(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            self.workers.append(worker)
+            return worker
+
+        with patch.object(pipeline_runner.threading, "Thread", side_effect=make_worker):
+            record = pipeline_runner.start_run("plan", "plan:p:execute", work)
+        # Unknown status is published before the final write; join the actual
+        # worker before reading its durable result or removing fixture state.
+        self.finish_workers()
+        persisted = json.loads((pipeline_runner.RUNS_DIR / record.run_id / "run.json").read_text())
         self.assertEqual(record.status, "unknown")
         self.assertEqual(pipeline_runner.active_run_id(record.key), record.run_id)
         self.assertEqual(persisted["status"], "unknown")
+        self.assertIsNotNone(persisted["finished_at"])
 
     def test_second_controller_cannot_launch_owned_key(self):
         program = """

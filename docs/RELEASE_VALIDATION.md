@@ -1,9 +1,16 @@
 # Release validation
 
-Pull requests run `make -j4 check` and the Chromium browser workflow in
+Pull requests run `make -k -j4 check` and the Chromium browser workflow in
 `.github/workflows/release-validation.yml`. The job uses disposable fixtures,
 read-only repository permissions and no database credentials. The workflow is
 prepared in the repository; a passing local run does not prove GitHub has run it.
+
+Make continues independent suites after a failure and retains a failing exit
+code; targets that depend on a failed prerequisite are skipped. This does not
+continue inside a failed test script, after a Makefile parse error, or past a
+timeout or interruption. The collector proceeds to the browser scope after a
+normally completed check command, even when checks fail. CI first requires the
+validation-reader tests to pass before it invokes that collector.
 
 ## Three distinct evidence levels
 

@@ -71,6 +71,24 @@ now derives both timestamps from one observation. A forced clock-crossing
 regression covers standalone, RAC and Grid builders without relaxing freshness
 validation or claiming the aborted run passed.
 
+The cancelled Linux run for `6997c0e` also retained a separate test-cleanup
+failure: live inventory's failed-RAC case removed its temporary directory while
+the real controller worker was still persisting its terminal result. A controlled
+pause before final persistence reproduced the cleanup error after every test
+assertion had passed. Inventory, assistant and interrupted-controller harnesses
+now join actual workers before removing directories or restoring patched globals;
+observing a terminal status alone is not proof that the thread has exited.
+Deterministic inventory and assistant barriers exercise that distinction.
+This is a test-lifetime defect, not evidence
+that a production database operation failed.
+
+The release collector now uses `make -k -j4 check`, retaining a failed result
+while running other independent suites. A disposable Makefile regression proves
+that an independent target executes after an earlier failure, a target depending
+on the failure is skipped, and the receipt remains failed. This provides fuller
+failure coverage without relaxing any acceptance gate; individual scripts,
+timeouts and interruptions can still prevent some work from completing.
+
 ## Compatibility and operational limits
 
 Older live recovery requests remain inspectable and existing execution outcomes

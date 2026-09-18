@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-import time
+import threading
 import unittest
 from unittest.mock import patch
 from runtime_fixture import runtime_receipt, host_runtime_receipts
@@ -34,6 +34,10 @@ class LiveInventoryTests(unittest.TestCase):
             side_effect=lambda *_args, **_kwargs: self.snapshot()))
         self.host = {"id": "targetdb", "ssh_alias": "never-connect", "remote_root": "/fixture",
                      "password": "HOST_SECRET"}
+        self.workers = []
+        # unittest cleanups run in reverse order: join before restoring the
+        # mocked paths/transports or deleting the temporary run directory.
+        self.addCleanup(self.finish_workers)
 
     def snapshot(self, patches=None):
         return {"schema_version": "1.0", "collector": {"name": "oracle.topology.discover", "version": "1"},
@@ -56,14 +60,84 @@ class LiveInventoryTests(unittest.TestCase):
         args.update(overrides)
         return inventory.build_receipt(**args)
 
+    def finish_workers(self):
+        remaining = []
+        for worker in self.workers:
+            if worker.ident is None:  # Thread construction/start may have failed.
+                continue
+            worker.join(timeout=5)
+            if worker.is_alive():
+                remaining.append(worker.name)
+        self.assertEqual(remaining, [], "Isolated discovery workers did not exit")
+
     def run_discovery(self):
-        record = runner.start_run("pipeline", "host:targetdb:pipeline", lambda _record:
-            pipeline.step_discovery("targetdb", self.host, {"inventory_receipt": True}))
-        deadline = time.monotonic() + 5
-        while record.status in {"queued", "running"} and time.monotonic() < deadline:
-            time.sleep(0.005)
+        real_thread = runner.threading.Thread
+
+        def track_thread(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            self.workers.append(worker)
+            return worker
+
+        with patch.object(runner.threading, "Thread", side_effect=track_thread):
+            record = runner.start_run("pipeline", "host:targetdb:pipeline", lambda _record:
+                pipeline.step_discovery("targetdb", self.host, {"inventory_receipt": True}))
+        self.finish_workers()
         self.assertNotIn(record.status, {"queued", "running"})
         return record
+
+    def test_terminal_status_does_not_release_fixture_before_final_persistence(self):
+        entered, release, joining, returned = (threading.Event() for _ in range(4))
+        results, errors = [], []
+        real_thread = threading.Thread
+        real_persist = runner.RunRecord._persist
+        self.ssh.side_effect = remote.RemoteError("ssh_failed", "fixture unavailable")
+
+        class ObservedWorker(real_thread):
+            def join(self, timeout=None):
+                joining.set()
+                return super().join(timeout)
+
+        def hold_terminal_persist(record):
+            if record.status == "failed" and not entered.is_set():
+                entered.set()
+                if not release.wait(10):
+                    raise AssertionError("Fixture did not release terminal persistence")
+            return real_persist(record)
+
+        def discover():
+            try:
+                results.append(self.run_discovery())
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                returned.set()
+
+        driver = real_thread(target=discover)
+        with patch.object(runner.threading, "Thread", ObservedWorker), \
+             patch.object(runner.RunRecord, "_persist", hold_terminal_persist):
+            driver.start()
+            try:
+                self.assertTrue(entered.wait(5), "Worker never reached terminal persistence")
+                self.assertTrue(joining.wait(5), "Harness did not join the actual worker")
+                record = next(iter(runner.RUNS.values()))
+                self.assertEqual(record.status, "failed")
+                self.assertIsNone(record.finished_at)
+                self.assertFalse(returned.is_set(), "Terminal status escaped the worker join")
+                self.assertEqual(runner.RUNS_DIR, self.root / "runs")
+                self.assertTrue(self.root.is_dir())
+            finally:
+                release.set()
+                driver.join(timeout=5)
+                self.finish_workers()
+        self.assertFalse(driver.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(returned.is_set())
+        self.assertEqual(len(results), 1)
+        record = results[0]
+        self.assertIsNotNone(record.finished_at)
+        self.assertNotIn(record.key, runner._ACTIVE_KEYS)
+        persisted = json.loads((runner.RUNS_DIR / record.run_id / "run.json").read_text())
+        self.assertEqual(persisted["finished_at"], record.finished_at)
 
     def test_discovery_receipt_is_bound_to_its_native_run_and_configuration(self):
         record = self.run_discovery()

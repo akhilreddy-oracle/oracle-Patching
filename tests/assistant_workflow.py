@@ -44,6 +44,36 @@ class AssistantTests(unittest.TestCase):
         self.owner = 'operator'
         self.conversation = assistant.create(self.owner)['id']
         self.submit = Mock(side_effect=AssertionError('No native launch was expected'))
+        self.workers = []
+        self.run_workers = {}
+        real_start, real_thread = runner.start_run, threading.Thread
+
+        def start_tracked(kind, key, fn):
+            launched = []
+
+            def make_worker(*args, **kwargs):
+                worker = real_thread(*args, **kwargs)
+                launched.append(worker)
+                self.workers.append(worker)
+                return worker
+
+            with patch.object(runner.threading, 'Thread', side_effect=make_worker):
+                record = real_start(kind, key, fn)
+            self.assertEqual(len(launched), 1)
+            self.run_workers[record.run_id] = launched[0]
+            return record
+
+        self.enterContext(patch.object(runner, 'start_run', side_effect=start_tracked))
+        # Runs before patched state, notifications and temporary files unwind,
+        # including when an assertion fails before wait_run is reached.
+        self.addCleanup(self.finish_workers)
+
+    def finish_workers(self):
+        for worker in self.workers:
+            if worker.ident is not None:
+                worker.join(5)
+        self.assertFalse(any(worker.is_alive() for worker in self.workers),
+                         'Isolated assistant worker survived test cleanup')
 
     def conversation_data(self):
         return assistant._read(assistant._path(self.owner, self.conversation), self.owner)
@@ -71,13 +101,59 @@ class AssistantTests(unittest.TestCase):
         return record
 
     def wait_run(self, run_id):
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            record = runner.get_run(run_id)
-            if record.status in {'succeeded', 'failed', 'unknown'}:
-                return record
-            time.sleep(0.005)
-        self.fail('Isolated assistant worker did not finish')
+        worker = self.run_workers[run_id]
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), 'Isolated assistant worker did not finish')
+        return runner.get_run(run_id)
+
+    def test_wait_run_keeps_fixture_alive_until_final_persistence_finishes(self):
+        finalizing, release = threading.Event(), threading.Event()
+        joined, returned = threading.Event(), threading.Event()
+        original_persist = runner.RunRecord._persist
+        errors = []
+
+        def delayed_persist(record):
+            if record.finished_at is not None:
+                finalizing.set()
+                if not release.wait(10):
+                    raise AssertionError('Final-persistence fixture was not released')
+            return original_persist(record)
+
+        with patch.object(runner.RunRecord, '_persist', new=delayed_persist), \
+             patch.object(assistant.local_llm, 'complete', return_value={'role': 'assistant', 'content': 'Finished response'}):
+            run_id = assistant.send(self.owner, self.conversation, 'Explain the workflow', {'read'}, lambda: self.hosts)
+            real_join = self.run_workers[run_id].join
+
+            def observed_join(*args, **kwargs):
+                joined.set()
+                return real_join(*args, **kwargs)
+
+            def wait_for_worker():
+                try:
+                    self.wait_run(run_id)
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    returned.set()
+
+            waiter = threading.Thread(target=wait_for_worker)
+            with patch.object(self.run_workers[run_id], 'join', side_effect=observed_join):
+                try:
+                    self.assertTrue(finalizing.wait(5))
+                    self.assertEqual(runner.get_run(run_id).status, 'succeeded')
+                    waiter.start()
+                    self.assertTrue(joined.wait(5))
+                    self.assertFalse(returned.is_set(), 'Terminal status does not mean the worker has finished writing')
+                finally:
+                    release.set()
+                    if waiter.ident is not None:
+                        waiter.join(5)
+                    self.wait_run(run_id)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(errors, [])
+        persisted = json.loads((runner.RUNS_DIR / run_id / 'run.json').read_text())
+        self.assertIsNotNone(persisted['finished_at'])
+        self.assertIsNone(runner.active_run_id(runner.get_run(run_id).key))
 
     def test_proposal_never_executes_and_repeated_identical_model_call_reuses_it(self):
         first = self.proposal()

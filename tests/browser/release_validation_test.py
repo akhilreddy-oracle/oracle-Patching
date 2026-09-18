@@ -65,6 +65,29 @@ class ValidationEvidenceTests(unittest.TestCase):
         self.record(exit_code=1)
         self.assertEqual(rv.validation_status(self.root)["fixture_tested"]["status"], "failed")
 
+    def test_failed_suite_does_not_hide_independent_suite_results(self):
+        # Serial scheduling makes the failure occur before make can start the
+        # independent target. With -j4 alone it might happen to start both.
+        (self.root / "Makefile").write_text(
+            ".NOTPARALLEL:\n"
+            ".PHONY: check fail independent dependent\n"
+            "check: fail independent dependent\n"
+            "fail:\n\t@exit 1\n"
+            "independent:\n\t@touch independent-ran\n"
+            "dependent: fail\n\t@touch dependent-ran\n"
+        )
+        bundle = self.root / "collected-validation"
+        self.assertEqual(rv.run_validation(self.root, bundle, ["check"], timeout=10), 1)
+        self.assertTrue((self.root / "independent-ran").is_file())
+        self.assertFalse((self.root / "dependent-ran").exists())
+        receipt = json.loads((bundle / "manifest.json").read_text())["receipts"][0]
+        self.assertEqual(receipt["command"], ["make", "-k", "-j4", "check"])
+        self.assertNotEqual(receipt["exit_code"], 0)
+        status = rv.validation_status(self.root, bundle)
+        self.assertEqual(status["fixture_tested"]["status"], "failed")
+        self.assertEqual(status["live_lab_verified"]["status"], "unverified")
+        self.assertEqual(status["production_approved"]["status"], "unverified")
+
     def test_changed_or_missing_logs_invalidate_status(self):
         self.record()
         (self.bundle / "browser.log").write_text("Different evidence")
