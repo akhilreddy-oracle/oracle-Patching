@@ -172,7 +172,3 @@ export function syncSecondaryNav(active) {
     else link.removeAttribute("aria-current");
   });
 }
-
-export function getCachedHosts() {
-  return hostsCache;
-}

@@ -20,8 +20,6 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-BIN = REPO_ROOT / "bin"
 SHIMS_DIR = Path(__file__).resolve().parent / "recovery_fixtures"
 
 

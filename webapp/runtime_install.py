@@ -186,7 +186,7 @@ def stage_archive(archive_path, parent, expected):
             require(0 < len(members) <= 4096, "invalid runtime member count")
             total = 0
             for member in members:
-                relative = relative_file(member.name)
+                relative_file(member.name)
                 require(member.isfile() and member.name not in seen and 0 <= member.size <= 32 * 1024 * 1024,
                         "unsafe or duplicate archive member")
                 total += member.size

@@ -239,16 +239,6 @@ opu_resolve_directory() {
     return 0
 }
 
-# Back-compat wrapper: require a directory (symlink-to-dir allowed via resolve).
-opu_require_real_directory() {
-    local path label resolved
-    path=${1-}
-    label=${2:-path}
-    resolved=$(opu_resolve_directory "$path" "$label") || return $?
-    [ -n "$resolved" ] || return 66
-    return 0
-}
-
 opu_safe_field() {
     if printf '%s' "${1-}" | grep '[[:cntrl:]]' >/dev/null 2>&1; then
         return 1

@@ -141,18 +141,6 @@ opu_append_event() {
         "$(opu_json_escape "$status")" >>"$event_file"
 }
 
-opu_atomic_publish() {
-    local source destination temporary
-    source=$1
-    destination=$2
-    temporary="${destination}.tmp.$$"
-    cp "$source" "$temporary" || return 74
-    mv "$temporary" "$destination" || {
-        rm -f "$temporary"
-        return 74
-    }
-}
-
 opu_publish_completion() {
     local result_file exit_code request_hash completion_dir temporary_dir result_digest completion_digest
     result_file=$1

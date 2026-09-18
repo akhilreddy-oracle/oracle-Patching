@@ -10,7 +10,7 @@ import hashlib
 import json
 import os
 import runtime_paths
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 import re
 import stat
 

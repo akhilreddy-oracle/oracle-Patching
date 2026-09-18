@@ -45,7 +45,6 @@ import application_views
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 HOSTS_FILE = runtime_paths.hosts_file()
-SSH_TIMEOUT_SECONDS = 45
 DISCOVERY_TIMEOUT_SECONDS = pipeline_steps.DISCOVERY_TIMEOUT_SECONDS
 
 STATIC_CONTENT_TYPES = {
@@ -877,11 +876,6 @@ No socket, HTTP parser or listener is constructed by this class.
                 self._send_json(404, {"error": "unknown_step", "message": f"No such pipeline step: {step}"})
                 return
 
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             # Server-side host inventory for cross-host actions; never trust the client's copy.
             body.pop("_hosts", None)
             body.pop("_record", None)
@@ -910,20 +904,10 @@ No socket, HTTP parser or listener is constructed by this class.
             return
 
         if path == "/api/plans":
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_plan_action("create", None, body)
             return
 
         if path == "/api/plans/testmode-demo":
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             try:
                 plan_id = body["plan_id"]
                 requester = body["requester"]
@@ -1014,11 +998,6 @@ No socket, HTTP parser or listener is constructed by this class.
         if path.startswith("/api/plans/") and path.endswith("/retry-task"):
             plan_id = path[len("/api/plans/"):-len("/retry-task")]
             try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
-            try:
                 actor = body["actor"]
                 task_id = body["task_id"]
             except KeyError as exc:
@@ -1040,11 +1019,6 @@ No socket, HTTP parser or listener is constructed by this class.
 
         if path.startswith("/api/plans/") and path.endswith("/execute-next"):
             plan_id = path[len("/api/plans/"):-len("/execute-next")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             try:
                 actor = body["actor"]
             except KeyError as exc:
@@ -1072,11 +1046,6 @@ No socket, HTTP parser or listener is constructed by this class.
 
         if path.startswith("/api/plans/") and path.endswith("/execute-remaining"):
             plan_id = path[len("/api/plans/"):-len("/execute-remaining")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             try:
                 actor = body["actor"]
             except KeyError as exc:
@@ -1113,11 +1082,6 @@ No socket, HTTP parser or listener is constructed by this class.
 
         if path.startswith("/api/plans/") and path.endswith("/publish-agent-queue"):
             plan_id = path[len("/api/plans/"):-len("/publish-agent-queue")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             actor = body.get("actor")
             if not self._require_role(actor, "dispatch"):
                 return
@@ -1130,11 +1094,6 @@ No socket, HTTP parser or listener is constructed by this class.
             return
 
         if path == "/api/agent/claim":
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             agent_id = body.get("agent_id") or body.get("actor")
             if not self._require_role(agent_id, "agent"):
                 return
@@ -1152,11 +1111,6 @@ No socket, HTTP parser or listener is constructed by this class.
             return
 
         if path == "/api/agent/complete":
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             agent_id = body.get("agent_id") or body.get("actor")
             if not self._require_role(agent_id, "agent"):
                 return
@@ -1176,100 +1130,50 @@ No socket, HTTP parser or listener is constructed by this class.
 
         if path.startswith("/api/plans/") and path.endswith("/approve"):
             plan_id = path[len("/api/plans/"):-len("/approve")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_plan_action("approve", plan_id, body)
             return
 
         if path.startswith("/api/plans/") and path.endswith("/authorize"):
             plan_id = path[len("/api/plans/"):-len("/authorize")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_plan_action("authorize", plan_id, body)
             return
 
         if path.startswith("/api/plans/") and path.endswith("/dispatch"):
             plan_id = path[len("/api/plans/"):-len("/dispatch")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_plan_action("dispatch", plan_id, body)
             return
 
         if path.startswith("/api/plans/") and path.endswith("/create-rollback"):
             plan_id = path[len("/api/plans/"):-len("/create-rollback")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_plan_action("create-rollback", plan_id, body)
             return
 
         if path == "/api/recovery/testmode-demo":
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("create", None, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/analyze"):
             request_id = path[len("/api/recovery/"):-len("/analyze")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("analyze", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/approve"):
             request_id = path[len("/api/recovery/"):-len("/approve")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("approve", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/authorize"):
             request_id = path[len("/api/recovery/"):-len("/authorize")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("authorize", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/execute"):
             request_id = path[len("/api/recovery/"):-len("/execute")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("execute", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/reconcile"):
             request_id = path[len("/api/recovery/"):-len("/reconcile")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("reconcile", request_id, body)
             return
 

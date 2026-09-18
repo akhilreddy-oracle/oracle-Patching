@@ -400,7 +400,7 @@ def retry_task(plan_id: str, task_id: str, actor: str) -> dict:
     validate_plan_id(plan_id)
     if not isinstance(task_id, str) or not _ID_RE.fullmatch(task_id):
         raise PlanError(f"task_id contains unsupported characters: {task_id!r}")
-    plan = status(plan_id)
+    status(plan_id)
     task = next((t for t in list_tasks(plan_id) if t.get("task_id") == task_id), None)
     if task is None:
         raise PlanError(f"task {task_id} not found on plan {plan_id}")
