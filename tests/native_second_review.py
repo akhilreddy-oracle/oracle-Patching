@@ -204,7 +204,6 @@ stage_rac_rollback_precheck
             if "load_task_cluster_runtime()" in source:
                 names.append("load_task_cluster_runtime")
             definitions = "\n".join(function(source, name) for name in names)
-            definitions += "\n" + function((ROOT / "lib/opu/execution.sh").read_text(), "opu_execution_prepare_attempt")
             for collect in ("1", "0", "fail"):
                 with self.subTest(tool=tool, collect=collect), tempfile.TemporaryDirectory() as temporary:
                     base = Path(temporary)
@@ -221,12 +220,13 @@ stage_rac_rollback_precheck
                     controller = base / "controller"
                     controller.write_text("#!/bin/sh\nprintf '{}\\n'\n")
                     controller.chmod(0o700)
-                    command = "set -eu; " + definitions + r'''
+                    command = ("set -eu; . " + shlex.quote(str(ROOT / "lib/opu/common.sh")) + "; . "
+                               + shlex.quote(str(ROOT / "lib/opu/execution.sh")) + "; " + definitions) + r'''
 die() { echo "$*" >&2; exit 65; }
 require_root() { :; }; opu_execution_host_lock() { :; }; load_plan() { :; }
 load_task_after_claim() { LOCAL_NODE=fixture; TASK_FILE=fixture; }
 opu_execution_verify_attempt() { :; }; close_inherited_executor_lock() { :; }
-verify_sealed_json() { :; }; heartbeat() { :; }; opu_now_utc() { printf fixture; }
+verify_sealed_json() { :; }; opu_now_utc() { printf fixture; }
 acquire_executor_lock() { printf '%s' '{"baseline":{"active_version":"18.0.0.0.0","upgrade_state":"NORMAL","active_patch_level":"111","release_patch_level":"111"}}' >"$BINDING_FILE"; }
 run_typed_stage() { if [ "$COLLECT" = fail ]; then return 65; elif [ "$COLLECT" = 1 ]; then collect_cluster_runtime "$TASK_DIR/current"; fi; }
 emit_evidence() { jq -n --arg active "${CLUSTER_ACTIVE_PATCH_LEVEL:-unknown}" --arg release "${CLUSTER_RELEASE_PATCH_LEVEL:-unknown}" '{active_patch_level:$active,release_patch_level:$release}' >"$TASK_DIR/evidence.json"; }

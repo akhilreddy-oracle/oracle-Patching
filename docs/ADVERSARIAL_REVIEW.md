@@ -89,6 +89,16 @@ on the failure is skipped, and the receipt remains failed. This provides fuller
 failure coverage without relaxing any acceptance gate; individual scripts,
 timeouts and interruptions can still prevent some work from completing.
 
+The completed Linux gate for `5046d38` passed all 39 browser cases but failed
+an extracted rollback supervisor fixture. It exited 127 before evidence capture:
+the fixture omitted the shared heartbeat library that the production adapter
+already loads. The extracted Grid supervisor fixture had the same omission.
+Both now source the actual common/execution helpers instead of obsolete local
+heartbeat stubs. The rollback assertion requires the expected supervisor failure
+code, evidence carrying the original datapatch exit 42, and no subsequent SQL
+probe. This preserves the failure-handling contract and exposes missing helper
+dependencies directly in diagnostics.
+
 ## Compatibility and operational limits
 
 Older live recovery requests remain inspectable and existing execution outcomes

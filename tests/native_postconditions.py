@@ -100,14 +100,16 @@ with tempfile.TemporaryDirectory(prefix="opu-postconditions-") as temporary:
     controller = directory / "controller"
     controller.write_text("#!/bin/sh\nprintf '{}\\n'\n")
     controller.chmod(0o700)
-    command = "set -e; " + "\n".join(function(script, name) for name in ("execute_task", "stage_rac_rollback_datapatch")) + r'''
+    command = ("set -e; . " + shlex.quote(str(ROOT / "lib/opu/common.sh")) + "; . "
+               + shlex.quote(str(ROOT / "lib/opu/execution.sh")) + "; "
+               + "\n".join(function(script, name) for name in ("execute_task", "stage_rac_rollback_datapatch"))) + r'''
 require_root() { :; }; opu_execution_host_lock() { :; }; load_plan() { :; }
 verify_source_apply_lineage() { :; }; verify_source_documents() { :; }; verify_recovery() { :; }
 node_key() { printf '%s' "$1"; }; current_short_host() { printf fixture; }
 opu_execution_prepare_attempt() { TASK_DIR="$1/$3"; }
 acquire_executor_lock() { :; }; load_task_after_claim() { LOCAL_NODE=fixture; TASK_FILE=fixture; }
 opu_execution_verify_attempt() { :; }; opu_now_utc() { printf fixture; }; close_inherited_executor_lock() { :; }
-heartbeat() { :; }; stage_success_outcome() { printf binary_state_known; }; derive_outcome() { printf binary_state_known; }
+stage_success_outcome() { printf binary_state_known; }; derive_outcome() { printf binary_state_known; }
 emit_evidence() { printf '{"status":"%s","exit_code":%s}\n' "$1" "$3" >"$TASK_DIR/evidence.json"; }
 load_binding() { :; }; verify_open_window() { :; }; verify_prior_node_validations() { :; }
 verify_all_nodes_running() { :; }; verify_services_available() { :; }; require_inventory_state() { :; }
@@ -123,7 +125,8 @@ execute_task
 '''
     result = subprocess.run(["bash", "-c", command, "fixture", temporary], capture_output=True, text=True, timeout=10)
     task = directory / "rollback-state/plans/fixture-plan/nodes/fixture/tasks/fixture-task"
-    assert result.returncode != 0, result.stdout
+    assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+    assert (task / "evidence.json").is_file(), (result.returncode, result.stdout, result.stderr)
     assert json.loads((task / "evidence.json").read_text()) == {"status": "failed", "exit_code": 42}
     assert not (task / "probe-after-failed-command").exists()
 
