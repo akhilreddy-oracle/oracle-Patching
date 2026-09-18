@@ -394,21 +394,55 @@ def dispatch(plan_id: str, actor: str) -> dict:
     return status(plan_id)
 
 
-@_controller_plan_operation
 def retry_task(plan_id: str, task_id: str, actor: str) -> dict:
     """Re-open a plan paused by this task's failure so it can be executed again."""
     validate_plan_id(plan_id)
     if not isinstance(task_id, str) or not _ID_RE.fullmatch(task_id):
         raise PlanError(f"task_id contains unsupported characters: {task_id!r}")
-    status(plan_id)
-    task = next((t for t in list_tasks(plan_id) if t.get("task_id") == task_id), None)
-    if task is None:
-        raise PlanError(f"task {task_id} not found on plan {plan_id}")
-    result = _run([
-        "retry-task", "--plan-id", plan_id, "--task-id", task_id, "--actor", actor,
-    ])
-    # Executors allocate an attempt generation; previous evidence is immutable.
-    return result if isinstance(result, dict) else status(plan_id)
+    if not isinstance(actor, str) or not _ID_RE.fullmatch(actor):
+        raise PlanError("retry actor contains unsupported characters")
+    import agent_queue
+
+    try:
+        with transport_lock(plan_id), agent_queue.retry_admission(plan_id, task_id) as job:
+            if pipeline_runner.active_run_id(f"plan:{plan_id}:execute"):
+                raise PlanError("Controller execution is active or unresolved; reconcile it before retrying a task")
+            plan = status(plan_id)
+            if job is None:
+                task = next((t for t in list_tasks(plan_id) if t.get("task_id") == task_id), None)
+                if task is None:
+                    raise PlanError(f"task {task_id} not found on plan {plan_id}")
+                result = _run(["retry-task", "--plan-id", plan_id, "--task-id", task_id, "--actor", actor])
+                return result if isinstance(result, dict) else status(plan_id)
+
+            # The native verifier checks custody. The queue's failed result
+            # additionally binds the exact attempt that is being reopened.
+            previous = job["result"]["task"]
+            digest = previous.get("task_result_sha256")
+            if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+                raise PlanError("Queue retry has no bound previous task result")
+            def verified_task():
+                value = _run(["task-status", "--plan-id", plan_id, "--task-id", task_id])
+                if (not isinstance(value, dict) or value.get("plan_id") != plan_id or value.get("task_id") != task_id
+                        or value.get("adapter") != job["adapter"] or type(value.get("retry_count", 0)) is not int):
+                    raise PlanError("Native task differs from this queue retry")
+                return value
+
+            task = verified_task()
+            if task.get("status") == "failed" and task.get("retry_count", 0) == job["attempt"] and task.get("task_result_sha256") == digest:
+                _run(["retry-task", "--plan-id", plan_id, "--task-id", task_id, "--actor", actor])
+                task = verified_task()
+                plan = status(plan_id)
+            # Recovery from a controller failure after native retry but before
+            # queue publication must not increment the native attempt again.
+            if (task.get("status") != "pending" or task.get("retry_count") != job["attempt"] + 1
+                    or task.get("previous_attempt_result_sha256") != digest or plan.get("state") != "running"):
+                raise PlanError("Native retry is not a verified pending successor of this failed queue attempt")
+            agent_queue.publish_task(plan_id=plan_id, task_id=task_id, node=job["node"], adapter=job["adapter"],
+                                     payload={**job["payload"], "task": task})
+            return task
+    except agent_queue.QueueError as exc:
+        raise PlanError(str(exc)) from exc
 
 
 def next_task(plan_id: str) -> dict | None:

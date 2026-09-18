@@ -79,6 +79,7 @@ lib/opu/jobs.sh
 lib/opu/journal.sh
 lib/opu/lock_recovery.py
 lib/opu/oracle_inventory.sh
+lib/opu/production_cert.py
 lib/opu/python.sh
 lib/opu/recovery_capacity.py
 lib/opu/recovery_evidence.sh

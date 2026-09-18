@@ -19,6 +19,11 @@ replaces in-place remote tool updates with retained, verified code generations.
 The older second-pass runtime-race limitation is superseded by that implementation;
 the separate Oracle/model/environment acceptance limits below remain.
 
+The later [adversarial correctness review](ADVERSARIAL_REVIEW.md) starts from
+`adae38e` and records additional reproduced recovery-route, report-observation,
+controller-incarnation, queue-retry and production-marker defects. Its explicit
+compatibility limits and failure cases supplement the earlier coverage below.
+
 The second pass preserves reviewed README/media bindings, rejects incomplete
 node evidence, binds confirmed AI plan creation through native sealing, excludes
 competing HTTP/pull-agent transports, and corrects stale Grid runtime reporting.

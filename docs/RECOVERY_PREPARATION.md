@@ -199,6 +199,21 @@ snapshot freshness, exact standalone database/home/owner/SID, and configured
 host binding before submitting remote work. The native adapter repeats its
 admission checks before downtime.
 
+The application requires one indexed discovery node whose effective SSH alias
+matches the host's recovery execution alias. Refresh **Discover** before creating
+a request. The request retains copies and hashes of the discovery snapshot and
+node index, plus its canonical node route; later actions recheck those copies
+and the configured route. An SSH alias does not have to equal the server's
+reported hostname or FQDN. New discovery observations do not rewrite an existing
+request's historical inputs.
+
+Requests created before this routing binding was introduced remain available for
+read-only inspection and reconciliation of an existing execution. They cannot
+receive new analysis, approval, authorization, execution or patch-evidence
+selection. Inspect and reconcile outstanding work first, then refresh discovery
+and create a new request for further admissions. The application does not attach
+new provenance to an older request automatically.
+
 From the host's Recovery stage:
 
 1. Create a preparation request and inspect its live capacity analysis.

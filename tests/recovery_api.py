@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Recovery HTTP routing and identity tests with no server, sockets, or SSH."""
 from email.message import Message
+from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
@@ -48,7 +49,7 @@ class RecoveryApiTests(unittest.TestCase):
         handler.send_response = lambda status: replies.append((status,None))
         handler.send_header = lambda *args: None
         handler.end_headers = lambda: None
-        handler._resolved_host = lambda host_id: self.host if host_id == "source" else None
+        handler._resolved_host = lambda host_id: self.host if host_id == self.host["id"] else None
         getattr(handler, "do_" + method)()
         return replies[-1]
 
@@ -65,6 +66,41 @@ class RecoveryApiTests(unittest.TestCase):
             create.assert_called_once_with("backup-1", "requester", host=self.host, host_id="source", database="ORCL",
                 backup_parent="/u02/backups",window_start=body["window_start"],window_end=body["window_end"],policy=body["policy"])
         self.assertEqual(self.submissions[0][:2], ("recovery", "recovery:backup-1:create"))
+
+    def test_discovery_to_http_to_controller_preserves_the_recorded_route(self):
+        # Retain the real discovery publisher, HTTP dispatch and recovery
+        # controller. Only SSH/process boundaries use disposable transport.
+        from recoveryctl_live import LiveRecoveryTests
+        from runtime_fixture import runtime_receipt
+        import pipeline_steps
+        fixture = LiveRecoveryTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        self.host = fixture.host
+        with patch.object(pipeline_steps.tools_sync, "ensure_host_tools", return_value=[runtime_receipt("source", "/opt/opu")]), \
+             patch.object(pipeline_steps.remote, "run_remote_json", return_value=fixture.snapshot):
+            pipeline_steps.step_discovery("sourcedb", self.host, {})
+        with patch.object(recoveryctl, "list_requests", return_value=[]):
+            status, guidance = self.request("/api/recovery?host_id=sourcedb", actor="viewer", method="GET")
+        self.assertEqual(status, 200)
+        self.assertTrue(guidance["target_capabilities"][0]["can_create"])
+        now = datetime.now(timezone.utc); fmt = "%Y-%m-%dT%H:%M:%SZ"
+        body = {**self.body(), "request_id": "r1", "host_id": "sourcedb", "policy": fixture.policy,
+                "window_start": now.strftime(fmt), "window_end": (now + timedelta(hours=1)).strftime(fmt)}
+        fixture.raw.side_effect = lambda *a, **k: fixture.response({"request_id": "r1", "state": "awaiting_approval"})
+        self.assertEqual(self.request("/api/recovery", actor="requester", body=body)[0], 202)
+        self.assertEqual(fixture.raw.call_args.args[0], "source")
+        binding = recoveryctl._metadata("r1")["discovery_binding"]
+        self.assertEqual(binding["route"], {"node": "sourcedb", "ssh_alias": "source"})
+        self.host["nodes"] = [{"name": "other-node", "ssh_alias": "other-alias"}]
+        fixture.hostfile.write_text(json.dumps({"hosts": [self.host]}))
+        fixture.sync.reset_mock(); fixture.raw.reset_mock()
+        with patch.object(recoveryctl, "list_requests", return_value=[]):
+            status, guidance = self.request("/api/recovery?host_id=sourcedb", actor="viewer", method="GET")
+        self.assertEqual(status, 200)
+        self.assertFalse(guidance["target_capabilities"][0]["can_create"])
+        self.assertIn("discovery_routing", [item["id"] for item in guidance["target_capabilities"][0]["blockers"]])
+        status, _ = self.request("/api/recovery", actor="requester", body={**body, "request_id": "r2"})
+        self.assertGreaterEqual(status, 400)
+        fixture.sync.assert_not_called(); fixture.raw.assert_not_called()
 
     def test_create_role_identity_unknown_host_and_extra_transport_fields_fail_closed(self):
         with patch.object(recoveryctl, "create_live") as create:

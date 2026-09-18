@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
@@ -24,6 +25,10 @@ class RecoveryCapabilityTests(unittest.TestCase):
         self.enterContext(patch.object(evidence, "VAR_DIR", self.root / "hosts"))
         self.enterContext(patch.object(recoveryctl, "LIVE_DIR", self.root / "live"))
         self.enterContext(patch.object(recoveryctl, "RECOVERY_DIR", self.root / "fixtures"))
+        self.host = {"id": "source", "ssh_alias": "source", "remote_root": "/opt/opu", "sudo": True}
+        self.hostfile = self.root / "configured-hosts.json"
+        self.hostfile.write_text(json.dumps({"hosts": [self.host]}))
+        self.enterContext(patch.object(recoveryctl, "HOSTS_FILE", self.hostfile))
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         self.snapshot = {
             "schema_version": "1.0", "collector": {"name": "oracle.topology.discover"},
@@ -95,6 +100,8 @@ class RecoveryCapabilityTests(unittest.TestCase):
         self.assertEqual(result["target_capabilities"][0]["status"], "unknown")
         self.assertFalse((self.root / "hosts").exists())
         evidence.write_evidence("source", "snapshot", self.snapshot)
+        evidence.write_evidence("source", "snapshot_nodes", {"nodes": [
+            {"name": "source", "ssh_alias": "source", "evidence": "snapshot"}]})
         evidence.write_evidence("source", "policy", self.policy)
         self.assertTrue(recoveryctl.target_capabilities("source")["target_capabilities"][0]["can_create"])
         path = evidence.evidence_path("source", "snapshot")
@@ -104,8 +111,30 @@ class RecoveryCapabilityTests(unittest.TestCase):
         self.assertFalse(recoveryctl.target_capabilities("source")["target_capabilities"][0]["can_create"])
         self.assertFalse(recoveryctl.target_capabilities("target")["target_capabilities"][0]["can_create"])
 
+    def test_capability_exposes_missing_index_and_divergent_routes_without_writes(self):
+        evidence.write_evidence("source", "snapshot", self.snapshot)
+        evidence.write_evidence("source", "policy", self.policy)
+        with patch.object(recoveryctl.tools_sync, "ensure_tools") as sync, patch.object(recoveryctl.remote, "run_remote_raw") as remote:
+            result = recoveryctl.target_capabilities("source")["target_capabilities"][0]
+            self.assertFalse(result["can_create"])
+            blocker = next(item for item in result["blockers"] if item["id"] == "discovery_routing")
+            self.assertIn("refresh Discover", blocker["next_action"])
+            evidence.write_evidence("source", "snapshot_nodes", {"nodes": [
+                {"name": "source", "ssh_alias": "source", "evidence": "snapshot"}]})
+            self.assertTrue(recoveryctl.target_capabilities("source")["target_capabilities"][0]["can_create"])
+            self.host["nodes"] = [{"name": "other", "ssh_alias": "other"}]
+            self.hostfile.write_text(json.dumps({"hosts": [self.host]}))
+            result = recoveryctl.target_capabilities("source")["target_capabilities"][0]
+            self.assertFalse(result["can_create"])
+            blocker = next(item for item in result["blockers"] if item["id"] == "discovery_routing")
+            self.assertIn("aliases differ", blocker["observed"])
+            self.assertFalse((self.root / "hosts" / ".locks").exists())
+            sync.assert_not_called(); remote.assert_not_called()
+
     def test_create_rechecks_exact_saved_snapshot_after_ui_capability_was_eligible(self):
         evidence.write_evidence("source", "snapshot", self.snapshot)
+        evidence.write_evidence("source", "snapshot_nodes", {"nodes": [
+            {"name": "source", "ssh_alias": "source", "evidence": "snapshot"}]})
         evidence.write_evidence("source", "policy", self.policy)
         self.assertTrue(recoveryctl.target_capabilities("source")["target_capabilities"][0]["can_create"])
         host = {"id": "source", "ssh_alias": "source", "remote_root": "/opt/opu", "sudo": True}

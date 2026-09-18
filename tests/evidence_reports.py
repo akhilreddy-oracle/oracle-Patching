@@ -2,6 +2,7 @@
 """Verified evidence comparison, absent data and safe export fixtures."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -90,6 +91,66 @@ class ReportTests(unittest.TestCase):
         report = reports.build('p')
         self.assertEqual(self.comparison(report, 'invalid_objects')['after']['value'], 0)
         self.assertEqual(len(report['evidence']['tasks']), 2)
+
+    def test_sorted_mutation_artifacts_cannot_replace_after_inventory_with_before(self):
+        for stage, prefix in (('rac_opatch_apply', 'apply'), ('grid_opatch_apply', 'apply'),
+                              ('rac_opatch_rollback', 'rollback'), ('grid_opatch_rollback', 'rollback')):
+            with self.subTest(stage=stage):
+                self.tasks.clear()
+                self.task('mutation-' + stage, stage, files={
+                    prefix + '-after-lspatches.log': '123;resulting inventory\n',
+                    prefix + '-before-lspatches.log': '999;previous inventory\n',
+                })
+                fact = self.comparison(reports.build('p'), 'binary_inventory')['after']
+                self.assertEqual(fact['value'], ['123'])
+                self.assertTrue(fact['source']['label'].endswith(prefix + '-after-lspatches.log'))
+
+    def test_standalone_datapatch_pre_health_cannot_overwrite_post_dictionary(self):
+        self.task(files={
+            'datapatch-dictionary.log': 'INVALID_OBJECTS=0\nCOMPONENT=CATALOG|VALID\n',
+            'datapatch-pre-health.log': 'DATABASE_UNIQUE_NAME=ORCL\nINVALID_OBJECTS=7\n',
+        })
+        fact = self.comparison(reports.build('p'), 'invalid_objects')['after']
+        self.assertEqual(fact['value'], 0)
+        self.assertTrue(fact['source']['label'].endswith('datapatch-dictionary.log'))
+
+    def test_successful_rollback_inventory_can_be_empty_without_retaining_applied_patches(self):
+        for output in ('', 'OPatch succeeded.\n', 'There are no Interim patches installed in this Oracle Home.\nOPatch succeeded.\n'):
+            with self.subTest(output=output):
+                self.tasks.clear()
+                self.plan.update(state='succeeded', intent='patch_rollback')
+                self.task('004-rollback-rac1', 'rac_opatch_rollback', files={
+                    'rollback-after-lspatches.log': output,
+                    'rollback-before-lspatches.log': '39034528;applied RU\n',
+                })
+                self.task('009-final-local', 'rac_rollback_final_validate', files={
+                    'rollback-cluster-final-lspatches.log': output,
+                })
+                report = reports.build('p')
+                fact = self.comparison(report, 'binary_inventory')['after']
+                self.assertTrue(report['completion_verified'])
+                self.assertEqual((fact['status'], fact['value']), ('verified', []))
+                self.assertEqual(fact['source']['task_id'], '009-final-local')
+
+    def test_missing_or_unrecognizable_after_inventory_never_becomes_empty_success(self):
+        self.task('004-apply-rac1', 'rac_opatch_apply', files={
+            'apply-before-lspatches.log': '123;baseline\n',
+        })
+        self.assertEqual(self.comparison(reports.build('p'), 'binary_inventory')['after']['status'], 'unknown')
+        self.task('005-validate-rac1', 'rac_node_validate', files={'node-validate-lspatches.log': '39034528;applied RU\n'})
+        self.task('009-final-local', 'cluster_final_validate', files={'cluster-final-lspatches.log': 'Inventory unavailable\n'})
+        fact = self.comparison(reports.build('p'), 'binary_inventory')['after']
+        self.assertEqual((fact['status'], fact['value']), ('unknown', None))
+        self.assertEqual(fact['source']['task_id'], '009-final-local')
+
+    def test_json_observation_side_must_match_the_stage(self):
+        self.task('005-final-local', 'final_validate', files={
+            'report-after.json': {'target': self.target, 'observations': {'invalid_objects': 0}},
+            'report-before.json': {'target': self.target, 'observations': {'invalid_objects': 7}},
+        })
+        fact = self.comparison(reports.build('p'), 'invalid_objects')['after']
+        self.assertEqual(fact['value'], 0)
+        self.assertTrue(fact['source']['label'].endswith('report-after.json'))
 
     def test_custody_change_rolls_back_all_facts_from_that_task(self):
         directory = self.task(files={'a-dictionary.log': 'INVALID_OBJECTS=0\n', 'z-lspatches.log': '39034528;RU\n'})
@@ -187,6 +248,24 @@ class ReportTests(unittest.TestCase):
         with self.assertRaises(OSError): reports._checked(link, digest)
         hard = self.root / 'hardlink'; hard.hardlink_to(path)
         with self.assertRaises(ValueError): reports._checked(path, digest)
+
+    def test_safe_source_read_rejects_fifo_oversize_and_path_replacement(self):
+        fifo = self.root / 'fifo'; os.mkfifo(fifo)
+        with self.assertRaises(ValueError): reports.evidence.read_regular_bytes(fifo)
+        path = self.root / 'file'; path.write_bytes(b'data')
+        with self.assertRaises(ValueError): reports.evidence.read_regular_bytes(path, maximum=3)
+        original = reports.evidence.os.fstat
+        calls = 0
+        def replace_after_capture(fd):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                replacement = self.root / 'replacement'; replacement.write_bytes(b'data')
+                replacement.replace(path)
+            return original(fd)
+        with patch.object(reports.evidence.os, 'fstat', side_effect=replace_after_capture):
+            with self.assertRaisesRegex(ValueError, 'source changed'):
+                reports.evidence.read_regular_bytes(path)
 
     def test_export_escapes_dynamic_html_formulas_and_secrets(self):
         report = reports.build('p')

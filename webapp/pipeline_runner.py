@@ -9,8 +9,10 @@ polls GET /api/runs/{run_id} for status/log/result.
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import re
+import stat
 import threading
 import time
 import uuid
@@ -30,6 +32,48 @@ _PROCESS_ID = uuid.uuid4().hex
 _CURRENT = threading.local()
 _UNRESOLVED = {"queued", "running", "unknown", "reconciling"}
 _STATUSES = _UNRESOLVED | {"succeeded", "failed"}
+_OWNER_LOCKS = {}
+_OWNER_REGISTRY_LOCK = threading.Lock()
+
+
+def _reset_after_fork() -> None:
+    """A child must neither retain its parent's ownership nor reuse its locks."""
+    global _PROCESS_ID, _OWNER_REGISTRY_LOCK, _REGISTRY_LOCK, _CURRENT
+    for descriptor, _, _ in _OWNER_LOCKS.values():
+        os.close(descriptor)
+    _OWNER_LOCKS.clear()
+    RUNS.clear()
+    _ACTIVE_KEYS.clear()
+    _PROCESS_ID = uuid.uuid4().hex
+    _OWNER_REGISTRY_LOCK = threading.Lock()
+    _REGISTRY_LOCK = threading.Lock()
+    _CURRENT = threading.local()
+
+
+os.register_at_fork(after_in_child=_reset_after_fork)
+
+
+def _owner_identity() -> dict:
+    """Hold an incarnation lock, independent of reusable numeric process IDs."""
+    key = (str(RUNS_DIR.resolve()), _PROCESS_ID, os.getpid())
+    with _OWNER_REGISTRY_LOCK:
+        if key not in _OWNER_LOCKS:
+            path = RUNS_DIR / ".owners" / (_PROCESS_ID + ".lock")
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_uid != os.geteuid():
+                    raise ValueError("Controller ownership lock is unsafe")
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            # Keep the descriptor until process exit. It is not inherited by exec.
+            _OWNER_LOCKS[key] = (descriptor, info.st_dev, info.st_ino)
+        _, device, inode = _OWNER_LOCKS[key]
+    return {"pid": os.getpid(), "instance": _PROCESS_ID, "protocol": "incarnation-lock-v1",
+            "lock_device": device, "lock_inode": inode}
 
 
 class RunConflict(Exception):
@@ -41,7 +85,7 @@ class RunConflict(Exception):
 
 
 class RunRecord:
-    def __init__(self, run_id: str, kind: str, key: str):
+    def __init__(self, run_id: str, kind: str, key: str, *, _new_owner: bool = True):
         self.run_id = run_id
         self.kind = kind
         self.key = key
@@ -52,7 +96,7 @@ class RunRecord:
         self.log_lines: list[str] = []
         self.result = None
         self.error = None
-        self.owner = {"pid": os.getpid(), "instance": _PROCESS_ID}
+        self.owner = _owner_identity() if _new_owner else {}
         self.context: dict = {}
         self.reconciliation: dict | None = None
         self.timeline: list[dict] = [{'sequence': 1, 'at': self.created_at, 'event': 'queued', 'message': 'Operation queued'}]
@@ -242,7 +286,7 @@ def _load_persisted(run_id: str) -> RunRecord | None:
         return None
     if not isinstance(data, dict):
         return None
-    record = RunRecord(run_id, data.get("kind") or "unknown", data.get("key") or "")
+    record = RunRecord(run_id, data.get("kind") or "unknown", data.get("key") or "", _new_owner=False)
     raw_status = data.get("status")
     invalid_status = not isinstance(raw_status, str) or raw_status not in _STATUSES
     record.status = "unknown" if invalid_status else raw_status
@@ -267,6 +311,30 @@ def _load_persisted(run_id: str) -> RunRecord | None:
 
 
 def _owner_alive(owner: dict) -> bool:
+    if owner.get("protocol") == "incarnation-lock-v1":
+        instance = owner.get("instance")
+        if not isinstance(instance, str) or not re.fullmatch(r"[a-f0-9]{32}", instance):
+            return True
+        descriptor = None
+        try:
+            descriptor = os.open(RUNS_DIR / ".owners" / (instance + ".lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077
+                    or info.st_uid != os.geteuid()
+                    or (info.st_dev, info.st_ino) != (owner.get("lock_device"), owner.get("lock_inode"))):
+                return True
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except (OSError, ValueError, TypeError):
+            # Missing, replaced or inaccessible proof cannot establish death.
+            return True
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    if owner.get("protocol") is not None:
+        return True
+    # Historical records have no incarnation proof. Keep their PID check
+    # conservative, including when an unrelated process has reused that PID.
     try:
         pid = int(owner.get("pid") or 0)
         if pid <= 0:

@@ -42,6 +42,9 @@ class LiveRecoveryTests(unittest.TestCase):
                          "databases": [{"db_unique_name": "ORCL", "oracle_home": "/u01/db", "runtime": {"instance": "ORCL",
                              "status": "complete", "database_role": "PRIMARY", "open_mode": "READ WRITE", "instance_state": "OPEN", "log_mode": "NOARCHIVELOG", "cdb": "NO"}}]}
         evidence.write_evidence("sourcedb", "snapshot", self.snapshot)
+        evidence.write_evidence("sourcedb", "snapshot_sourcedb", self.snapshot)
+        evidence.write_evidence("sourcedb", "snapshot_nodes", {"schema_version": "1.0", "nodes": [
+            {"name": "sourcedb", "ssh_alias": "source", "evidence": "snapshot_sourcedb"}]})
         evidence.write_evidence("sourcedb", "policy", self.policy)
         self.sync = self.enterContext(patch.object(recoveryctl.tools_sync, "ensure_tools", side_effect=runtime_receipt))
         self.shell = self.enterContext(patch.object(recoveryctl.remote, "run_remote_shell", return_value=self.response("")))
@@ -354,6 +357,7 @@ class LiveRecoveryTests(unittest.TestCase):
                           (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"), None]:
             snapshot = {**self.snapshot, "collected_at": timestamp}
             evidence.write_evidence("sourcedb", "snapshot", snapshot)
+            evidence.write_evidence("sourcedb", "snapshot_sourcedb", snapshot)
             with self.assertRaisesRegex(recoveryctl.RecoveryError, "Refresh discovery"):
                 self.create()
         self.raw.assert_not_called()
@@ -363,6 +367,125 @@ class LiveRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(recoveryctl.RecoveryError, "retarget"):
             self.create(host={**self.host, "ssh_alias": "other"})
         self.raw.assert_not_called()
+
+    def test_discovery_and_recovery_must_use_the_same_single_ssh_route(self):
+        for nodes in ([{"name": "one", "ssh_alias": "different-node"}],
+                      [{"name": "one", "ssh_alias": "source"}, {"name": "two", "ssh_alias": "source"}]):
+            with self.subTest(nodes=nodes):
+                self.host["nodes"] = nodes
+                self.hostfile.write_text(json.dumps({"hosts": [self.host]}))
+                with self.assertRaisesRegex(recoveryctl.RecoveryError, "Standalone recovery"):
+                    self.create()
+        self.sync.assert_not_called()
+        self.raw.assert_not_called()
+        self.push.assert_not_called()
+
+    def test_create_requires_matching_discovery_index_and_primary_bytes(self):
+        for index in (None, {"nodes": []}, {"nodes": [{"name": "sourcedb", "ssh_alias": "other", "evidence": "snapshot_sourcedb"}]}):
+            with self.subTest(index=index):
+                evidence.clear_evidence("sourcedb", "snapshot_nodes")
+                if index is not None:
+                    evidence.write_evidence("sourcedb", "snapshot_nodes", index)
+                with self.assertRaisesRegex(recoveryctl.RecoveryError, "Refresh Discover"):
+                    self.create()
+        evidence.write_evidence("sourcedb", "snapshot_nodes", {"nodes": [
+            {"name": "sourcedb", "ssh_alias": "source", "evidence": "snapshot_sourcedb"}]})
+        evidence.write_evidence("sourcedb", "snapshot_sourcedb", {**self.snapshot, "host": {"name": "other"}})
+        with self.assertRaisesRegex(recoveryctl.RecoveryError, "Refresh Discover"):
+            self.create()
+        self.sync.assert_not_called()
+        self.raw.assert_not_called()
+
+    def test_unsafe_discovery_files_are_rejected_without_blocking_or_remote_work(self):
+        index = evidence.evidence_path("sourcedb", "snapshot_nodes")
+        original = index.read_bytes()
+        reference = self.root / "index-reference.json"; reference.write_bytes(original)
+        for kind in ("symlink", "hardlink", "fifo", "oversized"):
+            with self.subTest(kind=kind):
+                index.unlink()
+                if kind == "symlink":
+                    index.symlink_to(reference)
+                elif kind == "hardlink":
+                    index.hardlink_to(reference)
+                elif kind == "fifo":
+                    os.mkfifo(index)
+                else:
+                    with index.open("wb") as stream:
+                        stream.truncate(4 * 1024 * 1024 + 1)
+                with self.assertRaisesRegex(recoveryctl.RecoveryError, "Refresh Discover"):
+                    self.create()
+        self.sync.assert_not_called(); self.raw.assert_not_called()
+
+    def test_selection_rejects_a_stale_callers_node_route(self):
+        self.prepared()
+        stale = {**self.host, "nodes": [{"name": "other-node", "ssh_alias": "source"}]}
+        with self.assertRaisesRegex(recoveryctl.RecoveryError, "different configured host"):
+            recoveryctl.selection_status("r1", host_id="sourcedb", host=stale)
+        self.raw.assert_not_called()
+
+    def test_node_fqdn_and_ssh_alias_need_not_equal_discovered_hostname(self):
+        self.host["nodes"] = [{"name": "db-node.example.test"}]
+        self.hostfile.write_text(json.dumps({"hosts": [self.host]}))
+        self.snapshot["host"] = {"name": "oracle-guest"}
+        evidence.write_evidence("sourcedb", "snapshot", self.snapshot)
+        evidence.write_evidence("sourcedb", "snapshot_db-node", self.snapshot)
+        evidence.write_evidence("sourcedb", "snapshot_nodes", {"nodes": [
+            {"name": "db-node", "ssh_alias": "source", "evidence": "snapshot_db-node"}]})
+        result = self.create()
+        self.assertEqual(result["state"], "awaiting_approval")
+        binding = recoveryctl._metadata("r1")["discovery_binding"]
+        self.assertEqual(binding["route"], {"node": "db-node", "ssh_alias": "source"})
+        self.assertEqual(self.raw.call_args.args[0], "source")
+
+    def test_changed_node_routes_reject_new_actions_before_synchronization(self):
+        self.prepared()
+        self.host["nodes"] = [{"name": "different-node", "ssh_alias": "other"}]
+        self.hostfile.write_text(json.dumps({"hosts": [self.host]}))
+        self.sync.reset_mock()
+        for action in (lambda: recoveryctl.analyze("r1"),
+                       lambda: recoveryctl.approve("r1", "approver", "TICKET"),
+                       lambda: recoveryctl.authorize("r1", "operator"),
+                       lambda: recoveryctl.execute("r1", "operator")):
+            with self.assertRaises(recoveryctl.RecoveryError):
+                action()
+        self.sync.assert_not_called()
+        self.raw.assert_not_called()
+
+    def test_saved_discovery_binding_is_immutable_but_new_evidence_does_not_retarget_it(self):
+        self.prepared()
+        evidence.write_evidence("sourcedb", "snapshot", {"new": "discovery"})
+        evidence.write_evidence("sourcedb", "snapshot_nodes", {"nodes": []})
+        self.raw.return_value = self.response({"request_id": "r1", "state": "awaiting_approval"})
+        self.assertEqual(recoveryctl.status("r1")["state"], "awaiting_approval")
+        (recoveryctl.LIVE_DIR / "r1" / "snapshot_nodes.json").chmod(0o600)
+        (recoveryctl.LIVE_DIR / "r1" / "snapshot_nodes.json").write_text('{}')
+        self.sync.reset_mock(); self.raw.reset_mock()
+        with self.assertRaisesRegex(recoveryctl.RecoveryError, "immutable evidence changed"):
+            recoveryctl.analyze("r1")
+        self.sync.assert_not_called(); self.raw.assert_not_called()
+
+    def test_legacy_requests_remain_inspectable_but_cannot_gain_new_authority(self):
+        self.prepared()
+        metadata = recoveryctl._metadata("r1"); metadata.pop("discovery_binding")
+        write_json(recoveryctl.LIVE_DIR / "r1" / "metadata.json", metadata)
+        self.raw.return_value = self.response({"request_id": "r1", "state": "awaiting_approval"})
+        self.assertEqual(recoveryctl.status("r1")["state"], "awaiting_approval")
+        self.sync.reset_mock(); self.raw.reset_mock()
+        for action in (lambda: recoveryctl.analyze("r1"),
+                       lambda: recoveryctl.approve("r1", "approver", "TICKET"),
+                       lambda: recoveryctl.authorize("r1", "operator"),
+                       lambda: recoveryctl.execute("r1", "operator"),
+                       lambda: recoveryctl.selection_status("r1", host_id="sourcedb", host=self.host)):
+            with self.assertRaisesRegex(recoveryctl.RecoveryError, "predates verified discovery routing"):
+                action()
+        self.sync.assert_not_called(); self.raw.assert_not_called()
+        self.execution()
+        self.shell.return_value = self.response("DEAD\n")
+        with patch.object(recoveryctl, "_execute_live", return_value={"status": "fixture-reconciliation"}) as existing:
+            result = recoveryctl.reconcile("r1", "operator")
+        self.assertEqual(result["status"], "fixture-reconciliation")
+        self.assertEqual(existing.call_args.kwargs["action"], "reconcile")
+        self.assertEqual(existing.call_args.args[1]["ssh_alias"], "source")
 
     def test_native_response_cannot_change_bound_input_or_target(self):
         self.prepared()

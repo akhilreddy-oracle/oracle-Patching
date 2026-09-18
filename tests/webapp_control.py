@@ -11,6 +11,7 @@ import sys
 import tempfile
 import tarfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from runtime_fixture import runtime_receipt, host_runtime_receipts
@@ -616,6 +617,114 @@ sys.stdin.readline()
             if child.poll() is None:
                 child.kill()
                 child.communicate()
+
+    def test_incarnation_lock_blocks_live_owner_and_allows_reused_pid_after_exit(self):
+        program = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import pipeline_runner as runner
+runner.RUNS_DIR = Path(sys.argv[2])
+record = runner.RunRecord('bbbbbbbbbbbb', 'pipeline', 'host:fixture:pipeline')
+record.status = 'running'
+record._persist()
+print(record.run_id, flush=True)
+sys.stdin.readline()
+"""
+        child = subprocess.Popen([sys.executable, "-B", "-c", program, str(Path(server.__file__).parent), str(pipeline_runner.RUNS_DIR)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            run_id = child.stdout.readline().strip()
+            self.assertEqual(run_id, "bbbbbbbbbbbb")
+            record = pipeline_runner.get_run(run_id)
+            self.assertEqual(record.status, "unknown")
+            options = {"actor": "operator", "inspect": lambda _: {}, "confirm_no_active_execution": True, "note": "Verified no native execution remains"}
+            with self.assertRaises(pipeline_runner.RunConflict):
+                pipeline_runner.reconcile_run(run_id, **options)
+            child.communicate("exit\n", timeout=5)
+            self.assertEqual(child.returncode, 0)
+            # A replacement controller (or an unrelated process) can reuse the
+            # same numeric PID. The old incarnation's lock is now released.
+            record.owner["pid"] = os.getpid()
+            record._persist()
+            self.assertFalse(pipeline_runner._owner_alive(record.owner))
+            result = pipeline_runner.reconcile_run(run_id, **options)
+            self.assertEqual(result["status"], "failed")
+            self.assertIsNone(pipeline_runner.active_run_id(record.key))
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+
+    def test_legacy_or_damaged_owner_proof_is_conservative(self):
+        self.assertTrue(pipeline_runner._owner_alive({"pid": os.getpid(), "instance": "old-controller"}))
+        owner = {"pid": 2147483647, "instance": "f" * 32, "protocol": "incarnation-lock-v1",
+                 "lock_device": 0, "lock_inode": 0}
+        self.assertTrue(pipeline_runner._owner_alive(owner), "Missing proof must not release ownership")
+        path = pipeline_runner.RUNS_DIR / ".owners" / (owner["instance"] + ".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(""); path.chmod(0o600)
+        self.assertTrue(pipeline_runner._owner_alive(owner), "A substituted inode must not release ownership")
+
+    def test_reading_historical_runs_does_not_create_owner_locks(self):
+        for run_id, status in (("cccccccccccc", "succeeded"), ("dddddddddddd", "running")):
+            directory = pipeline_runner.RUNS_DIR / run_id
+            directory.mkdir(parents=True)
+            (directory / "run.json").write_text(json.dumps({"status": status, "kind": "pipeline", "key": run_id,
+                                                          "owner": {"pid": 2147483647, "instance": "historical"}}))
+            with patch.object(pipeline_runner, "_owner_identity", side_effect=AssertionError("Historical read acquired ownership")):
+                record = pipeline_runner.get_run(run_id)
+            self.assertEqual(record.status, "succeeded" if status == "succeeded" else "unknown")
+            self.assertFalse((pipeline_runner.RUNS_DIR / ".owners").exists())
+
+    def test_forked_incarnations_release_only_their_own_locks(self):
+        program = """
+import json, os, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import pipeline_runner as runner
+runner.RUNS_DIR = Path(sys.argv[2])
+signals = Path(sys.argv[3])
+owner = runner._owner_identity()
+print(json.dumps({'role': 'parent', 'owner': owner}), flush=True)
+child = os.fork()
+role = 'parent' if child else 'child'
+if not child:
+    print(json.dumps({'role': role, 'owner': runner._owner_identity()}), flush=True)
+deadline = time.monotonic() + 10
+while not (signals / role).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+os._exit(0)
+"""
+        def wait_released(owner):
+            deadline = time.monotonic() + 3
+            while pipeline_runner._owner_alive(owner) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(pipeline_runner._owner_alive(owner))
+
+        for first, second in (("child", "parent"), ("parent", "child")):
+            with self.subTest(first_exit=first):
+                signals = self.root / ("fork-" + first)
+                signals.mkdir()
+                process = subprocess.Popen([sys.executable, "-B", "-c", program, str(Path(server.__file__).parent),
+                                            str(pipeline_runner.RUNS_DIR), str(signals)],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    messages = [json.loads(process.stdout.readline()) for _ in range(2)]
+                    owners = {item["role"]: item["owner"] for item in messages}
+                    self.assertNotEqual(owners["parent"]["instance"], owners["child"]["instance"])
+                    self.assertTrue(all(pipeline_runner._owner_alive(owner) for owner in owners.values()))
+                    (signals / first).touch()
+                    wait_released(owners[first])
+                    self.assertTrue(pipeline_runner._owner_alive(owners[second]))
+                    (signals / second).touch()
+                    wait_released(owners[second])
+                    _, stderr = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 0, stderr)
+                finally:
+                    (signals / "parent").touch()
+                    (signals / "child").touch()
+                    process.communicate(timeout=12)
 
     def test_custom_plan_names_use_explicit_host_identity(self):
         plan = {"plan_id": "custom-change-name", "created_at": "2026-09-14T00:00:00Z", "source_documents": {"readiness": {"path": str(evidence.VAR_DIR / "host-a" / "evidence" / "readiness.json")}}}

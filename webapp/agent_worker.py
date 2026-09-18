@@ -15,7 +15,7 @@ def run_once(node: str, agent: str, lease: int = 120, token: str | None = None) 
     test_mode = os.environ.get("OPU_AGENT_TEST_MODE") == "1"
     if not test_mode and not Path(os.environ.get("OPU_PLAN_STATE_DIR", "")).is_absolute():
         raise agent_queue.QueueError("an absolute OPU_PLAN_STATE_DIR is required before claiming real work", 409)
-    job = agent_queue.claim(node, agent, lease_seconds=lease, agent_token=token)
+    job = agent_queue.claim(node, agent, lease_seconds=lease, agent_token=token, managed=True)
     if job is None:
         return {"status": "idle", "message": "no queued work for node"}, 0
     claim_token = job["claim_token"]
@@ -42,6 +42,7 @@ def run_once(node: str, agent: str, lease: int = 120, token: str | None = None) 
         agent_queue.extend_lease(job["job_id"], agent, lease, **credentials)
         argv = [executor, "execute", "--plan-id", job["plan_id"], "--task-id", job["task_id"],
                 "--actor", agent, "--lease-seconds", str(lease)]
+        agent_queue.admit_launch(job["job_id"], agent, **credentials)
         try:
             proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except OSError:

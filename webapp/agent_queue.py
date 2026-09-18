@@ -15,6 +15,9 @@ import json
 import os
 import stat
 import time
+import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 import runtime_paths
 
@@ -24,6 +27,7 @@ from adapters import EXECUTOR_PATHS
 QUEUE_DIR_ENV = "OPU_AGENT_QUEUE_DIR"
 DEFAULT_QUEUE_DIR = runtime_paths.state_dir() / "agent-queue"
 ENROLLMENT_REQUIRED_ENV = "OPU_AGENT_ENROLLMENT_REQUIRED"
+_ADMISSIONS = ContextVar("queue_plan_admissions", default=frozenset())
 
 
 class QueueError(Exception):
@@ -57,7 +61,7 @@ def _write_job(path: Path, payload: dict) -> None:
     write_json(path, payload)
 
 
-def _read_job(path: Path) -> dict:
+def _read_job(path: Path, *, job_id: str | None = None) -> dict:
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as source:
@@ -69,7 +73,7 @@ def _read_job(path: Path) -> dict:
         if len(raw) > 4 * 1024 * 1024:
             raise ValueError("oversized job record")
         job = json.loads(raw)
-        if not isinstance(job, dict) or job.get("job_id") != path.stem:
+        if not isinstance(job, dict) or job.get("job_id") != (job_id or path.stem):
             raise ValueError("invalid job binding")
         if not isinstance(job.get("status"), str) or job["status"] not in {"queued", "claimed", "running", "completed", "reconciliation_required"}:
             raise ValueError("invalid job state")
@@ -90,6 +94,9 @@ def _read_job(path: Path) -> dict:
             raise ValueError("invalid job payload")
         if job.get("result") is not None and not isinstance(job["result"], dict):
             raise ValueError("invalid job result")
+        if job.get("launch_protocol") is not None and (job["launch_protocol"] != "managed-admission-v1"
+                or job.get("launch_state") not in {"unlaunched", "admitted"}):
+            raise ValueError("invalid managed launch state")
         result_status = (job.get("result") or {}).get("status")
         if result_status is not None and not isinstance(result_status, str):
             raise ValueError("invalid job result status")
@@ -125,6 +132,24 @@ def _public(job: dict) -> dict:
     return {k: v for k, v in job.items() if k != "claim_token_sha256"}
 
 
+@contextmanager
+def plan_admission(plan_id: str, *, timeout: float = 10):
+    """Serialize publication/retry with claims without blocking other plans."""
+    _identifier(plan_id, "plan_id")
+    path = queue_dir() / ".plan-admission" / (plan_id + ".lock")
+    key = (str(path), os.getpid(), threading.get_ident())
+    held = _ADMISSIONS.get()
+    if key in held:
+        yield
+        return
+    with file_lock(path, timeout=timeout):
+        token = _ADMISSIONS.set(held | {key})
+        try:
+            yield
+        finally:
+            _ADMISSIONS.reset(token)
+
+
 def publish_task(*, plan_id: str, task_id: str, node: str, adapter: str, payload: dict | None = None) -> dict:
     for value, label in ((plan_id, "plan_id"), (task_id, "task_id"), (node, "node")):
         _identifier(value, label)
@@ -138,7 +163,7 @@ def publish_task(*, plan_id: str, task_id: str, node: str, adapter: str, payload
         raise QueueError("invalid task retry generation")
     job_id = f"{plan_id}__{task_id}"
     path = _job_path(job_id)
-    with file_lock(queue_dir() / ".queue.lock"):
+    with plan_admission(plan_id), file_lock(queue_dir() / ".queue.lock"):
         old = _read_job(path) if path.exists() else None
         if old:
             if old["node"] != node or old["adapter"] != adapter or old["plan_id"] != plan_id or old["task_id"] != task_id:
@@ -149,8 +174,10 @@ def publish_task(*, plan_id: str, task_id: str, node: str, adapter: str, payload
                 raise QueueError("reconcile previous attempt before publishing a retry", 409)
             archive = queue_dir() / "history" / job_id / f"attempt-{old.get('attempt', 0)}.json"
             if archive.exists():
-                raise QueueError("queue attempt history already exists", 409)
-            _write_job(archive, old)
+                if _read_job(archive, job_id=job_id) != old:
+                    raise QueueError("queue attempt history differs from the previous attempt", 409)
+            else:
+                _write_job(archive, old)
         now = int(time.time())
         job = {"schema_version": "1.0", "job_id": job_id, "plan_id": plan_id, "task_id": task_id,
                "node": node, "adapter": adapter, "attempt": attempt, "status": "queued",
@@ -194,6 +221,36 @@ def assert_no_unresolved_plan_tasks(plan_id: str) -> None:
                 raise QueueError("Pull-agent work reserves this plan; reconcile its queue attempt before HTTP execution", 409)
 
 
+@contextmanager
+def retry_admission(plan_id: str, task_id: str):
+    """Permit only a completed failed attempt, preserving future queue work."""
+    _identifier(task_id, "task_id")
+    with plan_admission(plan_id):
+        with file_lock(queue_dir() / ".queue.lock"):
+            jobs = [_read_job(path) for path in sorted((queue_dir() / "jobs").glob("*.json"))]
+            jobs = [job for job in jobs if job["plan_id"] == plan_id]
+            candidate = next((job for job in jobs if job["task_id"] == task_id), None)
+            if jobs:
+                if candidate is None:
+                    raise QueueError("This plan has published work but no matching retry attempt", 409)
+                for job in jobs:
+                    if job["status"] == "queued" and job["task_id"] > task_id:
+                        continue
+                    result = job.get("result") or {}
+                    task = result.get("task") or {}
+                    if (job["status"] != "completed" or result.get("source") != "sealed_plan_task"
+                            or not isinstance(task, dict) or task.get("plan_id") != plan_id
+                            or task.get("task_id") != job["task_id"] or task.get("adapter") != job["adapter"]
+                            or type(task.get("retry_count", 0)) is not int or task.get("retry_count", 0) != job["attempt"]
+                            or task.get("status") not in {"succeeded", "failed"}
+                            or result.get("status") not in {"success", "succeeded", "failed"}
+                            or (task["status"] == "failed") != (result["status"] == "failed")):
+                        raise QueueError("Active or unverified queue work prevents task retry", 409)
+                if (candidate.get("result") or {}).get("status") != "failed":
+                    raise QueueError("Only a verified failed queue attempt can be retried", 409)
+        yield candidate
+
+
 def _expire(job: dict, now: int) -> bool:
     if job["status"] in {"claimed", "running"} and int(job.get("lease_expires_epoch") or 0) <= now:
         job.update(status="reconciliation_required", updated_at_epoch=now,
@@ -203,7 +260,7 @@ def _expire(job: dict, now: int) -> bool:
     return False
 
 
-def claim(node: str, agent_id: str, lease_seconds: int = 120, agent_token: str | None = None) -> dict | None:
+def claim(node: str, agent_id: str, lease_seconds: int = 120, agent_token: str | None = None, *, managed: bool = False) -> dict | None:
     _identifier(node, "node"); _identifier(agent_id, "agent_id")
     if type(lease_seconds) is not int or not 30 <= lease_seconds <= 3600:
         raise QueueError("lease_seconds must be between 30 and 3600")
@@ -227,12 +284,20 @@ def claim(node: str, agent_id: str, lease_seconds: int = 120, agent_token: str |
                    (j["status"] != "completed" or (j.get("result") or {}).get("status") not in {"success", "succeeded"})
                    for j in peers):
                 continue
-            token = secrets.token_urlsafe(32)
-            job.update(status="claimed", claimed_by=agent_id, lease_expires_epoch=now + lease_seconds,
-                       updated_at_epoch=now, claim_generation=job.get("claim_generation", 0) + 1,
-                       claim_token_sha256=hashlib.sha256(token.encode()).hexdigest())
-            _write_job(_job_path(job["job_id"]), job)
-            return {**_public(job), "claim_token": token}
+            try:
+                with plan_admission(job["plan_id"], timeout=0):
+                    token = secrets.token_urlsafe(32)
+                    job.update(status="claimed", claimed_by=agent_id, lease_expires_epoch=now + lease_seconds,
+                               updated_at_epoch=now, claim_generation=job.get("claim_generation", 0) + 1,
+                               claim_token_sha256=hashlib.sha256(token.encode()).hexdigest())
+                    job.pop("launch_protocol", None)
+                    job.pop("launch_state", None)
+                    if managed:
+                        job.update(launch_protocol="managed-admission-v1", launch_state="unlaunched")
+                    _write_job(_job_path(job["job_id"]), job)
+                    return {**_public(job), "claim_token": token}
+            except TimeoutError:
+                continue
     return None
 
 
@@ -254,6 +319,19 @@ def extend_lease(job_id: str, agent_id: str, seconds: int, agent_token: str | No
         _owned(job, agent_id, agent_token, claim_token)
         now = int(time.time())
         job.update(status="running", lease_expires_epoch=now + seconds, updated_at_epoch=now)
+        _write_job(path, job)
+        return _public(job)
+
+
+def admit_launch(job_id: str, agent_id: str, agent_token: str | None = None, claim_token: str | None = None) -> dict:
+    """Fence a late managed worker before any subprocess can be created."""
+    with file_lock(queue_dir() / ".queue.lock"):
+        path = _job_path(job_id)
+        job = _read_job(path)
+        _owned(job, agent_id, agent_token, claim_token)
+        if job.get("launch_protocol") != "managed-admission-v1" or job.get("launch_state") != "unlaunched":
+            raise QueueError("This claim has no unused managed launch admission", 409)
+        job.update(launch_state="admitted", updated_at_epoch=int(time.time()))
         _write_job(path, job)
         return _public(job)
 
@@ -309,6 +387,8 @@ def defer_pending(job_id: str, agent_id: str, reason: str, agent_token: str | No
         job = _read_job(path)
         _owned(job, agent_id, agent_token, claim_token)
         job.pop("claim_token_sha256", None)
+        job.pop("launch_protocol", None)
+        job.pop("launch_state", None)
         job.update(status="queued", claimed_by=None, lease_expires_epoch=None,
                    updated_at_epoch=int(time.time()), reason=reason)
         _write_job(path, job)
@@ -356,13 +436,25 @@ def reconcile(job_id: str, actor: str) -> dict:
             raise QueueError("job does not require reconciliation", 409)
         generation, attempt = job.get("claim_generation", 0), job.get("attempt", 0)
     task = native_task(job)
-    if task.get("status") not in {"succeeded", "failed"}:
+    unlaunched = (task.get("status") == "pending" and job.get("launch_protocol") == "managed-admission-v1"
+                  and job.get("launch_state") == "unlaunched")
+    if task.get("status") not in {"succeeded", "failed"} and not unlaunched:
         raise QueueError("sealed task has no verified terminal outcome for this attempt", 409)
     with file_lock(queue_dir() / ".queue.lock"):
         job = _read_job(path)
         if (job["status"] != "reconciliation_required" or job.get("claim_generation", 0) != generation
                 or job.get("attempt", 0) != attempt):
             raise QueueError("queue attempt changed while verifying reconciliation", 409)
+        if unlaunched:
+            if job.get("launch_protocol") != "managed-admission-v1" or job.get("launch_state") != "unlaunched":
+                raise QueueError("managed launch admission changed during reconciliation", 409)
+            job.pop("claim_token_sha256", None)
+            job.pop("launch_protocol", None)
+            job.pop("launch_state", None)
+            job.update(status="queued", claimed_by=None, lease_expires_epoch=None, updated_at_epoch=int(time.time()),
+                       reconciled_by=actor, reason="Operator verified pending native task and unused managed launch admission")
+            _write_job(path, job)
+            return _public(job)
         job.update(status="completed", lease_expires_epoch=None, updated_at_epoch=int(time.time()),
                    reconciled_by=actor, result={"status": task["status"], "source": "sealed_plan_task", "task": task})
         _write_job(path, job)

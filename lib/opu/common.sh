@@ -327,14 +327,6 @@ opu_operation_error() {
     OPU_ERROR_RETRYABLE=${3:-false}
 }
 
-# Exact line match for production certification markers. Substring grep would
-# accept OPU_PRODUCTION_CERTIFIED=10 / =1foo and fail open.
-opu_cert_marker_line() {
-    local file=$1 key=$2
-    [ -f "$file" ] && [ ! -L "$file" ] || return 1
-    grep -Eq "^${key}$" "$file"
-}
-
 opu_boolean_value() {
     local value label
     value=${1-}
@@ -352,27 +344,14 @@ opu_boolean_value() {
 # requires an explicit local certification marker. Lab/default builds leave
 # production mode off and are unaffected.
 opu_require_production_certified() {
-    local mode cert checklist
+    local mode cert checklist helper
     mode=$(opu_boolean_value "${OPU_PRODUCTION_MODE:-0}" OPU_PRODUCTION_MODE) || return $?
     [ "$mode" = 1 ] || return 0
     checklist=$(opu_boolean_value "${OPU_PRODUCTION_REQUIRE_CHECKLIST:-0}" OPU_PRODUCTION_REQUIRE_CHECKLIST) || return $?
     cert=${OPU_PRODUCTION_CERT_FILE:-/etc/oracle-patching/production.cert}
-    [ -f "$cert" ] && [ ! -L "$cert" ] || {
-        opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is missing: $cert"
+    helper="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/production_cert.py"
+    opu_python "$helper" "$cert" "$checklist" || {
+        opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is missing, unsafe, invalid or incomplete: $cert"
         return 77
     }
-    opu_cert_marker_line "$cert" 'OPU_PRODUCTION_CERTIFIED=1' || {
-        opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is invalid: $cert"
-        return 77
-    }
-    case "$checklist" in
-        1)
-            for key in OPU_SBOM_VERIFIED=1 OPU_RELEASE_SIGNED=1 OPU_THREAT_MODEL_SIGNED=1; do
-                opu_cert_marker_line "$cert" "$key" || {
-                    opu_error "OPU_PRODUCTION_MODE checklist incomplete; missing $key in $cert"
-                    return 77
-                }
-            done
-            ;;
-    esac
 }

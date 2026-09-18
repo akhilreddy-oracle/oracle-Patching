@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 from contextlib import contextmanager
@@ -93,6 +94,27 @@ def read_evidence(host_id: str, name: str) -> dict | None:
     if not path.is_file():
         return None
     return json.loads(path.read_text())
+
+
+def read_regular_bytes(path: Path, maximum: int = 4 * 1024 * 1024) -> bytes:
+    """Capture bounded evidence without following links or accepting a moving file."""
+    path = Path(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > maximum:
+            raise ValueError("source is not a bounded independent regular file")
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            data = stream.read(maximum + 1)
+        after, named = os.fstat(fd), path.lstat()
+        identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns, item.st_nlink, item.st_mode)
+        if identity(before) != identity(after) or identity(named) != identity(before):
+            raise ValueError("source changed while being verified")
+        if len(data) > maximum:
+            raise ValueError("source exceeds the evidence size limit")
+        return data
+    finally:
+        os.close(fd)
 
 
 @contextmanager
