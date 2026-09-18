@@ -18,5 +18,5 @@ opu_find_python() {
 opu_python() {
   local executable
   executable=$(opu_find_python) || return $?
-  "$executable" "$@"
+  "$executable" -B "$@"
 }

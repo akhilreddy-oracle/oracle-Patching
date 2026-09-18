@@ -9,9 +9,9 @@ case "$input" in
   *OPU_RECOVERY_PREP_PROBE*)
     state=$(cat "$state_file")
     if [ "$state" = OPEN ]; then
-      printf 'ORCL|ORCL|PRIMARY|READ WRITE|NOARCHIVELOG|OPEN|12345|%s/spfileORCL.ora|1024\n' "$OPU_TEST_RUNTIME"
+      printf 'ORCL|ORCL|PRIMARY|READ WRITE|NOARCHIVELOG|OPEN|12345|%s/spfileORCL.ora|1024|%s\n' "$OPU_TEST_RUNTIME" "${OPU_TEST_CDB-NO}"
     else
-      printf 'ORCL|ORCL|PRIMARY|MOUNTED|NOARCHIVELOG|MOUNTED|12345|%s/spfileORCL.ora|1024\n' "$OPU_TEST_RUNTIME"
+      printf 'ORCL|ORCL|PRIMARY|MOUNTED|NOARCHIVELOG|MOUNTED|12345|%s/spfileORCL.ora|1024|%s\n' "$OPU_TEST_RUNTIME" "${OPU_TEST_CDB-NO}"
     fi
     ;;
   *OPU_RECOVERY_PREP_CAPACITY*)

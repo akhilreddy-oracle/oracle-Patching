@@ -18,6 +18,19 @@ if run approve --job-id grid-job-001 --actor patch-admin >/dev/null 2>&1; then
     echo 'requester self-approval was accepted' >&2; exit 1
 fi
 run approve --job-id grid-job-001 --actor dba-approver
+# Rejected lifecycle transitions cannot replace already-authorized evidence.
+if run ready --job-id grid-job-001 --actor precheck-agent --evidence-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null 2>&1; then
+    echo 'ready was accepted after approval' >&2; exit 1
+fi
+[ "$(cat "$TMP/state/jobs/grid-job-001/precheck_evidence.sha256")" = "$digest" ]
+if run approve --job-id grid-job-001 --actor different-approver >/dev/null 2>&1; then
+    echo 'duplicate approval was accepted' >&2; exit 1
+fi
+[ "$(cat "$TMP/state/jobs/grid-job-001/approved_by")" = dba-approver ]
+# The read and completion entry points must reject traversal identifiers too.
+if run status --job-id ../jobs/grid-job-001 >/dev/null 2>&1; then
+    echo 'job path traversal was accepted' >&2; exit 1
+fi
 run start --job-id grid-job-001 --actor patch-operator
 next=$(run next --job-id grid-job-001)
 task=$(jq -r '.task_id' <<<"$next")

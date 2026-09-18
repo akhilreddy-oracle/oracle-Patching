@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import runtime_paths
 import re
 import shlex
 import subprocess
@@ -36,8 +37,8 @@ TOOL = REPO_ROOT / "bin" / "opu-database-recovery-prepare"
 # path can never look like a real deployment location. Confirmed by hitting
 # this directly: bin/opu-database-recovery-prepare:33-39.
 RECOVERY_DIR = Path("/tmp/opu-webapp-recovery-fixtures")
-LIVE_DIR = Path(__file__).resolve().parent / "var" / "recovery-live"
-HOSTS_FILE = Path(__file__).resolve().parent / "hosts.json"
+LIVE_DIR = runtime_paths.state_dir() / "recovery-live"
+HOSTS_FILE = runtime_paths.hosts_file()
 REMOTE_STATE_DIR = "/var/lib/oracle-patching-utility/recovery-preparations"
 LIVE_EXECUTE_TIMEOUT_SECONDS = 86400
 LIVE_POLL_INTERVAL_SECONDS = 5
@@ -63,7 +64,7 @@ def capability() -> dict:
     return {**result, "live_available": True, "live_reason": None}
 
 
-def _target_capability(snapshot, database, maximum_age, *, now=None, window_start=None) -> dict:
+def _target_capability(snapshot, database, maximum_age, *, now=None, window_start=None, routing_requirement=None) -> dict:
     """Screen saved observations for request creation, never authorize a backup.
 
     Discovery cannot prove SPFILE, backup capacity or current live identity.
@@ -72,7 +73,7 @@ def _target_capability(snapshot, database, maximum_age, *, now=None, window_star
     """
     now = now or datetime.now(timezone.utc)
     snapshot = snapshot if isinstance(snapshot, dict) else {}
-    requirements = []
+    requirements = [routing_requirement] if routing_requirement is not None else []
 
     def check(key, label, observed, required, status, action, stage="discovery"):
         requirements.append({"id": key, "label": label, "observed": observed,
@@ -99,13 +100,15 @@ def _target_capability(snapshot, database, maximum_age, *, now=None, window_star
     runtime = selected.get("runtime") if isinstance(selected.get("runtime"), dict) else {}
     for key, label, expected in (("status", "Runtime evidence", "complete"), ("database_role", "Database role", "PRIMARY"),
                                   ("open_mode", "Open mode", "READ WRITE"), ("instance_state", "Instance state", "OPEN"),
-                                  ("log_mode", "Log mode", "NOARCHIVELOG")):
+                                  ("log_mode", "Log mode", "NOARCHIVELOG"), ("cdb", "CDB status", "NO")):
         actual = runtime.get(key)
         known = isinstance(actual, str) and bool(actual.strip()) and actual.lower() not in {"unknown", "unavailable", "uncollected"}
         action = "Refresh Discover for this database"
         if known and actual != expected:
             action = ("Select a NOARCHIVELOG test database; this adapter does not support ARCHIVELOG backup preparation"
-                      if key == "log_mode" else "Review the database state with its operator, then refresh Discover")
+                      if key == "log_mode" else
+                      "Select a non-CDB database; multitenant recovery preparation is not supported"
+                      if key == "cdb" else "Review the database state with its operator, then refresh Discover")
         check(key, label, actual if known else "Unknown", expected,
               "passed" if actual == expected else "blocked" if known else "unknown", action)
     home = selected.get("oracle_home")
@@ -148,26 +151,44 @@ def _target_capability(snapshot, database, maximum_age, *, now=None, window_star
             "next_action": "Create a request for native analysis; this is not approval to execute" if can_create else blockers[0]["next_action"]}
 
 
-def target_capabilities(host_id: str) -> dict:
-    """Read-only, host-scoped creation guidance from cached discovery evidence."""
+def _discovery_directory(host_id: str) -> Path:
     evidence.validate_host_id(host_id)
     root = evidence.VAR_DIR.resolve()
     directory = (root / host_id / "evidence").resolve()
     if root not in directory.parents:
         raise evidence.EvidenceError("Host evidence directory escapes its configured root")
+    return directory
+
+
+def target_capabilities(host_id: str) -> dict:
+    """Read-only, host-scoped creation guidance from cached discovery evidence."""
+    import host_config
+    directory = _discovery_directory(host_id)
 
     def read(name):
         path = directory / f"{name}.json"
         try:
-            return json.loads(path.read_text()) if path.is_file() and not path.is_symlink() else None
+            return json.loads(evidence.read_regular_bytes(path))
         except (OSError, ValueError):
             return None
 
     snapshot, policy = read("snapshot"), read("policy")
+    routing = {"id": "discovery_routing", "label": "Discovery SSH route", "status": "unknown", "stage": "discovery",
+               "required": "One indexed node using the configured recovery SSH alias",
+               "observed": "No verified discovery route", "next_action": "Check the configured host/node SSH aliases, then refresh Discover for this host"}
+    try:
+        host = host_config.load(HOSTS_FILE).get(host_id)
+        if host is None:
+            raise RecoveryError("Recovery host is not configured")
+        snapshot_bytes, _, binding = _read_discovery_binding(host_id, host)
+        snapshot = json.loads(snapshot_bytes)
+        routing.update(status="passed", observed=f"{binding['route']['node']} via {binding['route']['ssh_alias']}")
+    except (RecoveryError, OSError, ValueError, TypeError) as exc:
+        routing["observed"] = str(exc)
     maximum_age = policy.get("maximum_snapshot_age_seconds") if isinstance(policy, dict) else 1800
     databases = snapshot.get("databases") if isinstance(snapshot, dict) else None
     names = sorted({item["db_unique_name"] for item in databases if isinstance(item, dict) and isinstance(item.get("db_unique_name"), str) and _ID_RE.fullmatch(item["db_unique_name"])}) if isinstance(databases, list) else []
-    return {"target_capabilities": [_target_capability(snapshot, name, maximum_age) for name in names or [None]],
+    return {"target_capabilities": [_target_capability(snapshot, name, maximum_age, routing_requirement=routing) for name in names or [None]],
             "target_capability_context": {"host_id": host_id, "source": "saved_discovery", "maximum_snapshot_age_seconds": maximum_age,
                                           "policy_source": "saved_policy" if isinstance(policy, dict) else "default_policy",
                                           "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}}
@@ -202,6 +223,8 @@ def _env_for(request_id: str) -> dict:
 
 
 def _run(request_id: str, args: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict | None:
+    if args and args[0] not in {"status", "list", "report"}:
+        runtime_paths.require_fixtures_allowed()
     argv = [str(TOOL), *args]
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=_env_for(request_id))
@@ -231,6 +254,7 @@ def create_testmode_demo(request_id: str, requester: str, *, host_id: str | None
         evidence.validate_host_id(host_id)
     if _live_path(request_id).exists():
         raise RecoveryError("A live recovery request already uses this request_id")
+    runtime_paths.require_fixtures_allowed()
     fx = recovery_fixtures.build(fixture_dir, request_id)
     (fixture_dir / "webapp-metadata.json").write_text(json.dumps({"host_id": host_id}) + "\n")
     args = [
@@ -317,8 +341,9 @@ def selection_status(request_id: str, *, host_id: str, host: dict) -> dict:
     if not _is_live(request_id):
         raise RecoveryError("Only a completed live recovery request can supply patch evidence")
     metadata = _metadata(request_id)
-    configured = _configured_host(metadata)
-    if metadata["host_id"] != host_id or any(host.get(k) != configured.get(k) for k in ("id", "ssh_alias", "remote_root", "sudo")):
+    configured = _configured_host(metadata, require_discovery_binding=True)
+    if (metadata["host_id"] != host_id or any(host.get(k) != configured.get(k) for k in ("id", "ssh_alias", "remote_root", "sudo"))
+            or _recovery_route(host) != _recovery_route(configured)):
         raise RecoveryError("Recovery evidence belongs to a different configured host")
     current = status(request_id)
     execution = current.get("webapp_execution") or {}
@@ -414,9 +439,85 @@ def _update_metadata(request_id: str, **values) -> dict:
     return current
 
 
-def _configured_host(metadata: dict) -> dict:
+def _recovery_route(host: dict) -> dict:
+    """One supported SSH route, shared by discovery and recovery execution."""
+    alias = host.get("ssh_alias")
+    nodes = host.get("nodes")
+    if not isinstance(alias, str) or not alias:
+        raise RecoveryError("Standalone recovery requires a configured SSH alias")
+    if nodes:
+        if not isinstance(nodes, list) or len(nodes) != 1 or not isinstance(nodes[0], dict):
+            raise RecoveryError("Standalone recovery requires exactly one configured node")
+        name = str(nodes[0].get("name") or "").split(".", 1)[0]
+        node_alias = nodes[0].get("ssh_alias", alias)
+    else:
+        name, node_alias = host["id"], alias
+    if node_alias != alias:
+        raise RecoveryError("Standalone recovery discovery and execution SSH aliases differ; correct the host configuration and refresh discovery")
+    _identifier(name, "recovery node")
+    return {"node": name, "ssh_alias": alias}
+
+
+def _read_discovery_binding(host_id: str, host: dict) -> tuple[bytes, bytes, dict]:
+    """Capture the collector's recorded route without inferring it from a hostname."""
+    route = _recovery_route(host)
+    directory = _discovery_directory(host_id)
     try:
-        hosts = json.loads(HOSTS_FILE.read_text())["hosts"]
+        index_bytes = evidence.read_regular_bytes(directory / "snapshot_nodes.json")
+        snapshot_bytes = evidence.read_regular_bytes(directory / "snapshot.json")
+        index = json.loads(index_bytes)
+        entries = index.get("nodes") if isinstance(index, dict) else None
+        if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+            raise ValueError("not one indexed node")
+        entry = entries[0]
+        if entry.get("name") != route["node"] or entry.get("ssh_alias") != route["ssh_alias"]:
+            raise ValueError("discovery was collected using a different configured route")
+        name = entry.get("evidence") or evidence.node_snapshot_evidence_name(entry["name"])
+        evidence.validate_evidence_name(name)
+        if evidence.read_regular_bytes(directory / f"{name}.json") != snapshot_bytes:
+            raise ValueError("indexed snapshot and primary snapshot differ")
+    except (OSError, ValueError, TypeError) as exc:
+        raise RecoveryError("Refresh Discover for the configured recovery host; its primary snapshot must match one indexed SSH route") from exc
+    return snapshot_bytes, index_bytes, {"schema_version": "1.0", "route": route,
+        "snapshot_sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
+        "index_sha256": hashlib.sha256(index_bytes).hexdigest()}
+
+
+def _discovery_binding(host_id: str, host: dict) -> tuple[bytes, bytes, dict]:
+    with evidence.host_lock(host_id):
+        return _read_discovery_binding(host_id, host)
+
+
+def _verify_discovery_binding(metadata: dict, host: dict, *, required: bool) -> None:
+    binding = metadata.get("discovery_binding")
+    if binding is None:
+        if required:
+            raise RecoveryError("This recovery request predates verified discovery routing. Inspect or reconcile existing work; refresh Discover and create a new request for further backup actions")
+        return
+    try:
+        if (not isinstance(binding, dict) or binding.get("schema_version") != "1.0"
+                or binding.get("route") != _recovery_route(host)
+                or binding.get("snapshot_sha256") != metadata["inputs"]["snapshot"]["sha256"]):
+            raise ValueError("discovery route changed")
+        base = _live_path(metadata["request_id"])
+        captured = {}
+        for name, key in (("snapshot.json", "snapshot_sha256"), ("snapshot_nodes.json", "index_sha256")):
+            captured[name] = evidence.read_regular_bytes(base / name)
+            if hashlib.sha256(captured[name]).hexdigest() != binding.get(key):
+                raise ValueError("immutable discovery copy changed")
+        index = json.loads(captured["snapshot_nodes.json"])
+        entries = index.get("nodes") if isinstance(index, dict) else None
+        if (not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict)
+                or {"node": entries[0].get("name"), "ssh_alias": entries[0].get("ssh_alias")} != binding["route"]):
+            raise ValueError("saved discovery index differs from bound routing")
+    except (OSError, KeyError, ValueError, TypeError) as exc:
+        raise RecoveryError("Recovery discovery routing or its immutable evidence changed; refusing to retarget the request") from exc
+
+
+def _configured_host(metadata: dict, *, require_discovery_binding: bool = False) -> dict:
+    import host_config
+    try:
+        hosts = host_config.load(HOSTS_FILE).values()
         matches = [h for h in hosts if h.get("id") == metadata["host_id"]]
         if len(matches) != 1:
             raise ValueError("host not configured uniquely")
@@ -424,18 +525,19 @@ def _configured_host(metadata: dict) -> dict:
         bound = metadata["host"]
         if any(host.get(k) != bound.get(k) for k in ("id", "ssh_alias", "remote_root", "sudo")):
             raise ValueError("host configuration changed")
+        _verify_discovery_binding(metadata, host, required=require_discovery_binding)
         return host
     except (OSError, KeyError, ValueError, TypeError) as exc:
         raise RecoveryError("Configured recovery host changed or is unavailable; refusing to retarget the request") from exc
 
 
-def _argv(host: dict, action: str, request_id: str, extra: list[str] | None = None) -> list[str]:
+def _argv(host: dict, action: str, request_id: str, extra: list[str] | None = None, *, runtime: dict) -> list[str]:
     # A clean remote environment cannot inherit fixture overrides, arbitrary
     # Oracle command substitutions, or a shell startup file from the webapp.
-    root = _absolute_remote_path(host.get("remote_root"), "configured remote_root")
+    tool = tools_sync.tool_path(host, [runtime], "bin/opu-database-recovery-prepare")
     return ["env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "LC_ALL=C",
             f"OPU_RECOVERY_PREP_STATE_DIR={REMOTE_STATE_DIR}",
-            f"{root}/bin/opu-database-recovery-prepare", action, "--request-id", request_id, *(extra or [])]
+            tool, action, "--request-id", request_id, *(extra or [])]
 
 
 def _parse_native(response, request_id: str) -> dict:
@@ -451,8 +553,10 @@ def _parse_native(response, request_id: str) -> dict:
     return payload
 
 
-def _native(host: dict, request_id: str, action: str, extra: list[str] | None = None) -> dict:
-    response = remote.run_remote_raw(host["ssh_alias"], _argv(host, action, request_id, extra),
+def _native(host: dict, request_id: str, action: str, extra: list[str] | None = None, *, runtime: dict | None = None) -> dict:
+    if runtime is None:
+        runtime = tools_sync.ensure_tools(host["ssh_alias"], host["remote_root"], bool(host.get("sudo")))
+    response = remote.run_remote_raw(host["ssh_alias"], _argv(host, action, request_id, extra, runtime=runtime),
                                      timeout=DEFAULT_TIMEOUT_SECONDS, sudo=True)
     result = _parse_native(response, request_id)
     # The native tool verifies its sealed request. Independently bind transport
@@ -523,7 +627,9 @@ def create_live(request_id: str, requester: str, *, host: dict, host_id: str,
     if not isinstance(host, dict) or host.get("id") != host_id or not isinstance(host.get("ssh_alias"), str):
         raise RecoveryError("A configured recovery host is required")
     _absolute_remote_path(host.get("remote_root"), "configured remote_root")
-    _configured_host({"host_id": host_id, "host": host})
+    configured = _configured_host({"host_id": host_id, "host": host})
+    if _recovery_route(host) != _recovery_route(configured):
+        raise RecoveryError("Configured recovery node routing changed; refusing to retarget the request")
     for value in (window_start, window_end):
         if not isinstance(value, str):
             raise RecoveryError("Maintenance window must use UTC timestamps")
@@ -535,10 +641,7 @@ def create_live(request_id: str, requester: str, *, host: dict, host_id: str,
         raise RecoveryError("Maintenance window end must follow its start")
     if (datetime.strptime(window_end, "%Y-%m-%dT%H:%M:%SZ") - datetime.strptime(window_start, "%Y-%m-%dT%H:%M:%SZ")).total_seconds() > 86400:
         raise RecoveryError("Recovery maintenance window cannot exceed 24 hours")
-    snapshot_path = evidence.evidence_path(host_id, "snapshot")
-    if not snapshot_path.is_file() or snapshot_path.is_symlink():
-        raise RecoveryError("Run discovery for the selected host before creating recovery preparation")
-    snapshot_bytes = snapshot_path.read_bytes()
+    snapshot_bytes, index_bytes, discovery_binding = _discovery_binding(host_id, host)
     try:
         snapshot = json.loads(snapshot_bytes)
     except (ValueError, TypeError) as exc:
@@ -578,11 +681,12 @@ def create_live(request_id: str, requester: str, *, host: dict, host_id: str,
     input_dir = f"{REMOTE_STATE_DIR}/webapp-inputs/{request_id}"
     metadata = {"mode": "live", "request_id": request_id, "host_id": host_id,
                 "host": {k: host.get(k) for k in ("id", "ssh_alias", "remote_root", "sudo")},
+                "discovery_binding": discovery_binding,
                 "database": database, "target": target, "remote_input_dir": input_dir, "create_state": "preparing",
                 "inputs": {"snapshot": {"path": f"{input_dir}/snapshot.json", "sha256": hashlib.sha256(snapshot_bytes).hexdigest()},
                            "policy": {"path": f"{input_dir}/policy.json", "sha256": hashlib.sha256(policy_bytes).hexdigest()}}}
     write_json(base / "metadata.json", metadata)
-    for name, data in (("snapshot.json", snapshot_bytes), ("policy.json", policy_bytes)):
+    for name, data in (("snapshot.json", snapshot_bytes), ("snapshot_nodes.json", index_bytes), ("policy.json", policy_bytes)):
         path = base / name
         with path.open("xb") as stream:
             stream.write(data)
@@ -590,7 +694,8 @@ def create_live(request_id: str, requester: str, *, host: dict, host_id: str,
             os.fsync(stream.fileno())
         path.chmod(0o400)
     # Install from trusted local package; no payload-provided host or command.
-    tools_sync.ensure_tools(host["ssh_alias"], host["remote_root"], bool(host.get("sudo")))
+    host = _configured_host(_metadata(request_id), require_discovery_binding=True)
+    runtime = tools_sync.ensure_tools(host["ssh_alias"], host["remote_root"], bool(host.get("sudo")))
     _update_metadata(request_id, create_state="remote_create_unknown")
     q = shlex.quote
     prepare = (f"set -eu; umask 077; [ ! -L {q(REMOTE_STATE_DIR)} ]; "
@@ -610,7 +715,7 @@ def create_live(request_id: str, requester: str, *, host: dict, host_id: str,
         raise RecoveryError("Remote immutable recovery input verification failed", sealed.stderr)
     result = _native(host, request_id, "create", ["--requester", requester,
         "--snapshot", metadata["inputs"]["snapshot"]["path"], "--policy", metadata["inputs"]["policy"]["path"],
-        "--database", database, "--backup-parent", backup_parent, "--window-start", window_start, "--window-end", window_end])
+        "--database", database, "--backup-parent", backup_parent, "--window-start", window_start, "--window-end", window_end], runtime=runtime)
     metadata = _update_metadata(request_id, create_state="created", last_status=result)
     return _decorate(result, metadata)
 
@@ -678,7 +783,12 @@ def _import_evidence(request_id: str, host: dict, native: dict) -> dict:
 
 
 def _terminal_result(request_id: str, host: dict, execution: dict, returncode: int) -> dict:
-    native = _native(host, request_id, "status")
+    runtime = None
+    if "runtime_root" in execution or "runtime_fingerprint" in execution:
+        runtime = {"ssh_alias": host["ssh_alias"], "runtime_root": execution.get("runtime_root"),
+                   "fingerprint": execution.get("runtime_fingerprint")}
+        tools_sync.runtime_for_host(host, [runtime])
+    native = _native(host, request_id, "status", runtime=runtime)
     action = execution.get("action", "execute")
     is_reconcile = action == "reconcile"
     if native.get("state") == "running":
@@ -712,7 +822,8 @@ def _execute_live(request_id: str, host: dict, actor: str, action: str = "execut
         field = "reconciliation_execution" if action == "reconcile" else "execution"
         if metadata.get(field):
             raise RecoveryError(f"Recovery {action} was already submitted; inspect or reconcile its run instead of retrying")
-        current = _native(host, request_id, "status")
+        runtime = tools_sync.ensure_tools(host["ssh_alias"], host["remote_root"], bool(host.get("sudo")))
+        current = _native(host, request_id, "status", runtime=runtime)
         required_state = "running" if action == "reconcile" else "authorized"
         if current.get("state") != required_state or (current.get("authorization") or {}).get("actor") != actor:
             raise RecoveryError(f"Recovery must be {required_state} and authorized by this actor before {action}")
@@ -722,15 +833,17 @@ def _execute_live(request_id: str, host: dict, actor: str, action: str = "execut
                 raise RecoveryError("Original recovery wrapper must be proven exited before service reconciliation")
         run_dir = f"{REMOTE_STATE_DIR}/webapp-executions/{request_id}/{uuid.uuid4().hex}"
         execution = {"request_id": request_id, "remote_run_dir": run_dir, "actor": actor, "action": action,
-                     "terminal": False, "submitted_at": time.time()}
+                     "terminal": False, "submitted_at": time.time(),
+                     "runtime_root": runtime["runtime_root"], "runtime_fingerprint": runtime["fingerprint"]}
         # Persist both request ownership and pipeline context before SSH. A lost
         # launch response is unknown, never permission to launch a second job.
         _update_metadata(request_id, **{field: execution})
         pipeline_runner.set_execution_context(detached_execution=True, detached_terminal=False,
             recovery_request_id=request_id, recovery_action=action, host_id=host["id"], ssh_alias=host["ssh_alias"],
-            remote_root=host["remote_root"], remote_run_dir=run_dir)
+            remote_root=host["remote_root"], remote_run_dir=run_dir,
+            runtime_root=runtime["runtime_root"], runtime_fingerprint=runtime["fingerprint"])
         q = shlex.quote
-        command = " ".join(q(a) for a in _argv(host, action, request_id, ["--actor", actor]))
+        command = " ".join(q(a) for a in _argv(host, action, request_id, ["--actor", actor], runtime=runtime))
         wrapper = f"umask 077; echo $$ >pid.tmp; mv pid.tmp pid; {command} >stdout 2>stderr </dev/null; rc=$?; echo $rc >rc.tmp; mv rc.tmp rc"
         parent = str(PurePosixPath(run_dir).parent)
         launch = (f"set -eu; umask 077; mkdir -p {q(parent)}; mkdir {q(run_dir)}; cd {q(run_dir)}; "
@@ -781,7 +894,7 @@ def _live_status(request_id: str) -> dict:
 
 def _live_action(request_id: str, action: str, extra: list[str]) -> dict:
     metadata = _metadata(request_id)
-    host = _configured_host(metadata)
+    host = _configured_host(metadata, require_discovery_binding=action != "reconcile")
     for index in range(0, len(extra), 2):
         _identifier(extra[index + 1], extra[index])
     if action == "execute":
@@ -831,6 +944,8 @@ def reconcile_detached_run(record: dict) -> dict:
                 "host_id": host["id"], "ssh_alias": host["ssh_alias"], "remote_root": host["remote_root"],
                 "remote_run_dir": execution.get("remote_run_dir")}.items()):
             raise RecoveryError("Persisted recovery execution context does not match this request")
+        if any(context.get(k) != execution.get(k) for k in ("runtime_root", "runtime_fingerprint")):
+            raise RecoveryError("Persisted recovery runtime differs from its launch")
         if context.get("remote_pid") is not None and context["remote_pid"] != execution.get("pid"):
             raise RecoveryError("Persisted recovery execution PID does not match this request")
         state, rc = _poll_launch(host, execution)

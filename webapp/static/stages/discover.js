@@ -1,5 +1,6 @@
 import { el, badge, classifyStatus, row, th, td, tdBadge, renderErrorBox } from "../dom.js";
-import { apiFetch } from "../api.js";
+import { apiFetch, getReadSignal } from "../api.js";
+import { liveDiscoveryAccess } from "../actor.js";
 import { runToCompletion, RunStartError } from "../runs.js";
 import {
   helperText,
@@ -28,6 +29,7 @@ const DB_BADGE_HINTS = {
 };
 
 export async function renderDiscoverStage(mount, hostId) {
+  const signal = getReadSignal();
   mount.innerHTML = "";
   mount.appendChild(
     el("div", { class: "stage-head" }, [
@@ -40,7 +42,20 @@ export async function renderDiscoverStage(mount, hostId) {
     el("button", { id: "discover-run", type: "button", text: "Run live discovery" }),
     el("span", { id: "discover-status", class: "status-chip", role: "status", "aria-live": "polite", text: "idle" }),
   ]);
+  const runButton = toolbar.querySelector("#discover-run");
+  const permissionHint = helperText("", "warn");
+  permissionHint.setAttribute("id", "discover-permission");
+  runButton.setAttribute("aria-describedby", "discover-permission");
+  const updateAccess = () => {
+    const access = liveDiscoveryAccess();
+    runButton.disabled = !access.allowed;
+    permissionHint.textContent = access.reason;
+    permissionHint.hidden = access.allowed;
+    return access.allowed;
+  };
+  updateAccess();
   mount.appendChild(toolbar);
+  mount.appendChild(permissionHint);
   const errBox = formErrorBox();
   mount.appendChild(errBox);
   const logBox = el("pre", { class: "run-log", style: "display:none" });
@@ -50,24 +65,31 @@ export async function renderDiscoverStage(mount, hostId) {
 
   async function showCached() {
     body.innerHTML = "";
+    const statusEl = toolbar.querySelector("#discover-status");
     try {
       const res = await apiFetch(`/api/hosts/${encodeURIComponent(hostId)}/pipeline`);
       const pipe = await res.json();
       const disc = (pipe.steps || []).find((s) => s.step === "discovery");
       if (!disc?.done || !disc.evidence) {
+        statusEl.textContent = "no evidence";
+        statusEl.className = "status-chip is-warn";
         body.appendChild(helperText("No live discovery evidence yet. Run live discovery (30–90s).", "warn"));
         return;
       }
       renderTopology(body, disc.evidence, disc.phases || [], hostId);
-      const statusEl = toolbar.querySelector("#discover-status");
       statusEl.textContent = disc.phases_status || disc.status || "cached";
-      statusEl.className = `status-chip is-${classifyStatus(disc.phases_status || disc.status) === "ok" ? "ok" : "warn"}`;
+      const kind = classifyStatus(disc.phases_status || disc.status);
+      statusEl.className = `status-chip is-${kind === "neutral" ? "warn" : kind}`;
     } catch (err) {
+      if (err.name === "AbortError" || err.status === 401) throw err;
+      statusEl.textContent = "unavailable";
+      statusEl.className = "status-chip is-bad";
       body.appendChild(helperText(`Could not load pipeline state: ${err}`, "error"));
     }
   }
 
   toolbar.querySelector("#discover-run").addEventListener("click", async () => {
+    if (signal?.aborted || !updateAccess()) return;
     const btn = toolbar.querySelector("#discover-run");
     const statusEl = toolbar.querySelector("#discover-status");
     clearFormError(errBox);
@@ -109,7 +131,7 @@ export async function renderDiscoverStage(mount, hostId) {
       statusEl.textContent = "error";
       statusEl.className = "status-chip is-bad";
     } finally {
-      btn.disabled = false;
+      updateAccess();
     }
   });
 

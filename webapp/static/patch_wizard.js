@@ -48,7 +48,8 @@ export function planReview(context) {
 
 export function maintenanceWindowError(start, end, now = Date.now()) {
   const utc = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
-  if (![start, end].every((value) => utc.test(value) && Number.isFinite(Date.parse(value)))) return "Use complete UTC timestamps, for example 2026-09-15T15:00:00Z.";
+  if (![start, end].every((value) => utc.test(value) && Number.isFinite(Date.parse(value))
+      && new Date(Date.parse(value)).toISOString().slice(0, 19) === value.slice(0, 19))) return "Use valid UTC calendar timestamps, for example 2026-09-15T15:00:00Z.";
   if (Date.parse(end) <= Date.parse(start)) return "The maintenance window must end after it starts.";
   if (Date.parse(end) <= now) return "The maintenance window has expired. Choose a future end time.";
   return null;

@@ -5,9 +5,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 from docx import Document
-from docx.enum.section import WD_SECTION
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING, WD_TAB_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
@@ -25,9 +24,7 @@ INK = "1F2933"
 MUTED = "667085"
 LIGHT_BLUE = "E8EEF5"
 LIGHTER_BLUE = "F3F7FB"
-LIGHT_GRAY = "F2F4F7"
 MID_GRAY = "D0D5DD"
-WHITE = "FFFFFF"
 GOLD = "B5852B"
 RED = "9B1C1C"
 GREEN = "22643A"
@@ -156,24 +153,6 @@ def set_run_font(run, name="Calibri", size=None, color=INK, bold=None, italic=No
         run.bold = bold
     if italic is not None:
         run.italic = italic
-
-
-def set_keep_with_next(paragraph, keep=True) -> None:
-    p_pr = paragraph._p.get_or_add_pPr()
-    node = p_pr.find(qn("w:keepNext"))
-    if keep and node is None:
-        node = OxmlElement("w:keepNext")
-        p_pr.append(node)
-    elif not keep and node is not None:
-        p_pr.remove(node)
-
-
-def set_keep_together(paragraph, keep=True) -> None:
-    p_pr = paragraph._p.get_or_add_pPr()
-    node = p_pr.find(qn("w:keepLines"))
-    if keep and node is None:
-        node = OxmlElement("w:keepLines")
-        p_pr.append(node)
 
 
 def paragraph_border_bottom(paragraph, color=BLUE, size="14", space="5") -> None:
@@ -391,20 +370,6 @@ def add_body(doc, text: str, bold_lead: str | None = None, italic=False):
 def add_bullet(doc, text: str, bullet_num_id: int, bold_lead: str | None = None):
     p = doc.add_paragraph()
     apply_numbering(p, bullet_num_id)
-    if bold_lead and text.startswith(bold_lead):
-        r1 = p.add_run(bold_lead)
-        set_run_font(r1, bold=True)
-        r2 = p.add_run(text[len(bold_lead):])
-        set_run_font(r2)
-    else:
-        r = p.add_run(text)
-        set_run_font(r)
-    return p
-
-
-def add_numbered(doc, text: str, number_num_id: int, bold_lead: str | None = None):
-    p = doc.add_paragraph()
-    apply_numbering(p, number_num_id)
     if bold_lead and text.startswith(bold_lead):
         r1 = p.add_run(bold_lead)
         set_run_font(r1, bold=True)

@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Disposable deployment packaging/admission tests; no root, systemd or SSH."""
+import ast
+import hashlib
+import importlib.metadata
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import subprocess
+import tarfile
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('controller_deployment', ROOT / 'deploy/controller.py')
+deploy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(deploy)
+
+
+class DeploymentTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='opu-deploy-')
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.source = self.base / 'source'
+        for name in deploy.SOURCE_DIRS:
+            (self.source / name).mkdir(parents=True)
+        for name, content in {'webapp/server.py': 'pass\n', 'deploy/controller.py': 'pass\n',
+                              'webapp/host_config.py': 'pass\n', 'webapp/local_llm.py': 'pass\n', 'webapp/runtime_paths.py': 'pass\n',
+                              'webapp/api.py': 'pass\n', 'webapp/api_transport.py': 'pass\n',
+                              'webapp/api_models.py': 'pass\n', 'webapp/application_views.py': 'pass\n',
+                              'scripts/requirements.txt': '', 'webapp/requirements-sso.txt': '',
+                              'webapp/requirements-api.txt': 'fastapi==0.141.1\n'}.items():
+            (self.source / name).write_text(content)
+        (self.source / 'deploy/templates').mkdir()
+        for name in ('oracle-patching.service', 'controller.env', 'nginx.conf', 'opu-ollama.service'):
+            (self.source / 'deploy/templates' / name).write_bytes((ROOT / 'deploy/templates' / name).read_bytes())
+        self.bundle = self.base / 'release.tar.gz'
+
+    def package(self):
+        return deploy.build(self.source, self.bundle, 'fixture-release')
+
+    def config(self):
+        values = {'public_hostname': 'patching.lab.example', 'enable_ollama': False}
+        for name in (*deploy.INPUT_FILES, 'tls_certificate', 'tls_private_key'):
+            target = self.base / name
+            target.write_text('fixture\n')
+            target.chmod(0o600)
+            values[name] = str(target)
+        Path(values['hosts_file']).write_text('{"hosts": []}')
+        Path(values['principals_file']).write_text(json.dumps({'principals': [
+            {'actor': role, 'roles': [role], 'token_sha256': hashlib.sha256(role.encode()).hexdigest()}
+            for role in ('requester', 'approver', 'operator')]}))
+        path = self.base / 'deployment.json'
+        path.write_text(json.dumps(values))
+        path.chmod(0o600)
+        return values, path
+
+    def test_bundle_excludes_local_credentials_state_fixtures_and_dependencies(self):
+        for relative in ('webapp/var/plans', 'webapp/recovery_fixtures', 'webapp/__pycache__'):
+            target = self.source / relative
+            target.mkdir(parents=True)
+            (target / 'secret').write_text('MUST_NOT_SHIP')
+        for name in ('hosts.json', '.env', 'secrets.json', 'debug.log'):
+            (self.source / 'webapp' / name).write_text('MUST_NOT_SHIP')
+        result = self.package()
+        manifest, contents = deploy.read_bundle(self.bundle, result['bundle_sha256'])
+        self.assertEqual(manifest['release_id'], 'fixture-release')
+        self.assertFalse(any(b'MUST_NOT_SHIP' in content for content in contents.values()))
+        self.assertIn('webapp/server.py', contents)
+        self.assertIn('deploy/templates/oracle-patching.service', contents)
+        with self.assertRaises(FileExistsError):
+            self.package()
+
+    def test_source_symlinks_and_checksum_drift_are_rejected(self):
+        secret = self.base / 'private'
+        secret.write_text('private')
+        link = self.source / 'webapp/link.py'
+        link.symlink_to(secret)
+        with self.assertRaisesRegex(ValueError, 'links'):
+            self.package()
+        self.assertFalse(self.bundle.exists())
+        link.unlink()
+        self.package()
+        with self.assertRaisesRegex(ValueError, 'checksum'):
+            deploy.read_bundle(self.bundle, '0' * 64)
+
+    def test_validly_hashed_bundle_missing_installer_dependencies_is_rejected(self):
+        for name in ('scripts/requirements.txt', 'webapp/requirements-api.txt', 'webapp/host_config.py',
+                     'webapp/api.py', 'webapp/api_transport.py', 'webapp/api_models.py',
+                     'webapp/application_views.py', 'deploy/templates/nginx.conf'):
+            with self.subTest(name=name):
+                target = self.source / name; original = target.read_bytes(); target.unlink()
+                result = self.package()
+                with self.assertRaisesRegex(ValueError, 'installation dependencies'):
+                    deploy.read_bundle(self.bundle, result['bundle_sha256'])
+                target.write_bytes(original); self.bundle.unlink()
+
+    def test_input_swapped_during_open_is_rejected_without_reading_or_following_it(self):
+        target = self.base / 'checked-input'; replacement = self.base / 'replacement'
+        open_file = deploy.os.open
+        for kind in ('file', 'symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                target.write_bytes(b'checked bytes'); replacement.write_bytes(b'unchecked bytes')
+                def swap(path, flags):
+                    self.assertEqual(Path(path), target)
+                    target.unlink()
+                    if kind == 'file': replacement.rename(target)
+                    elif kind == 'symlink': target.symlink_to(replacement)
+                    else: os.mkfifo(target)
+                    return open_file(path, flags)
+                with patch.object(deploy.os, 'open', side_effect=swap):
+                    with self.assertRaises((ValueError, OSError)):
+                        deploy.regular(target)
+                target.unlink()
+                if replacement.exists(): replacement.unlink()
+
+    def test_administrator_input_parent_directories_must_also_be_protected(self):
+        target = self.base / 'input'; target.write_bytes(b'data')
+        real_stat = Path.stat
+        def metadata(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            return SimpleNamespace(st_uid=0, st_mode=0o40777 if path == self.base else 0o40755)
+        with patch.object(Path, 'stat', autospec=True, side_effect=metadata):
+            with self.assertRaisesRegex(ValueError, 'input directories'):
+                deploy.regular(target, admin=True)
+
+    def test_archive_traversal_links_and_duplicate_members_are_rejected(self):
+        for kind in ('traversal', 'link', 'duplicate'):
+            with self.subTest(kind=kind):
+                raw = io.BytesIO()
+                with tarfile.open(fileobj=raw, mode='w:gz') as archive:
+                    item = tarfile.TarInfo('../outside' if kind == 'traversal' else 'webapp/server.py')
+                    if kind == 'link':
+                        item.type, item.linkname = tarfile.SYMTYPE, '/etc/shadow'
+                    archive.addfile(item)
+                    if kind == 'duplicate':
+                        archive.addfile(item)
+                path = self.base / (kind + '.tar.gz')
+                path.write_bytes(raw.getvalue())
+                with self.assertRaisesRegex(ValueError, 'unsafe'):
+                    deploy.read_bundle(path, deploy.sha(raw.getvalue()))
+                self.assertFalse((self.base / 'outside').exists())
+
+    def test_manifest_tampering_is_rejected_even_with_matching_archive_hash(self):
+        result = self.package()
+        manifest, contents = deploy.read_bundle(self.bundle, result['bundle_sha256'])
+        contents['webapp/server.py'] = b'changed source'
+        raw = io.BytesIO()
+        contents['deployment-manifest.json'] = deploy.canonical(manifest)
+        with tarfile.open(fileobj=raw, mode='w:gz') as archive:
+            for name, content in contents.items():
+                item = tarfile.TarInfo(name); item.size = len(content)
+                archive.addfile(item, io.BytesIO(content))
+        path = self.base / 'changed.tar.gz'
+        path.write_bytes(raw.getvalue())
+        with self.assertRaisesRegex(ValueError, 'verification'):
+            deploy.read_bundle(path, deploy.sha(raw.getvalue()))
+
+    def test_configuration_requires_distinct_active_roles_and_safe_tls_values(self):
+        values, path = self.config()
+        self.assertEqual(deploy.load_config(path, admin=False)['public_hostname'], values['public_hostname'])
+        people = Path(values['principals_file'])
+        original = people.read_text()
+        people.write_text(json.dumps({'principals': [{'actor': 'admin', 'roles': ['requester', 'approver', 'operator'], 'token_sha256': 'a' * 64}]}))
+        with self.assertRaisesRegex(ValueError, 'distinct active'):
+            deploy.load_config(path, admin=False)
+        people.write_text(original)
+        entries = json.loads(original)
+        entries['principals'][1]['expires_at'] = '2000-01-01T00:00:00Z'
+        people.write_text(json.dumps(entries))
+        with self.assertRaisesRegex(ValueError, 'distinct active'):
+            deploy.load_config(path, admin=False)
+        people.write_text(original)
+        values['public_hostname'] = 'lab.example; return 200;'
+        path.write_text(json.dumps(values))
+        with self.assertRaisesRegex(ValueError, 'hostname'):
+            deploy.load_config(path, admin=False)
+
+    def test_external_or_cloud_assistant_configuration_is_rejected(self):
+        values, path = self.config()
+        assistant = self.base / 'assistant.json'
+        values['assistant_config_file'] = str(assistant)
+        path.write_text(json.dumps(values))
+        for config in ({'enabled': True, 'model': 'local-model', 'base_url': 'https://external.example/v1'},
+                       {'enabled': True, 'model': 'model:cloud'},
+                       {'enabled': True, 'model': 'REPLACE_WITH_MODEL'}):
+            assistant.write_text(json.dumps(config))
+            with self.assertRaises(ValueError):
+                deploy.load_config(path, admin=False)
+        assistant.write_text('{"enabled":true,"model":"local-model"}')
+        self.assertEqual(deploy.load_config(path, admin=False)['assistant_config_file'], str(assistant))
+
+    def test_admission_matches_runtime_host_principal_and_model_config_types(self):
+        values, path = self.config()
+        hosts = Path(values['hosts_file'])
+        for payload in ({'hosts': [{'id': 'Prod'}, {'id': 'prod'}]}, {'hosts': [{'id': 'prod', 'sudo': 'false'}]}):
+            hosts.write_text(json.dumps(payload))
+            with self.assertRaises(ValueError): deploy.load_config(path, admin=False)
+        hosts.write_text('{"hosts":[]}')
+        people = Path(values['principals_file']); original = people.read_text()
+        for field, invalid in (('disabled', 0), ('disabled', ''), ('expires_at', 0), ('expires_at', ''), ('roles', [[]])):
+            payload = json.loads(original); payload['principals'][0][field] = invalid
+            people.write_text(json.dumps(payload))
+            with self.assertRaises(ValueError): deploy.load_config(path, admin=False)
+        people.write_text(original)
+        assistant = self.base / 'assistant.json'; values['assistant_config_file'] = str(assistant)
+        path.write_text(json.dumps(values))
+        for fields in ({'timeout_seconds': '30'}, {'max_tokens': True}, {'allow_private_endpoint': 0},
+                       {'unsupported': True}, {'model': 'model with spaces'}):
+            assistant.write_text(json.dumps({'enabled': True, 'model': 'local-model', **fields}))
+            with self.assertRaises(ValueError): deploy.load_config(path, admin=False)
+
+    def test_configuration_parses_validated_bytes_without_reopening_paths(self):
+        values, path = self.config()
+        original = deploy.regular
+        def inspected(target, **kwargs):
+            raw = original(target, **kwargs)
+            if target == Path(values['hosts_file']): target.write_text('{"hosts":[{"id":"prod","sudo":"false"}]}')
+            if target == Path(values['principals_file']): target.write_text('{}')
+            return raw
+        with patch.object(deploy, 'regular', side_effect=inspected), patch.object(Path, 'read_text', side_effect=AssertionError('Unchecked input reopen')):
+            self.assertEqual(deploy.load_config(path, admin=False)['public_hostname'], values['public_hostname'])
+
+    def test_existing_install_or_state_refuses_all_mutation(self):
+        values, _ = self.config()
+        result = self.package()
+        manifest, contents = deploy.read_bundle(self.bundle, result['bundle_sha256'])
+        existing = self.base / 'existing-state'
+        existing.mkdir(); sealed = existing / 'plan.json'
+        sealed.write_text('sealed absolute paths must not move')
+        with patch.object(deploy, 'STATE_PARENT', existing), patch.object(deploy.pwd, 'getpwnam', side_effect=KeyError), \
+             patch.object(deploy.os, 'geteuid', return_value=0), patch.object(deploy.subprocess, 'run') as run:
+            self.assertIn(str(existing), deploy.fresh_conflicts())
+            with self.assertRaisesRegex(ValueError, 'existing paths'):
+                deploy.install_fresh(manifest, contents, values)
+            run.assert_not_called()
+        self.assertEqual(sealed.read_text(), 'sealed absolute paths must not move')
+
+    def test_install_revalidates_inputs_before_any_filesystem_or_command_mutation(self):
+        values, path = self.config()
+        deploy.load_config(path, admin=False)
+        result = self.package()
+        manifest, contents = deploy.read_bundle(self.bundle, result['bundle_sha256'])
+        Path(values['hosts_file']).write_text('{"hosts":[{"id":"prod","sudo":"false"}]}')
+        install = self.base / 'must-not-exist'
+        regular = deploy.regular
+        with patch.object(deploy, 'INSTALL', install), patch.object(deploy.os, 'geteuid', return_value=0), \
+             patch.object(deploy, 'preflight', return_value={'blockers': []}), \
+             patch.object(deploy, 'regular', side_effect=lambda target, **kwargs: regular(target, maximum=kwargs.get('maximum', deploy.MAX_BUNDLE))), \
+             patch.object(deploy.subprocess, 'run') as command:
+            with self.assertRaisesRegex(ValueError, 'sudo must be a boolean'):
+                deploy.install_fresh(manifest, contents, values)
+            command.assert_not_called()
+        self.assertFalse(install.exists())
+
+    def test_python_39_is_rejected_before_creating_installation_paths(self):
+        values, _ = self.config()
+        result = self.package()
+        manifest, contents = deploy.read_bundle(self.bundle, result['bundle_sha256'])
+        install = self.base / 'not-created'
+        with patch.object(deploy, 'INSTALL', install), \
+             patch.object(deploy.sys, 'version_info', (3, 9, 23)), \
+             patch.object(deploy.os, 'geteuid', return_value=0), \
+             patch.object(deploy.subprocess, 'run') as run:
+            admission = deploy.preflight(manifest, values)
+            self.assertTrue(any('Python 3.10 or later' in message for message in admission['blockers']))
+            with self.assertRaisesRegex(ValueError, 'Python 3.10 or later'):
+                deploy.install_fresh(manifest, contents, values)
+            run.assert_not_called()
+        self.assertFalse(install.exists())
+        with patch.object(deploy.sys, 'version_info', (3, 10, 0)):
+            admission = deploy.preflight(manifest, values)
+            self.assertFalse(any('Python 3.10 or later' in message for message in admission['blockers']))
+
+    def test_fresh_install_stages_stopped_services_without_ssh_or_old_state(self):
+        values, _ = self.config()
+        result = self.package()
+        manifest, contents = deploy.read_bundle(self.bundle, result['bundle_sha256'])
+        for name in ('INSTALL', 'CONFIG', 'STATE_PARENT', 'SSH_HOME', 'UNIT', 'NGINX'):
+            self.enterContext(patch.object(deploy, name, self.base / name.lower()))
+        self.enterContext(patch.object(deploy, 'STATE', deploy.STATE_PARENT / 'controller'))
+        commands = []
+        validated_hosts = Path(values['hosts_file']).read_bytes()
+        def command(argv, **kwargs):
+            commands.append(argv)
+            # The administrator's source file may change after admission. The
+            # copied config must remain the exact validated snapshot.
+            if argv[0] == sys.executable:
+                Path(values['hosts_file']).write_text('{"hosts":[{"id":"prod","sudo":"false"}]}')
+            if argv[0] == 'useradd':
+                deploy.SSH_HOME.mkdir()
+            return SimpleNamespace(returncode=0)
+        original = deploy.regular
+        self.enterContext(patch.object(deploy, 'regular', side_effect=lambda path, **kwargs: original(path, maximum=kwargs.get('maximum', deploy.MAX_BUNDLE))))
+        self.enterContext(patch.object(deploy, 'preflight', return_value={'status': 'ready_for_fresh_install', 'blockers': [], 'services_will_start': False}))
+        self.enterContext(patch.object(deploy.os, 'geteuid', return_value=0))
+        self.enterContext(patch.object(deploy.os, 'chown'))
+        self.enterContext(patch.object(deploy.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())))
+        self.enterContext(patch.object(deploy.subprocess, 'run', side_effect=command))
+        installed = deploy.install_fresh(manifest, contents, values)
+        self.assertEqual(installed['status'], 'installed_stopped')
+        self.assertFalse(installed['services_will_start'])
+        self.assertEqual((deploy.INSTALL / 'current').resolve(), deploy.INSTALL / 'releases/fixture-release')
+        self.assertFalse(deploy.NGINX.exists())
+        self.assertEqual([cmd for cmd in commands if cmd[0] == 'systemctl'], [['systemctl', 'daemon-reload']])
+        self.assertFalse(any(cmd[0] in {'ssh', 'scp', 'chown', 'chmod'} for cmd in commands))
+        self.assertEqual(list(deploy.STATE.iterdir()), [])
+        self.assertEqual((deploy.CONFIG / 'principals.json').stat().st_mode & 0o777, 0o640)
+        self.assertEqual((deploy.CONFIG / 'hosts.json').read_bytes(), validated_hosts)
+        release = deploy.INSTALL / 'releases/fixture-release'
+        pip_install = next(cmd for cmd in commands if cmd[1:4] == ['-m', 'pip', 'install'])
+        requirements = [pip_install[index + 1] for index, argument in enumerate(pip_install) if argument == '-r']
+        self.assertEqual(requirements, [str(release / name) for name in (
+            'scripts/requirements.txt', 'webapp/requirements-sso.txt', 'webapp/requirements-api.txt')])
+        self.assertEqual((release / 'webapp/requirements-api.txt').read_bytes(), contents['webapp/requirements-api.txt'])
+        self.assertLess(commands.index(pip_install), commands.index([str(release / '.venv/bin/python'), '-m', 'pip', 'check']))
+
+    def test_template_network_and_credential_boundaries(self):
+        nginx = (ROOT / 'deploy/templates/nginx.conf').read_text()
+        http = nginx.split('server {', 2)[1]
+        self.assertIn('access_log off;', http)
+        self.assertIn('error_log /dev/null crit;', http)
+        self.assertNotIn('$request_uri', nginx)
+        self.assertIn('proxy_pass http://127.0.0.1:8765;', nginx)
+        service = (ROOT / 'deploy/templates/oracle-patching.service').read_text()
+        self.assertIn('User=opu-controller', service)
+        self.assertIn('RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6', service)
+        self.assertNotIn('PrivateNetwork=yes', service)
+        ollama = (ROOT / 'deploy/templates/opu-ollama.service').read_text()
+        self.assertIn('OLLAMA_HOST=127.0.0.1:11434', ollama)
+        self.assertIn('OLLAMA_NO_CLOUD=1', ollama)
+
+
+class MacDependencyAdmissionTests(unittest.TestCase):
+    """Exercise only admission code; never launch or inspect actual services."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='opu-mac-admission-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'webapp').mkdir()
+        (self.root / 'webapp/requirements-api.txt').write_text('fastapi==0.141.1\n')
+        source = (ROOT / 'scripts/start-local-mac.command').read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+        tree = ast.parse(source)
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in {'fail', 'check_api_dependencies'}]
+        self.assertEqual(len(functions), 2)
+        self.namespace = {'ROOT': self.root, 'importlib': importlib}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), 'mac-launcher-admission', 'exec'), self.namespace)
+
+    def test_missing_or_mismatched_package_blocks_with_install_instruction(self):
+        for outcome in (importlib.metadata.PackageNotFoundError('fastapi'), '0.0.0'):
+            with self.subTest(outcome=type(outcome).__name__), \
+                    patch.object(importlib.metadata, 'version', side_effect=outcome if isinstance(outcome, Exception) else None,
+                                 return_value=outcome), \
+                    patch.object(importlib, 'import_module') as importing:
+                with self.assertRaisesRegex(SystemExit, 'pip install .*requirements-api.txt'):
+                    self.namespace['check_api_dependencies']()
+                importing.assert_not_called()
+
+    def test_broken_dependency_import_blocks_even_when_distribution_version_matches(self):
+        with patch.object(importlib.metadata, 'version', return_value='0.141.1'), \
+                patch.object(importlib, 'import_module', side_effect=ImportError('broken extension')):
+            with self.assertRaisesRegex(SystemExit, 'missing or inconsistent'):
+                self.namespace['check_api_dependencies']()
+
+    def test_pinned_importable_package_passes_without_external_commands(self):
+        with patch.object(importlib.metadata, 'version', return_value='0.141.1'), \
+                patch.object(importlib, 'import_module', return_value=object()) as importing, \
+                patch.object(subprocess, 'run') as command:
+            self.namespace['check_api_dependencies']()
+            importing.assert_called_once_with('fastapi')
+            command.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
+import runtime_paths
 
 TICKETS_ENV = "OPU_ITSM_TICKETS_FILE"
 REQUIRED_ENV = "OPU_ITSM_REQUIRED"
-DEFAULT_TICKETS_FILE = Path(__file__).resolve().parent / "var" / "change-tickets.json"
+DEFAULT_TICKETS_FILE = runtime_paths.state_dir() / "change-tickets.json"
 
 
 class ItsmError(Exception):
@@ -38,22 +40,41 @@ def tickets_path() -> Path:
 
 def _load_registry() -> list[dict]:
     path = tickets_path()
-    if not path.is_file() or path.is_symlink():
-        raise ItsmError(
-            f"change-ticket registry missing at {path}; refusing approval (fail-closed)"
-        )
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o022):
+                raise ValueError("unsafe registry")
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("oversized registry")
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate registry key")
+                result[key] = value
+            return result
+        data = json.loads(raw, object_pairs_hook=unique)
+    except (OSError, ValueError, RecursionError) as exc:
         raise ItsmError(
-            f"change-ticket registry unreadable at {path}: {exc}; refusing approval (fail-closed)"
+            f"change-ticket registry unreadable or unsafe at {path}; refusing approval (fail-closed)"
         ) from exc
     tickets = data.get("tickets") if isinstance(data, dict) else None
     if not isinstance(tickets, list):
         raise ItsmError(
             f"change-ticket registry malformed at {path} (expected {{\"tickets\": [...]}}); refusing approval (fail-closed)"
         )
-    return [entry for entry in tickets if isinstance(entry, dict)]
+    seen = set()
+    for entry in tickets:
+        if (not isinstance(entry, dict) or not isinstance(entry.get("ticket"), str)
+                or not entry["ticket"].strip() or not isinstance(entry.get("state"), str)
+                or not entry["state"].strip() or entry["ticket"].strip() in seen):
+            raise ItsmError("change-ticket registry has malformed or ambiguous entries; refusing approval (fail-closed)")
+        seen.add(entry["ticket"].strip())
+    return tickets
 
 
 def list_tickets() -> list[dict]:

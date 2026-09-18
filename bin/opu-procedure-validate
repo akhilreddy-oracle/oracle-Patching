@@ -121,7 +121,10 @@ validate() {
     echo 'FPP (Fleet Patching and Provisioning) procedures are rejected: this build has no rhpctl/FPP-server adapter. See docs/FUTURE_ADAPTERS.md.' >&2
     return 2
   fi
-  violations=$(procedure_contract_violations || true)
+  if ! violations=$(procedure_contract_violations); then
+    echo 'procedure manifest fields could not be validated against the Oracle procedure contract' >&2
+    return 2
+  fi
   if [ -n "$violations" ]; then
     {
       echo 'procedure manifest is incomplete or violates the Oracle procedure contract:'

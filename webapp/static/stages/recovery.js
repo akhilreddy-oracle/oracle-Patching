@@ -3,6 +3,7 @@ import { apiFetch } from "../api.js";
 import { belongsToHost, newestFirst } from "../host_scope.js";
 import { getActor } from "../actor.js";
 import { runToCompletion } from "../runs.js";
+import { maintenanceWindowError } from "../patch_wizard.js";
 import {
   helperText, field, bindActorField, formErrorBox, showFormError, clearFormError,
   requireActor, requireToken, requireNonEmpty, isAbsolutePath, formatRunFailure,
@@ -190,8 +191,7 @@ function liveRecoveryForm(hostId, snapshot, savedPolicy, capabilities) {
     if (!parent) return;
     if (!isAbsolutePath(parent)) { showFormError(errBox, "Backup parent directory must be an absolute path on this host."); return; }
     const start = windowStart.value.trim(), end = windowEnd.value.trim();
-    const utc = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
-    if (![start, end].every((value) => utc.test(value) && Number.isFinite(Date.parse(value))) || Date.parse(end) <= Date.parse(start) || Date.parse(end) <= Date.now()) {
+    if (maintenanceWindowError(start, end)) {
       showFormError(errBox, "Use UTC timestamps such as 2026-09-14T15:00:00Z, with an end after the start and in the future."); return;
     }
     const recovery = policyRecoveryBlock(hostId);

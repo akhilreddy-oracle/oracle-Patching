@@ -26,6 +26,33 @@ inbox. See [application enhancements](docs/APPLICATION_ENHANCEMENTS.md) for the
 supported scope and [release validation](docs/RELEASE_VALIDATION.md) for the
 fixture, live lab and production evidence levels.
 
+The [local-model patching assistant](docs/PATCHING_ASSISTANT.md) runs live patch
+inventory checks for operators, inspects saved evidence when requested and prepares
+typed patch/backup actions for confirmation through the existing workflow.
+[Linux deployment tooling](docs/REMOTE_DEPLOYMENT.md) provides versioned
+code, persistent state, TLS and optional same-server inference. Model availability,
+server deployment and live Oracle validation must be verified separately.
+
+For the configured MacBook installation, use the [local Mac launcher](docs/MAC_LOCAL_SETUP.md)
+to start the application and its dedicated Ollama service.
+
+The controller requires Python 3.10 or later. Install its reviewed direct
+dependencies into the repository virtual environment before starting it or
+running API/browser checks:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r scripts/requirements.txt -r webapp/requirements-sso.txt -r webapp/requirements-api.txt
+.venv/bin/python -m pip check
+```
+
+`requirements-api.txt` pins FastAPI, Pydantic and Uvicorn for the HTTP layer,
+and HTTPX for ASGI tests. Continue using `python -B webapp/server.py` as the
+entry point; startup validation and the single loopback worker remain under
+application control. Managed-host Oracle executors do not require this API
+stack. Installing packages alone does not configure credentials or certify
+live execution.
+
 Architecture and delivery decomposition are complete. The current build has
 read-only discovery, evidence reconciliation, artifact/procedure validation,
 OPatch compatibility, policy readiness, verified recovery evidence, and typed
@@ -151,6 +178,10 @@ make check
 
 - Oracle Database 19c Release Updates on Oracle Linux x86-64
 - Standalone and RAC Database / Grid Infrastructure adapters
+- Database patch apply/rollback, OJVM, and home-switch adapters currently admit
+  **non-CDB databases only**. Runtime probes must explicitly observe `CDB=NO`;
+  multitenant and unknown container scope block before mutation. Full PDB and
+  seed SQL validation and open-state restoration are not implemented.
 - Data Guard-aware orchestration after primary workflows are proven
 - Discovery, inventory, patch repository, prechecks, approvals, execution,
   validation, rollback, reporting, and audit

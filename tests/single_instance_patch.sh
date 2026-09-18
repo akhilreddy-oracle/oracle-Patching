@@ -77,6 +77,7 @@ else
   printf 'sql:%s\n' "$fd" >>"$OPU_TEST_FD_CALLS"
 fi
 if grep -q 'shutdown immediate' <<<"$input"; then
+  printf 'shutdown:%s\n' "$fd" >>"$OPU_TEST_FD_CALLS"
   [ "$(cat "$OPU_TEST_DATABASE_STATE")" = up ] || exit 1
   printf 'down\n' >"$OPU_TEST_DATABASE_STATE"
 elif grep -q '^startup;' <<<"$input"; then
@@ -101,10 +102,11 @@ elif grep -q 'alter system register' <<<"$input"; then
 else
   [ "$(cat "$OPU_TEST_DATABASE_STATE")" = up ] || exit 1
   printf '%s\n' \
-    'INSTANCE_NAME=ORCL' \
+    "INSTANCE_NAME=${OPU_TEST_INSTANCE_NAME-ORCL}" \
     'INSTANCE_STATUS=OPEN' \
-    'DATABASE_UNIQUE_NAME=ORCL' \
-    'DATABASE_ROLE=PRIMARY' \
+    "DATABASE_UNIQUE_NAME=${OPU_TEST_DATABASE_NAME-ORCL}" \
+    "CDB=${OPU_TEST_CDB-NO}" \
+    "DATABASE_ROLE=${OPU_TEST_DATABASE_ROLE-PRIMARY}" \
     'OPEN_MODE=READ WRITE' \
     'LOG_MODE=ARCHIVELOG' \
     'INVALID_OBJECTS=0'
@@ -302,7 +304,7 @@ create_plan() {
 }
 
 execute() {
-  local plan_id=$1 task_id=$2
+  local plan_id=$1 task_id=$2 actor=${3:-standalone-worker}
   OPU_PLAN_STATE_DIR="$PLAN_STATE" \
   OPU_SINGLE_INSTANCE_STATE_DIR="$EXECUTION_STATE" \
   OPU_SINGLE_INSTANCE_TEST_MODE=1 \
@@ -320,7 +322,7 @@ execute() {
   OPU_TEST_FAIL_ROLLBACK="$FAIL_ROLLBACK" \
   OPU_TEST_SQLPATCH_ACTION_STATE="$SQLPATCH_ACTION_STATE" \
   OPU_SINGLE_INSTANCE_TEST_APPLY_CAPACITY_BYTES="$CAPACITY_BYTES" \
-    "$EXECUTOR" execute --plan-id "$plan_id" --task-id "$task_id" --actor standalone-worker --lease-seconds 30
+    "$EXECUTOR" execute --plan-id "$plan_id" --task-id "$task_id" --actor "$actor" --lease-seconds 30
 }
 
 execute_rollback() {
@@ -343,6 +345,20 @@ execute_rollback() {
   OPU_TEST_SQLPATCH_ACTION_STATE="$SQLPATCH_ACTION_STATE" \
     "$ROOT/bin/opu-database-single-instance-rollback" execute --plan-id "$plan_id" --task-id "$task_id" --actor rollback-worker --lease-seconds 30
 }
+
+# Current adapters cannot verify every PDB and seed SQL state. Prove the real
+# precheck rejects CDB/unknown scope while leaving database and binaries alone.
+for scope in YES ''; do
+  scope_plan=standalone-cdb-${scope:-unknown}
+  create_plan "$scope_plan"
+  scope_task=$(plan next --plan-id "$scope_plan" | jq -r '.task_id')
+  if OPU_TEST_CDB="$scope" execute "$scope_plan" "$scope_task" >"$TMP/$scope_plan.out" 2>&1; then
+    echo 'unsupported or unknown CDB scope passed native precheck' >&2; exit 1
+  fi
+  grep -F 'non-CDB databases only' "$EXECUTION_STATE/plans/$scope_plan/tasks/$scope_task/stderr.log" >/dev/null
+  [ "$(cat "$DATABASE_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
+  plan status --plan-id "$scope_plan" | jq -e '.state == "paused"' >/dev/null
+done
 
 # Artifact tampering must fail before any database mutation.
 create_plan standalone-tamper
@@ -424,6 +440,42 @@ APPLY_CALLS_AFTER=$(grep -c '^apply ' "$OPATCH_CALLS" 2>/dev/null || true)
 [ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
 rm -f "$FAIL_APPLICABILITY"
 
+# A successful precheck does not authorize a later outage against a changed
+# database, instance, role or unsupported CDB scope. Exercise the real native
+# apply task with changed live SQL observations, then retry its no-mutation
+# failure without replacing any approval or deleting prior attempt evidence.
+create_plan standalone-health-drift
+HEALTH_PRECHECK=$(plan next --plan-id standalone-health-drift | jq -r '.task_id')
+execute standalone-health-drift "$HEALTH_PRECHECK" >/dev/null
+HEALTH_APPLY=$(plan next --plan-id standalone-health-drift | jq -r '.task_id')
+HEALTH_ATTEMPT=0
+for drift in database instance role cdb unknown-cdb; do
+  SHUTDOWNS_BEFORE=$(grep -c '^shutdown:' "$FD_CALLS" || true)
+  LISTENER_STOPS_BEFORE=$(grep -c '^listener-stop:' "$FD_CALLS" || true)
+  APPLY_CALLS_BEFORE=$(grep -c '^apply ' "$OPATCH_CALLS" || true)
+  set +e
+  case "$drift" in
+    database) OPU_TEST_DATABASE_NAME=UNREVIEWED OPU_SINGLE_INSTANCE_WAIT_ATTEMPTS=1 execute standalone-health-drift "$HEALTH_APPLY" >"$TMP/health-$drift.json" 2>"$TMP/health-$drift.stderr" ;;
+    instance) OPU_TEST_INSTANCE_NAME=OTHER OPU_SINGLE_INSTANCE_WAIT_ATTEMPTS=1 execute standalone-health-drift "$HEALTH_APPLY" >"$TMP/health-$drift.json" 2>"$TMP/health-$drift.stderr" ;;
+    role) OPU_TEST_DATABASE_ROLE='PHYSICAL STANDBY' OPU_SINGLE_INSTANCE_WAIT_ATTEMPTS=1 execute standalone-health-drift "$HEALTH_APPLY" >"$TMP/health-$drift.json" 2>"$TMP/health-$drift.stderr" ;;
+    cdb) OPU_TEST_CDB=YES OPU_SINGLE_INSTANCE_WAIT_ATTEMPTS=1 execute standalone-health-drift "$HEALTH_APPLY" >"$TMP/health-$drift.json" 2>"$TMP/health-$drift.stderr" ;;
+    unknown-cdb) OPU_TEST_CDB='' OPU_SINGLE_INSTANCE_WAIT_ATTEMPTS=1 execute standalone-health-drift "$HEALTH_APPLY" >"$TMP/health-$drift.json" 2>"$TMP/health-$drift.stderr" ;;
+  esac
+  HEALTH_RC=$?
+  set -e
+  [ "$HEALTH_RC" -eq 65 ] || { echo "apply accepted changed live $drift" >&2; exit 1; }
+  jq -e --argjson attempt "$HEALTH_ATTEMPT" '.status == "failed" and .outcome_class == "no_mutation" and .retry_count == $attempt' "$TMP/health-$drift.json" >/dev/null
+  [ "$(grep -c '^shutdown:' "$FD_CALLS" || true)" -eq "$SHUTDOWNS_BEFORE" ]
+  [ "$(grep -c '^listener-stop:' "$FD_CALLS" || true)" -eq "$LISTENER_STOPS_BEFORE" ]
+  [ "$(grep -c '^apply ' "$OPATCH_CALLS" || true)" -eq "$APPLY_CALLS_BEFORE" ]
+  [ "$(cat "$DATABASE_STATE")" = up ] && [ "$(cat "$LISTENER_STATE")" = up ] && [ ! -f "$PATCH_STATE" ]
+  plan status --plan-id standalone-health-drift | jq -e '.state == "paused"' >/dev/null
+  if [ "$drift" != unknown-cdb ]; then
+    plan retry-task --plan-id standalone-health-drift --task-id "$HEALTH_APPLY" --actor patch-operator >/dev/null
+    HEALTH_ATTEMPT=$((HEALTH_ATTEMPT+1))
+  fi
+done
+
 # A binary-apply failure must pause without pretending that Oracle recovered.
 create_plan standalone-opatch-failure
 FAILURE_PRECHECK=$(plan next --plan-id standalone-opatch-failure | jq -r '.task_id')
@@ -470,7 +522,9 @@ for expected_stage in precheck apply validate datapatch final_validate; do
   TASK_JSON=$(plan next --plan-id standalone-success)
   TASK_ID=$(jq -r '.task_id' <<<"$TASK_JSON")
   [ "$(jq -r '.stage' <<<"$TASK_JSON")" = "$expected_stage" ]
-  execute standalone-success "$TASK_ID" >"$TMP/$expected_stage-result.json"
+  source_worker=standalone-worker
+  [ "$expected_stage" != apply ] || source_worker=standalone-apply-worker
+  execute standalone-success "$TASK_ID" "$source_worker" >"$TMP/$expected_stage-result.json"
   jq -e --arg stage "$expected_stage" '.status == "succeeded" and .stage == $stage and .postcondition.status == "passed" and (.outcome_class | IN("no_mutation","binary_state_known")) and (.record_sha256 | test("^[a-f0-9]{64}$"))' "$TMP/$expected_stage-result.json" >/dev/null
 done
 
@@ -502,16 +556,20 @@ create_rollback_plan() {
 # Source apply worker cannot approve or authorize the derived rollback plan.
 plan create-rollback --plan-id standalone-rollback-sod --requester rollback-admin \
   --source-plan-id standalone-success --window-start "$WINDOW_START" --window-end "$WINDOW_END" >/dev/null
-plan status --plan-id standalone-rollback-sod | jq -e '.source_apply.actors == ["standalone-worker"]' >/dev/null
-if plan approve --plan-id standalone-rollback-sod --actor standalone-worker --approval-ticket TEST-ROLLBACK-SOD >/dev/null 2>&1; then
-  echo 'source apply worker was allowed to approve standalone rollback' >&2
-  exit 1
-fi
+plan status --plan-id standalone-rollback-sod | jq -e '.source_apply.actors == ["standalone-apply-worker","standalone-worker"]' >/dev/null
+for source_worker in standalone-apply-worker standalone-worker; do
+  if plan approve --plan-id standalone-rollback-sod --actor "$source_worker" --approval-ticket TEST-ROLLBACK-SOD >/dev/null 2>&1; then
+    echo "source apply worker $source_worker was allowed to approve standalone rollback" >&2
+    exit 1
+  fi
+done
 plan approve --plan-id standalone-rollback-sod --actor rollback-approver --approval-ticket TEST-ROLLBACK-SOD >/dev/null
-if plan authorize --plan-id standalone-rollback-sod --actor standalone-worker >/dev/null 2>&1; then
-  echo 'source apply worker was allowed to authorize standalone rollback' >&2
-  exit 1
-fi
+for source_worker in standalone-apply-worker standalone-worker; do
+  if plan authorize --plan-id standalone-rollback-sod --actor "$source_worker" >/dev/null 2>&1; then
+    echo "source apply worker $source_worker was allowed to authorize standalone rollback" >&2
+    exit 1
+  fi
+done
 
 # A failed OPatch rollback is an unknown binary outcome and cannot be retried.
 create_rollback_plan standalone-rollback-failure

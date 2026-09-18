@@ -1,0 +1,11 @@
+{
+  "public_hostname": "patching.example.com",
+  "tls_certificate": "/etc/pki/tls/certs/patching.example.com.crt",
+  "tls_private_key": "/etc/pki/tls/private/patching.example.com.key",
+  "hosts_file": "/root/opu-install-inputs/hosts.json",
+  "principals_file": "/root/opu-install-inputs/principals.json",
+  "ssh_config_file": "/root/opu-install-inputs/ssh_config",
+  "known_hosts_file": "/root/opu-install-inputs/known_hosts",
+  "ssh_private_key_file": "/root/opu-install-inputs/controller_ed25519",
+  "enable_ollama": false
+}

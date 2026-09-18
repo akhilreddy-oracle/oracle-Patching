@@ -228,6 +228,20 @@ class TargetContextTests(unittest.TestCase):
         self.native_authority.assert_called_once()
         self.assertEqual([call.args[1] for call in self.runner.native.call_args_list], ['status'] + ['task-status'] * 5)
 
+    def test_versioned_inspector_retains_legacy_plan_paths(self):
+        base = self.root.resolve()
+        code = base / '.opu-runtimes' / ('a' * 64)
+        code.mkdir(parents=True)
+        with patch.object(M, 'ROOT', code), patch.dict(os.environ, {'OPU_PLAN_STATE_DIR': str(base / 'var/webapp-plans')}):
+            plan, target, authority = M.target_context(self.args, self.runner)
+            self.assertEqual((plan, target), (self.plan, self.target))
+            self.assertEqual(authority['plan_state'], 'paused')
+            self.assertTrue(all(call.args[0] == base / 'var/webapp-plans' for call in self.runner.native.call_args_list))
+            self.runner.native.reset_mock()
+            with patch.dict(os.environ, {'OPU_PLAN_STATE_DIR': str(code / 'var/webapp-plans')}), self.assertRaises(M.trust.Blocked):
+                M.target_context(self.args, self.runner)
+            self.runner.native.assert_not_called()
+
     def test_running_pending_remains_supported_but_other_pairs_are_blocked(self):
         self.plan['state'] = 'running'
         final = self.tasks['005-final-validate-local']

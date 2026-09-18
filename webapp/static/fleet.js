@@ -134,7 +134,9 @@ export async function renderFleet(mount, savedMessage = "") {
       el("tbody", {}, selected.map((row) => el("tr", {}, [
         el("td", { class: "fleet-identity", "data-label": "Database / host" }, [el("strong", { text: row.database }), el("p", { text: row.host_label || row.host_id }), el("small", { class: "mono", text: row.oracle_home })]),
         el("td", { "data-label": "Environment", text: row.environment }), el("td", { "data-label": "Oracle version", text: row.oracle_version }),
-        el("td", { class: "fleet-patches", "data-label": "Patch baseline" }, [el("p", { text: row.patch_baseline }), badge(row.baseline_status, statusKind(row.baseline_status)), ...(row.desired_patch_baseline !== "unknown" ? [el("p", { class: "helper-text", text: `Required: ${row.desired_patch_baseline}` })] : [])]),
+        el("td", { class: "fleet-patches", "data-label": "Patch baseline" }, [el("p", { text: row.patch_baseline }), badge(row.baseline_status, statusKind(row.baseline_status)),
+          ...(typeof row.baseline_reason === "string" && row.baseline_reason ? [el("p", { class: "helper-text", text: row.baseline_reason })] : []),
+          ...(row.desired_patch_baseline !== "unknown" ? [el("p", { class: "helper-text", text: `Required: ${row.desired_patch_baseline}` })] : [])]),
         el("td", { "data-label": "Backup" }, [badge(row.backup_status, statusKind(row.backup_status)), el("p", { class: "helper-text", text: row.backup_completed_at || "Completion time unknown" })]),
         el("td", { "data-label": "Readiness" }, [badge(row.readiness, statusKind(row.readiness)), ...(row.blockers != null ? [el("p", { class: "helper-text", text: `${row.blockers} blockers` })] : [])]),
         el("td", { class: "fleet-evidence", "data-label": "Evidence" }, [badge(row.evidence_status, statusKind(row.evidence_status)), el("p", { class: "helper-text", text: row.evidence_at || "Observation time unknown" })]),

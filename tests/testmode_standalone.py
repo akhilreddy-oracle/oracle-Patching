@@ -18,6 +18,38 @@ import testmode_fixtures
 
 
 class SharedStandaloneTests(unittest.TestCase):
+    def test_fixture_freshness_uses_one_clock_observation_across_second_boundary(self):
+        real_run = subprocess.run
+        first_epoch = int(datetime.now(timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory(prefix='opu-fixture-clock-') as temporary:
+            for builder in (testmode_fixtures.build, testmode_fixtures.build_rac, testmode_fixtures.build_grid):
+                with self.subTest(builder=builder.__name__):
+                    observations = []
+
+                    def advancing_clock(args, *positional, **kwargs):
+                        # Only current-time observations advance. Date
+                        # formatting and native fixture tools still run normally.
+                        if args in (["date", "-u", "+%s"], ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"]):
+                            epoch = first_epoch + len(observations)
+                            observations.append(epoch)
+                            value = str(epoch) if args[-1] == "+%s" else datetime.fromtimestamp(epoch, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                            return subprocess.CompletedProcess(args, 0, value + '\n', '')
+                        return real_run(args, *positional, **kwargs)
+
+                    with patch.object(testmode_fixtures.subprocess, 'run', side_effect=advancing_clock):
+                        fixture = builder(Path(temporary) / builder.__name__)
+                    readiness = json.loads(fixture['evidence']['readiness'].read_text())
+                    policy = json.loads(fixture['evidence']['policy'].read_text())
+                    parse = lambda value: int(datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp())
+                    for entry in readiness['snapshot_evidence']:
+                        snapshot = json.loads(Path(entry['path']).read_text())
+                        self.assertEqual(snapshot['collected_at'], entry['collected_at'])
+                        self.assertEqual(entry['collected_at'], readiness['evaluated_at'])
+                        self.assertEqual(entry['valid_until'], readiness['valid_until'])
+                        self.assertEqual(parse(entry['valid_until']) - parse(entry['collected_at']),
+                                         policy['maximum_snapshot_age_seconds'])
+                    self.assertEqual(len(observations), 1)
+
     def test_complete_demo_retains_native_inventory_recompile_and_report_custody(self):
         with tempfile.TemporaryDirectory(prefix='opu-shared-demo-') as temporary:
             base = Path(temporary)

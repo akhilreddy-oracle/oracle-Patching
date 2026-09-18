@@ -6,13 +6,12 @@ import hashlib
 import html
 import io
 import json
-import os
 from pathlib import Path
 import re
-import stat
 from datetime import datetime, timezone
 
 import execution_console
+import evidence
 import planctl
 from diagnostics import redact_text, redacted
 
@@ -20,27 +19,25 @@ _METRICS = {'binary_inventory': 'Binary patch inventory', 'sql_patch_status': 'T
             'invalid_objects': 'Invalid objects', 'components': 'Database components',
             'listener_ready': 'Listener exposes target as READY', 'database_state': 'Database state'}
 
+# These are the native dispatch stages, not labels invented by the report.
+_FINAL_STAGES = {
+    'final_validate', 'rollback_final_validate',
+    'cluster_final_validate', 'rac_rollback_final_validate',
+    'grid_cluster_final_validate', 'grid_rollback_cluster_final_validate',
+    'opatchauto_cluster_final_validate', 'opatchauto_rollback_cluster_final_validate',
+    'ojvm_final_validate', 'ojvm_rollback_final_validate',
+    'oop_final_validate', 'oop_switchback_final_validate',
+}
+
 
 def _checked(path, expected, maximum=64 * 1024 * 1024):
     path = Path(path)
     if not isinstance(expected, str) or not re.fullmatch(r'[a-f0-9]{64}', expected):
         raise ValueError('source has no valid SHA-256 binding')
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > maximum:
-            raise ValueError('source is not a bounded independent regular file')
-        with os.fdopen(os.dup(fd), 'rb') as stream:
-            data = stream.read(maximum + 1)
-        after = os.fstat(fd)
-        named = path.lstat()
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino):
-            raise ValueError('source changed while being verified')
-        if len(data) > maximum or hashlib.sha256(data).hexdigest() != expected:
-            raise ValueError('source SHA-256 does not match the sealed reference')
-        return data
-    finally:
-        os.close(fd)
+    data = evidence.read_regular_bytes(path, maximum)
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError('source SHA-256 does not match the sealed reference')
+    return data
 
 
 def _unknown():
@@ -50,6 +47,30 @@ def _unknown():
 def _set(facts, key, value, source):
     if value is not None:
         facts[key] = {'status': 'verified', 'value': value, 'source': source}
+
+
+def _precheck(stage):
+    return stage == 'precheck' or stage.endswith('_precheck')
+
+
+def _inventory_facts(text, source, facts):
+    # A completed native inventory query can legitimately return no patches.
+    # Missing/unrecognizable output must not retain an older positive inventory.
+    patches, recognized = [], True
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line in {'OPatch succeeded.', 'There are no Interim patches installed in this Oracle Home.'}:
+            continue
+        match = re.fullmatch(r'([0-9]{1,20});.*', line)
+        if match:
+            patches.append(match[1])
+        else:
+            recognized = False
+    if recognized:
+        _set(facts, 'binary_inventory', sorted(set(patches)), source)
+    else:
+        facts['binary_inventory'] = {'status': 'unknown', 'value': None, 'source': source,
+                                     'reason': 'The latest inventory artifact has unrecognized output'}
 
 
 def _snapshot_facts(document, target, source, facts):
@@ -75,10 +96,13 @@ def _snapshot_facts(document, target, source, facts):
 def _text_facts(name, text, source, facts, target):
     # Only specific custodied native artifacts carry these facts. Generic
     # stdout/error text is never interpreted as a successful health check.
+    if not _precheck(source.get('stage') or '') and re.search(r'(?:^|-)(?:before|pre|precheck)(?:-|\.)', name):
+        # Custody manifests are sorted by filename, not by observation time:
+        # apply-before sorts after apply-after. A pre-mutation probe cannot
+        # describe a completed stage's resulting inventory or database health.
+        return
     if name.endswith('lspatches.log'):
-        patches = re.findall(r'(?m)^([0-9]{1,20});', text)
-        if patches:
-            _set(facts, 'binary_inventory', sorted(set(patches)), source)
+        _inventory_facts(text, source, facts)
     values = dict(re.findall(r'(?m)^([A-Z_]+)=(.*?)\s*$', text))
     if name.endswith('health.log'):
         if values.get('DATABASE_UNIQUE_NAME') != target.get('database_unique_name'):
@@ -141,14 +165,17 @@ def build(plan_id):
             native = json.loads(_checked(directory / 'evidence.json', task.get('evidence_sha256')))
             if not isinstance(manifest, dict) or not isinstance(native, dict):
                 raise ValueError('native evidence and custody must be objects')
-            if native.get('plan_id') != plan_id or native.get('plan_sha256') != plan['plan_sha256'] or native.get('task_id') != task['task_id'] or native.get('status') != task.get('status'):
+            if (native.get('plan_id') != plan_id or native.get('plan_sha256') != plan['plan_sha256']
+                    or native.get('task_id') != task['task_id'] or native.get('status') != task.get('status')
+                    or native.get('stage') != task.get('stage')):
                 raise ValueError('native evidence scope differs from its verified task')
             native_target = native.get('target') or {}
-            if not isinstance(native_target, dict) or any(target.get(key) and native_target.get(key) != target[key] for key in ('database_unique_name', 'oracle_home')):
+            if not isinstance(native_target, dict) or any(target.get(key) and native_target.get(key) != target[key] for key in ('database_unique_name', 'oracle_home', 'grid_home')):
                 raise ValueError('native evidence targets another database/home')
             # Failed tasks retain diagnostics but cannot overwrite healthy facts
             # with incomplete checks or pre-failure console output.
-            destination = before if task.get('stage') in {'precheck', 'rollback_precheck'} else after
+            stage = task.get('stage') or ''
+            destination = before if _precheck(stage) else after
             task_facts, task_sources, failure_diagnostics = dict(destination), [], []
             for item in manifest.get('files') or []:
                 if not isinstance(item, dict):
@@ -167,6 +194,8 @@ def build(plan_id):
                                                     'text': redact_text(raw.decode('utf-8', 'replace'), 4000)})
                     continue
                 if name in {'report-before.json', 'report-after.json'}:
+                    if name != ('report-before.json' if _precheck(stage) else 'report-after.json'):
+                        continue
                     document = json.loads(raw)
                     if not isinstance(document, dict) or not isinstance(document.get('target'), dict) or document['target'].get('database_unique_name') != target.get('database_unique_name') or document['target'].get('oracle_home') != target.get('oracle_home'):
                         raise ValueError('reporting observation targets another database/home')
@@ -188,7 +217,7 @@ def build(plan_id):
             checked_tasks.add(task['task_id'])
         except (OSError, ValueError, TypeError, KeyError) as exc:
             gaps.append({'source': task.get('task_id'), 'reason': redact_text(str(exc), 400)})
-    final = [task for task in task_rows if task.get('stage') in {'final_validate', 'rollback_final_validate'}]
+    final = [task for task in task_rows if task.get('stage') in _FINAL_STAGES]
     source_complete = plan.get('state') == 'succeeded' and len(final) == 1 and final[0].get('status') == 'succeeded' and final[0].get('evidence_verified') is True and final[0].get('task_id') in checked_tasks
     rollback = {'status': 'requires_native_validation' if source_complete and plan.get('intent', 'patch_apply') == 'patch_apply' else 'not_available',
                 'approved': False, 'native_validation': 'not_run',
@@ -203,7 +232,7 @@ def build(plan_id):
               'maintenance_window': plan.get('maintenance_window'), 'generated_at': datetime.now(timezone.utc).isoformat(),
               'completion_verified': source_complete, 'comparison': comparison, 'verified_sources': sources,
               'evidence': {'tasks': evidence_records}, 'gaps': gaps, 'rollback': rollback,
-              'interpretation': 'Verified means the saved evidence and its custody matched their sealed hashes. It is not a fresh live-health check. Unknown means evidence is absent or unverifiable.',
+              'interpretation': 'Verified means the saved evidence and its custody matched their sealed hashes. It is not a fresh live-health check. Each metric describes its named source; inventory is not an all-node cluster compliance assessment. Unknown means evidence is absent or unverifiable.',
               'after_scope': 'verified final validation' if source_complete else 'latest verified completed stages; final validation is incomplete'}
     report = redacted(report)
     report['report_sha256'] = hashlib.sha256(json.dumps(report, sort_keys=True, separators=(',', ':')).encode()).hexdigest()

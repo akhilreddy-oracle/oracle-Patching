@@ -111,6 +111,28 @@ next task can run. Failed work pauses the plan. `reconcile` turns an expired
 task into `unknown` and pauses the plan; it deliberately does not return the
 task to pending or invoke a retry.
 
+Executors keep renewing while they capture and seal stage evidence, then stop
+and join the heartbeat and synchronously renew before handing completion to
+the controller. A renewal failure during that handoff preserves the evidence
+and blocks completion. A heartbeat failure already recorded as an unknown
+stage outcome retains the existing failed-evidence reconciliation path.
+
+`complete` records `completion_admitted_at_epoch` when it acquires the exclusive
+plan task lock. It checks lease ownership at that admission time and retains
+the lock throughout evidence verification and custody, preventing a competing
+renewal, reconciliation, or claim. `completed_at_epoch` records the later
+verified persistence time. For new results, `completed_after_lease` means the
+lease had expired at admission; verification duration alone cannot make an
+on-time completion late. Historical results without an admission timestamp
+retain their original recorded meaning and are not rewritten.
+
+Renewal likewise checks the existing lease at lock admission, then rechecks the
+actual current maintenance window before persisting a bounded new expiry.
+It cannot revive ownership already expired at admission. A new claim requires
+at least 30 seconds left in the window. An already-valid owner may renew with
+as little as one second left; that renewal still ends at the sealed window
+deadline and cannot succeed once the window closes.
+
 Dispatch now records a sealed manifest of the complete expected task set and
 atomically reserves every target host. Overlapping plans, including database
 and Grid plans, cannot dispatch concurrently. Reservations persist across

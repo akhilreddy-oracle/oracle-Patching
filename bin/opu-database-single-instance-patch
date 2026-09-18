@@ -60,8 +60,9 @@ acquire_executor_lock() {
     [ -x "$flock_command" ] || die 'standalone test flock command is not executable'
   fi
   if [ "$flock_command" != flock ] || command -v flock >/dev/null 2>&1; then
-    exec 8>"$RUN_DIR/executor.lock"
+    opu_execution_open_lock_file "$RUN_DIR/executor.lock" 8 || die "unsafe executor lock"
     "$flock_command" -n 8 || die 'another standalone executor owns this plan'
+    opu_execution_validate_lock "$RUN_DIR/executor.lock" 8 || die "unsafe executor lock"
     EXECUTOR_LOCK_USES_FLOCK=1
   elif [ "$TEST_MODE" = 1 ]; then
     EXECUTOR_LOCK_DIR="$RUN_DIR/executor.lock.d"
@@ -255,6 +256,7 @@ set pages 0 heading off feedback off verify off echo off trimspool on lines 3276
 select 'INSTANCE_NAME=' || instance_name from v$instance;
 select 'INSTANCE_STATUS=' || status from v$instance;
 select 'DATABASE_UNIQUE_NAME=' || db_unique_name from v$database;
+select 'CDB=' || cdb from v$database;
 select 'DATABASE_ROLE=' || database_role from v$database;
 select 'OPEN_MODE=' || open_mode from v$database;
 select 'LOG_MODE=' || log_mode from v$database;
@@ -263,10 +265,11 @@ exit;
 SQL
 }
 
-probe_value() { sed -n "s/^$1=//p" "$2" | tail -n1 | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'; }
+probe_value() { opu_sql_probe_value "$1" "$2"; }
 
 healthy_probe() {
   local file=$1
+  opu_require_non_cdb_probe "$file" || return $?
   [ "$(probe_value DATABASE_UNIQUE_NAME "$file")" = "$DATABASE" ] &&
     [ "$(probe_value INSTANCE_STATUS "$file")" = OPEN ] &&
     [ "$(probe_value DATABASE_ROLE "$file")" = PRIMARY ] &&
@@ -384,7 +387,8 @@ wait_for_listener_ready() {
 
 current_health() {
   local output_file=$1
-  database_probe "$ORACLE_SID" "$output_file" && healthy_probe "$output_file"
+  database_probe "$ORACLE_SID" "$output_file" && healthy_probe "$output_file" &&
+    [ "$(probe_value INSTANCE_NAME "$output_file")" = "$ORACLE_SID" ]
 }
 
 wait_for_database_health() {
@@ -497,6 +501,7 @@ stage_apply() {
   opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/apply-conflict.log"
   check_apply_capacity
   verify_extjob_permissions
+  current_health "$TASK_DIR/apply-pre-health.log" || die 'database identity or health changed immediately before binary apply'
   cat <<'SQL' | sqlplus_fixed "$ORACLE_SID"
 whenever sqlerror exit failure
 shutdown immediate;
@@ -569,7 +574,7 @@ SQL
 
 require_healthy_dictionary() {
   local output_file=$1 invalid components enabled
-  dictionary_probe "$output_file"
+  dictionary_probe "$output_file" || die 'could not query the database dictionary'
   invalid=$(probe_value INVALID_OBJECTS "$output_file")
   components=$(probe_value NONVALID_COMPONENTS "$output_file")
   enabled=$(probe_value ENABLED_COMPONENTS "$output_file")
@@ -783,7 +788,7 @@ verify_source_apply() {
 
 sqlpatch_latest() {
   local output_file=$1
-  cat <<SQL | sqlplus_fixed "$ORACLE_SID" >"$output_file"
+  cat <<SQL | sqlplus_fixed "$ORACLE_SID" >"$output_file" 2>&1
 whenever sqlerror exit failure
 whenever oserror exit failure
 set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
@@ -957,17 +962,6 @@ run_typed_stage() {
   esac
 }
 
-heartbeat() {
-  local stage_pid=$1 interval=$((LEASE_SECONDS / 3)) elapsed=0
-  [ "$interval" -le 60 ] || interval=60; [ "$interval" -ge 10 ] || interval=10
-  while kill -0 "$stage_pid" 2>/dev/null; do
-    sleep 1; kill -0 "$stage_pid" 2>/dev/null || break
-    elapsed=$((elapsed + 1)); [ "$elapsed" -ge "$interval" ] || continue; elapsed=0
-    if ! env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" renew --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --lease-seconds "$LEASE_SECONDS" >/dev/null 2>"$TASK_DIR/heartbeat-error.log"; then
-      : >"$TASK_DIR/heartbeat-failed"; return 1
-    fi
-  done
-}
 
 emit_evidence() {
   local status=$1 postcondition=$2 exit_code=$3 detail=$4 finished=$5 outcome_class=$6 stdout_sha stderr_sha tmp canonical record_sha
@@ -1018,7 +1012,7 @@ PY_REPORT_ARTIFACTS
 }
 
 execute_task() {
-  local claim_output stage_pid heartbeat_pid stage_rc finished status postcondition detail outcome_class complete_rc
+  local heartbeat_failed=0 claim_output stage_pid stage_rc finished status postcondition detail outcome_class complete_rc
   require_root; opu_execution_host_lock || return $?; load_plan; verify_source_documents
   mkdir -p "$EXECUTION_STATE_DIR/plans/$PLAN_ID"; RUN_DIR="$EXECUTION_STATE_DIR/plans/$PLAN_ID"; opu_execution_prepare_attempt "$RUN_DIR/tasks" "$PLAN_STATE_DIR/plans/$PLAN_ID/tasks/$TASK_ID.json" "$TASK_ID" || return $?; mkdir -p "$RUN_DIR/tasks"
   [ ! -e "$TASK_DIR" ] || die "execution evidence already exists for task $TASK_ID"
@@ -1031,12 +1025,11 @@ execute_task() {
   STARTED_AT=$(opu_now_utc)
   set +e
   (set -e; close_inherited_executor_lock; run_typed_stage) >"$TASK_DIR/stdout.log" 2>"$TASK_DIR/stderr.log" & stage_pid=$!
-  (exec 7>&-; close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
+  opu_execution_start_heartbeat || return $?
   wait "$stage_pid"; stage_rc=$?
-  kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true
   set -e
   finished=$(opu_now_utc)
-  if [ -f "$TASK_DIR/heartbeat-failed" ]; then status=failed; postcondition=unknown; detail='task lease heartbeat failed; Oracle outcome requires reconciliation'; stage_rc=75
+  if [ -f "$TASK_DIR/heartbeat-failed" ]; then heartbeat_failed=1; status=failed; postcondition=unknown; detail='task lease heartbeat failed; Oracle outcome requires reconciliation'; stage_rc=75
   elif [ "$stage_rc" -eq 0 ]; then status=succeeded; postcondition=passed; detail="$STAGE postcondition passed"
   else status=failed; postcondition=failed; detail="$STAGE failed; inspect sealed task logs"; fi
   if [ -f "$TASK_DIR/binary-state-unknown" ]; then
@@ -1051,6 +1044,7 @@ execute_task() {
   [ -n "${RECOVERY_FILE_SHA:-}" ] || { RECOVERY_FILE_SHA=$(jq -r '.recovery.manifest_sha256 // empty' "$PLAN_FILE"); RECOVERY_RECORD_SHA=$(jq -r '.recovery.record_sha256 // empty' "$PLAN_FILE"); }
   if [ -f "$BINDING_FILE" ] && verify_sealed_json "$BINDING_FILE" record_sha256; then ORACLE_SID=$(jq -r '.target.oracle_sid' "$BINDING_FILE"); fi
   emit_evidence "$status" "$postcondition" "$stage_rc" "$detail" "$finished" "$outcome_class"
+  opu_execution_finish_heartbeat "$status" "$postcondition" "$heartbeat_failed" || return $?
   set +e
   env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" complete --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --status "$status" --evidence "$TASK_DIR/evidence.json"
   complete_rc=$?; set -e

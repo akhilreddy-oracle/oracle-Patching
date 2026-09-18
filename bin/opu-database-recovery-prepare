@@ -49,6 +49,13 @@ epoch() {
   date -u -d "$1" +%s 2>/dev/null ||
     date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || return 1
 }
+valid_window_time() {
+  local parsed canonical
+  [[ ${1:-} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+  parsed=$(epoch "$1") || return 1
+  canonical=$(date -u -r "$parsed" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$parsed" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || return 1
+  [ "$canonical" = "$1" ]
+}
 request_dir() { printf '%s/%s' "$STATE_ROOT" "$1"; }
 request_file() { printf '%s/request.json' "$(request_dir "$1")"; }
 sha_file() { opu_hash_file "$1"; }
@@ -153,18 +160,22 @@ set_execution_phase() {
 
 verify_window_shape() {
   local start=$1 end=$2 start_epoch end_epoch
-  start_epoch=$(epoch "$start") || die 'window-start must be UTC in YYYY-MM-DDTHH:MM:SSZ format'
-  end_epoch=$(epoch "$end") || die 'window-end must be UTC in YYYY-MM-DDTHH:MM:SSZ format'
+  valid_window_time "$start" || die 'window-start must be a valid UTC calendar time in YYYY-MM-DDTHH:MM:SSZ format'
+  valid_window_time "$end" || die 'window-end must be a valid UTC calendar time in YYYY-MM-DDTHH:MM:SSZ format'
+  start_epoch=$(epoch "$start"); end_epoch=$(epoch "$end")
   [ "$start_epoch" -lt "$end_epoch" ] || die 'maintenance window end must be after start'
   [ $((end_epoch - start_epoch)) -le "$MAX_WINDOW_SECONDS" ] || die 'maintenance window cannot exceed 24 hours'
 }
 
 verify_open_window() {
-  local now start end
+  local now start end start_time end_time
+  start_time=$(jq -r '.maintenance_window.start' "$REQUEST_FILE")
+  end_time=$(jq -r '.maintenance_window.end' "$REQUEST_FILE")
+  verify_window_shape "$start_time" "$end_time"
   now=$(date -u +%s)
-  start=$(epoch "$(jq -r '.maintenance_window.start' "$REQUEST_FILE")") || die 'request window start is invalid'
-  end=$(epoch "$(jq -r '.maintenance_window.end' "$REQUEST_FILE")") || die 'request window end is invalid'
-  [ "$now" -ge "$start" ] && [ "$now" -le "$end" ] || die 'maintenance window is not open'
+  start=$(epoch "$start_time") || die 'request window start is invalid'
+  end=$(epoch "$end_time") || die 'request window end is invalid'
+  [ "$now" -ge "$start" ] && [ "$now" -lt "$end" ] || die 'maintenance window is not open'
 }
 
 verify_bound_inputs() {
@@ -258,19 +269,27 @@ probe_live_database() {
   local output=$1 sql_file="${PREFLIGHT_WORK_DIR:-$REQUEST_DIR/evidence}/live-probe.sql" line extra
   cat >"$sql_file" <<'SQL'
 whenever sqlerror exit failure
+whenever oserror exit failure
 set pages 0 heading off feedback off verify off echo off trimspool on lines 32767
 -- OPU_RECOVERY_PREP_PROBE
 select d.db_unique_name || '|' || i.instance_name || '|' || d.database_role || '|' ||
        d.open_mode || '|' || d.log_mode || '|' || i.status || '|' || d.dbid || '|' ||
        nvl((select value from v$parameter where name='spfile'),'') || '|' ||
-       (select nvl(sum(bytes),0) from v$datafile)
+       (select nvl(sum(bytes),0) from v$datafile) || '|' || d.cdb
   from v$database d cross join v$instance i;
 exit;
 SQL
   run_sql_file "$ORACLE_HOME_TARGET" "$ORACLE_OWNER" "$ORACLE_SID" "$sql_file" "$output" || return 1
-  line=$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' "$output" | sed '/^$/d' | tail -n1)
-  IFS='|' read -r LIVE_DATABASE LIVE_SID LIVE_ROLE LIVE_OPEN_MODE LIVE_LOG_MODE LIVE_INSTANCE_STATUS LIVE_DBID LIVE_SPFILE LIVE_DATABASE_BYTES extra <<<"$line"
+  # This query returns one ten-field row. Do not discard earlier rows or
+  # diagnostics: a last-row selection could hide conflicting target evidence.
+  line=$(awk -F '[|]' '
+    { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, "") }
+    NF { count++; if (NF != 10) invalid=1; row=$0 }
+    END { if (count != 1 || invalid) exit 1; print row }
+  ' "$output") || die 'live database identity probe must return exactly one complete ten-field row without diagnostics'
+  IFS='|' read -r LIVE_DATABASE LIVE_SID LIVE_ROLE LIVE_OPEN_MODE LIVE_LOG_MODE LIVE_INSTANCE_STATUS LIVE_DBID LIVE_SPFILE LIVE_DATABASE_BYTES LIVE_CDB extra <<<"$line"
   [ -z "${extra:-}" ] || return 1
+  [ "$LIVE_CDB" = NO ] || die 'recovery preparation supports non-CDB databases only; live CDB=NO is required before any downtime'
   valid_id "$LIVE_DATABASE" database || return 1
   valid_id "$LIVE_SID" oracle-sid || return 1
   [[ "$LIVE_DBID" =~ ^[0-9]+$ ]] || return 1
@@ -701,6 +720,9 @@ EOF
   fi
   ! grep -Eq 'RMAN-00569|RMAN-00558|RMAN-0100[6-9]' "$REQUEST_DIR/evidence/backup-rman-syntax.log" ||
     die 'generated RMAN command file reported a syntax error'
+  # Inventory, capacity checks and RMAN syntax validation may outlive the
+  # approved window. Recheck immediately before the first service mutation.
+  verify_open_window
   MUTATION_STARTED=1; set_execution_phase quiesce
   if [ "$LISTENER_WAS_RUNNING" -eq 1 ]; then
     as_owner "$ORACLE_OWNER" env "ORACLE_HOME=$ORACLE_HOME_TARGET" "PATH=$ORACLE_HOME_TARGET/bin:/usr/bin:/bin" "$ORACLE_HOME_TARGET/bin/lsnrctl" stop "$LISTENER_NAME" >"$REQUEST_DIR/evidence/listener-stop.log" 2>&1

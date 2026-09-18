@@ -5,7 +5,10 @@ and `opu-recovery-evidence-collect`. It creates a new recovery set; the
 collector remains the independent read-only validator.
 
 The first supported preparation adapter is a standalone `PRIMARY`, `READ
-WRITE`, `NOARCHIVELOG` database using an SPFILE. Oracle requires a
+WRITE`, `NOARCHIVELOG`, **non-CDB** database using an SPFILE. Live analysis and
+execution require explicit `CDB=NO` before downtime. CDB and unknown scope are
+blocked because this adapter does not capture and restore each PDB's open
+state. Oracle requires a
 `NOARCHIVELOG` whole-database backup to follow a consistent shutdown and run
 while the database is mounted. The utility therefore treats preparation as a
 separately approved maintenance-window operation, not as an online check.
@@ -195,6 +198,21 @@ prepare the missing backup. The application validates the full policy contract,
 snapshot freshness, exact standalone database/home/owner/SID, and configured
 host binding before submitting remote work. The native adapter repeats its
 admission checks before downtime.
+
+The application requires one indexed discovery node whose effective SSH alias
+matches the host's recovery execution alias. Refresh **Discover** before creating
+a request. The request retains copies and hashes of the discovery snapshot and
+node index, plus its canonical node route; later actions recheck those copies
+and the configured route. An SSH alias does not have to equal the server's
+reported hostname or FQDN. New discovery observations do not rewrite an existing
+request's historical inputs.
+
+Requests created before this routing binding was introduced remain available for
+read-only inspection and reconciliation of an existing execution. They cannot
+receive new analysis, approval, authorization, execution or patch-evidence
+selection. Inspect and reconcile outstanding work first, then refresh discovery
+and create a new request for further admissions. The application does not attach
+new provenance to an older request automatically.
 
 From the host's Recovery stage:
 

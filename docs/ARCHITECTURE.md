@@ -1,5 +1,18 @@
 # Oracle Patching Utility Architecture
 
+## Current implementation notice
+
+The sections below describe the target architecture and original delivery scope;
+they are not an inventory of deployed capabilities. The current controller uses
+FastAPI/Uvicorn with one loopback worker, typed overview routes and an ASGI bridge
+to existing controller services. Runs still use persisted filesystem state and
+background threads, and live execution still launches native workers over SSH.
+The lab pull queue does not implement the distributed control database and
+durable workflow system shown below. AI proposals can submit native actions only
+through human confirmation and existing authorization/safety gates. See
+[framework migration and acceptance](FRAMEWORK_MIGRATION.md) for the exact
+implemented scope, preserved boundaries and proposed later phases.
+
 This architecture is for a greenfield system. Prior patching utilities are not
 dependencies or implementation baselines; every contract and component will be
 created and verified in this repository.

@@ -11,8 +11,10 @@ import sys
 import tempfile
 import tarfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
+from runtime_fixture import runtime_receipt, host_runtime_receipts
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "webapp"))
@@ -48,9 +50,19 @@ class ControlPlaneTests(unittest.TestCase):
         self.enterContext(patch.object(planctl, "PLAN_STATE_DIR", self.root / "plans"))
         self.enterContext(patch.object(recoveryctl, "RECOVERY_DIR", self.root / "recovery"))
         self.enterContext(patch.object(evidence, "VAR_DIR", self.root / "hosts"))
+        self.workers = []
+        self.addCleanup(self.finish_workers)
 
-    def request(self, path, *, actor="operator", body=None, raw=None, length=None, method="POST", extra_headers=None):
+    def finish_workers(self):
+        for worker in self.workers:
+            if worker.ident is not None:
+                worker.join(5)
+        self.assertFalse(any(worker.is_alive() for worker in self.workers),
+                         "Isolated controller worker survived test cleanup")
+
+    def request(self, path, *, actor="operator", body=None, raw=None, length=None, method="POST", extra_headers=None, before_body=None):
         handler = server.Handler.__new__(server.Handler)
+        handler.command = method
         handler.path = path
         handler.headers = Message()
         handler.headers["Authorization"] = "Bearer " + actor + "-token"
@@ -58,7 +70,12 @@ class ControlPlaneTests(unittest.TestCase):
         handler.headers["Content-Length"] = str(len(content) if length is None else length)
         for key, value in (extra_headers or {}).items():
             handler.headers[key] = value
-        handler.rfile = io.BytesIO(content)
+        class Body(io.BytesIO):
+            def read(self, length=-1):
+                if before_body:
+                    before_body()
+                return super().read(length)
+        handler.rfile = Body(content)
         handler.wfile = io.BytesIO()
         result = []
         handler._send_json = lambda status, payload: result.append((status, payload))
@@ -79,6 +96,299 @@ class ControlPlaneTests(unittest.TestCase):
         status, payload = self.request("/api/session", actor="approver", method="GET")
         self.assertEqual((status, payload["actor"], payload["roles"]), (200, "approver", ["approver"]))
 
+    def test_delayed_body_cannot_submit_after_principal_revocation_or_token_rotation(self):
+        original = self.principals.read_text()
+        for route in ("/api/recovery/r/execute", "/api/plans/p/execute-next", "/api/hosts/h/pipeline/discovery"):
+            for change in ({"disabled": True}, {"roles": ["viewer"]},
+                           {"token_sha256": hashlib.sha256(b"replacement-fixture-token").hexdigest()}):
+                with self.subTest(route=route, change=change):
+                    self.principals.write_text(original)
+                    def revoke():
+                        data = json.loads(original)
+                        next(row for row in data["principals"] if row["actor"] == "operator").update(change)
+                        self.principals.write_text(json.dumps(data))
+                    with patch.object(pipeline_runner, "start_run") as start:
+                        status, _ = self.request(route, before_body=revoke)
+                        self.assertEqual(status, 403 if "roles" in change else 401)
+                        start.assert_not_called()
+
+    def test_delayed_body_cannot_transfer_authority_to_a_reassigned_token_or_lab_mode(self):
+        original = self.principals.read_text()
+        for transition in ("principal", "lab"):
+            with self.subTest(transition=transition), patch.dict(os.environ, {}):
+                self.principals.write_text(original)
+                def transfer():
+                    if transition == "lab":
+                        os.environ.update(OPU_WEBAPP_RBAC="0", OPU_WEBAPP_TOKEN="operator-token")
+                    else:
+                        data = json.loads(original)
+                        next(row for row in data["principals"] if row["actor"] == "operator")["actor"] = "replacement-operator"
+                        self.principals.write_text(json.dumps(data))
+                with patch.object(pipeline_runner, "start_run") as start:
+                    status, payload = self.request("/api/recovery/r/execute", before_body=transfer)
+                    self.assertEqual(status, 403)
+                    self.assertEqual(payload["message"], "Authenticated identity changed before dispatch")
+                    start.assert_not_called()
+
+    def test_legacy_live_get_routes_require_operator_and_keep_saved_reads_available(self):
+        with patch.object(server, "run_discovery", return_value={"fresh": True}) as discovery, \
+             patch.object(server, "build_estate", return_value=[]) as estate:
+            for route in ("/api/hosts/h/discovery", "/api/estate?live=1", "/api/estate?live=%31"):
+                for role in ("viewer", "requester", "approver"):
+                    self.assertEqual(self.request(route, actor=role, method="GET")[0], 403)
+            discovery.assert_not_called()
+            estate.assert_not_called()
+            self.assertEqual(self.request("/api/estate?live=0", actor="viewer", method="GET")[0], 200)
+            estate.assert_called_once_with(live=False)
+            self.assertEqual(self.request("/api/hosts/h/discovery", method="GET"), (200, {"fresh": True}))
+            self.assertEqual(self.request("/api/estate?live=1", method="GET")[0], 200)
+            estate.assert_called_with(live=True)
+
+    def test_discovery_session_hint_matches_principal_policy_and_post_authorization(self):
+        with patch.object(pipeline_runner, "start_run") as start:
+            for role in ("viewer", "requester", "approver", "operator"):
+                status, session = self.request("/api/session", actor=role, method="GET")
+                self.assertEqual(status, 200)
+                self.assertEqual(session["permissions"]["live_discovery"], role == "operator")
+                if role != "operator":
+                    self.assertEqual(self.request("/api/hosts/h/pipeline/discovery", actor=role)[0], 403)
+            start.assert_not_called()
+            start.return_value = SimpleNamespace(run_id="fixture-discovery")
+            self.assertEqual(self.request("/api/hosts/h/pipeline/discovery"), (202, {"run_id": "fixture-discovery"}))
+            start.assert_called_once()
+        # The hint follows the authority policy, rather than a separate role list.
+        with patch.dict(auth.ACTION_ROLES, {"execute": {"requester"}}):
+            self.assertTrue(self.request("/api/session", actor="requester", method="GET")[1]["permissions"]["live_discovery"])
+            self.assertFalse(self.request("/api/session", actor="operator", method="GET")[1]["permissions"]["live_discovery"])
+
+    def test_discovery_session_hint_allows_authenticated_lab_mode_without_roles(self):
+        with patch.dict(os.environ, {"OPU_WEBAPP_RBAC": "0", "OPU_WEBAPP_TOKEN": "operator-token"}):
+            status, session = self.request("/api/session", method="GET")
+        self.assertEqual(status, 200)
+        self.assertEqual(session["mode"], "lab")
+        self.assertEqual(session["roles"], [])
+        self.assertTrue(session["permissions"]["live_discovery"])
+
+    def test_company_live_get_requires_csrf_before_discovery(self):
+        observed = []
+        def authenticate(cookie, *, method, csrf, origin):
+            observed.append(method)
+            if method != "GET" and csrf != "valid-proof":
+                raise auth.AuthError("CSRF required", status=403)
+            return {"actor": "operator", "roles": ["operator"]}
+        with patch.object(server.company_auth, "configured", return_value=True), \
+             patch.object(server.company_auth, "authenticate", side_effect=authenticate), \
+             patch.object(server, "run_discovery", return_value={}) as discovery, \
+             patch.object(server, "build_estate", return_value=[]) as estate:
+            headers = {"Cookie": "opu_company_session=fixture"}
+            for route in ("/api/hosts/h/discovery", "/api/estate?live=1"):
+                self.assertEqual(self.request(route, method="GET", extra_headers=headers)[0], 403)
+            discovery.assert_not_called()
+            estate.assert_not_called()
+            headers["X-CSRF-Token"] = "valid-proof"
+            self.assertEqual(self.request("/api/hosts/h/discovery", method="GET", extra_headers=headers)[0], 200)
+            self.assertEqual(observed, ["POST", "POST", "POST"])
+
+    def test_synchronous_discovery_shares_async_pipeline_reservation(self):
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        def discover(*args):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return {"fresh": True}
+        with patch.object(server.pipeline_steps, "step_discovery", side_effect=discover):
+            worker = threading.Thread(target=lambda: results.append(server.run_discovery({"id": "h"})))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                with self.assertRaises(pipeline_runner.RunConflict):
+                    pipeline_runner.start_run("pipeline", "host:h:pipeline", lambda record: None)
+            finally:
+                release.set()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(results, [{"fresh": True}])
+
+    def test_principal_registry_rejects_writable_linked_and_non_utf8_files(self):
+        self.principals.chmod(0o666)
+        with self.assertRaises(auth.AuthError):
+            auth.require_api_auth("Bearer operator-token")
+        self.principals.chmod(0o600)
+        alias = self.root / "linked-principals"
+        os.link(self.principals, alias)
+        with self.assertRaises(auth.AuthError):
+            auth.require_api_auth("Bearer operator-token")
+        alias.unlink()
+        self.principals.write_bytes(b"\xff")
+        with self.assertRaises(auth.AuthError):
+            auth.require_api_auth("Bearer operator-token")
+
+    def test_lab_token_is_private_rotatable_and_never_follows_a_link(self):
+        path = self.root / "api-token"
+        with patch.object(auth, "TOKEN_FILE", path), patch.dict(os.environ, {"OPU_WEBAPP_TOKEN": ""}):
+            first = auth.ensure_token()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            path.write_text("rotated-token\n")
+            self.assertEqual(auth.ensure_token(), "rotated-token")
+            self.assertNotEqual(first, "rotated-token")
+            path.chmod(0o644)
+            with self.assertRaises(auth.AuthError):
+                auth.ensure_token()
+            path.unlink()
+            victim = self.root / "preserved"
+            victim.write_text("do not overwrite")
+            path.symlink_to(victim)
+            with self.assertRaises(auth.AuthError):
+                auth.ensure_token()
+            self.assertEqual(victim.read_text(), "do not overwrite")
+
+    def test_production_flags_cannot_silently_disable_guards(self):
+        certificate = self.root / "missing.cert"
+        with patch.dict(os.environ, {"OPU_PRODUCTION_CERT_FILE": str(certificate)}):
+            for value in ("1", "TRUE", "Yes", " on ", "tru"):
+                with self.subTest(value=value), patch.dict(os.environ, {"OPU_PRODUCTION_MODE": value}):
+                    with self.assertRaises(server.production.ProductionError):
+                        server.production.require_live_mutation_allowed()
+            certificate.write_text("OPU_PRODUCTION_CERTIFIED=1\n")
+            for value in ("TRUE", " yes ", "invalid"):
+                with self.subTest(checklist=value), patch.dict(os.environ, {"OPU_PRODUCTION_MODE": "1", "OPU_PRODUCTION_REQUIRE_CHECKLIST": value}):
+                    with self.assertRaises(server.production.ProductionError):
+                        server.production.require_live_mutation_allowed()
+
+    def test_lab_token_storage_errors_are_controlled(self):
+        with patch.dict(os.environ, {"OPU_WEBAPP_TOKEN": ""}):
+            for error in (OSError("denied"), ValueError("unsafe lock"), TimeoutError("busy")):
+                with self.subTest(error=type(error).__name__), patch.object(auth, "file_lock", side_effect=error):
+                    with self.assertRaises(auth.AuthError) as raised:
+                        auth.ensure_token()
+                    self.assertEqual(raised.exception.status, 503)
+
+    def test_artifact_staging_rejects_ambiguous_types_before_remote_work(self):
+        stages = server.pipeline_steps
+        valid = {"artifact_dir": "/patch", "owner": "oracle", "source": {"zip_path": "/patch.zip"}}
+        with patch.object(stages.tools_sync, "ensure_host_tools", side_effect=host_runtime_receipts) as sync, \
+             patch.object(stages.remote, "run_remote_raw") as run:
+            for update in ({"replace": "false"}, {"replace": 1}, {"owner": []}, {"artifact_dir": {}},
+                           {"source": []}, {"source": {"zip_path": "/patch.zip", "unexpected": True}},
+                           {"source": {"host_id": 7}}):
+                with self.subTest(update=update), self.assertRaises(server.remote.RemoteError):
+                    stages.step_stage_artifact("h", {}, {**valid, **update})
+            sync.assert_not_called()
+            run.assert_not_called()
+
+    def test_failed_media_replacement_invalidates_prior_approval_evidence(self):
+        stages = server.pipeline_steps
+        for name in stages._ARTIFACT_BOUND_EVIDENCE:
+            evidence.write_evidence("h", name, {"status": "passed"})
+        with patch.object(stages.tools_sync, "ensure_host_tools", side_effect=server.remote.RemoteError("install", "fixture failure")):
+            with self.assertRaises(server.remote.RemoteError):
+                stages.step_stage_artifact("h", {}, {"artifact_dir": "/patch", "owner": "oracle",
+                    "source": {"zip_path": "/patch.zip"}, "replace": True})
+        for name in stages._ARTIFACT_BOUND_EVIDENCE:
+            self.assertIsNone(evidence.read_evidence("h", name))
+
+    def test_collector_exit_status_cannot_be_masked_by_json_output(self):
+        for code in (-9, 1, 65, 126, 127, 255):
+            with self.subTest(code=code):
+                result = subprocess.CompletedProcess([], code, '{"status":"passed"}', "failure")
+                with patch.object(server.remote.subprocess, "run", return_value=result):
+                    with self.assertRaises(server.remote.RemoteError):
+                        server.remote.run_remote_json("fixture", ["/fixture/collector"])
+                with patch.object(server.pipeline_steps.localtools.subprocess, "run", return_value=result):
+                    with self.assertRaises(server.pipeline_steps.localtools.LocalToolError):
+                        server.pipeline_steps.localtools.run_tool("opu-readiness-evaluate", [])
+        for payload in ({"status": "blocked"}, {"artifact": {"status": "blocked"}}):
+            result = subprocess.CompletedProcess([], 2, json.dumps(payload), "findings")
+            with patch.object(server.remote.subprocess, "run", return_value=result):
+                self.assertEqual(server.remote.run_remote_json("fixture", ["/fixture/collector"]), payload)
+        for code, payload in ((2, {"status": "passed"}), (0, []), (0, None)):
+            result = subprocess.CompletedProcess([], code, json.dumps(payload), "")
+            with patch.object(server.remote.subprocess, "run", return_value=result):
+                with self.assertRaises(server.remote.RemoteError):
+                    server.remote.run_remote_json("fixture", ["/fixture/collector"])
+        with patch.object(server.remote.subprocess, "run") as run:
+            for alias in ("-oProxyCommand=anything", "has space", "bad\nname", ""):
+                with self.assertRaises(server.remote.RemoteError):
+                    server.remote.run_remote_raw(alias, ["true"])
+            run.assert_not_called()
+
+    def test_evidence_identifiers_cannot_escape_or_include_trailing_newline(self):
+        for name in ("../outside", "a/b", "valid\n", None, []):
+            with self.subTest(name=name):
+                with self.assertRaises(evidence.EvidenceError):
+                    evidence.evidence_path("h", name)
+                with self.assertRaises(evidence.EvidenceError):
+                    evidence.validate_host_id(name)
+                with self.assertRaises(planctl.PlanError):
+                    planctl.validate_plan_id(name)
+
+    def test_inventory_cannot_silently_choose_duplicate_or_malformed_hosts(self):
+        inventory = self.root / "hosts.json"
+        host = {"id": "h", "ssh_alias": "fixture", "remote_root": "/fixture", "sudo": False}
+        with patch.object(server, "HOSTS_FILE", inventory), patch.object(planctl, "HOSTS_FILE", inventory), \
+             patch.object(server.remote, "run_remote_raw") as ssh:
+            for hosts in ([host, {**host, "ssh_alias": "wrong"}], [host, {**host, "id": "H"}],
+                          [{**host, "sudo": "false"}], [{**host, "ssh_alias": "-oProxyCommand=anything"}],
+                          *[[{**host, "remote_root": root}] for root in ("/", "//", "/./", "/opt/./opu")],
+                          [{**host, "nodes": [{"name": "n"}, {"name": "N"}]}]):
+                inventory.write_text(json.dumps({"hosts": hosts}))
+                self.assertEqual(self.request("/api/estate", method="GET")[0], 503)
+                with self.assertRaises(planctl.PlanError):
+                    planctl._load_hosts()
+            inventory.write_text(json.dumps({"hosts": [host]}))
+            self.assertEqual(server.load_hosts(), {"h": host})
+            ssh.assert_not_called()
+
+    def test_failed_pipeline_attempt_invalidates_older_success(self):
+        stages = server.pipeline_steps
+        documents = ("snapshot", "reconciliation", "artifact", "procedure", "compatibility", "compatibility_reconciliation", "readiness")
+        cases = (
+            (stages.step_reconcile, {}, ("reconciliation", "compatibility_reconciliation", "readiness")),
+            (stages.step_artifact_inspect, {"artifact_dir": "/new-artifact"}, ("artifact", "procedure", "compatibility", "compatibility_reconciliation", "readiness")),
+            (stages.step_compatibility_collect, {"artifact_dir": "/new-artifact"}, ("compatibility", "compatibility_reconciliation", "readiness")),
+            (stages.step_compatibility_reconcile, {}, ("compatibility_reconciliation", "readiness")),
+            (stages.step_readiness_evaluate, {"policy": {}}, ("readiness",)),
+        )
+        for function, body, invalidated in cases:
+            with self.subTest(stage=function.__name__):
+                for name in documents:
+                    evidence.write_evidence("h", name, {"status": "passed", "old": True})
+                with patch.object(stages.tools_sync, "ensure_host_tools", side_effect=RuntimeError("fixture failure")), \
+                     patch.object(stages.localtools, "run_tool", side_effect=RuntimeError("fixture failure")):
+                    with self.assertRaises(RuntimeError):
+                        function("h", {"id": "h", "ssh_alias": "fixture", "remote_root": "/fixture"}, body)
+                for name in invalidated:
+                    self.assertIsNone(evidence.read_evidence("h", name), name)
+
+    def test_partial_multinode_refresh_cannot_publish_mixed_or_previous_inventory(self):
+        stages = server.pipeline_steps
+        host = {"id": "h", "ssh_alias": "n1", "remote_root": "/fixture", "nodes": [
+            {"name": "n1", "ssh_alias": "n1"}, {"name": "n2", "ssh_alias": "n2"}]}
+        for name in ("snapshot", "snapshot_nodes", "snapshot_n1", "readiness"):
+            evidence.write_evidence("h", name, {"old": True})
+        with patch.object(stages.tools_sync, "ensure_host_tools", side_effect=host_runtime_receipts), \
+             patch.object(stages.remote, "run_remote_json", side_effect=[{"host": {"name": "n1"}}, server.remote.RemoteError("ssh_timeout", "n2 failed")]):
+            with self.assertRaises(server.remote.RemoteError):
+                stages.step_discovery("h", host, {})
+        self.assertEqual(evidence.read_evidence("h", "snapshot_n1"), {"old": True})
+        self.assertEqual(evidence.list_snapshot_paths("h"), [])
+        self.assertIsNone(evidence.read_evidence("h", "readiness"))
+        host["nodes"][1]["name"] = "n1.other-domain"
+        with self.assertRaises(server.remote.RemoteError):
+            stages._configured_nodes(host)
+
+    def test_execution_limits_and_notifications_do_not_claim_completion(self):
+        with patch.object(planctl, "status", return_value={"state": "running"}), \
+             patch.object(planctl, "execute_next_task", return_value={"status": "succeeded"}) as execute:
+            result = planctl.execute_remaining_tasks("p", "operator", max_tasks=1)
+            self.assertEqual(result["stopped_reason"], "max_tasks_reached")
+            execute.assert_called_once()
+        cases = ((result, "progress"), ({"plan_state": "paused", "task_results": [{"status": "failed"}]}, "failed"),
+                 ({"plan_state": "succeeded", "task_results": [{"status": "succeeded"}]}, "succeeded"))
+        with patch.object(server.notifications, "emit") as emit:
+            for payload, event in cases:
+                server._notify_execution("p", "operator", payload, remaining=True)
+                self.assertEqual(emit.call_args.args[0], "plan.execute." + event)
     def test_procedure_hints_route_reads_selected_readme_without_starting_work(self):
         hint = {"required_opatch_version": "12.2.0.1.49", "readme_identifier": "README notes.html"}
         with patch.object(server.procedure_hints, "get_hints", return_value=hint) as read, \
@@ -279,18 +589,23 @@ class ControlPlaneTests(unittest.TestCase):
         def work(record):
             pipeline_runner.set_execution_context(detached_execution=True, detached_terminal=False)
             raise RuntimeError("contact lost")
-        record = pipeline_runner.start_run("plan", "plan:p:execute", work)
-        # Wait on the actual worker state, without invoking any external service.
-        import time
-        persisted = {}
-        for _ in range(100):
-            persisted = json.loads((pipeline_runner.RUNS_DIR / record.run_id / "run.json").read_text())
-            if persisted.get("status") == "unknown":
-                break
-            time.sleep(0.01)
+        real_thread = threading.Thread
+
+        def make_worker(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            self.workers.append(worker)
+            return worker
+
+        with patch.object(pipeline_runner.threading, "Thread", side_effect=make_worker):
+            record = pipeline_runner.start_run("plan", "plan:p:execute", work)
+        # Unknown status is published before the final write; join the actual
+        # worker before reading its durable result or removing fixture state.
+        self.finish_workers()
+        persisted = json.loads((pipeline_runner.RUNS_DIR / record.run_id / "run.json").read_text())
         self.assertEqual(record.status, "unknown")
         self.assertEqual(pipeline_runner.active_run_id(record.key), record.run_id)
         self.assertEqual(persisted["status"], "unknown")
+        self.assertIsNotNone(persisted["finished_at"])
 
     def test_second_controller_cannot_launch_owned_key(self):
         program = """
@@ -317,6 +632,133 @@ sys.stdin.readline()
                 child.kill()
                 child.communicate()
 
+    def test_incarnation_lock_blocks_live_owner_and_allows_reused_pid_after_exit(self):
+        program = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import pipeline_runner as runner
+runner.RUNS_DIR = Path(sys.argv[2])
+record = runner.RunRecord('bbbbbbbbbbbb', 'pipeline', 'host:fixture:pipeline')
+record.status = 'running'
+record._persist()
+print(record.run_id, flush=True)
+sys.stdin.readline()
+"""
+        child = subprocess.Popen([sys.executable, "-B", "-c", program, str(Path(server.__file__).parent), str(pipeline_runner.RUNS_DIR)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            run_id = child.stdout.readline().strip()
+            self.assertEqual(run_id, "bbbbbbbbbbbb")
+            record = pipeline_runner.get_run(run_id)
+            self.assertEqual(record.status, "unknown")
+            options = {"actor": "operator", "inspect": lambda _: {}, "confirm_no_active_execution": True, "note": "Verified no native execution remains"}
+            with self.assertRaises(pipeline_runner.RunConflict):
+                pipeline_runner.reconcile_run(run_id, **options)
+            child.communicate("exit\n", timeout=5)
+            self.assertEqual(child.returncode, 0)
+            # A replacement controller (or an unrelated process) can reuse the
+            # same numeric PID. The old incarnation's lock is now released.
+            record.owner["pid"] = os.getpid()
+            record._persist()
+            self.assertFalse(pipeline_runner._owner_alive(record.owner))
+            result = pipeline_runner.reconcile_run(run_id, **options)
+            self.assertEqual(result["status"], "failed")
+            self.assertIsNone(pipeline_runner.active_run_id(record.key))
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+
+    def test_legacy_or_damaged_owner_proof_is_conservative(self):
+        self.assertTrue(pipeline_runner._owner_alive({"pid": os.getpid(), "instance": "old-controller"}))
+        owner = {"pid": 2147483647, "instance": "f" * 32, "protocol": "incarnation-lock-v1",
+                 "lock_device": 0, "lock_inode": 0}
+        self.assertTrue(pipeline_runner._owner_alive(owner), "Missing proof must not release ownership")
+        path = pipeline_runner.RUNS_DIR / ".owners" / (owner["instance"] + ".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(""); path.chmod(0o600)
+        self.assertTrue(pipeline_runner._owner_alive(owner), "A substituted inode must not release ownership")
+
+    def test_current_ownership_requires_the_held_incarnation_and_original_lock(self):
+        self.assertFalse(pipeline_runner.is_current_owner({}))
+        self.assertFalse((pipeline_runner.RUNS_DIR / ".owners").exists())
+        record = pipeline_runner.RunRecord("012345abcdef", "assistant", "isolated-turn")
+        owner = dict(record.owner)
+        self.assertTrue(pipeline_runner.is_current_owner(owner))
+        for field, value in (("pid", os.getpid() + 1), ("instance", "0" * 32),
+                             ("protocol", "unknown"), ("lock_device", -1), ("lock_inode", -1)):
+            with self.subTest(field=field):
+                self.assertFalse(pipeline_runner.is_current_owner({**owner, field: value}))
+        self.assertFalse(pipeline_runner.is_current_owner({"pid": owner["pid"], "instance": owner["instance"]}))
+        path = pipeline_runner.RUNS_DIR / ".owners" / (owner["instance"] + ".lock")
+        path.unlink()
+        path.write_text("replacement")
+        path.chmod(0o600)
+        self.assertFalse(pipeline_runner.is_current_owner(owner))
+        record._persist()
+        self.assertEqual(pipeline_runner._load_persisted(record.run_id).status, "unknown")
+
+    def test_reading_historical_runs_does_not_create_owner_locks(self):
+        for run_id, status in (("cccccccccccc", "succeeded"), ("dddddddddddd", "running")):
+            directory = pipeline_runner.RUNS_DIR / run_id
+            directory.mkdir(parents=True)
+            (directory / "run.json").write_text(json.dumps({"status": status, "kind": "pipeline", "key": run_id,
+                                                          "owner": {"pid": 2147483647, "instance": "historical"}}))
+            with patch.object(pipeline_runner, "_owner_identity", side_effect=AssertionError("Historical read acquired ownership")):
+                record = pipeline_runner.get_run(run_id)
+            self.assertEqual(record.status, "succeeded" if status == "succeeded" else "unknown")
+            self.assertFalse((pipeline_runner.RUNS_DIR / ".owners").exists())
+
+    def test_forked_incarnations_release_only_their_own_locks(self):
+        program = """
+import json, os, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import pipeline_runner as runner
+runner.RUNS_DIR = Path(sys.argv[2])
+signals = Path(sys.argv[3])
+owner = runner._owner_identity()
+print(json.dumps({'role': 'parent', 'owner': owner}), flush=True)
+child = os.fork()
+role = 'parent' if child else 'child'
+if not child:
+    print(json.dumps({'role': role, 'owner': runner._owner_identity()}), flush=True)
+deadline = time.monotonic() + 10
+while not (signals / role).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+os._exit(0)
+"""
+        def wait_released(owner):
+            deadline = time.monotonic() + 3
+            while pipeline_runner._owner_alive(owner) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(pipeline_runner._owner_alive(owner))
+
+        for first, second in (("child", "parent"), ("parent", "child")):
+            with self.subTest(first_exit=first):
+                signals = self.root / ("fork-" + first)
+                signals.mkdir()
+                process = subprocess.Popen([sys.executable, "-B", "-c", program, str(Path(server.__file__).parent),
+                                            str(pipeline_runner.RUNS_DIR), str(signals)],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    messages = [json.loads(process.stdout.readline()) for _ in range(2)]
+                    owners = {item["role"]: item["owner"] for item in messages}
+                    self.assertNotEqual(owners["parent"]["instance"], owners["child"]["instance"])
+                    self.assertTrue(all(pipeline_runner._owner_alive(owner) for owner in owners.values()))
+                    (signals / first).touch()
+                    wait_released(owners[first])
+                    self.assertTrue(pipeline_runner._owner_alive(owners[second]))
+                    (signals / second).touch()
+                    wait_released(owners[second])
+                    _, stderr = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 0, stderr)
+                finally:
+                    (signals / "parent").touch()
+                    (signals / "child").touch()
+                    process.communicate(timeout=12)
+
     def test_custom_plan_names_use_explicit_host_identity(self):
         plan = {"plan_id": "custom-change-name", "created_at": "2026-09-14T00:00:00Z", "source_documents": {"readiness": {"path": str(evidence.VAR_DIR / "host-a" / "evidence" / "readiness.json")}}}
         self.assertEqual(planctl._with_host_identity(plan)["host_id"], "host-a")
@@ -340,7 +782,7 @@ sys.stdin.readline()
     def test_remote_reconciliation_inspects_existing_launch_only(self):
         host = {"id": "h", "node_name": "n", "ssh_alias": "alias", "remote_root": "/opt/opu"}
         context = {"plan_id": "p", "task_id": "t", "node": "n", "host_id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu", "remote_run_dir": "/opt/opu/var/webapp-runs/p/t/" + "a" * 32}
-        with patch.object(planctl, "_resolve_node_host", return_value=host), patch.object(planctl.remote, "run_remote_shell", return_value=SimpleNamespace(returncode=0, stdout="RC\n0\n")) as shell, patch.object(planctl.remote, "run_remote_raw", side_effect=[SimpleNamespace(returncode=0, stdout='{"status":"succeeded"}'), SimpleNamespace(returncode=0, stdout="")]), patch.object(planctl, "_sync_plan_from_host") as sync, patch.object(planctl, "status", return_value={"state": "running"}), patch.object(planctl, "_run", return_value={"status": "succeeded"}) as verified:
+        with patch.object(planctl, "_resolve_node_host", return_value=host), patch.object(planctl.remote, "run_remote_shell", return_value=SimpleNamespace(returncode=0, stdout="RC\n0\n")) as shell, patch.object(planctl.remote, "run_remote_raw", side_effect=[SimpleNamespace(returncode=0, stdout='{"status":"succeeded","task_id":"t"}'), SimpleNamespace(returncode=0, stdout="")]), patch.object(planctl, "_sync_plan_from_host") as sync, patch.object(planctl, "status", return_value={"state": "running"}), patch.object(planctl, "_run", return_value={"status": "succeeded"}) as verified:
             result = planctl.reconcile_detached_run({"context": context})
             self.assertEqual(result["status"], "succeeded")
             self.assertNotIn("nohup", shell.call_args.args[1])
@@ -353,7 +795,7 @@ sys.stdin.readline()
         stderr = "x" * 5000 + "\npassword=private-value token='private-token'\nAuthorization: Bearer private-bearer\nanother Oracle executor owns this host\n"
         with patch.object(planctl.production, "require_live_mutation_allowed"), \
              patch.object(planctl, "_resolve_live_host_for_task", return_value=host), \
-             patch.object(planctl, "_sync_plan_to_host", return_value="/opt/opu/plans"), \
+             patch.object(planctl, "_sync_plan_to_host", return_value=("/opt/opu/plans", runtime_receipt(host["ssh_alias"], host["remote_root"]))), \
              patch.object(planctl, "_run_detached_remote", return_value=(75, "private stdout", stderr)) as launch, \
              patch.object(planctl, "_sync_plan_from_host"), \
              patch.object(planctl, "_run", return_value={"status": "pending"}) as verified, \
@@ -369,24 +811,24 @@ sys.stdin.readline()
             self.assertIn("[REDACTED]", error["stderr"])
             launch.assert_called_once()
             verified.assert_called_once_with(["task-status", "--plan-id", "p", "--task-id", "t"])
-            context.assert_called_once_with(task_definition_sha256="a" * 64, task_retry_count=1)
+            context.assert_called_once_with(runtime_root=runtime_receipt("alias", "/opt/opu")["runtime_root"], runtime_fingerprint="a" * 64, task_definition_sha256="a" * 64, task_retry_count=1)
 
     def test_live_verified_terminal_result_is_unchanged(self):
         host = {"id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu"}
         task = {"task_id": "t", "adapter": "database_single_instance_opatch", "task_definition_sha256": "a" * 64, "retry_count": 1}
         with patch.object(planctl.production, "require_live_mutation_allowed"), \
              patch.object(planctl, "_resolve_live_host_for_task", return_value=host), \
-             patch.object(planctl, "_sync_plan_to_host", return_value="/opt/opu/plans"), \
-             patch.object(planctl, "_run_detached_remote", return_value=(0, '{"status":"succeeded"}', "")) as launch, \
+             patch.object(planctl, "_sync_plan_to_host", return_value=("/opt/opu/plans", runtime_receipt(host["ssh_alias"], host["remote_root"]))), \
+             patch.object(planctl, "_run_detached_remote", return_value=(0, '{"status":"succeeded","task_id":"t"}', "")) as launch, \
              patch.object(planctl, "_sync_plan_from_host"), \
              patch.object(planctl, "_run", return_value={"status": "succeeded"}) as verified, \
              patch.object(planctl, "status", return_value={"state": "running"}), \
              patch.object(pipeline_runner, "set_execution_context") as context:
-            self.assertEqual(planctl._execute_live("p", {}, task, "operator"), {"status": "succeeded"})
+            self.assertEqual(planctl._execute_live("p", {}, task, "operator"), {"status": "succeeded", "task_id": "t"})
             launch.assert_called_once()
             verified.assert_called_once_with(["task-status", "--plan-id", "p", "--task-id", "t"])
             self.assertEqual([item.kwargs for item in context.call_args_list],
-                             [{"task_definition_sha256": "a" * 64, "task_retry_count": 1}, {"detached_terminal": True}])
+                             [{"runtime_root":runtime_receipt("alias", "/opt/opu")["runtime_root"], "runtime_fingerprint":"a" * 64, "task_definition_sha256": "a" * 64, "task_retry_count": 1}, {"detached_terminal": True}])
 
     def test_reconciliation_reports_preclaim_error_without_clearing_unknown(self):
         host = {"id": "h", "node_name": "n", "ssh_alias": "alias", "remote_root": "/opt/opu"}
@@ -466,7 +908,8 @@ sys.stdin.readline()
             entry = tarfile.TarInfo("../../escaped")
             entry.size = 6
             archive.addfile(entry, io.BytesIO(b"unsafe"))
-        with patch.object(planctl.remote, "run_remote_checked"), patch.object(planctl.remote, "pull_file", return_value=buffer.getvalue()):
+        with patch.object(planctl, "_temporary_remote_archive", return_value="/tmp/opu-plan-transfer.ABCDEFGHIJKL"), \
+             patch.object(planctl.remote, "run_remote_checked"), patch.object(planctl.remote, "pull_file", return_value=buffer.getvalue()):
             with self.assertRaises(planctl.PlanError):
                 planctl._sync_plan_from_host({"ssh_alias": "fixture"}, "p", "/fixture")
         self.assertFalse((self.root / "escaped").exists())

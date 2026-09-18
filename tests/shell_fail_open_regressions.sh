@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Regression suite for shell fail-open defects (cert substring, empty DG members,
-# reinstate-on-blocked, lock PID reclaim).
+# reinstate-on-blocked).
 set -euo pipefail
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/opu-shell-failopen.XXXXXX")
@@ -75,35 +75,7 @@ dbg H3 "reinstate_blocked_eval" "{\"rc\":$rc,\"status\":$(jq -c '.status' "$TMP/
 [ "$rc" -eq 2 ] || fail "reinstate with blocked eval should exit 2"
 jq -e '.status == "blocked"' "$TMP/re-blocked.json" >/dev/null || fail "reinstate should be blocked"
 
-# H5: lock reclaim must not steal from a live holder PID
-mkdir -p "$TMP/plan/.task-lock"
-printf '%s\n' "$$" >"$TMP/plan/.task-lock/pid"
-# Pretend old mtime
-touch -t 200001010000 "$TMP/plan/.task-lock" 2>/dev/null || touch -d '2000-01-01' "$TMP/plan/.task-lock" 2>/dev/null || true
-holder_alive=0
-kill -0 "$$" 2>/dev/null && holder_alive=1
-# Simulate lock() reclaim decision
-holder=$(cat "$TMP/plan/.task-lock/pid")
-reclaimed=0
-if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-  reclaimed=0
-else
-  reclaimed=1
-fi
-dbg H5 "lock_live_holder" "{\"holder_alive\":$holder_alive,\"reclaimed\":$reclaimed}"
-[ "$reclaimed" -eq 0 ] || fail "live holder lock was reclaimed"
-
-# Dead holder should be reclaimable
-printf '999999\n' >"$TMP/plan/.task-lock/pid"
-holder=$(cat "$TMP/plan/.task-lock/pid")
-reclaimed=0
-if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-  reclaimed=0
-else
-  reclaimed=1
-fi
-dbg H5 "lock_dead_holder" "{\"reclaimed\":$reclaimed}"
-[ "$reclaimed" -eq 1 ] || fail "dead holder lock should be reclaimable"
+# Cross-process controller locking is exercised by native_controller_edges.py.
 
 # H4: document lag formula expectation (live SQL path) — fixture lag still authoritative in TEST_MODE
 dbg H4 "lag_sql_total_seconds" "{\"note\":\"live SQL uses day/hour/minute/second sum; fixture path unchanged\"}"

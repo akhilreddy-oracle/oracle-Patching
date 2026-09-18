@@ -50,7 +50,7 @@ class CompanyApiTests(unittest.TestCase):
         cookie = self.fx.finish()
         return cookie, company_auth.authenticate(cookie)
 
-    def request(self, path, *, cookie=None, method="GET", body=None, headers=None):
+    def request(self, path, *, cookie=None, method="GET", body=None, headers=None, before_body=None):
         handler = server.Handler.__new__(server.Handler)
         handler.path, handler.command = path, method
         handler.headers = Message()
@@ -60,7 +60,12 @@ class CompanyApiTests(unittest.TestCase):
             handler.headers[key] = value
         raw = json.dumps(body or {}).encode()
         handler.headers["Content-Length"] = str(len(raw))
-        handler.rfile, handler.wfile = io.BytesIO(raw), io.BytesIO()
+        class Body(io.BytesIO):
+            def read(self, length=-1):
+                if before_body:
+                    before_body()
+                return super().read(length)
+        handler.rfile, handler.wfile = Body(raw), io.BytesIO()
         result = {"headers": []}
         def response(status):
             result["status"] = status
@@ -100,6 +105,7 @@ class CompanyApiTests(unittest.TestCase):
         self.assertEqual(reply["body"]["csrf_token"], session["csrf_token"])
         self.assertEqual(reply["body"]["mode"], "company")
         self.assertTrue(reply["body"]["rbac_enabled"])
+        self.assertTrue(reply["body"]["permissions"]["live_discovery"])
         self.assertNotIn("groups", reply["body"])
         self.assertNotIn("id_token", reply["body"])
         self.assertIn(("Cache-Control", "no-store"), reply["headers"])
@@ -118,6 +124,43 @@ class CompanyApiTests(unittest.TestCase):
         self.assertEqual(reply["status"], 403)
         self.assert_no_mutation()
 
+    def test_delayed_post_body_rechecks_company_role_session_and_csrf_before_dispatch(self):
+        for change, expected in (("roles", 403), ("logout", 401), ("csrf", 403)):
+            with self.subTest(change=change):
+                self.fx.settings["group_roles"]["operators"] = ["operator"]; self.fx.save()
+                cookie, session = self.session()
+                def revoke():
+                    if change == "roles":
+                        self.fx.settings["group_roles"]["operators"] = ["viewer"]; self.fx.save()
+                    elif change == "logout":
+                        company_auth.logout(cookie, **{"csrf": session["csrf_token"], "origin": "https://patching.example"})
+                    else:
+                        # A rotated server-side proof must not leave this
+                        # already-admitted request using its stale CSRF value.
+                        with company_auth._db() as db:
+                            key = company_auth._hash(company_auth.cookie_value(cookie, company_auth.SESSION_COOKIE))
+                            row = db.execute("SELECT key,value FROM records WHERE kind='session' AND key=?", (key,)).fetchone()
+                            value = json.loads(row[1]); value["csrf_token"] = "rotated-fixture-csrf"
+                            db.execute("UPDATE records SET value=? WHERE key=?", (json.dumps(value), row[0]))
+                reply = self.request("/api/plans/p/execute-next", cookie=cookie, method="POST",
+                    headers=self.mutation_headers(session), before_body=revoke)
+                self.assertEqual(reply["status"], expected)
+                self.assert_no_mutation()
+
+    def test_company_discovery_permission_matches_role_and_denies_post_before_work(self):
+        self.fx.settings["group_roles"]["requesters"] = ["requester"]
+        self.fx.save()
+        cookie, session = self.session(["requesters"])
+        reply = self.request("/api/session", cookie=cookie)
+        self.assertEqual(reply["status"], 200)
+        self.assertFalse(reply["body"]["permissions"]["live_discovery"])
+        denied = self.request("/api/hosts/h/pipeline/discovery", cookie=cookie, method="POST", headers=self.mutation_headers(session))
+        self.assertEqual(denied["status"], 403)
+        self.assert_no_mutation()
+        # Company capability checks use the same central action policy too.
+        with patch.dict(auth.ACTION_ROLES, {"execute": {"requester"}}):
+            self.assertTrue(self.request("/api/session", cookie=cookie)["body"]["permissions"]["live_discovery"])
+
     def test_forged_actor_requester_and_actor_header_are_rejected(self):
         self.fx.settings["group_roles"]["all-actions"] = ["requester","approver","operator"]
         self.fx.save()
@@ -135,6 +178,40 @@ class CompanyApiTests(unittest.TestCase):
         self.assertEqual(reply["status"],204)
         self.assertTrue(any(name == "Set-Cookie" and "Max-Age=0" in value for name,value in reply["headers"]))
         self.assertEqual(self.request("/api/session", cookie=cookie)["status"],401)
+        self.assert_no_mutation()
+
+    def test_active_logout_still_requires_csrf_and_does_not_accept_action_fields(self):
+        cookie, session = self.session()
+        for headers in ({'Origin': 'https://patching.example'},
+                        {**self.mutation_headers(session), 'Origin': 'https://other.example'}):
+            reply = self.request('/api/auth/logout', cookie=cookie, method='POST', headers=headers)
+            self.assertEqual(reply['status'], 403)
+            self.assertFalse(any(name == 'Set-Cookie' for name, _ in reply['headers']))
+            self.assertEqual(self.request('/api/session', cookie=cookie)['status'], 200)
+        reply = self.request('/api/auth/logout', cookie=cookie, method='POST',
+            body={'actor': 'forged', 'operation': 'execute'}, headers=self.mutation_headers(session))
+        self.assertEqual(reply['status'], 400)
+        self.assertEqual(self.request('/api/session', cookie=cookie)['status'], 200)
+        self.assert_no_mutation()
+
+    def test_revoked_or_changed_provider_session_can_only_be_cleared_from_exact_origin(self):
+        for change in ({'group_roles': {'other-group': ['viewer']}}, {'client_id': 'different-client'}):
+            with self.subTest(change=change):
+                original = dict(self.fx.settings)
+                cookie, _ = self.session()
+                self.fx.settings.update(change); self.fx.save()
+                self.assertIn(self.request('/api/session', cookie=cookie)['status'], (401, 403))
+                for origin in (None, 'null', 'https://other.example', 'https://patching.example.attacker.invalid'):
+                    headers = {'Origin': origin} if origin is not None else {}
+                    reply = self.request('/api/auth/logout', cookie=cookie, method='POST', headers=headers)
+                    self.assertEqual(reply['status'], 403)
+                    self.assertFalse(any(name == 'Set-Cookie' for name, _ in reply['headers']))
+                reply = self.request('/api/auth/logout', cookie=cookie, method='POST',
+                    headers={'Origin': 'https://patching.example'})
+                self.assertEqual(reply['status'], 204)
+                self.assertTrue(any(name == 'Set-Cookie' and 'Max-Age=0' in value for name, value in reply['headers']))
+                self.fx.settings = original; self.fx.save()
+                self.assertEqual(self.request('/api/session', cookie=cookie)['status'], 401, 'cleanup revoked the durable session')
         self.assert_no_mutation()
 
     def test_login_callback_uses_signed_token_without_logging_code_or_tokens(self):

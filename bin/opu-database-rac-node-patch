@@ -312,6 +312,7 @@ set pages 0 heading off feedback off verify off echo off trimspool on lines 3276
 select 'INSTANCE_NAME=' || instance_name from v$instance;
 select 'INSTANCE_STATUS=' || status from v$instance;
 select 'DATABASE_UNIQUE_NAME=' || db_unique_name from v$database;
+select 'CDB=' || cdb from v$database;
 select 'DATABASE_ROLE=' || database_role from v$database;
 select 'OPEN_MODE=' || open_mode from v$database;
 select 'INVALID_OBJECTS=' || count(*) from dba_objects where status = 'INVALID';
@@ -320,11 +321,12 @@ SQL
 }
 
 probe_value() {
-  sed -n "s/^$1=//p" "$2" | tail -n1 | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'
+  opu_sql_probe_value "$1" "$2"
 }
 
 healthy_probe() {
   local probe_path=$1 expected_sid=$2
+  opu_require_non_cdb_probe "$probe_path" || return $?
   [ "$(probe_value DATABASE_UNIQUE_NAME "$probe_path")" = "$DATABASE" ] &&
     [ "$(probe_value INSTANCE_NAME "$probe_path")" = "$expected_sid" ] &&
     [ "$(probe_value INSTANCE_STATUS "$probe_path")" = OPEN ] &&
@@ -727,6 +729,8 @@ stage_rac_drain() {
   load_binding; verify_source_documents; verify_recovery; verify_artifact; verify_open_window
   require_bound_instance_state running "$TASK_DIR/drain-local-instance.log"
   require_surviving_instance
+  database_probe "$ORACLE_SID" "$TASK_DIR/drain-pre-health.log" &&
+    healthy_probe "$TASK_DIR/drain-pre-health.log" "$ORACLE_SID" || die 'RAC database identity or health changed before service drain'
   drain_services
 }
 
@@ -737,6 +741,8 @@ stage_rac_stop() {
   verify_services_available away-from-local
   opatch_prereq_check CheckPatchApplicableOnCurrentPlatform "$TASK_DIR/stop-platform-applicability.log"
   opatch_prereq_check CheckConflictAgainstOHWithDetail "$TASK_DIR/stop-conflict.log"
+  database_probe "$ORACLE_SID" "$TASK_DIR/stop-pre-health.log" &&
+    healthy_probe "$TASK_DIR/stop-pre-health.log" "$ORACLE_SID" || die 'RAC database identity or health changed before instance shutdown'
   srvctl_run stop instance -db "$DATABASE" -instance "$ORACLE_SID" -stopoption immediate
   wait_bound_instance stopped || die 'local instance did not stop through Clusterware'
   : >"$TASK_DIR/instance-down"
@@ -930,8 +936,9 @@ run_typed_stage() {
 
 acquire_executor_lock() {
   if command -v flock >/dev/null 2>&1; then
-    exec 8>"$NODE_RUN_DIR/executor.lock"
+    opu_execution_open_lock_file "$NODE_RUN_DIR/executor.lock" 8 || die "unsafe executor lock"
     flock -n 8 || die 'another RAC executor owns this node and plan'
+    opu_execution_validate_lock "$NODE_RUN_DIR/executor.lock" 8 || die "unsafe executor lock"
     EXECUTOR_LOCK_USES_FLOCK=1
   elif [ "$TEST_MODE" = 1 ]; then
     EXECUTOR_LOCK_DIR="$NODE_RUN_DIR/executor.lock.d"
@@ -947,24 +954,6 @@ close_inherited_executor_lock() {
   exec 8>&-
 }
 
-heartbeat() {
-  local stage_pid=$1 interval=$((LEASE_SECONDS / 3)) elapsed=0
-  [ "$interval" -le 60 ] || interval=60
-  [ "$interval" -ge 10 ] || interval=10
-  while kill -0 "$stage_pid" 2>/dev/null; do
-    sleep 1
-    kill -0 "$stage_pid" 2>/dev/null || break
-    elapsed=$((elapsed + 1))
-    [ "$elapsed" -ge "$interval" ] || continue
-    elapsed=0
-    if ! env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" renew \
-      --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" \
-      --lease-seconds "$LEASE_SECONDS" >/dev/null 2>"$TASK_DIR/heartbeat-error.log"; then
-      : >"$TASK_DIR/heartbeat-failed"
-      return 1
-    fi
-  done
-}
 
 stage_success_outcome() {
   case "$STAGE" in
@@ -1051,7 +1040,7 @@ emit_evidence() {
 }
 
 execute_task() {
-  local claim_output stage_pid heartbeat_pid stage_rc finished_at status postcondition detail outcome_class complete_rc
+  local heartbeat_failed=0 claim_output stage_pid stage_rc finished_at status postcondition detail outcome_class complete_rc
   require_root
   opu_execution_host_lock || return $?
   load_plan
@@ -1082,13 +1071,11 @@ execute_task() {
   set +e
   (set -e; close_inherited_executor_lock; run_typed_stage) >"$TASK_DIR/stdout.log" 2>"$TASK_DIR/stderr.log" &
   stage_pid=$!
-  (exec 7>&-; close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
+  opu_execution_start_heartbeat || return $?
   wait "$stage_pid"; stage_rc=$?
-  kill "$heartbeat_pid" 2>/dev/null || true
-  wait "$heartbeat_pid" 2>/dev/null || true
   set -e
   finished_at=$(opu_now_utc)
-  if [ -f "$TASK_DIR/heartbeat-failed" ]; then
+  if [ -f "$TASK_DIR/heartbeat-failed" ]; then heartbeat_failed=1;
     status=failed; postcondition=unknown
     detail='task lease heartbeat failed; Oracle outcome requires controller reconciliation'
     stage_rc=75; outcome_class=$(derive_outcome)
@@ -1102,6 +1089,7 @@ execute_task() {
     outcome_class=$(derive_outcome)
   fi
   emit_evidence "$status" "$postcondition" "$stage_rc" "$detail" "$finished_at" "$outcome_class"
+  opu_execution_finish_heartbeat "$status" "$postcondition" "$heartbeat_failed" || return $?
   set +e
   env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" complete \
     --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" \

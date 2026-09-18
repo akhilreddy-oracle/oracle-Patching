@@ -33,6 +33,7 @@ class Element {
   set textContent(value) { this.replaceChildren(); this._text = String(value ?? ''); }
   set innerHTML(value) { assert.equal(value, '', 'The UI must render data as text'); this.replaceChildren(); }
   appendChild(child) { if (child.parentElement) child.parentElement.children = child.parentElement.children.filter(item => item !== child); child.parentElement = this; this.children.push(child); return child; }
+  remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(child => child !== this); this.parentElement = null; }
   replaceChildren(...children) { for (const child of this.children) child.parentElement = null; this.children = []; this._text = ''; children.forEach(child => this.appendChild(child)); }
   addEventListener(name, listener) { const handlers = this.listeners.get(name) || []; handlers.push(listener); this.listeners.set(name, handlers); }
   async fire(name) { for (const listener of this.listeners.get(name) || []) await listener({ target: this, preventDefault() {} }); }
@@ -75,19 +76,24 @@ const api = await import('../webapp/static/api.js');
 const actor = await import('../webapp/static/actor.js');
 const { classifyStatus } = await import('../webapp/static/dom.js');
 const { belongsToHost, newestFirst } = await import('../webapp/static/host_scope.js');
-const { renderPlanList, renderPlanDetail } = await import('../webapp/static/plans.js');
-const { renderRecoveryList, renderRecoveryDetail } = await import('../webapp/static/recovery_pages.js');
+const { renderPlanList, renderPlanDetail, renderPlanNew, renderPlanDemoNew, renderRollbackNew } = await import('../webapp/static/plans.js');
+const { renderRecoveryList, renderRecoveryDetail, renderRecoveryNew } = await import('../webapp/static/recovery_pages.js');
 const { renderWorkspace } = await import('../webapp/static/workspace.js');
 const { renderExecuteStage } = await import('../webapp/static/stages/execute.js');
+const { renderDiscoverStage } = await import('../webapp/static/stages/discover.js');
+const { renderPlanStage } = await import('../webapp/static/stages/plan.js');
 const { renderReadinessStage } = await import('../webapp/static/stages/readiness.js');
 const { renderRecoveryStage } = await import('../webapp/static/stages/recovery.js');
 const { hydrateBackupPolicy, policyRecoveryBlock, backupPolicyChooser } = await import('../webapp/static/backup_policy.js');
 const { createPageRenderer } = await import('../webapp/static/navigation.js');
+const { renderValidation } = await import('../webapp/static/validation.js');
+const { renderEstate } = await import('../webapp/static/estate.js');
 const { startRun, pollRun, runToCompletion } = await import('../webapp/static/runs.js');
 const { reconciliationCard } = await import('../webapp/static/run_reconciliation.js');
-const { refreshSession } = await import('../webapp/static/shell.js');
+const { refreshSession, refreshHostNav } = await import('../webapp/static/shell.js');
 const { executionWindow } = await import('../webapp/static/plan_window.js');
 const { evidenceReport } = await import('../webapp/static/report_view.js');
+const { executionConsole } = await import('../webapp/static/execution_console.js');
 const { canInspectExtjob, extjobInspection } = await import('../webapp/static/extjob_inspection.js');
 const { buildProcedure, PROCEDURE_ADAPTERS, REQUIRED_PRECHECKS } = await import('../webapp/static/procedure_adapters.js');
 
@@ -144,6 +150,110 @@ test('real list renderers surface authentication failures through the page bound
   }
 });
 
+test('discovery exposes authentication recovery instead of swallowing an expired session', async () => {
+  fetch = async () => response({ message: 'Session expired' }, 401);
+  const page = mount(); const render = createPageRenderer(page, view => renderDiscoverStage(view, 'prod'));
+  await render();
+  assert.match(page.textContent, /Authentication required/);
+  assert.ok(page.querySelector('.auth-recovery-form'));
+  render.cancel();
+});
+
+test('discovery refresh cannot retain green success when its evidence reload is missing or fails', async () => {
+  actor.setSessionIdentity({ mode: 'lab', permissions: { live_discovery: true } });
+  for (const reload of [response({ steps: [] }), response({ message: 'Evidence read failed' }, 503)]) {
+    let pipelineReads = 0;
+    fetch = async (url, options = {}) => {
+      if (options.method === 'POST') return response({ run_id: 'discover-refresh' }, 202);
+      if (url.startsWith('/api/runs/')) return response({ status: 'succeeded' });
+      assert.equal(url, '/api/hosts/prod/pipeline');
+      return ++pipelineReads === 1 ? response({ steps: [{ step: 'discovery', done: true, status: 'ok', evidence: { host: { name: 'previous-host' } } }] }) : reload;
+    };
+    const page = mount(); await renderDiscoverStage(page, 'prod');
+    assert.equal(page.querySelector('#discover-status').textContent, 'ok');
+    await button(page, 'Run live discovery').fire('click');
+    const status = page.querySelector('#discover-status');
+    assert.equal(status.classList.contains('is-ok'), false);
+    assert.equal(status.textContent, reload.status === 503 ? 'unavailable' : 'no evidence');
+    assert.doesNotMatch(page.textContent, /previous-host/);
+    assert.equal(button(page, 'Run live discovery').disabled, false);
+  }
+});
+
+test('discovery controls prevent denied or unavailable sessions from issuing a POST', async () => {
+  const identities = [
+    null,
+    { mode: 'principal', actor: 'requester', roles: ['requester'], rbac_enabled: true, permissions: { live_discovery: false } },
+    { mode: 'principal', actor: 'operator', roles: ['operator'], rbac_enabled: true, permissions: { live_discovery: false } },
+    { mode: 'company', actor: 'requester', roles: ['requester'], rbac_enabled: true, csrf_token: 'fixture', expires_at: Date.now() / 1000 + 600, permissions: { live_discovery: false } },
+    { mode: 'company', actor: 'operator', roles: ['operator'], rbac_enabled: true, csrf_token: 'fixture', expires_at: Date.now() / 1000 - 1, permissions: { live_discovery: true } },
+  ];
+  for (const session of identities) {
+    actor.setSessionIdentity(session);
+    const posts = [];
+    fetch = async (url, options = {}) => {
+      if (options.method === 'POST') posts.push(url);
+      return response(url === '/api/estate' ? { hosts: [{ id: 'prod', status: 'pending' }] } : url === '/api/fleet' ? { databases: [] } : { steps: [] });
+    };
+    for (const [render, label] of [[renderEstate, 'Refresh live SSH'], [page => renderDiscoverStage(page, 'prod'), 'Run live discovery']]) {
+      const page = mount(); await render(page); const control = button(page, label);
+      assert.equal(control.disabled, true);
+      const hint = page.querySelector('#' + control.getAttribute('aria-describedby'));
+      assert.ok(hint.textContent); assert.equal(hint.hidden, false);
+      await control.fire('click'); // Even a synthetic event cannot bypass the UI admission guard.
+    }
+    assert.deepEqual(posts, []);
+  }
+});
+
+test('server-admitted discovery works for principal, company and lab sessions', async () => {
+  for (const mode of ['principal', 'company', 'lab']) {
+    actor.setSessionIdentity({ mode, actor: 'fixture-operator', rbac_enabled: mode !== 'lab', permissions: { live_discovery: true },
+      csrf_token: 'fixture-csrf', expires_at: Date.now() / 1000 + 600 });
+    for (const [render, label] of [[renderEstate, 'Refresh live SSH'], [page => renderDiscoverStage(page, 'prod'), 'Run live discovery']]) {
+      const posts = [];
+      fetch = async (url, options = {}) => {
+        if (options.method === 'POST') { posts.push(url); return response({ run_id: 'discovery' }, 202); }
+        if (url.startsWith('/api/runs/')) return response({ status: 'succeeded' });
+        return response(url === '/api/estate' ? { hosts: [{ id: 'prod', status: 'pending' }] } : url === '/api/fleet' ? { databases: [] } : { steps: [] });
+      };
+      const page = mount(); await render(page); const control = button(page, label);
+      assert.equal(control.disabled, false, mode);
+      assert.equal(page.querySelector('#' + control.getAttribute('aria-describedby')).hidden, true);
+      await control.fire('click');
+      assert.deepEqual(posts, ['/api/hosts/prod/pipeline/discovery']);
+      assert.equal(control.disabled, false);
+    }
+  }
+});
+
+test('authentication recovery exposes a blank password form and only replaces the credential on explicit sign-in', async () => {
+  storage.set('opu-webapp-token', 'old-shared-token');
+  fetch = async url => response(url === '/api/auth/config' ? { configured: false } : { message: 'Missing or invalid principal credential' }, url === '/api/auth/config' ? 200 : 401);
+  const page = mount(); const render = createPageRenderer(page, renderPlanList); await render();
+  const form = page.querySelector('.auth-recovery-form'); const input = form.querySelector('input');
+  assert.equal(input.getAttribute('type'), 'password'); assert.equal(input.value, '');
+  assert.equal(button(form, 'Sign in').getAttribute('type'), 'submit');
+  input.value = ' personal-principal-token '; await input.fire('input');
+  assert.equal(api.getApiToken(), 'old-shared-token');
+  let changed = 0; const handler = () => { changed++; }; window.addEventListener(api.TOKEN_EVENT, handler);
+  await form.fire('submit'); window.removeEventListener(api.TOKEN_EVENT, handler);
+  assert.equal(api.getApiToken(), 'personal-principal-token'); assert.equal(changed, 1);
+  assert.equal(input.value, ''); assert.doesNotMatch(page.textContent, /personal-principal-token|old-shared-token/);
+  assert.equal(location.hash, '#/estate'); render.cancel();
+});
+
+test('authentication recovery retains company login and can retry an unchanged token', async () => {
+  let attempts = 0;
+  fetch = async () => response({ configured: true, login_url: '/api/auth/login', label: 'Company sign in' });
+  const page = mount(); const render = createPageRenderer(page, async () => { attempts++; throw new api.ApiError({ message: 'Company sign in is required.' }, 401); });
+  await render(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(page.querySelector('a').getAttribute('href'), '/api/auth/login');
+  assert.match(page.textContent, /Company sign in is required/);
+  const form = page.querySelector('form'); form.querySelector('input').value = api.getApiToken();
+  await form.fire('submit'); assert.equal(attempts, 2); render.cancel();
+});
+
 test('navigation aborts old reads and prevents stale results or errors replacing a new page', async () => {
   let release; let firstSignal; let call = 0;
   const page = mount();
@@ -153,6 +263,124 @@ test('navigation aborts old reads and prevents stale results or errors replacing
   });
   const first = render(); await render(); assert.equal(firstSignal.aborted, true); release(); await first;
   assert.equal(page.textContent, 'current'); render.cancel();
+});
+
+test('cancelled execution view cannot start a native log refresh from a late saved response', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  let reads = 0, release; const posts = [];
+  const data = { guidance: 'Original execution history', runs: [{ run_id: 'native-run', can_observe: true, status: 'running' }] };
+  fetch = async (url, options = {}) => {
+    if (options.method === 'POST') { posts.push(url); return response({ run_id: 'unexpected-observe' }); }
+    assert.equal(url, '/api/plans/P1/execution');
+    return ++reads === 1 ? response(data) : { ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) };
+  };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  panel.querySelector('input').checked = true;
+  const refresh = button(panel, 'Refresh timeline').fire('click');
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); api.setReadSignal(new AbortController().signal);
+  release({ ...data, guidance: 'Stale response' }); await refresh;
+  assert.deepEqual(posts, []);
+  assert.match(panel.textContent, /Original execution history/);
+  assert.doesNotMatch(panel.textContent, /Stale response/);
+});
+
+test('replaced execution panel cannot start native log following while its page remains active', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  let reads = 0, release; const posts = [];
+  const data = { guidance: 'Execution history', runs: [{ run_id: 'native-run', can_observe: true, status: 'running' }] };
+  fetch = async (url, options = {}) => {
+    if (options.method === 'POST') { posts.push(url); return response({ run_id: 'unexpected-observe' }); }
+    assert.equal(url, '/api/plans/P1/execution');
+    return ++reads === 1 ? response(data) : { ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) };
+  };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  panel.querySelector('input').checked = true;
+  const refresh = button(panel, 'Refresh timeline').fire('click');
+  await new Promise(resolve => setImmediate(resolve));
+  panel.remove(); release(data); await refresh;
+  assert.equal(controller.signal.aborted, false, 'a same-page panel refresh does not cancel the route');
+  assert.deepEqual(posts, [], 'a detached follow widget must not start SSH observation');
+  controller.abort();
+});
+
+test('obsolete estate discovery completion cannot clear the new active host or launch new reads', async () => {
+  actor.setSessionIdentity({ mode: 'lab', permissions: { live_discovery: true } });
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  const rail = document.body.appendChild(new Element('nav')); rail.setAttribute('id', 'rail-hosts');
+  let release; const calls = [];
+  const hosts = [{ id: 'prod', label: 'Production', status: 'ok' }];
+  fetch = async (url, options = {}) => {
+    calls.push([url, options.method || 'GET']);
+    if (options.method === 'POST') {
+      assert.equal(url, '/api/hosts/prod/pipeline/discovery');
+      return new Promise(resolve => { release = () => resolve(response({ run_id: 'accepted-discovery' }, 202)); });
+    }
+    if (url === '/api/fleet') return response({ databases: [] });
+    assert.equal(url, '/api/estate'); return response({ hosts });
+  };
+  const page = mount(); await renderEstate(page);
+  const refresh = button(page, 'Refresh live SSH').fire('click');
+  controller.abort(); api.setReadSignal(new AbortController().signal); page.remove();
+  await refreshHostNav('prod');
+  const count = calls.length; release(); await refresh;
+  assert.equal(calls.length, count, 'old refresh must not poll or reload data under the new route identity');
+  assert.equal(rail.querySelector('a').getAttribute('aria-current'), 'page');
+});
+
+test('host navigation ignores a cancelled response even when its JSON body completes late', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  const rail = document.body.appendChild(new Element('nav')); rail.setAttribute('id', 'rail-hosts');
+  rail.textContent = 'Current host navigation';
+  let release;
+  fetch = async () => ({ ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) });
+  const pending = refreshHostNav(null);
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); api.setReadSignal(new AbortController().signal);
+  release({ hosts: [{ id: 'obsolete', status: 'ok' }] });
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(rail.textContent, 'Current host navigation');
+});
+
+test('execution timeline retains the newest refresh when older responses arrive later', async () => {
+  const pending = []; let reads = 0;
+  fetch = async () => ++reads === 1 ? response({ guidance: 'Initial history' })
+    : { ok: true, status: 200, json: () => new Promise(resolve => pending.push(resolve)) };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  const first = button(panel, 'Refresh timeline').fire('click');
+  const second = button(panel, 'Refresh timeline').fire('click');
+  await new Promise(resolve => setImmediate(resolve));
+  pending[1]({ guidance: 'Current history' }); await second;
+  pending[0]({ guidance: 'Stale history' }); await first;
+  assert.match(panel.textContent, /Current history/);
+  assert.doesNotMatch(panel.textContent, /Stale history/);
+});
+
+test('release validation stops loading after its response and retains every evidence level', async () => {
+  let release;
+  fetch = async url => {
+    assert.equal(url, '/api/validation');
+    return new Promise(resolve => { release = () => resolve(response({
+      fixture_tested: { status: 'unknown', reason: 'Source changed after validation.' },
+      live_lab_verified: { status: 'unverified', reason: 'No live lab evidence recorded.' },
+      production_approved: { status: 'unverified', reason: 'No production approval recorded.' },
+    })); });
+  };
+  const page = mount(); const render = createPageRenderer(page, renderValidation);
+  const pending = render();
+  assert.match(page.textContent, /Loading…/);
+  assert.equal(page.querySelector('.route-view').getAttribute('aria-busy'), 'true');
+  release(); await pending;
+  assert.doesNotMatch(page.textContent, /Loading…/);
+  assert.equal(page.querySelector('.route-view').getAttribute('aria-busy'), 'false');
+  assert.deepEqual(page.querySelectorAll('h2').map(node => node.textContent), ['Fixture tests', 'Live lab verification', 'Production approval']);
+  assert.deepEqual(page.querySelectorAll('.badge').map(node => node.textContent), ['unknown', 'unverified', 'unverified']);
+  for (const reason of ['Source changed after validation.', 'No live lab evidence recorded.', 'No production approval recorded.']) assert.ok(page.textContent.includes(reason));
+  assert.equal(page.querySelectorAll('.badge-ok').length, 0);
+  render.cancel();
 });
 
 test('API sends the acting identity only on writes and still joins an active run conflict', async () => {
@@ -174,6 +402,66 @@ test('unknown outcomes and a navigation during launch cannot poll forever or rep
   };
   const run = runToCompletion('/operation', {}); controller.abort(); api.setReadSignal(new AbortController().signal); release();
   await assert.rejects(run, error => error.name === 'AbortError'); assert.equal(reads, 0);
+});
+
+test('a cancelled run response cannot publish completion after another page is opened', async () => {
+  const controller = new AbortController(); let release; const ticks = [];
+  fetch = async () => ({ ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) });
+  const pending = pollRun('previous-page-run', { signal: controller.signal, onTick: record => ticks.push(record) });
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); release({ status: 'succeeded', run_id: 'previous-page-run' });
+  await assert.rejects(pending, error => error.name === 'AbortError');
+  assert.deepEqual(ticks, []);
+});
+
+test('a late authentication failure from cancelled navigation cannot clear the newer identity or CSRF', async () => {
+  const previous = new AbortController(); api.setReadSignal(previous.signal);
+  let release;
+  fetch = async () => new Promise(resolve => { release = resolve; });
+  const oldSession = refreshSession();
+  previous.abort(); api.setReadSignal(new AbortController().signal);
+  fetch = async () => response({ rbac_enabled: true, actor: 'new-operator', roles: ['operator'], csrf_token: 'new-fixture-csrf' });
+  await refreshSession();
+  release(response({ message: 'Old session expired' }, 401));
+  await assert.rejects(oldSession, error => error.status === 401);
+  assert.equal(actor.authenticatedActor(), 'new-operator');
+  let headers;
+  fetch = async (_url, options) => { headers = options.headers; return response({}); };
+  await api.apiFetch('/fixture-write', { method: 'POST', body: '{}' });
+  assert.equal(headers['X-CSRF-Token'], 'new-fixture-csrf');
+  assert.equal(headers['X-OPU-Actor'], 'new-operator');
+});
+
+test('creation pages open the submitted record even if its editable ID changes while the run finishes', async () => {
+  const cases = [
+    [renderPlanNew, 'source', 'Plan ID', 'Create plan', '/api/plans', 'plan_id', 'plans'],
+    [renderPlanDemoNew, null, 'Plan ID', 'Build fixture and create plan', '/api/plans/testmode-demo', 'plan_id', 'plans'],
+    [renderRollbackNew, 'source-plan', 'Rollback plan ID', 'Create rollback plan', '/api/plans/source-plan/create-rollback', 'plan_id', 'plans'],
+    [renderPlanStage, 'source', 'Plan ID', 'Create plan', '/api/plans', 'plan_id', 'plans'],
+    [renderRecoveryNew, null, 'Request ID', 'Build fixture and create request', '/api/recovery/testmode-demo', 'request_id', 'recovery'],
+  ];
+  const procedure = buildProcedure('database_single_instance_opatch', procedureFields, artifact);
+  for (const [renderer, target, label, action, route, key, index] of cases) {
+    let finish; const posted = []; location.hash = '#/estate';
+    fetch = async (url, options) => {
+      if (options.method === 'POST') { posted.push({ url, body: JSON.parse(options.body) }); return response({ run_id: 'create-run' }, 202); }
+      if (url === '/api/runs/create-run') return new Promise(resolve => { finish = () => resolve(response({ status: 'succeeded' })); });
+      if (url.endsWith('/pipeline')) return response({ steps: [
+        { step: 'artifact-inspect', done: true, evidence: { artifact } },
+        { step: 'procedure-validate', done: true, status: 'ready_for_planning', evidence: { procedure } },
+      ] });
+      return response({ plans: [], tasks: [] });
+    };
+    const page = mount(); await renderer(page, target);
+    const id = field(page, label); id.value = 'submitted-record';
+    const pending = button(page, action).fire('click');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof finish, 'function', `${renderer.name} should have submitted its run`);
+    id.value = 'edited-after-submit'; finish(); await pending;
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].url, route); assert.equal(posted[0].body[key], 'submitted-record');
+    assert.equal(location.hash, `#/${index}/submitted-record`, renderer.name);
+  }
 });
 
 const artifact = { sha256: 'a'.repeat(64), patch_ids: ['12345678'], platforms: [{ id: '226' }], readme_files: [{ path: 'README.html', sha256: 'b'.repeat(64) }] };
@@ -206,6 +494,7 @@ test('actual readiness form can submit every adapter and does not require a data
     };
     const page = mount(); await renderReadinessStage(page, 'grid-host');
     const card = page.querySelectorAll('.step-card').find(card => card.querySelector('h3')?.textContent === 'Procedure validation');
+    assert.match(card.textContent, /support non-CDB databases only; CDB\/PDB patching is unavailable/);
     const adapter = field(card, 'Adapter'); adapter.value = name; await adapter.fire('change');
     field(card, 'Patch ID').value = '12345678'; field(card, 'Platform ID').value = '226';
     field(card, 'Required OPatch').value = '12.2.0.1.49'; field(card, 'README identifier').value = 'README.html';
@@ -630,21 +919,34 @@ test('host lock operations retain token and actor requirements', async () => {
   assert.match(page.textContent, /actor/i);
 });
 
-test('token changes refresh the real app and authenticated actor inputs cannot impersonate another principal', async () => {
+test('token changes refresh the real app permissions and authenticated actor inputs cannot impersonate another principal', async () => {
+  location.hash = '#/estate';
   for (const id of ['app', 'rail-session', 'rail-hosts']) { const node = new Element('div'); node.setAttribute('id', id); document.body.appendChild(node); }
   let sessions = 0;
   fetch = async (url, options) => {
-    if (url === '/api/session') { sessions++; const who = options.headers.Authorization === 'Bearer bob-token' ? 'bob' : 'alice'; return response({ actor: who, roles: ['operator'], rbac_enabled: true }); }
-    return response({ hosts: [] });
+    if (url === '/api/session') {
+      sessions++; const who = options.headers.Authorization === 'Bearer bob-token' ? 'bob' : 'alice';
+      return response({ actor: who, mode: 'principal', roles: [who === 'bob' ? 'operator' : 'requester'], rbac_enabled: true,
+        permissions: { live_discovery: who === 'bob' } });
+    }
+    return response(url === '/api/estate' ? { hosts: [{ id: 'prod', status: 'pending' }] } : url === '/api/fleet' ? { databases: [] } : { steps: [] });
   };
   await import('../webapp/static/app.js');
   const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
   await settle(); assert.equal(actor.getActor(), 'alice');
+  assert.equal(button(document.getElementById('app'), 'Refresh live SSH').disabled, true);
   const input = document.getElementById('session-acting-as'); assert.equal(input.readOnly, true);
   actor.setActor('mallory'); assert.equal(actor.getActor(), 'alice');
   api.setApiToken('bob-token'); await settle();
   assert.equal(actor.getActor(), 'bob'); assert.equal(input.value, 'bob'); assert.ok(sessions >= 2);
   assert.match(document.getElementById('rail-session').textContent, /Authenticated as bob/);
+  assert.equal(button(document.getElementById('app'), 'Refresh live SSH').disabled, false);
+  location.hash = '#/hosts/prod/discover'; window.dispatchEvent(new Event('hashchange')); await settle();
+  assert.equal(button(document.getElementById('app'), 'Run live discovery').disabled, false);
+  api.setApiToken('alice-token'); await settle();
+  assert.equal(actor.getActor(), 'alice');
+  assert.equal(button(document.getElementById('app'), 'Run live discovery').disabled, true);
+  location.hash = '#/estate'; window.dispatchEvent(new Event('hashchange')); await settle();
 });
 
 
@@ -853,6 +1155,26 @@ test('failed recovery analysis refresh clears previously passed approval evidenc
   assert.match(page.textContent, /Run analysis and resolve its findings before approval/);
   await button(page, 'Approve').fire('click');
   assert.equal(calls.filter(url => url.endsWith('/approve')).length, 0);
+});
+
+test('recovery analysis cannot relaunch while a running or unknown operation awaits resolution', async () => {
+  const posts = [];
+  for (const status of ['pending', 'queued', 'running', 'unknown']) {
+    for (const analysis of [null, { status: 'passed' }]) {
+      fetch = async (url, options = {}) => {
+        if (options.method === 'POST') posts.push(url);
+        return response({ request_id: 'live-1', state: 'awaiting_approval', mode: 'live', analysis,
+          latest_run: { run_id: 'existing-run', status } });
+      };
+      const page = mount(); await renderRecoveryDetail(page, 'live-1');
+      const analyze = button(page, analysis ? 'Refresh analysis' : 'Analyze recovery');
+      assert.equal(analyze.disabled, true, status);
+      await analyze.fire('click');
+      assert.match(page.textContent, /Existing operation must finish or be reconciled/);
+      assert.equal(page.querySelectorAll('button').some(node => node.textContent === 'Approve'), false);
+    }
+  }
+  assert.deepEqual(posts, []);
 });
 
 test('live recovery execution describes real downtime and fixtures are never offered as host planning evidence', async () => {

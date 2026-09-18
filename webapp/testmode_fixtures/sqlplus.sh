@@ -30,6 +30,7 @@ elif grep -q 'INSTANCE_NAME=' <<<"$input"; then
     'INSTANCE_NAME=ORCL' \
     'INSTANCE_STATUS=OPEN' \
     'DATABASE_UNIQUE_NAME=ORCL' \
+    'CDB=NO' \
     'DATABASE_ROLE=PRIMARY' \
     'OPEN_MODE=READ WRITE' \
     'LOG_MODE=ARCHIVELOG' \

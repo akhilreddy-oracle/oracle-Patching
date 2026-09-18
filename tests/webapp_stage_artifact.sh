@@ -9,10 +9,12 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/opu-webapp-stage.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 cd "$ROOT/webapp"
 OPU_TEST_TMP="$TMP" python3 - <<'PY'
-import json, os, subprocess, sys
+import base64, json, os, subprocess, sys
 from pathlib import Path
 
 sys.path.insert(0, ".")
+sys.path.append(str(Path.cwd().parent / "tests"))
+from runtime_fixture import host_runtime_receipts
 import evidence
 evidence.VAR_DIR = Path(os.environ["OPU_TEST_TMP"]) / "hosts"
 import pipeline_steps, remote, tools_sync
@@ -42,14 +44,20 @@ def fake_run_remote_shell(alias, script, timeout=45, sudo=False):
         return cp(0, "10.0.0.2\n") if "10.0.0.2" in script else cp(1, "")
     if script.strip() == "id -un":
         return cp(0, "opc\n")
+    if "/etc/ssh/ssh_host_ed25519_key.pub" in script:
+        blob = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + b"x" * 32
+        return cp(0, "ssh-ed25519 " + base64.b64encode(blob).decode() + " fixture\n")
+    if "mktemp -d /tmp/opu-transfer." in script:
+        return cp(0, "/tmp/opu-transfer.ABCDEFGHIJKL\n")
     if "authorized_keys" in script:
         return cp(0, "")
     if "set -o pipefail" in script:  # direct transfer executed on src
         assert script.count("tar -C /u01/stage -cf - 39034528") == 1 and "opu-forced-command" in script
         assert "-o IdentitiesOnly=yes" in script and "opc@10.0.0.2" in script
+        assert "-o StrictHostKeyChecking=yes" in script and "accept-new" not in script
         media["n1"] = "COMPLETE"
         return cp(0, json.dumps({"status": "staged", "artifact": DIR, "patch_id": "39034528", "files": 3, "bytes": 999}) + "\n")
-    if script.startswith("chmod 600") or script.startswith("rm -f"):
+    if script.startswith("set -eu; rm -f -- /tmp/opu-transfer."):
         return cp(0, "")
     if "cat" in script and tools_sync.STAMP_NAME in script:
         return cp(1, "", "missing")
@@ -63,9 +71,14 @@ def fake_pipe_remote(src_alias, src_argv, dst_alias, dst_argv, timeout=45, src_s
 
 remote.run_remote_shell = fake_run_remote_shell
 remote.pipe_remote = fake_pipe_remote
-remote.push_file = lambda alias, path, data, timeout=45: calls.append(("push", alias, path))
+def fake_push(alias, path, data, timeout=45, private=False):
+    assert private and path.startswith("/tmp/opu-transfer.ABCDEFGHIJKL/")
+    if path.endswith("/known_hosts"):
+        assert data.startswith(b"10.0.0.2 ssh-ed25519 ")
+    calls.append(("push", alias, path))
+remote.push_file = fake_push
 remote.pull_file = lambda alias, path, timeout=45, sudo=False: (_ for _ in ()).throw(remote.RemoteError("x", "no stamp"))
-tools_sync.ensure_host_tools = lambda host, force=False: calls.append(("tools", host["id"])) or []
+tools_sync.ensure_host_tools = lambda host, force=False: calls.append(("tools", host["id"])) or host_runtime_receipts(host)
 
 # Snapshot evidence supplies the Oracle Home owner.
 evidence.write_evidence(HOST_ID, "snapshot", {"oracle_homes": [{"path": "/u01/app/oracle/product/19/dbhome_1", "owner": "oracle"}],
@@ -90,12 +103,12 @@ assert evidence.read_evidence(HOST_ID, "artifact") is None and evidence.read_evi
 assert evidence.read_evidence(HOST_ID, "snapshot") is not None
 # The restricted transfer key was installed and then removed on n1; src key removed.
 installs = [c for c in calls if c[0] == "shell" and c[1] == "n1" and "authorized_keys" in c[2]]
-assert len(installs) == 2 and ">>" in installs[0][2] and "sed -i" in installs[1][2], installs
+assert len(installs) == 2 and ">>" in installs[0][2] and "awk -v marker=" in installs[1][2], installs
 # The forced command pins the exact staging invocation and the source IPs; no pty/forwarding.
 auth = installs[0][2]
 for needle in ('from="10.0.0.1"', "opu-artifact-stage", "--from-tar-stdin", "--owner oracle", "no-pty", "no-port-forwarding", "no-agent-forwarding"):
     assert needle in auth, (needle, auth)
-assert any(c[0] == "shell" and c[1] == "src" and c[2].startswith("rm -f /tmp/opu-transfer-") for c in calls)
+assert any(c[0] == "shell" and c[1] == "src" and c[2].startswith("set -eu; rm -f -- /tmp/opu-transfer.") for c in calls)
 
 # 3. Idempotent: complete nodes are skipped unless replace=true.
 result2 = pipeline_steps.step_stage_artifact(HOST_ID, HOST, {"artifact_dir": DIR, "source": {"host_id": "src"}, "_hosts": HOSTS})
@@ -120,12 +133,25 @@ expect_error({"artifact_dir": DIR, "source": {"host_id": "src"}, "transfer": "te
 media["n2"] = "INCOMPLETE"
 expect_error({"artifact_dir": DIR, "source": {"host_id": "src"}, "transfer": "direct"}, "unreachable")
 
+# Cleanup uncertainty after direct transfer must never start a relay fallback.
+media["n1"] = "INCOMPLETE"
+before_relay = len([c for c in calls if c[0] == "pipe"])
+def cleanup_failure(alias, script, **kwargs):
+    if alias == "n1" and "awk -v marker=" in script:
+        calls.append(("shell", alias, script))
+        return cp(1, "", "fixture cleanup failed")
+    return fake_run_remote_shell(alias, script, **kwargs)
+remote.run_remote_shell = cleanup_failure
+expect_error({"artifact_dir": DIR, "source": {"host_id": "src"}}, "transfer_cleanup_failed")
+assert len([c for c in calls if c[0] == "pipe"]) == before_relay
+remote.run_remote_shell = fake_run_remote_shell
+
 # 5. tools_sync fingerprint is stable and changes with content.
 fp1 = tools_sync.local_fingerprint(); fp2 = tools_sync.local_fingerprint()
 assert fp1 == fp2 and len(fp1) == 64
 
-# 6. readiness-chain: runs every step in order with saved inputs, refreshes only
-#    tool-derived digests, stops at the first blocked step, logs progress.
+# 6. readiness-chain: changed media requires renewed requirements review;
+#    matching reviewed inputs preserve their bindings and stop at a blocker.
 CH = "chainhost"
 evidence.write_evidence(CH, "artifact", {"artifact": {"path": DIR, "sha256": "a" * 64, "readme_files": [{"path": "README.html", "sha256": "b" * 64}]}})
 evidence.write_evidence(CH, "procedure_input", {"patch_id": "39034528", "artifact_sha256": "old", "oracle_references": [{"kind": "patch_readme", "identifier": "README.html", "sha256": "old"}]})
@@ -148,6 +174,19 @@ class Rec:
     def __init__(self): self.lines = []
     def log(self, line): self.lines.append(line)
 rec = Rec()
+try:
+    pipeline_steps.step_readiness_chain(CH, HOST, {"_record": rec})
+except pipeline_steps.localtools.LocalToolError as exc:
+    assert "reviewed procedure" in str(exc), exc
+else:
+    raise AssertionError("chain rebound old requirements to changed patch media")
+assert order == ["discovery", "reconcile", "artifact-inspect"], order
+assert "procedure-validate" not in seen
+assert evidence.read_evidence(CH, "procedure_input")["artifact_sha256"] == "old"
+# Simulate the operator reviewing this exact media and saving its requirements.
+evidence.write_evidence(CH, "procedure_input", {"patch_id": "39034528", "artifact_sha256": "a" * 64,
+    "oracle_references": [{"kind": "patch_readme", "identifier": "README.html", "sha256": "b" * 64}]})
+order.clear()
 out = pipeline_steps.step_readiness_chain(CH, HOST, {"_record": rec})
 assert order == ["discovery", "reconcile", "artifact-inspect", "procedure-validate", "compatibility-collect"], order
 assert out["status"] == "blocked" and out["stopped_at"] == "compatibility-collect" and out["findings"] == ["n1: Incomplete patch media"], out

@@ -38,7 +38,7 @@ def _objects(value):
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
-def _bound_readiness(host_id, readiness, snapshot, policy):
+def _bound_readiness(host_id, readiness, snapshot, procedure_input):
     refs = readiness.get("snapshot_evidence")
     if not isinstance(refs, list) or not refs:
         return False
@@ -55,11 +55,35 @@ def _bound_readiness(host_id, readiness, snapshot, policy):
             matches_current = matches_current or json.loads(raw) == snapshot
         except (ValueError, KeyError, TypeError, OSError):
             return False
+    binding = readiness.get("evidence")
+    if not matches_current or not isinstance(binding, dict):
+        return False
+    required = {"policy_sha256": "policy", "reconciliation_sha256": "reconciliation",
+                "artifact_manifest_sha256": "artifact", "procedure_validation_sha256": "procedure",
+                "compatibility_sha256": "compatibility_reconciliation"}
+    optional = {"recovery_sha256": "recovery"}
     try:
-        policy_sha = hashlib.sha256(evidence.evidence_path(host_id, "policy").read_bytes()).hexdigest()
-        binding = readiness.get("evidence")
-        return matches_current and isinstance(binding, dict) and binding.get("policy_sha256") == policy_sha
-    except OSError:
+        for field, name in {**required, **{k: v for k, v in optional.items() if k in binding}}.items():
+            path = evidence.evidence_path(host_id, name)
+            if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != binding.get(field):
+                return False
+        validated = _read(host_id, "procedure")
+        source = validated.get("evidence")
+        if (validated.get("status") != "ready_for_planning" or validated.get("procedure") != procedure_input
+                or not isinstance(source, dict) or source.get("procedure_sha256") != hashlib.sha256(
+                    evidence.evidence_path(host_id, "procedure_input").read_bytes()).hexdigest()
+                or readiness.get("patch_id") != procedure_input.get("patch_id")):
+            return False
+        if "dataguard_sha256" in binding:
+            dg = readiness.get("dataguard_evaluation")
+            if (not isinstance(dg, dict) or dg.get("sha256") != binding["dataguard_sha256"]
+                    or not isinstance(dg.get("path"), str)):
+                return False
+            path = Path(dg["path"])
+            if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != dg["sha256"]:
+                return False
+        return True
+    except (OSError, ValueError, TypeError):
         return False
 
 
@@ -81,7 +105,7 @@ def build(hosts, *, now=None, can_manage_metadata=False):
         freshness = "fresh" if fresh else "stale" if stamp is not None and stamp <= now else "unknown"
         homes = {h.get("path"): h for h in _objects(snapshot.get("oracle_homes")) if isinstance(h.get("path"), str)}
         databases = _objects(snapshot.get("databases")) or [{}]
-        bound = _bound_readiness(host_id, readiness, snapshot, policy)
+        bound = _bound_readiness(host_id, readiness, snapshot, procedure)
         valid_until = epoch(readiness.get("valid_until"))
         for database in databases:
             home = homes.get(database.get("oracle_home"), {}) if isinstance(database.get("oracle_home"), str) else {}
@@ -90,12 +114,23 @@ def build(hosts, *, now=None, can_manage_metadata=False):
             desired = configured.get("desired_patch_baseline")
             patches = home.get("patches")
             inventory = isinstance(patches, list) and all(isinstance(x, str) and x.isdigit() for x in patches)
-            inventory = inventory and home.get("opatch_inventory_xml_status") == "collected"
+            inventory = (inventory and home.get("opatch_inventory_xml_status") == "collected"
+                         and home.get("patch_inventory_source") == "opatch_lsinventory_xml"
+                         and isinstance(home.get("opatch_inventory_xml_sha256"), str)
+                         and len(home["opatch_inventory_xml_sha256"]) == 64
+                         and all(c in "0123456789abcdef" for c in home["opatch_inventory_xml_sha256"]))
             baseline_status = "unknown"
-            if fresh and inventory and desired:
+            cluster = snapshot.get("cluster") if isinstance(snapshot.get("cluster"), dict) else {}
+            multi_node = (isinstance(host.get("nodes"), list) and len(host["nodes"]) > 1
+                          or isinstance(cluster.get("nodes"), list) and len(cluster["nodes"]) > 1
+                          or cluster.get("status") == "detected")
+            baseline_reason = ("All-node baseline compliance is unavailable: this view contains the primary node's inventory."
+                               if multi_node else None)
+            if fresh and inventory and desired and not multi_node:
                 baseline_status = "compliant" if desired in patches else "behind"
             name = database.get("db_unique_name") if isinstance(database.get("db_unique_name"), str) else None
-            target_matches = name and procedure.get("database_unique_name") == name
+            target = procedure.get("target")
+            target_matches = name and isinstance(target, dict) and target.get("database_unique_name") == name
             readiness_status = "unknown"
             if fresh and bound and target_matches and valid_until and valid_until > now:
                 readiness_status = readiness.get("status") if readiness.get("status") in ("ready_for_approval", "blocked") else "unknown"
@@ -118,6 +153,7 @@ def build(hosts, *, now=None, can_manage_metadata=False):
                 "oracle_version": runtime.get("database_version") or home.get("version"),
                 "patch_baseline": ", ".join(patches) if inventory else None, "desired_patch_baseline": desired,
                 "baseline_status": baseline_status, "backup_status": backup_status,
+                "baseline_reason": baseline_reason,
                 "backup_completed_at": backup_time if epoch(backup_time) else None,
                 "readiness": readiness_status, "evidence_status": freshness, "evidence_at": snapshot.get("collected_at"),
                 "blockers": blockers, "backup_restore_validated": None,

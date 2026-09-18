@@ -21,7 +21,7 @@ jq -e '.status == "ready_for_approval" and (.gates | length == 1)' "$TMP/result.
 jq '.checks[1].conflict_check.status = "failed"' "$TMP/compatibility.json" >"$TMP/bad-compatibility.json"
 if "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/reconciliation.json" --snapshot "$TMP/node1.json" --snapshot "$TMP/node2.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/procedure.json" --compatibility "$TMP/bad-compatibility.json" --policy "$TMP/policy.json" >/dev/null 2>&1; then echo 'failed compatibility evidence was accepted' >&2; exit 1; fi
 if "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/reconciliation.json" --snapshot "$TMP/node1.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/procedure.json" --compatibility "$TMP/compatibility.json" --policy "$TMP/policy.json" >/dev/null 2>&1; then echo 'missing active-node snapshot was accepted' >&2; exit 1; fi
-jq -n --arg now "$now" --arg digest "$digest" '{schema_version:"1.0",collector:{name:"oracle.topology.discover"},collected_at:$now,host:{name:"standalone.example"},cluster:{status:"unavailable",grid_home:null,runtime:{status:"unavailable"},nodes:[]},oracle_homes:[{path:"/u01/db",owner:"oracle",version:"19.0.0.0.0",opatch_version:"12.2.0.1.51",platform:{status:"collected",id:"226",name:"Linux x86-64",source:"opatch_lsinventory_xml",source_sha256:$digest},patch_inventory_source:"opatch_lsinventory_xml",opatch_inventory_xml_sha256:$digest,patches:[]}],databases:[{db_unique_name:"ORCL",oracle_home:"/u01/db",runtime:{status:"complete",database_role:"PRIMARY",open_mode:"READ WRITE",instance_state:"OPEN",invalid_objects:0,sqlpatch_non_success:0,pdb_not_read_write:0,backup_age_minutes:1,fra_space_limit_bytes:0,fra_space_used_bytes:0,guaranteed_restore_points:0}}],warnings:[]}' >"$TMP/standalone.json"
+jq -n --arg now "$now" --arg digest "$digest" '{schema_version:"1.0",collector:{name:"oracle.topology.discover"},collected_at:$now,host:{name:"standalone.example"},cluster:{status:"unavailable",grid_home:null,runtime:{status:"unavailable"},nodes:[]},oracle_homes:[{path:"/u01/db",owner:"oracle",version:"19.0.0.0.0",opatch_version:"12.2.0.1.51",platform:{status:"collected",id:"226",name:"Linux x86-64",source:"opatch_lsinventory_xml",source_sha256:$digest},patch_inventory_source:"opatch_lsinventory_xml",opatch_inventory_xml_sha256:$digest,patches:[]}],databases:[{db_unique_name:"ORCL",oracle_home:"/u01/db",runtime:{status:"complete",cdb:"NO",database_role:"PRIMARY",open_mode:"READ WRITE",instance_state:"OPEN",invalid_objects:0,sqlpatch_non_success:0,pdb_not_read_write:0,backup_age_minutes:1,fra_space_limit_bytes:0,fra_space_used_bytes:0,guaranteed_restore_points:0}}],warnings:[]}' >"$TMP/standalone.json"
 standalone_sha=$(sha256sum "$TMP/standalone.json" | awk '{print $1}')
 jq -n --arg snapshot "$TMP/standalone.json" --arg sha "$standalone_sha" \
   '{schema_version:"1.0",status:"consistent",expected_nodes:["standalone"],snapshot_evidence:[{path:$snapshot,sha256:$sha}]}' >"$TMP/standalone-reconciliation.json"
@@ -29,6 +29,18 @@ jq -n --arg digest "$digest" '{schema_version:"1.0",status:"ready_for_planning",
 jq -n --arg digest "$digest" '{schema_version:"1.0",status:"passed",patch_id:"12345678",artifact_sha256:$digest,target:{family:"database",platform_id:"226"},checks:[{node:"standalone",home:"/u01/db",status:"passed",platform:{host_id:"226",host_name:"Linux x86-64",artifact_ids:["226"],procedure_id:"226",status:"passed"},opatch:{status:"passed"},applicability_check:{name:"CheckPatchApplicableOnCurrentPlatform",status:"passed",exit_code:0,evidence_path:"/tmp/standalone-platform.log",evidence_sha256:$digest},conflict_check:{name:"CheckConflictAgainstOHWithDetail",status:"passed",exit_code:0,evidence_path:"/tmp/standalone-conflict.log",evidence_sha256:$digest}}]}' >"$TMP/standalone-compatibility.json"
 "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/standalone-reconciliation.json" --snapshot "$TMP/standalone.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/policy.json" --output "$TMP/standalone-result.json" >/dev/null
 jq -e '.status == "ready_for_approval" and .target.platform_id == "226"' "$TMP/standalone-result.json" >/dev/null
+
+# A current, otherwise healthy CDB or unknown container scope cannot produce
+# ready evidence for database adapters that validate only a non-CDB registry.
+for cdb_expr in '.databases[0].runtime.cdb = "YES"' 'del(.databases[0].runtime.cdb)' '.databases[0].runtime.cdb = null'; do
+  jq "$cdb_expr" "$TMP/standalone.json" >"$TMP/cdb-snapshot.json"
+  cdb_sha=$(sha256sum "$TMP/cdb-snapshot.json" | awk '{print $1}')
+  jq -n --arg snapshot "$TMP/cdb-snapshot.json" --arg sha "$cdb_sha" '{schema_version:"1.0",status:"consistent",expected_nodes:["standalone"],snapshot_evidence:[{path:$snapshot,sha256:$sha}]}' >"$TMP/cdb-reconciliation.json"
+  if "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/cdb-reconciliation.json" --snapshot "$TMP/cdb-snapshot.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/policy.json" --output "$TMP/cdb-result.json" >/dev/null; then
+    echo 'CDB or unknown container scope was accepted by readiness' >&2; exit 1
+  fi
+  jq -e '.status == "blocked" and any(.gates[]; .name == "database_container_scope" and .status == "blocker")' "$TMP/cdb-result.json" >/dev/null
+done
 
 # Absent, null, negative and fractional invalid-object counts are unknown, never zero.
 for invalid_expr in 'del(.databases[0].runtime.invalid_objects)' '.databases[0].runtime.invalid_objects = null' '.databases[0].runtime.invalid_objects = -1' '.databases[0].runtime.invalid_objects = 0.5' '.databases[0].runtime.invalid_objects = "0"'; do
@@ -66,6 +78,29 @@ standby_rc=$?
 set -e
 [ "$standby_rc" -eq 2 ]
 jq -e '.status == "blocked" and any(.gates[]; .name == "dataguard_unsupported" and .status == "blocker")' "$TMP/standalone-standby-result.json" >/dev/null
+
+# A standby waiver requires current sealed DG evidence for its exact target.
+jq -n --arg now "$now" --arg digest "$digest" '{schema_version:"1.0",status:"ready_for_standby_first",evaluated_at:$now,observed_at:$now,gates:[],target:{db_unique_name:"ORCL",oracle_home:"/u01/db",database_role:"PHYSICAL STANDBY"},evidence:{observe_sha256:$digest,policy_sha256:$digest}}' >"$TMP/dg-base.json"
+seal_dataguard() {
+  local canonical hash
+  canonical=$(jq -cS 'del(.record_sha256)' "$1")
+  hash=$(printf '%s' "$canonical" | sha256sum | awk '{print $1}')
+  jq --arg hash "$hash" '.record_sha256=$hash' "$1" >"$2"
+}
+standby_eval() {
+  "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/standalone-standby-reconciliation.json" --snapshot "$TMP/standalone-standby.json" --artifact "$TMP/artifact.json" --procedure-validation "$TMP/standalone-procedure.json" --compatibility "$TMP/standalone-compatibility.json" --policy "$TMP/policy.json" --dataguard "$1"
+}
+seal_dataguard "$TMP/dg-base.json" "$TMP/dg-ready.json"
+standby_eval "$TMP/dg-ready.json" >"$TMP/dg-result.json"
+jq -e --arg now "$now" '.status == "ready_for_approval" and (.evidence.dataguard_sha256 | test("^[a-f0-9]{64}$")) and ((.valid_until | fromdateiso8601) <= (($now | fromdateiso8601) + 300))' "$TMP/dg-result.json" >/dev/null
+if standby_eval "$TMP/dg-base.json" >/dev/null 2>&1; then echo 'unsealed DG evaluation granted a standby waiver' >&2; exit 1; fi
+for mutation in '.target.db_unique_name="OTHER"' '.target.oracle_home="/other/home"' '.target.database_role="PRIMARY"' 'del(.target)' '.evaluated_at="2000-01-01T00:00:00Z"' '.evaluated_at="2099-01-01T00:00:00Z"' '.status="unknown"' '.observed_at="2000-01-01T00:00:00Z"' 'del(.observed_at)'; do
+  jq "$mutation" "$TMP/dg-base.json" >"$TMP/dg-mutated.json"
+  seal_dataguard "$TMP/dg-mutated.json" "$TMP/dg-mutated-sealed.json"
+  if standby_eval "$TMP/dg-mutated-sealed.json" >/dev/null 2>&1; then echo "unsafe DG waiver accepted: $mutation" >&2; exit 1; fi
+done
+jq '.target.oracle_home="/tampered"' "$TMP/dg-ready.json" >"$TMP/dg-tampered.json"
+if standby_eval "$TMP/dg-tampered.json" >/dev/null 2>&1; then echo 'tampered DG evaluation was accepted' >&2; exit 1; fi
 
 # Stale reconciliation digests must fail closed with an actionable binding detail.
 jq '.oracle_homes[0].patches += ["99999999"]' "$TMP/standalone.json" >"$TMP/standalone-drift.json"

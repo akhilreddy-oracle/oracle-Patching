@@ -40,7 +40,7 @@ collect() {
   done < <(expected_pairs)
 }
 emit() {
-  local file=$1 status=passed first=1 item finding_item
+  local file=$1 status=blocked first=1 item finding_item
   has_findings || status=passed
   printf '{"schema_version":"1.0","status":%s,"patch_id":%s,"artifact_sha256":%s,"target":{"family":%s,"platform_id":%s},"checks":[' "$(opu_json_string "$status")" "$(opu_json_string "$PATCH_ID")" "$(opu_json_string "$ARTIFACT_SHA")" "$(opu_json_string "$TARGET_FAMILY")" "$(opu_json_string "$TARGET_PLATFORM")" >"$file"
   for item in "${CHECKS[@]}"; do [ "$first" -eq 1 ] || printf ',' >>"$file"; printf '%s' "$item" >>"$file"; first=0; done

@@ -1,6 +1,3 @@
-import { el } from "./dom.js";
-import { getApiToken, setApiToken } from "./api.js";
-
 const ACTOR_KEY = "opu-webapp-actor";
 const ACTOR_EVENT = "opu-actor-change";
 let identity = null;
@@ -16,6 +13,19 @@ export function companySessionState() {
     && typeof identity.csrf_token === "string" && identity.csrf_token
     && typeof identity.expires_at === "number" && Number.isFinite(identity.expires_at)
     && identity.expires_at * 1000 > Date.now() ? "active" : "unavailable";
+}
+
+/** Use server-derived admission; never infer execution rights from role names. */
+export function liveDiscoveryAccess() {
+  if (!identity || typeof identity.permissions?.live_discovery !== "boolean") {
+    return { allowed: false, reason: "Live discovery permissions are unavailable. Sign in or reload this page to refresh your session." };
+  }
+  if (identity.mode === "company" && companySessionState() !== "active") {
+    return { allowed: false, reason: "Company session expired or unavailable. Sign in again before running live discovery." };
+  }
+  return identity.permissions.live_discovery
+    ? { allowed: true, reason: "" }
+    : { allowed: false, reason: "Your account cannot run live discovery. Sign in with an account permitted to execute host operations." };
 }
 
 export function setSessionIdentity(session) {
@@ -39,49 +49,4 @@ export function onActorChange(callback) {
   const handler = (event) => callback(event.detail);
   window.addEventListener(ACTOR_EVENT, handler);
   return () => window.removeEventListener(ACTOR_EVENT, handler);
-}
-
-export function mountActorWidget(container) {
-  const actorInput = el("input", {
-    id: "topbar-acting-as",
-    type: "text",
-    class: "actor-input",
-    placeholder: "operator id…",
-    value: getActor(),
-    title: "Separation-of-duties identity (requester / approver / operator must differ). Prefills Requester and Actor fields on forms.",
-    "aria-label": "Acting as",
-  });
-  actorInput.addEventListener("input", () => setActor(actorInput.value));
-  onActorChange((value) => {
-    if (document.activeElement !== actorInput) actorInput.value = value;
-  });
-
-  const tokenInput = el("input", {
-    id: "topbar-api-token",
-    type: "password",
-    class: "actor-input actor-token",
-    placeholder: "paste API token",
-    value: getApiToken(),
-    title: "API credential for a lab or service-principal session. Company sign-in uses its authenticated session.",
-    autocomplete: "off",
-    "aria-label": "API token",
-  });
-  tokenInput.addEventListener("input", () => setApiToken(tokenInput.value.trim()));
-
-  container.appendChild(
-    el("div", { class: "actor-widget" }, [
-      el("div", { class: "actor-widget-block" }, [
-        el("label", { for: "topbar-acting-as", text: "Acting as" }),
-        actorInput,
-      ]),
-      el("div", { class: "actor-widget-block" }, [
-        el("label", { for: "topbar-api-token", text: "API token" }),
-        tokenInput,
-      ]),
-      el("p", {
-        class: "actor-hint",
-        text: "Company and service sessions bind the actor to your identity. Lab sessions use an API token and a selected actor.",
-      }),
-    ])
-  );
 }

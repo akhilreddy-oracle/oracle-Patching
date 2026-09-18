@@ -5,6 +5,10 @@ set -euo pipefail
 umask 077
 export LC_ALL=C LANG=C
 
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/execution.sh"
+
 P=${0##*/}; DB=""; DB_HOME=""; PATCH_DIR=""; PATCH_ID=""; MODE=""; NODE_FILE=""; LOG_ROOT=/var/tmp; REMOTE_USER=root; APPROVED=0; BACKUP_EVIDENCE=""; MIN_FREE_MB=4096
 GRID_HOME=""; DB_OWNER=""; LOCAL_HOST=$(hostname -s 2>/dev/null || hostname); STATE=""; DONE=""; LOG=""; FAIL=""; CURRENT_NODE=""
 TEST_MODE=${OPU_DATABASE_ROLLING_TEST_MODE:-0}
@@ -31,8 +35,8 @@ vpatch() { [[ "$1" =~ ^[0-9]{1,20}$ ]]; }
 vdigest() { [[ "$1" =~ ^[a-f0-9]{64}$ ]]; }
 short() { printf '%s' "${1%%.*}"; }
 local_node() { [[ "$(short "$1")" == "$(short "$LOCAL_HOST")" ]]; }
-root() { local n=$1; shift; if local_node "$n"; then "$@"; elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$n" -- "$@"; else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$n" -- sudo -n "$@"; fi; }
-dbuser() { local n=$1; shift; if [[ "$TEST_MODE" == 1 ]] && local_node "$n"; then "$@"; elif local_node "$n"; then runuser -u "$DB_OWNER" -- "$@"; elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$n" -- runuser -u "$DB_OWNER" -- "$@"; else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$n" -- sudo -n runuser -u "$DB_OWNER" -- "$@"; fi; }
+root() { local n=$1; shift; if local_node "$n"; then "$@"; elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$n" -- "$(opu_shell_join "$@")"; else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$n" -- "$(opu_shell_join sudo -n "$@")"; fi; }
+dbuser() { local n=$1; shift; if [[ "$TEST_MODE" == 1 ]] && local_node "$n"; then "$@"; elif local_node "$n"; then runuser -u "$DB_OWNER" -- "$@"; elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$n" -- "$(opu_shell_join runuser -u "$DB_OWNER" -- "$@")"; else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$n" -- "$(opu_shell_join sudo -n runuser -u "$DB_OWNER" -- "$@")"; fi; }
 acquire_lock() {
   local dir=$1 flock_command=flock
   if [[ "$TEST_MODE" == 1 && -n "${OPU_DATABASE_ROLLING_TEST_FLOCK:-}" ]]; then
@@ -40,8 +44,9 @@ acquire_lock() {
     [[ -x "$flock_command" ]] || die 'test flock command is not executable'
   fi
   if [[ "$flock_command" != flock ]] || command -v flock >/dev/null 2>&1; then
-    exec 9>"$dir/.lock"
+    opu_execution_open_lock_file "$dir/.lock" 9 || die "unsafe executor lock"
     "$flock_command" -n 9 || die "another run owns $dir"
+    opu_execution_validate_lock "$dir/.lock" 9 || die "unsafe executor lock"
   else
     die 'flock is required for database rolling patch execution'
   fi

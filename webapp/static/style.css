@@ -30,7 +30,7 @@
 .finding-values dt { font-weight: 600; color: var(--muted); }
 .finding-values dd { margin: 0; overflow-wrap: anywhere; }
 .wizard-target { border-left: 4px solid var(--oracle-red); background: var(--surface); }
-.wizard-target .mono, .report-view .mono { overflow-wrap: anywhere; }
+.wizard-target .mono { overflow-wrap: anywhere; }
 .wizard-review { border-top: 2px solid var(--line-strong); }
 .table-scroll { overflow-x: auto; max-width: 100%; }
 .company-login { display: grid; gap: 8px; margin-top: 12px; }
@@ -527,18 +527,6 @@ button:disabled { opacity: 0.55; cursor: default; }
 .badge-bad { background: var(--bad-bg); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 30%, transparent); }
 .badge-neutral { background: var(--paper-deep); color: var(--muted); }
 
-.pill {
-  font-size: 11px;
-  padding: 3px 8px;
-  border-radius: var(--radius);
-  font-weight: 700;
-  text-transform: uppercase;
-}
-.pill-idle { background: var(--paper-deep); color: var(--muted); }
-.pill-loading { background: var(--warn-bg); color: var(--warn); }
-.pill-ok { background: var(--ok-bg); color: var(--ok); }
-.pill-error { background: var(--bad-bg); color: var(--bad); }
-
 table {
   width: 100%;
   border-collapse: collapse;
@@ -716,6 +704,12 @@ tr:last-child td { border-bottom: none; }
 }
 .error-box h2 { margin: 0 0 8px; color: var(--bad); font-size: 15px; }
 .error-message { font-weight: 600; }
+.auth-recovery { overflow-wrap: anywhere; }
+.auth-recovery-form { display: grid; gap: 8px; max-width: 440px; margin-block: 18px; }
+.auth-recovery-form label { font-weight: 600; }
+.auth-recovery-form input { width: 100%; min-width: 0; }
+.auth-recovery-form button { justify-self: start; }
+.auth-recovery-company:not(:empty) { margin-block: 16px 4px; }
 .error-detail {
   white-space: pre-wrap;
   font-family: var(--mono);
@@ -821,6 +815,49 @@ tr:last-child td { border-bottom: none; }
   font-weight: 700;
 }
 .page-lead { margin: 0; color: var(--muted); max-width: 52ch; }
+
+/* Assistant content and model text never determine the surrounding layout. */
+.assistant-heading { margin-bottom: 20px; }
+.assistant-heading h1 { margin: 0 0 6px; font-family: var(--font-brand); }
+.assistant-heading p { margin: 0; max-width: 78ch; color: var(--ink-soft); }
+.assistant-config h2 { display: inline; margin-right: 12px; font-size: 15px; }
+.assistant-config p { margin: 8px 0 0; overflow-wrap: anywhere; }
+.assistant-notice:not(:empty) { margin-block: 12px; padding: 12px 14px; border-left: 3px solid var(--oracle-red); background: var(--surface); overflow-wrap: anywhere; }
+.assistant-notice[role="alert"] { background: var(--bad-bg); color: var(--bad); }
+.assistant-layout { display: grid; grid-template-columns: minmax(170px, 230px) minmax(0, 1fr); gap: 20px; align-items: start; }
+.assistant-layout > *, .assistant-detail > * { min-width: 0; }
+.assistant-conversations h2 { margin-top: 0; font-size: 16px; }
+.assistant-conversations > button { width: 100%; }
+.assistant-conversations nav { display: grid; gap: 6px; margin-top: 14px; }
+.assistant-conversation-link { display: grid; gap: 4px; padding: 10px; border: 1px solid transparent; color: var(--ink-soft); text-decoration: none; overflow-wrap: anywhere; }
+.assistant-conversation-link:hover, .assistant-conversation-link[aria-current="page"] { border-color: var(--line-strong); background: var(--paper); }
+.assistant-conversation-link[aria-current="page"] { border-left: 3px solid var(--oracle-red); }
+.assistant-conversation-link time, .assistant-message time { color: var(--muted); font-size: 11px; }
+.assistant-conversation-heading, .assistant-action-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+.assistant-conversation-heading h2, .assistant-action-heading h3 { margin: 0; overflow-wrap: anywhere; }
+.assistant-transcript { display: grid; gap: 14px; margin-bottom: 20px; }
+.assistant-message { padding: 16px 18px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); min-width: 0; }
+.assistant-message-user { margin-left: min(8%, 40px); background: var(--paper-deep); }
+.assistant-message-assistant { border-left: 3px solid var(--oracle-red); }
+.assistant-message-author { margin: 0 0 8px; font-size: 12px; font-weight: 700; color: var(--muted); }
+.assistant-message-content { white-space: pre-wrap; overflow-wrap: anywhere; }
+.assistant-message time { display: block; margin-top: 10px; }
+.assistant-actions > h2 { font-size: 17px; }
+.assistant-action-targets { display: grid; grid-template-columns: minmax(110px, 150px) minmax(0, 1fr); gap: 6px 12px; }
+.assistant-action-targets dt { font-weight: 600; color: var(--muted); }
+.assistant-action-targets dd { margin: 0; overflow-wrap: anywhere; }
+.assistant-action pre { max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.assistant-action-summary, .assistant-action-error { overflow-wrap: anywhere; }
+.assistant-action-error { color: var(--bad); }
+.assistant-action-links, .assistant-action-buttons { display: flex; flex-wrap: wrap; gap: 10px 14px; margin-block: 14px; }
+.assistant-action-identity { margin-top: 12px; }
+.assistant-composer textarea { width: 100%; resize: vertical; min-height: 110px; }
+.assistant-composer .form-field { display: block; }
+.assistant-composer .form-field > span { display: block; margin-bottom: 7px; font-weight: 600; }
+.assistant-layout .button-secondary { background: var(--surface); color: var(--oracle-red-deep); border: 1px solid var(--line-strong); }
+.assistant-empty h2 { margin-top: 0; }
+@media (max-width: 1100px) { .assistant-layout { grid-template-columns: 1fr; } .assistant-conversations nav { max-height: 180px; overflow: auto; } }
+@media (max-width: 620px) { .assistant-action-targets { grid-template-columns: 1fr; gap: 3px; } .assistant-action-targets dd { margin-bottom: 10px; } .assistant-action-buttons button { width: 100%; } }
 
 @media (max-width: 900px) {
   .app-shell { grid-template-columns: 1fr; }

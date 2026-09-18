@@ -12,6 +12,7 @@ from http.cookies import SimpleCookie
 import json
 import os
 from pathlib import Path
+import runtime_paths
 import re
 import secrets
 import sqlite3
@@ -24,8 +25,8 @@ import urllib.request
 import auth
 
 CONFIG_ENV = "OPU_OIDC_CONFIG"
-DEFAULT_CONFIG = Path(__file__).resolve().parent / "var/oidc.json"
-STATE_DIR = Path(__file__).resolve().parent / "var/company-auth"
+DEFAULT_CONFIG = runtime_paths.state_dir() / "oidc.json"
+STATE_DIR = runtime_paths.state_dir() / "company-auth"
 SESSION_COOKIE = "opu_company_session"
 STATE_COOKIE = "opu_login_state"
 MAX_JSON = 1024 * 1024
@@ -41,13 +42,28 @@ def require(condition, message, status=503):
 
 
 def _url(value, *, loopback=False):
-    require(isinstance(value, str), "OIDC URL must be text")
-    p = urllib.parse.urlsplit(value)
+    require(isinstance(value, str) and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value), "OIDC URL must be text without whitespace or controls")
+    try:
+        p = urllib.parse.urlsplit(value)
+        port = p.port
+    except ValueError:
+        raise auth.AuthError("Unsafe OIDC URL", status=503) from None
     require(bool(p.hostname) and not p.username and not p.password and not p.fragment,
             "Unsafe OIDC URL")
+    require(port is None or 1 <= port <= 65535, "Unsafe OIDC URL port")
     require(p.scheme == "https" or (loopback and p.scheme == "http" and p.hostname in {"127.0.0.1", "localhost", "::1"}),
             "OIDC URLs require HTTPS")
     return p
+
+
+def _origin(c):
+    parsed = urllib.parse.urlsplit(c["redirect_uri"])
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = "[" + host + "]"
+    port = parsed.port
+    suffix = ":" + str(port) if port is not None and port != {"https": 443, "http": 80}[parsed.scheme] else ""
+    return parsed.scheme + "://" + host + suffix
 
 
 def config():
@@ -57,11 +73,16 @@ def config():
         info = path.lstat()
         require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid in {0, os.geteuid()}
                 and info.st_mode & 0o022 == 0, "OIDC configuration is not administrator-protected")
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as f:
             actual = os.fstat(f.fileno())
             require((actual.st_dev, actual.st_ino) == (info.st_dev, info.st_ino), "OIDC configuration changed")
+            require(stat.S_ISREG(actual.st_mode) and actual.st_nlink == 1 and actual.st_uid in {0, os.geteuid()}
+                    and not actual.st_mode & 0o022, "OIDC configuration is not administrator-protected")
             raw = f.read(65537)
+            after = os.fstat(f.fileno())
+            require((actual.st_size, actual.st_mtime_ns, actual.st_ctime_ns)
+                    == (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "OIDC configuration changed while reading")
         require(len(raw) <= 65536, "OIDC configuration is too large")
         c = json.loads(raw)
     except (OSError, ValueError) as exc:
@@ -86,7 +107,7 @@ def config():
     require(secret_env is None or (isinstance(secret_env, str) and re.fullmatch(r"[A-Z][A-Z0-9_]+", secret_env)),
             "Invalid client secret environment variable")
     method = c.setdefault("token_endpoint_auth_method", "client_secret_basic" if secret_env else "none")
-    require(method in {"none", "client_secret_basic", "client_secret_post"}, "Unsupported OIDC client authentication method")
+    require(isinstance(method, str) and method in {"none", "client_secret_basic", "client_secret_post"}, "Unsupported OIDC client authentication method")
     require((method == "none") == (secret_env is None), "OIDC client authentication and secret configuration differ")
     c["policy_sha256"] = hashlib.sha256(raw).hexdigest()
     return c
@@ -281,15 +302,28 @@ def authenticate(cookie_header, *, method="GET", csrf=None, origin=None):
     roles = _roles(c, principal["groups"])
     require(bool(roles), "Company access has been revoked", 403)
     if method not in {"GET", "HEAD"}:
-        expected_origin = urllib.parse.urlsplit(c["redirect_uri"])
-        require(origin in {None, expected_origin.scheme + "://" + expected_origin.netloc}
+        require(origin in {None, _origin(c)}
                 and isinstance(csrf, str) and secrets.compare_digest(csrf, principal["csrf_token"]), "Company session CSRF check failed", 403)
     return {**principal, "roles": roles, "mode": "company", "rbac_enabled": True}
 
 
-def logout(cookie_header):
+def logout(cookie_header, *, csrf=None, origin=None):
+    """Revoke only this browser's session, including a no-longer-authorized one.
+
+    An active session retains its CSRF check. An expired/revoked session cannot
+    fetch a new CSRF token, so its cleanup requires the configured exact origin.
+    This path never returns a principal or authorizes an application action.
+    """
     c = config()
     value = cookie_value(cookie_header, SESSION_COOKIE)
+    principal = _read(value, "session")
+    expected_origin = _origin(c)
+    active = principal and principal["issuer"] == c["issuer"] and principal["client_id"] == c["client_id"] and bool(_roles(c, principal["groups"]))
+    if active:
+        require(origin in {None, expected_origin} and isinstance(csrf, str)
+                and secrets.compare_digest(csrf, principal["csrf_token"]), "Company session CSRF check failed", 403)
+    else:
+        require(origin == expected_origin, "Company sign-out requires the configured application origin", 403)
     if value:
         _read(value, "session", consume=True)
     return cookie(SESSION_COOKIE, "", c, age=0)

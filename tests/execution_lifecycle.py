@@ -8,11 +8,16 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "bin/opu-patch-plan"
+sys.path.insert(0, str(ROOT / "webapp"))
+import agent_queue
+import planctl
 
 
 def digest(data):
@@ -164,6 +169,48 @@ with tempfile.TemporaryDirectory(prefix="opu-execution-lifecycle-") as temporary
             assert verified["retry_count"] == 1 and verified["status"] == "succeeded"
             assert (f.path(name) / "evidence" / task_id / "evidence.json").exists()
             assert (f.path(name) / "evidence" / (task_id + "-retry1") / "evidence.json").exists()
+
+    # The HTTP queue-retry adapter must use real native custody and retry
+    # generations while preserving the later, already-published tasks.
+    with patch.dict(os.environ, {"OPU_PLAN_STATE_DIR": str(f.state), "OPU_AGENT_QUEUE_DIR": str(base / "queue"),
+                                "OPU_AGENT_ENROLLMENT_REQUIRED": "0", "OPU_AGENT_TEST_MODE": "0"}), \
+         patch.object(planctl, "PLAN_STATE_DIR", f.state), \
+         patch.object(planctl.pipeline_runner, "RUNS_DIR", base / "runs"), \
+         patch.object(planctl.pipeline_runner, "RUNS", {}), \
+         patch.object(planctl.pipeline_runner, "_ACTIVE_KEYS", {}):
+        for name, unknown in (("queue-safe-retry", False), ("queue-unsafe-retry", True)):
+            f.seed(name)
+            jobs = planctl.publish_agent_queue(name)
+            first = agent_queue.claim(name, "worker")
+            task_id = f.claim(name)
+            f.complete(name, task_id, f.evidence(name, task_id, failed=True, unknown=unknown), failed=True)
+            completed = agent_queue.complete(first["job_id"], "worker", claim_token=first["claim_token"])
+            assert completed["result"]["source"] == "sealed_plan_task"
+            if unknown:
+                try:
+                    planctl.retry_task(name, task_id, "replacement-operator")
+                except planctl.PlanError:
+                    pass
+                else:
+                    raise AssertionError("queue retry bypassed native unknown-outcome rejection")
+                assert agent_queue.claim(name, "worker") is None
+                assert next(job for job in agent_queue.list_jobs() if job["job_id"] == first["job_id"])["attempt"] == 0
+                continue
+            successor = planctl.retry_task(name, task_id, "replacement-operator")
+            assert successor["retry_count"] == 1
+            assert successor["previous_attempt_result_sha256"] == completed["result"]["task"]["task_result_sha256"]
+            retry = agent_queue.claim(name, "worker")
+            assert retry["task_id"] == task_id and retry["attempt"] == 1 and agent_queue.native_ready(retry)
+            try:
+                agent_queue.extend_lease(first["job_id"], "worker", 60, claim_token=first["claim_token"])
+            except agent_queue.QueueError:
+                pass
+            else:
+                raise AssertionError("previous queue token retained authority over retried native task")
+            f.claim(name)
+            f.complete(name, task_id, f.evidence(name, task_id))
+            agent_queue.complete(retry["job_id"], "worker", claim_token=retry["claim_token"])
+            assert agent_queue.claim(name, "worker")["job_id"] == jobs[1]["job_id"]
 
     f.seed("success", count=1)
     task_id = f.claim("success")

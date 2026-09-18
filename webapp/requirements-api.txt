@@ -1,0 +1,7 @@
+# Controller HTTP runtime; managed-host Oracle executors do not need these.
+# Python 3.10 or later. Install without FastAPI/Uvicorn optional extras.
+fastapi==0.141.1
+pydantic==2.13.5
+uvicorn==0.53.0
+# ASGI integration test client used by the fixture validation suite.
+httpx==0.28.1

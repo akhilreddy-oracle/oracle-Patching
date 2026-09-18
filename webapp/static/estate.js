@@ -1,12 +1,14 @@
 import { el, badge, classifyStatus } from "./dom.js";
-import { apiFetch } from "./api.js";
+import { apiFetch, getReadSignal } from "./api.js";
 import { runToCompletion } from "./runs.js";
 import { helperText } from "./ux.js";
 import { refreshHostNav } from "./shell.js";
+import { liveDiscoveryAccess } from "./actor.js";
 
 import { renderFleet } from "./fleet.js";
 
 export async function renderEstate(mount) {
+  const signal = getReadSignal();
   mount.innerHTML = "";
   mount.appendChild(
     el("header", { class: "ws-header" }, [
@@ -21,12 +23,26 @@ export async function renderEstate(mount) {
   const fleet = el("section", { class: "panel fleet-dashboard" });
   mount.appendChild(fleet);
   await renderFleet(fleet);
+  if (signal?.aborted) return;
 
   const toolbar = el("div", { class: "toolbar" }, [
     el("button", { id: "estate-refresh-btn", type: "button", text: "Refresh live SSH" }),
     el("span", { id: "estate-refresh-status", class: "status-chip", role: "status", "aria-live": "polite", text: "" }),
   ]);
+  const refreshBtn = toolbar.querySelector("#estate-refresh-btn");
+  const permissionHint = helperText("", "warn");
+  permissionHint.setAttribute("id", "estate-discovery-permission");
+  refreshBtn.setAttribute("aria-describedby", "estate-discovery-permission");
+  const updateAccess = () => {
+    const access = liveDiscoveryAccess();
+    refreshBtn.disabled = !access.allowed;
+    permissionHint.textContent = access.reason;
+    permissionHint.hidden = access.allowed;
+    return access.allowed;
+  };
+  updateAccess();
   mount.appendChild(toolbar);
+  mount.appendChild(permissionHint);
   const detail = el("p", { id: "estate-refresh-detail", class: "helper-text", text: "" });
   mount.appendChild(detail);
 
@@ -35,8 +51,9 @@ export async function renderEstate(mount) {
 
   let data;
   try {
-    const res = await apiFetch("/api/estate");
+    const res = await apiFetch("/api/estate", { signal });
     data = await res.json();
+    if (signal?.aborted) return;
     if (!res.ok) {
       list.appendChild(el("p", { class: "empty-state", text: data.message || "Failed to load estate" }));
       return;
@@ -55,10 +72,10 @@ export async function renderEstate(mount) {
 
   paint(list, data.hosts);
 
-  const refreshBtn = toolbar.querySelector("#estate-refresh-btn");
   const refreshStatus = toolbar.querySelector("#estate-refresh-status");
 
   refreshBtn.addEventListener("click", async () => {
+    if (signal?.aborted || !updateAccess()) return;
     refreshBtn.disabled = true;
     refreshStatus.textContent = "refreshing…";
     refreshStatus.className = "status-chip is-loading";
@@ -70,7 +87,7 @@ export async function renderEstate(mount) {
     await Promise.all(
       ids.map(async (hostId) => {
         try {
-          const record = await runToCompletion(`/api/hosts/${encodeURIComponent(hostId)}/pipeline/discovery`, {});
+          const record = await runToCompletion(`/api/hosts/${encodeURIComponent(hostId)}/pipeline/discovery`, {}, { signal });
           outcomes.set(
             hostId,
             record.status === "failed"
@@ -85,10 +102,14 @@ export async function renderEstate(mount) {
         }
       })
     );
+    // Accepted discoveries continue independently, but their former page must
+    // not issue new reads or reset the active host after navigation/sign-in.
+    if (signal?.aborted) return;
 
     try {
-      const res = await apiFetch("/api/estate");
+      const res = await apiFetch("/api/estate", { signal });
       const fresh = await res.json();
+      if (signal?.aborted) return;
       if (res.ok && fresh.hosts) {
         data = fresh;
         for (const host of data.hosts) {
@@ -99,9 +120,11 @@ export async function renderEstate(mount) {
         }
         paint(list, data.hosts, outcomes);
         await renderFleet(fleet);
+        if (signal?.aborted) return;
         await refreshHostNav(null);
       }
     } catch {
+      if (signal?.aborted) return;
       paint(list, data.hosts, outcomes);
     }
 
@@ -118,7 +141,7 @@ export async function renderEstate(mount) {
         .join(" · ");
       detail.className = "helper-text helper-warn";
     }
-    refreshBtn.disabled = false;
+    updateAccess();
   });
 }
 

@@ -44,7 +44,7 @@ def generate_outputs(base: Path) -> list[tuple[str, str, dict]]:
         home["platform"]["source_sha256"] = "a" * 64
         home.update(patch_inventory_source="opatch_lsinventory_xml", opatch_inventory_xml_sha256="a" * 64)
         snapshot["oracle_homes"] = [home]
-        snapshot["databases"] = [{"db_unique_name": "ORCL", "oracle_home": home["path"], "runtime": {"status": "complete", "database_role": "PRIMARY", "open_mode": "READ WRITE", "instance_state": "OPEN", "invalid_objects": 0, "sqlpatch_non_success": 0, "pdb_not_read_write": 0, "backup_age_minutes": 1, "fra_space_limit_bytes": 0, "fra_space_used_bytes": 0, "guaranteed_restore_points": 0}}]
+        snapshot["databases"] = [{"db_unique_name": "ORCL", "oracle_home": home["path"], "runtime": {"status": "complete", "cdb": "NO", "database_role": "PRIMARY", "open_mode": "READ WRITE", "instance_state": "OPEN", "invalid_objects": 0, "sqlpatch_non_success": 0, "pdb_not_read_write": 0, "backup_age_minutes": 1, "fra_space_limit_bytes": 0, "fra_space_used_bytes": 0, "guaranteed_restore_points": 0}}]
         snapshot_path = base / "readiness-snapshot.json"
         snapshot_path.write_text(json.dumps(snapshot))
         reconciliation["snapshot_evidence"] = [{"path": str(snapshot_path), "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest()}]
@@ -55,6 +55,22 @@ def generate_outputs(base: Path) -> list[tuple[str, str, dict]]:
         if ready["status"] != "ready_for_approval":
             raise RuntimeError("positive readiness fixture did not pass")
         outputs.append(("ready evaluation", "readiness/patch-readiness-result-v1.schema.json", ready))
+        # Exercise the actual evaluator's out-of-place method, rather than
+        # hand-editing a ready result that may diverge from its producer.
+        oop_procedure = json.loads((fixture / "procedure.json").read_text())
+        oop_procedure["procedure"]["target"].update(method="switch_home", topology="single_instance")
+        oop_procedure["procedure"]["execution"] = {
+            "adapter": "database_out_of_place_switch",
+            "operations": ["database_home_clone", "database_opatch_apply_clone", "database_home_switch", "database_datapatch"],
+        }
+        oop_procedure_path = base / "out-of-place-procedure.json"
+        oop_procedure_path.write_text(json.dumps(oop_procedure))
+        oop_args = list(args)
+        oop_args[oop_args.index("--procedure-validation") + 1] = str(oop_procedure_path)
+        oop_ready = invoke("opu-readiness-evaluate", oop_args, env=env)
+        if oop_ready["status"] != "ready_for_approval" or oop_ready["target"]["method"] != "switch_home":
+            raise RuntimeError("out-of-place readiness fixture did not retain its passing method")
+        outputs.append(("out-of-place ready evaluation", "readiness/patch-readiness-result-v1.schema.json", oop_ready))
         snapshot["databases"][0]["runtime"]["invalid_objects"] = None
         snapshot_path.write_text(json.dumps(snapshot))
         reconciliation["snapshot_evidence"][0]["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
@@ -94,7 +110,7 @@ def check_runtime_contracts(validate_payload) -> list[str]:
                     malformed["coverage"] = {}
                 elif label == "artifact inspection":
                     malformed["artifact"].pop("sha256")
-                elif label in {"ready evaluation", "blocked evaluation"}:
+                elif label in {"ready evaluation", "out-of-place ready evaluation", "blocked evaluation"}:
                     malformed.pop("gates")
                 elif label == "standalone precheck execution":
                     malformed.pop("postcondition")

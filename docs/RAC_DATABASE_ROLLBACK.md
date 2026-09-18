@@ -6,6 +6,10 @@ derives every target, node, Oracle home, patch identifier, artifact digest,
 recovery record, and Oracle README reference from a fully succeeded
 `database_rolling_opatch` source plan.
 
+Database apply and rollback currently support non-CDB targets only. Live
+prechecks require `CDB=NO`; multitenant and unknown container scope block
+before service changes because per-container SQL validation is unavailable.
+
 ## Eligibility
 
 `create-rollback` fails closed unless the source apply plan and all of its
