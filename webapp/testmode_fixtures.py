@@ -137,7 +137,8 @@ def build(base_dir: Path) -> dict:
 
     owner = subprocess.run(["id", "-un"], capture_output=True, text=True, timeout=5).stdout.strip()
 
-    now_iso = subprocess.run(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], capture_output=True, text=True, timeout=5).stdout.strip()
+    now_epoch = _now_epoch()
+    now_iso = _iso_from_epoch(now_epoch)
     snapshot = {
         "schema_version": "1.0",
         "collector": {"name": "oracle.topology.discover", "version": "1"},
@@ -242,7 +243,7 @@ def build(base_dir: Path) -> dict:
     policy_path = base_dir / "policy.json"
     policy_path.write_text(json.dumps(policy, indent=2))
 
-    valid_until = _iso_from_epoch(_now_epoch() + 3600)
+    valid_until = _iso_from_epoch(now_epoch + policy["maximum_snapshot_age_seconds"])
     readiness = {
         "schema_version": "1.0",
         "status": "ready_for_approval",

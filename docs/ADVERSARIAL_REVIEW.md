@@ -62,6 +62,15 @@ The fixture now supplies a valid lease; its hardlink, symlink, FIFO, inode and
 lock-inheritance assertions are unchanged. That failed gate is retained as
 failure evidence, rather than replaced by its successful browser scope.
 
+The next Mac run (`6997c0e`) exposed an intermittent demo-builder defect: the
+standalone fixture sampled its collection time and expiry base separately. A
+second-boundary crossing produced a 3,601-second interval under a 3,600-second
+policy, correctly rejected by native admission. Its failed fixture and logs were
+retained; only the disposable validation process group was stopped. The builder
+now derives both timestamps from one observation. A forced clock-crossing
+regression covers standalone, RAC and Grid builders without relaxing freshness
+validation or claiming the aborted run passed.
+
 ## Compatibility and operational limits
 
 Older live recovery requests remain inspectable and existing execution outcomes
