@@ -157,7 +157,16 @@ verify_apply_plan_readiness_current() {
 }
 window_bounds() { WINDOW_START_EPOCH=$(epoch "$(jq -r '.maintenance_window.start' "$(plan_dir "$1")/plan.json")") || return 74; WINDOW_END_EPOCH=$(epoch "$(jq -r '.maintenance_window.end' "$(plan_dir "$1")/plan.json")") || return 74; }
 require_open_window() { local id=$1 now; window_bounds "$id" || return; now=$(date -u +%s); [ "$now" -ge "$WINDOW_START_EPOCH" ] && [ "$now" -lt "$WINDOW_END_EPOCH" ] || { opu_error 'maintenance window is not open'; return 65; }; }
-bounded_lease_expiry() { local id=$1 lease=$2 now desired; require_open_window "$id" || return; now=$(date -u +%s); desired=$((now+lease)); [ "$desired" -le "$WINDOW_END_EPOCH" ] || desired=$WINDOW_END_EPOCH; [ "$((desired-now))" -ge 30 ] || { opu_error 'less than 30 seconds remain in the maintenance window'; return 65; }; printf '%s' "$desired"; }
+bounded_lease_expiry() {
+  local id=$1 lease=$2 minimum_remaining=${3:-30} now desired
+  require_open_window "$id" || return
+  now=$(date -u +%s); desired=$((now+lease))
+  [ "$desired" -le "$WINDOW_END_EPOCH" ] || desired=$WINDOW_END_EPOCH
+  [ "$((desired-now))" -ge "$minimum_remaining" ] || {
+    opu_error "less than $minimum_remaining seconds remain in the maintenance window"; return 65;
+  }
+  printf '%s' "$desired"
+}
 prepare() { opu_validate_absolute_path "$STATE_DIR" 'plan state directory' || return; [ ! -L "$STATE_DIR" ] || { opu_error 'plan state directory cannot be a symbolic link'; return 64; }; mkdir -p "$STATE_DIR/plans" || return 73; }
 event() { local id name state actor detail; id=$1; name=$2; state=$3; actor=$4; detail=$5; printf '{"schema_version":"1.0","time":%s,"plan_id":%s,"event":%s,"state":%s,"actor":%s,"detail":%s}\n' "$(opu_json_string "$(opu_now_utc)")" "$(opu_json_string "$id")" "$(opu_json_string "$name")" "$(opu_json_string "$state")" "$(opu_json_string "$actor")" "$(opu_json_string "$detail")" >>"$(events_file "$id")"; }
 verify_plan() { local id=$1 file expected canonical actual; file="$(plan_dir "$id")/plan.json"; [ -f "$file" ] && [ ! -L "$file" ] || { opu_error "plan does not exist or is symbolic link: $id"; return 66; }; expected=$(jq -r '.plan_sha256 // empty' "$file") || return 74; canonical=$(jq -cS 'del(.plan_sha256)' "$file") || return 74; actual=$(opu_hash_string "$canonical") || return; [ -n "$expected" ] && [ "$expected" = "$actual" ] || { opu_error "plan integrity verification failed: $id"; return 74; }; }
@@ -1297,15 +1306,23 @@ claim() (
   event "$id" task_claimed running "$actor" "task_id=$task_id lease_expires_epoch=$expiry"; cat "$file"
 )
 renew() (
-  local id="" task_id="" actor="" lease=300 file now expiry claimant current_expiry
+  local id="" task_id="" actor="" lease=300 file now admitted expiry claimant current_expiry
   while [ "$#" -gt 0 ]; do case "$1" in --plan-id) id=${2:-}; shift 2;; --task-id) task_id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; --lease-seconds) lease=${2:-}; shift 2;; *) opu_error "unknown renew option: $1"; exit 64;; esac; done
   opu_validate_identifier "$id" 'plan ID' && opu_validate_identifier "$task_id" 'task ID' && opu_validate_identifier "$actor" actor || exit $?
   [[ "$lease" =~ ^[0-9]{1,4}$ ]] && [ "$lease" -ge 30 ] && [ "$lease" -le 3600 ] || { opu_error 'lease seconds must be between 30 and 3600'; exit 64; }
-  lock "$id" || exit $?; trap unlock EXIT; read_state "$id" || exit $?; [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; require_open_window "$id" || exit $?
+  lock "$id" || exit $?; trap unlock EXIT
+  admitted=$(date -u +%s)
+  read_state "$id" || exit $?; [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; require_open_window "$id" || exit $?
   target_reservation "$id" verify || exit $?
-  file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || exit $?; claimant=$(jq -r '.claimed_by // empty' "$file"); current_expiry=$(jq -r '.lease_expires_epoch // 0' "$file"); now=$(date -u +%s)
-  [ "$claimant" = "$actor" ] || { opu_error 'task is not claimed by this actor'; exit 77; }; [ "$current_expiry" -gt "$now" ] || { opu_error 'task lease already expired; reconcile first'; exit 75; }; jq -e '.status == "running"' "$file" >/dev/null || { opu_error 'task is not running'; exit 65; }
-  expiry=$(bounded_lease_expiry "$id" "$lease") || exit $?; jq --argjson expiry "$expiry" --argjson now "$now" '.lease_expires_epoch=$expiry | .lease_renewed_at_epoch=$now' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74
+  file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || exit $?; claimant=$(jq -r '.claimed_by // empty' "$file"); current_expiry=$(jq -r '.lease_expires_epoch // 0' "$file")
+  # The held task lock prevents reclamation during verification, just as for
+  # complete. Never revive a lease already expired when this lock was acquired.
+  [ "$claimant" = "$actor" ] || { opu_error 'task is not claimed by this actor'; exit 77; }; [ "$current_expiry" -gt "$admitted" ] || { opu_error 'task lease already expired; reconcile first'; exit 75; }; jq -e '.status == "running"' "$file" >/dev/null || { opu_error 'task is not running'; exit 65; }
+  # A valid existing owner may finish in the window's final seconds. New
+  # claims retain the helper's 30-second minimum; renewal never extends it.
+  expiry=$(bounded_lease_expiry "$id" "$lease" 1) || exit $?; now=$(date -u +%s)
+  [ "$expiry" -gt "$now" ] || { opu_error 'maintenance window closed before lease renewal'; exit 65; }
+  jq --argjson expiry "$expiry" --argjson now "$now" '.lease_expires_epoch=$expiry | .lease_renewed_at_epoch=$now' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74
   event "$id" task_lease_renewed running "$actor" "task_id=$task_id lease_expires_epoch=$expiry"; cat "$file"
 )
 verify_execution_evidence() {
@@ -1523,20 +1540,26 @@ custody_execution_evidence() {
 }
 
 complete() (
-  local id="" task_id="" actor="" status="" evidence="" evidence_file="" file now expiry claimant pending adapter record_sha="" late=0 structured=0 grace=${OPU_PLAN_COMPLETION_GRACE_SECONDS:-900}
+  local id="" task_id="" actor="" status="" evidence="" evidence_file="" file now admitted expiry claimant pending adapter record_sha="" late=0 structured=0 grace=${OPU_PLAN_COMPLETION_GRACE_SECONDS:-900}
   local evidence_source="" custody_manifest="" custody_manifest_sha="" custody_record_sha=""
   while [ "$#" -gt 0 ]; do case "$1" in --plan-id) id=${2:-}; shift 2;; --task-id) task_id=${2:-}; shift 2;; --actor) actor=${2:-}; shift 2;; --status) status=${2:-}; shift 2;; --evidence) evidence_file=${2:-}; shift 2;; --evidence-sha256) evidence=${2:-}; shift 2;; *) opu_error "unknown complete option: $1"; exit 64;; esac; done
   opu_validate_identifier "$id" 'plan ID' && opu_validate_identifier "$task_id" 'task ID' && opu_validate_identifier "$actor" actor || exit $?
   [[ "$status" =~ ^(succeeded|failed)$ ]] || { opu_error 'status must be succeeded or failed'; exit 64; }; [ -z "$evidence" ] || [ -z "$evidence_file" ] || { opu_error 'use either --evidence or --evidence-sha256, not both'; exit 64; }
   [[ "$grace" =~ ^[0-9]{2,4}$ ]] && [ "$grace" -ge 30 ] && [ "$grace" -le 3600 ] || { opu_error 'completion grace seconds must be between 30 and 3600'; exit 64; }
-  lock "$id" || exit $?; trap unlock EXIT; read_state "$id" || exit $?; [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || exit $?
-  target_reservation "$id" verify || exit $?
-  adapter=$(jq -r '.adapter' "$file"); if [ -n "$evidence_file" ]; then verify_execution_evidence "$id" "$task_id" "$actor" "$status" "$evidence_file" || exit $?; evidence=$EXECUTION_EVIDENCE_SHA; record_sha=$EXECUTION_EVIDENCE_RECORD_SHA; structured=1; elif [[ "$adapter" =~ ^(database_single_instance_opatch(_rollback)?|database_rolling_opatch|database_rac_opatch_rollback|grid_rolling_opatch(_rollback)?|grid_rolling_opatchauto(_rollback)?|database_ojvm_opatch(_rollback)?|database_out_of_place_switch(back)?)$ ]]; then opu_error 'managed execution requires structured --evidence'; exit 65; else [[ "$evidence" =~ ^[a-f0-9]{64}$ ]] || { opu_error 'evidence digest must be SHA-256 hex'; exit 64; }; fi
-  claimant=$(jq -r '.claimed_by // empty' "$file"); expiry=$(jq -r '.lease_expires_epoch // 0' "$file"); now=$(date -u +%s); [ "$claimant" = "$actor" ] || { opu_error 'task is not claimed by this actor'; exit 77; }; jq -e '.status == "running"' "$file" >/dev/null || { opu_error 'task is not running'; exit 65; }
-  if [ "$expiry" -le "$now" ]; then
-    [[ "$adapter" =~ ^(database_single_instance_opatch(_rollback)?|database_rolling_opatch|database_rac_opatch_rollback|grid_rolling_opatch(_rollback)?|grid_rolling_opatchauto(_rollback)?|database_ojvm_opatch(_rollback)?|database_out_of_place_switch(back)?)$ ]] && [ -n "$evidence_file" ] && [ "$((now-expiry))" -le "$grace" ] || { opu_error 'task lease expired; reconcile first'; exit 75; }
+  lock "$id" || exit $?; trap unlock EXIT
+  # This lock excludes renew, reconcile and a successor claim for the entire
+  # verification/custody transaction. Judge ownership when that transaction
+  # starts; its own verification work must not manufacture lease expiry.
+  admitted=$(date -u +%s)
+  read_state "$id" || exit $?; [ "$PLAN_STATE" = running ] || { opu_error 'plan is not running'; exit 65; }; file="$(plan_dir "$id")/tasks/$task_id.json"; verify_task "$file" || exit $?
+  adapter=$(jq -r '.adapter' "$file")
+  claimant=$(jq -r '.claimed_by // empty' "$file"); expiry=$(jq -r '.lease_expires_epoch // 0' "$file"); [ "$claimant" = "$actor" ] || { opu_error 'task is not claimed by this actor'; exit 77; }; jq -e '.status == "running"' "$file" >/dev/null || { opu_error 'task is not running'; exit 65; }
+  if [ "$expiry" -le "$admitted" ]; then
+    [[ "$adapter" =~ ^(database_single_instance_opatch(_rollback)?|database_rolling_opatch|database_rac_opatch_rollback|grid_rolling_opatch(_rollback)?|grid_rolling_opatchauto(_rollback)?|database_ojvm_opatch(_rollback)?|database_out_of_place_switch(back)?)$ ]] && [ -n "$evidence_file" ] && [ "$((admitted-expiry))" -le "$grace" ] || { opu_error 'task lease expired; reconcile first'; exit 75; }
     late=1
   fi
+  target_reservation "$id" verify || exit $?
+  if [ -n "$evidence_file" ]; then verify_execution_evidence "$id" "$task_id" "$actor" "$status" "$evidence_file" || exit $?; evidence=$EXECUTION_EVIDENCE_SHA; record_sha=$EXECUTION_EVIDENCE_RECORD_SHA; structured=1; elif [[ "$adapter" =~ ^(database_single_instance_opatch(_rollback)?|database_rolling_opatch|database_rac_opatch_rollback|grid_rolling_opatch(_rollback)?|grid_rolling_opatchauto(_rollback)?|database_ojvm_opatch(_rollback)?|database_out_of_place_switch(back)?)$ ]]; then opu_error 'managed execution requires structured --evidence'; exit 65; else [[ "$evidence" =~ ^[a-f0-9]{64}$ ]] || { opu_error 'evidence digest must be SHA-256 hex'; exit 64; }; fi
   if [ "$structured" -eq 1 ]; then
     evidence_source=$evidence_file
     custody_execution_evidence "$id" "$task_id" "$evidence_file" "$(jq -r '.retry_count // 0' "$file")" || exit $?
@@ -1545,10 +1568,11 @@ complete() (
     custody_manifest_sha=$EVIDENCE_CUSTODY_MANIFEST_SHA
     custody_record_sha=$EVIDENCE_CUSTODY_RECORD_SHA
   fi
+  now=$(date -u +%s)
   jq --arg status "$status" --arg evidence "$evidence" --arg evidence_path "$evidence_file" --arg evidence_source "$evidence_source" --arg record_sha "$record_sha" \
     --arg custody_manifest "$custody_manifest" --arg custody_manifest_sha "$custody_manifest_sha" --arg custody_record_sha "$custody_record_sha" \
-    --argjson now "$now" --argjson late "$late" '
-      .status=$status | .evidence_sha256=$evidence | .completed_at_epoch=$now | .completed_after_lease=($late == 1) |
+    --argjson now "$now" --argjson admitted "$admitted" --argjson late "$late" '
+      .status=$status | .evidence_sha256=$evidence | .completion_admitted_at_epoch=$admitted | .completed_at_epoch=$now | .completed_after_lease=($late == 1) |
       if $evidence_path != "" then
         .evidence_path=$evidence_path | .evidence_source_path=$evidence_source | .evidence_record_sha256=$record_sha |
         .evidence_custody={manifest_path:$custody_manifest,manifest_sha256:$custody_manifest_sha,record_sha256:$custody_record_sha}
@@ -1653,7 +1677,7 @@ retry_task() (
   # custody_execution_evidence): bump retry_count so the next completion of
   # this task_id is custodied under a fresh, never-before-used path instead
   # of colliding with the preserved record of this failure.
-  jq '.previous_attempt_result_sha256=.task_result_sha256 | del(.claimed_by, .claimed_at_epoch, .lease_expires_epoch, .evidence_sha256, .evidence_path, .evidence_source_path, .evidence_record_sha256, .evidence_custody, .completed_at_epoch, .completed_after_lease, .reconciled_at_epoch, .task_result_sha256) | .status = "pending" | .retry_count = ((.retry_count // 0) + 1)' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74
+  jq '.previous_attempt_result_sha256=.task_result_sha256 | del(.claimed_by, .claimed_at_epoch, .lease_expires_epoch, .lease_renewed_at_epoch, .evidence_sha256, .evidence_path, .evidence_source_path, .evidence_record_sha256, .evidence_custody, .completion_admitted_at_epoch, .completed_at_epoch, .completed_after_lease, .reconciled_at_epoch, .task_result_sha256) | .status = "pending" | .retry_count = ((.retry_count // 0) + 1)' "$file" >"$file.tmp" && mv "$file.tmp" "$file" || exit 74
   seal_task_attempt "$file" || exit $?
   transition "$id" paused running "$actor" "task_retried=$task_id"
   cat "$file"

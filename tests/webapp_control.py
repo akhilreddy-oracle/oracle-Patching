@@ -666,6 +666,25 @@ sys.stdin.readline()
         path.write_text(""); path.chmod(0o600)
         self.assertTrue(pipeline_runner._owner_alive(owner), "A substituted inode must not release ownership")
 
+    def test_current_ownership_requires_the_held_incarnation_and_original_lock(self):
+        self.assertFalse(pipeline_runner.is_current_owner({}))
+        self.assertFalse((pipeline_runner.RUNS_DIR / ".owners").exists())
+        record = pipeline_runner.RunRecord("012345abcdef", "assistant", "isolated-turn")
+        owner = dict(record.owner)
+        self.assertTrue(pipeline_runner.is_current_owner(owner))
+        for field, value in (("pid", os.getpid() + 1), ("instance", "0" * 32),
+                             ("protocol", "unknown"), ("lock_device", -1), ("lock_inode", -1)):
+            with self.subTest(field=field):
+                self.assertFalse(pipeline_runner.is_current_owner({**owner, field: value}))
+        self.assertFalse(pipeline_runner.is_current_owner({"pid": owner["pid"], "instance": owner["instance"]}))
+        path = pipeline_runner.RUNS_DIR / ".owners" / (owner["instance"] + ".lock")
+        path.unlink()
+        path.write_text("replacement")
+        path.chmod(0o600)
+        self.assertFalse(pipeline_runner.is_current_owner(owner))
+        record._persist()
+        self.assertEqual(pipeline_runner._load_persisted(record.run_id).status, "unknown")
+
     def test_reading_historical_runs_does_not_create_owner_locks(self):
         for run_id, status in (("cccccccccccc", "succeeded"), ("dddddddddddd", "running")):
             directory = pipeline_runner.RUNS_DIR / run_id

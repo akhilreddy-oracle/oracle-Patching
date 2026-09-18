@@ -81,16 +81,22 @@ def install(base: Path, checkout: Path) -> None:
         "OPU_TEST_SUCCESS_ROOT": str(backup_parent / REQUEST_ID)}
     transport_env["OPU_TEST_DATABASE_STATE"] = str(patch["state"]["database"])
 
-    # Source-only native executables run under the fixture environment even
-    # when the managed controller correctly invokes them with env -i.
-    native_names = {"opu-database-recovery-prepare", "opu-recovery-evidence-collect", "opu-opatch-compatibility-collect"}
+    # Native executors run under the fixture environment even when the managed
+    # controller invokes them with env -i. Topology is an explicit simulated
+    # Oracle observation; the real discovery step still publishes and binds it.
+    native_names = {"opu-database-recovery-prepare", "opu-recovery-evidence-collect", "opu-opatch-compatibility-collect",
+                    "opu-topology-discover"}
     for name in native_names:
         wrapper = runtime_root / "bin" / name
         exports = {key: value for key, value in transport_env.items()
                    if key.startswith("OPU_") or key in {"PATH", "PYTHONDONTWRITEBYTECODE", "TMPDIR"}}
+        command = [str(checkout / "bin" / name)]
+        if name == "opu-topology-discover":
+            command = [recovery["env"]["OPU_RECOVERY_PREP_TEST_TOPOLOGY_TOOL"],
+                       "--output", str(runtime / "discovery.json")]
         wrapper.write_text("#!/bin/bash\nset -eu\n" + "\n".join(
             f"export {key}={shlex.quote(value)}" for key, value in exports.items()) +
-            f"\nexec {shlex.quote(str(checkout / 'bin' / name))} \"$@\"\n")
+            f"\nexec {shlex.join(command)} \"$@\"\n")
         wrapper.chmod(0o750)
     # macOS has no setsid binary. This shim performs the actual OS operation;
     # the production detached launch, PID/rc polling and import remain intact.
@@ -175,9 +181,10 @@ def install(base: Path, checkout: Path) -> None:
             "remote_root": str(remote_root), "sudo": True, "nodes": [{"name": "testnode", "ssh_alias": ALIAS}]}
     (checkout / "webapp/hosts.json").write_text(json.dumps({"hosts": [host]}))
 
-    # Seed discovered Oracle observations and patch media, then derive every
-    # pure controller result using the actual native tools. The demo builder's
-    # synthetic backup/readiness documents are not admitted to host evidence.
+    # Supply simulated Oracle observations through the normal discovery
+    # publisher, including its per-node index and primary view. Derive later
+    # controller results using native tools; never seed completed recovery or
+    # readiness evidence from the demo builder.
     snapshot = json.loads(recovery["snapshot"].read_text())
     snapshot["host"]["name"] = "testnode.example"
     snapshot["oracle_homes"][0].update(path=str(home), patch_inventory_source="opatch_lsinventory_xml",
@@ -187,7 +194,7 @@ def install(base: Path, checkout: Path) -> None:
         pdb_not_read_write=0, backup_age_minutes=0, fra_space_limit_bytes=0, fra_space_used_bytes=0,
         guaranteed_restore_points=0)
     recovery["snapshot"].write_text(json.dumps(snapshot, indent=2))
-    evidence.write_evidence(HOST_ID, "snapshot", snapshot)
+    pipeline_steps.step_discovery(HOST_ID, host, {})
     artifact = json.loads(patch["evidence"]["artifact"].read_text())
     evidence.write_evidence(HOST_ID, "artifact", artifact)
     policy = json.loads(patch["evidence"]["policy"].read_text())

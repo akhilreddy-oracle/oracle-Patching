@@ -155,6 +155,21 @@ class AssistantApiTests(unittest.TestCase):
         for function in [*self.native.values(), *self.steps.values()]:
             function.assert_not_called()
 
+    def test_message_turn_uses_actual_controller_ownership_and_persists_response(self):
+        conversation = self.create(actor="operator")
+        path = f"/api/assistant/conversations/{conversation['id']}"
+        response = self.request(path + "/messages", method="POST", actor="operator",
+                                body={"content": "Explain the patch review process"})
+        self.assertEqual(response["status"], 202, response)
+        record = self.wait_run(response["body"]["run_id"])
+        self.assertEqual(record.owner["protocol"], "incarnation-lock-v1")
+        self.assertEqual(record.status, "succeeded", record.error)
+        current = self.request(path, actor="operator")["body"]["conversation"]
+        self.assertFalse(current["busy"])
+        self.assertEqual(current["messages"][-1]["content"], "Fixture response")
+        self.model.assert_called_once()
+        self.assert_no_native_calls()
+
     def test_individual_authentication_and_private_conversation_ownership(self):
         self.assertEqual(self.request(actor=None)["status"], 401)
         self.assertEqual(self.request(headers={"X-OPU-Actor": "operator"})["status"], 403)

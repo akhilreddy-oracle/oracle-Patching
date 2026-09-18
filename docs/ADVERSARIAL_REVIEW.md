@@ -16,6 +16,45 @@ correctness. They are not claims about incidents on the user's databases.
 | Worker crash before launch | A claimed job whose worker died before starting the executor became reconciliation-required, but its native task was still pending and could never satisfy terminal-only reconciliation. | The managed worker durably records launch admission immediately before creating a subprocess. Explicit operator reconciliation may release only an expired, verified-pending claim whose admission was never granted. The old claim token is invalidated atomically. Once launch is admitted, uncertainty remains blocked until verified native outcome. Legacy/manual claims do not gain this recovery shortcut. |
 | Production admission marker | Both controller and native guards accepted a world-writable or hard-linked certification marker. Independent marker reads could also produce a contradictory status/checklist display. | Both entry points share one bounded, protected descriptor read and exact, duplicate-aware parsing. Status uses one observation. Regressions cover permissions, links, special files, oversize/invalid data and replacement or mutation during the read. This local switch does not itself verify a signed release or grant independent production approval. |
 
+## Failures found by combined validation
+
+The first combined Mac gate for `4f505fe` failed. It was not installed into the
+running application. The native standalone suite stopped with `plan is not
+running`; the browser suite passed 37 cases and failed two. Focused passes did
+not override these failures. The [Linux gate for the same revision](https://github.com/akhilreddy-oracle/oracle-Patching/actions/runs/35372671281)
+also failed the assistant workflow and the same two browser cases; its native
+suites passed. This distinction is retained rather than attributing the Mac
+failure to Linux or treating the native issue as proven from its deleted state.
+
+The new incarnation metadata exposed a missed consumer: the assistant compared
+the entire owner dictionary to the old PID/instance-only shape. Valid model turns
+therefore failed before invoking the model. The assistant now uses the runner's
+shared ownership predicate, which verifies the exact held incarnation and its
+original protected lock inode without acquiring ownership while reading old
+records. Existing conversation/key/status fences still reject late replies. An
+existing assistant workflow test also reproduces this regression; the native
+gate had stopped before reaching that suite. A real-run HTTP regression now
+checks a message through persisted response, with only model output simulated.
+
+The connected browser fixture had seeded only a primary snapshot, while the new
+recovery route check correctly required indexed discovery. It now feeds its
+simulated topology through the real discovery publisher and checks the route
+capability before backup creation. The production guard was retained.
+
+The deleted temporary state from the original standalone failure cannot establish
+its cause. Separate controlled native reproductions did establish two timing
+defects that produce the same result: the executor stopped renewing before
+evidence sealing, and completion checked expiry after expensive verification
+while holding the lock that prevented renewal. In both cases the task succeeded,
+the plan paused with `task_completed_after_lease`, and the next task was refused.
+The affected executors now share a heartbeat through evidence sealing, join it
+before a synchronous lease handoff, and block success if renewal fails. Completion
+judges lateness at plan-lock admission, keeps that lock through verification and
+custody, and preserves the existing pause/reconciliation policy for already
+expired admission. The matching release receipt remains the authority for
+combined validation status; these corrections do not waive ownership or evidence
+checks.
+
 ## Compatibility and operational limits
 
 Older live recovery requests remain inspectable and existing execution outcomes

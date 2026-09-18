@@ -265,7 +265,7 @@ def _turn_owned(data, owner, record):
         and current.kind == "assistant"
         and current.key == data.get("active_run_key") and current.key.startswith(prefix)
         and current.status in {"queued", "running"}
-        and current.owner == {"pid": os.getpid(), "instance": pipeline_runner._PROCESS_ID})
+        and pipeline_runner.is_current_owner(current.owner))
 
 
 def _require_turn(data, owner, record):

@@ -72,8 +72,37 @@ def _owner_identity() -> dict:
             # Keep the descriptor until process exit. It is not inherited by exec.
             _OWNER_LOCKS[key] = (descriptor, info.st_dev, info.st_ino)
         _, device, inode = _OWNER_LOCKS[key]
+    return _incarnation_identity(device, inode)
+
+
+def _incarnation_identity(device: int, inode: int) -> dict:
     return {"pid": os.getpid(), "instance": _PROCESS_ID, "protocol": "incarnation-lock-v1",
             "lock_device": device, "lock_inode": inode}
+
+
+def is_current_owner(owner: dict) -> bool:
+    """Check existing ownership without acquiring a lock for a historical run.
+
+    Consumers must not duplicate the serialized owner schema. A matching PID or
+    instance alone cannot establish ownership of this controller incarnation.
+    """
+    key = (str(RUNS_DIR.resolve()), _PROCESS_ID, os.getpid())
+    with _OWNER_REGISTRY_LOCK:
+        held = _OWNER_LOCKS.get(key)
+        if held is None:
+            return False
+        descriptor, device, inode = held
+        if owner != _incarnation_identity(device, inode):
+            return False
+        try:
+            descriptor_info = os.fstat(descriptor)
+            path_info = (RUNS_DIR / ".owners" / (_PROCESS_ID + ".lock")).lstat()
+            return all(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                       and not info.st_mode & 0o077 and info.st_uid == os.geteuid()
+                       and (info.st_dev, info.st_ino) == (device, inode)
+                       for info in (descriptor_info, path_info))
+        except (OSError, ValueError):
+            return False
 
 
 class RunConflict(Exception):
@@ -304,7 +333,7 @@ def _load_persisted(run_id: str) -> RunRecord | None:
     record.controller_poll = data.get('controller_poll') if isinstance(data.get('controller_poll'), dict) else None
     if invalid_status:
         record.error = {"message": "Persisted run status is invalid; repair its record before launching more work"}
-    elif record.status in _UNRESOLVED and record.owner.get("instance") != _PROCESS_ID:
+    elif record.status in _UNRESOLVED and not is_current_owner(record.owner):
         record.status = "unknown"
         record.error = {"message": "Controller ownership was lost; reconcile the execution before relaunching"}
     return record

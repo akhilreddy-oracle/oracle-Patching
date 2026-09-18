@@ -822,15 +822,6 @@ run_typed_stage() {
   esac
 }
 
-heartbeat() {
-  local stage_pid=$1 interval=$((LEASE_SECONDS / 3)) elapsed=0
-  [ "$interval" -le 60 ] || interval=60; [ "$interval" -ge 10 ] || interval=10
-  while kill -0 "$stage_pid" 2>/dev/null; do
-    sleep 1; kill -0 "$stage_pid" 2>/dev/null || break
-    elapsed=$((elapsed + 1)); [ "$elapsed" -ge "$interval" ] || continue; elapsed=0
-    if ! env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" renew --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --lease-seconds "$LEASE_SECONDS" >/dev/null 2>"$TASK_DIR/heartbeat-error.log"; then : >"$TASK_DIR/heartbeat-failed"; return 1; fi
-  done
-}
 
 collect_task_artifacts() {
   local artifact_path artifact_sha unexpected_entry
@@ -875,7 +866,7 @@ emit_evidence() {
 }
 
 execute_task() {
-  local claim_output stage_pid heartbeat_pid stage_rc finished status postcondition detail outcome complete_rc
+  local heartbeat_failed=0 claim_output stage_pid stage_rc finished status postcondition detail outcome complete_rc
   require_root; opu_execution_host_lock || return $?; load_plan
   RUN_DIR="$EXECUTION_STATE_DIR/plans/$PLAN_ID"; opu_execution_prepare_attempt "$RUN_DIR/tasks" "$PLAN_STATE_DIR/plans/$PLAN_ID/tasks/$TASK_ID.json" "$TASK_ID" || return $?; mkdir -p "$RUN_DIR/tasks"
   [ ! -e "$TASK_DIR" ] || die "Grid execution evidence already exists for task $TASK_ID"
@@ -886,12 +877,11 @@ execute_task() {
   STARTED_AT=$(opu_now_utc)
   set +e
   (set -e; close_inherited_executor_lock; run_typed_stage) >"$TASK_DIR/stdout.log" 2>"$TASK_DIR/stderr.log" & stage_pid=$!
-  (exec 7>&-; close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
+  opu_execution_start_heartbeat || return $?
   wait "$stage_pid"; stage_rc=$?
-  kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true
   set -e
   finished=$(opu_now_utc)
-  if [ -f "$TASK_DIR/heartbeat-failed" ]; then status=failed; postcondition=unknown; detail='task lease heartbeat failed; Grid outcome requires reconciliation'; stage_rc=75
+  if [ -f "$TASK_DIR/heartbeat-failed" ]; then heartbeat_failed=1; status=failed; postcondition=unknown; detail='task lease heartbeat failed; Grid outcome requires reconciliation'; stage_rc=75
   elif [ "$stage_rc" -eq 0 ]; then status=succeeded; postcondition=passed; detail="$STAGE postcondition passed"
   elif [ -f "$TASK_DIR/binary-state-unknown" ] || [ -f "$TASK_DIR/inventory-unknown" ] || [ -f "$TASK_DIR/grid-state-unknown" ]; then status=failed; postcondition=unknown; detail="$STAGE outcome is ambiguous; retry is prohibited"
   else status=failed; postcondition=failed; detail="$STAGE failed; inspect sealed task logs"; fi
@@ -912,6 +902,7 @@ execute_task() {
   fi
   load_task_cluster_runtime
   emit_evidence "$status" "$postcondition" "$stage_rc" "$detail" "$finished" "$outcome"
+  opu_execution_finish_heartbeat "$status" "$postcondition" "$heartbeat_failed" || return $?
   set +e
   env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" complete --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --status "$status" --evidence "$TASK_DIR/evidence.json"
   complete_rc=$?; set -e
