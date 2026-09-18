@@ -55,6 +55,13 @@ expired admission. The matching release receipt remains the authority for
 combined validation status; these corrections do not waive ownership or evidence
 checks.
 
+The follow-up gate for `50b4889` passed all 39 browser cases but exposed a
+lock-safety fixture with a running task and no lease expiry. Earlier ownership
+admission correctly rejected that task before the intended unsafe-lock check.
+The fixture now supplies a valid lease; its hardlink, symlink, FIFO, inode and
+lock-inheritance assertions are unchanged. That failed gate is retained as
+failure evidence, rather than replaced by its successful browser scope.
+
 ## Compatibility and operational limits
 
 Older live recovery requests remain inspectable and existing execution outcomes

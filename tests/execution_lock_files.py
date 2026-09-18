@@ -8,6 +8,7 @@ import pwd
 import shlex
 import subprocess
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ". " + shlex.quote(str(ROOT / "lib/opu/common.sh")) + "; . " + shlex.quote(str(ROOT / "lib/opu/execution.sh")) + "; "
@@ -42,7 +43,8 @@ with tempfile.TemporaryDirectory(prefix="opu-lock-files-") as temporary:
     task = seal({"schema_version": "1.0", "task_id": "task1", "plan_id": "lock-test", "plan_sha256": plan["plan_sha256"],
                  "stage": "precheck", "node": "node1", "adapter": "fixture", "authorization_sha256": "a" * 64,
                  "authorization_record_sha256": "b" * 64}, "task_definition_sha256")
-    task.update(status="running", claimed_by="worker")
+    # Reach registry-lock validation with an actually valid task owner.
+    task.update(status="running", claimed_by="worker", lease_expires_epoch=int(time.time()) + 3600)
     write(plan_dir / "tasks" / "task1.json", task)
     env = dict(os.environ, OPU_PLAN_STATE_DIR=str(state), TEST_MODE="1", PLAN_STATE_DIR=str(state), OPU_EXECUTION_LOCK_DIR=str(base / "host"))
     (base / "host").mkdir()
