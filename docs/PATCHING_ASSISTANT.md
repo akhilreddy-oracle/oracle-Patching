@@ -24,6 +24,10 @@ real response on the deployment server before enabling customer use.
    over SSH, update evidence and invalidate previous readiness results. Chat
    waits for that exact run and reports its collected inventory, times and run ID.
    Missing/failed evidence stays unknown; saved snapshots are never a fallback.
+   Other phrasing, such as "Is patch 39034528 installed on targetdb?", can use
+   the model's `check_live_inventory` tool. It prepares an exact-host action card;
+   confirm that card to collect and display the same verified live receipt.
+   A proposed check has not collected inventory and cannot establish current state.
    A separate readiness refresh uses requirements and policy saved in the host
    wizard and retains its confirmation card.
 3. Ask to prepare a backup request, providing its database, host, backup parent
@@ -55,6 +59,8 @@ historical requests use saved evidence. A target must be one configured host in
 the question or the most recent unambiguous user host selection; assistant prose
 cannot select it. Missing or ambiguous targets prompt for a host. Viewer/requester
 accounts receive operator sign-in guidance without dispatching discovery.
+A newer unknown, ambiguous or negated host selection invalidates an earlier
+selection; a later question cannot silently return to the older host.
 
 The live answer is formatted by the controller from an immutable receipt of
 the actual node payloads returned to that native run. It verifies the run, host,
@@ -63,6 +69,9 @@ installed binary patch IDs. Later cache writes and model prose cannot replace
 that result. This reports binary inventory per Oracle home; it does not infer
 an RU label from the base Oracle version or claim per-patch SQL status from an
 aggregate failure count. Partial inventory is identified explicitly.
+Rejected receipts are labeled unverified in both the transcript and action card;
+their inventory is omitted from the chat result even if the native process
+finished successfully. The associated native run remains available for diagnosis.
 
 Live inventory facts are not embedded in application code. Host IDs and SSH
 targets come from the deployment's inventory; database names, homes, versions
@@ -70,11 +79,15 @@ and installed patches come from each run's collector payload. Generated-data
 regressions exercise previously unseen host names (including dots), different
 inventories on consecutive runs, and failures after successful checks.
 
-The current live-inventory shortcut recognizes English request patterns with
-keyword/regex rules and formats verified facts deterministically. It is not a
-general model-driven intent planner. Other chat requests use the local model's
-typed tools and reviewed proposals. This distinction matters when evaluating
-new phrasing: no claim is made that arbitrary prompts trigger live discovery.
+The live-inventory shortcut recognizes narrow English request patterns with
+keyword/regex rules and formats verified facts deterministically. Other phrasing
+uses the local model's typed `check_live_inventory` proposal, with the same role,
+configuration and receipt checks after confirmation. The controller rejects a
+model-selected host unless it matches the user's unambiguous configured selection;
+saved evidence and model prose cannot choose a target. Generic application/model
+version questions do not automatically reuse an earlier database target. Actual
+model interpretation still needs deployment-specific acceptance testing; the
+tool-call fixtures do not establish that every paraphrase is understood.
 
 Only this narrow live inventory request dispatches directly. Backup and patch
 actions remain proposals requiring confirmation and all native authorization,

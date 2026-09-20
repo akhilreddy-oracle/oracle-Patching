@@ -1,5 +1,5 @@
 import { el, badge, classifyStatus } from "./dom.js";
-import { apiFetch } from "./api.js";
+import { apiFetch, getReadSignal } from "./api.js";
 import { planBelongsToHost, belongsToHost, newestFirst } from "./host_scope.js";
 import { renderDiscoverStage } from "./stages/discover.js";
 import { renderReadinessStage } from "./stages/readiness.js";
@@ -10,6 +10,7 @@ import { renderRecoveryStage } from "./stages/recovery.js";
 import { WIZARD_STAGES as STAGES, wizardContext, targetSummary } from "./patch_wizard.js";
 
 export async function renderWorkspace(mount, hostId, stage) {
+  const signal = getReadSignal();
   mount.innerHTML = "";
 
   const stageStatuses = await loadStageStatuses(hostId);
@@ -22,11 +23,17 @@ export async function renderWorkspace(mount, hostId, stage) {
     ]),
   ]);
   mount.appendChild(header);
-  mount.appendChild(targetSummary(wizardContext(stageStatuses.steps, hostId)));
+  const target = el("div", { class: "workspace-target" });
+  target.appendChild(targetSummary(wizardContext(stageStatuses.steps, hostId)));
+  mount.appendChild(target);
 
   const rail = el("nav", { class: "stage-rail", "aria-label": "Lifecycle" });
+  const stageBadges = new Map();
   for (const s of STAGES) {
     const st = stageStatuses[s.id] || { kind: "neutral", text: "—" };
+    const statusBadge = badge(st.text, st.kind);
+    if (st.detail) statusBadge.title = st.detail;
+    stageBadges.set(s.id, statusBadge);
     const link = el("a", {
       class: `stage-rail-item${s.id === stage ? " is-active" : ""}`,
       ...(s.id === stage ? { "aria-current": "step" } : {}),
@@ -34,7 +41,7 @@ export async function renderWorkspace(mount, hostId, stage) {
     }, [
       el("span", { class: "stage-rail-label", text: s.label }),
       el("span", { class: "stage-rail-hint", text: s.hint }),
-      badge(st.text, st.kind),
+      statusBadge,
     ]);
     rail.appendChild(link);
   }
@@ -43,12 +50,44 @@ export async function renderWorkspace(mount, hostId, stage) {
   const stageMount = el("div", { class: "ws-stage" });
   mount.appendChild(stageMount);
 
-  if (stage === "discover") await renderDiscoverStage(stageMount, hostId);
-  else if (stage === "readiness") await renderReadinessStage(stageMount, hostId);
+  // A stage already read these saved observations. Update only its workspace
+  // summary, leaving the stage's controls and drafts in their existing mount.
+  const onEvidenceChanged = (steps) => {
+    if (signal?.aborted || !mount.isConnected) return;
+    updatePipelineStatuses(stageStatuses, steps);
+    target.replaceChildren(targetSummary(wizardContext(steps, hostId)));
+    for (const id of ["discover", "readiness"]) {
+      const state = stageStatuses[id], node = stageBadges.get(id);
+      node.textContent = state.text;
+      node.className = badge("", state.kind).className;
+    }
+  };
+  if (stage === "discover") await renderDiscoverStage(stageMount, hostId, { onEvidenceChanged });
+  else if (stage === "readiness") await renderReadinessStage(stageMount, hostId, { onEvidenceChanged });
   else if (stage === "plan") await renderPlanStage(stageMount, hostId);
   else if (stage === "execute") await renderExecuteStage(stageMount, hostId);
   else if (stage === "recovery") await renderRecoveryStage(stageMount, hostId);
-  else await renderDiscoverStage(stageMount, hostId);
+  else await renderDiscoverStage(stageMount, hostId, { onEvidenceChanged });
+}
+
+function updatePipelineStatuses(out, steps) {
+  out.steps = steps;
+  out.discover = { kind: "neutral", text: "idle" };
+  out.readiness = { kind: "neutral", text: "idle" };
+  const byId = Object.fromEntries(steps.map((s) => [s.step, s]));
+  const disc = byId.discovery;
+  if (disc?.done) {
+    const status = disc.phases_status || disc.status || "done";
+    out.discover = { kind: classifyStatus(status), text: String(status) };
+  }
+  const ready = byId["readiness-evaluate"];
+  const midSteps = ["reconcile", "artifact-inspect", "procedure-validate", "compatibility-collect", "compatibility-reconcile"];
+  const midDone = midSteps.filter((id) => byId[id]?.done).length;
+  if (ready?.done) {
+    out.readiness = { kind: classifyStatus(ready.status), text: String(ready.status || "done") };
+  } else if (midDone > 0) {
+    out.readiness = { kind: "warn", text: `${midDone}/6` };
+  }
 }
 
 async function loadStageStatuses(hostId) {
@@ -64,24 +103,7 @@ async function loadStageStatuses(hostId) {
     const res = await apiFetch(`/api/hosts/${encodeURIComponent(hostId)}/pipeline`);
     const data = await res.json();
     if (!res.ok) throw new Error(data.message || "Could not load host evidence");
-    const steps = data.steps || [];
-    out.steps = steps;
-    const byId = Object.fromEntries(steps.map((s) => [s.step, s]));
-
-    const disc = byId.discovery;
-    if (disc?.done) {
-      const status = disc.phases_status || disc.status || "done";
-      out.discover = { kind: classifyStatus(status), text: String(status) };
-    }
-
-    const ready = byId["readiness-evaluate"];
-    const midSteps = ["reconcile", "artifact-inspect", "procedure-validate", "compatibility-collect", "compatibility-reconcile"];
-    const midDone = midSteps.filter((id) => byId[id]?.done).length;
-    if (ready?.done) {
-      out.readiness = { kind: classifyStatus(ready.status), text: String(ready.status || "done") };
-    } else if (midDone > 0) {
-      out.readiness = { kind: "warn", text: `${midDone}/6` };
-    }
+    updatePipelineStatuses(out, Array.isArray(data.steps) ? data.steps : []);
   } catch (error) {
     // Authentication and cancellation must reach the page boundary.
     throw error;
@@ -105,12 +127,13 @@ async function loadStageStatuses(hostId) {
   }
 
   try {
-    const res = await apiFetch("/api/recovery");
+    const res = await apiFetch(`/api/recovery?host_id=${encodeURIComponent(hostId)}&view=saved`);
     const data = await res.json();
     const requests = newestFirst(data.requests || []).filter((request) => belongsToHost(request, hostId));
     if (requests.length) {
       const latest = requests[0];
-      out.recovery = { kind: classifyStatus(latest.state), text: latest.state || "present" };
+      out.recovery = { kind: classifyStatus(latest.state), text: `Saved: ${latest.state || "unknown"}`,
+        detail: latest.observed_at ? `Last observed ${latest.observed_at}; open Recovery to refresh.` : "Saved request state; observation time unknown. Open Recovery to refresh." };
     }
   } catch (error) {
     // Authentication and cancellation must reach the page boundary.

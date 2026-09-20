@@ -83,6 +83,147 @@ class LiveAssistantApiTests(fixture.AssistantApiTests):
         self.steps["readiness-chain"].assert_not_called()
         self.steps["recovery-collect"].assert_not_called()
 
+    def model_inventory_proposal(self, host_id="source"):
+        self.model.side_effect = [
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "check-current-inventory", "type": "function",
+                "function": {"name": "check_live_inventory", "arguments": json.dumps({"host_id": host_id})}}]},
+            {"role": "assistant", "content": "Review the live inventory action card.", "tool_calls": []},
+        ]
+
+    def test_live_model_selects_inventory_for_paraphrases_and_confirmation_returns_exact_receipt(self):
+        evidence.write_evidence("source", "snapshot", self.snapshot("11111111"))
+        for content in ("Is patch 39034528 installed on source?", "What is the current RU on source?",
+                        "Verify the current patches on source"):
+            with self.subTest(content=content):
+                self.model_inventory_proposal()
+                before = self.steps["discovery"].call_count
+                conversation_id, response = self.query(content)
+                model_record = self.finish_query(response)
+                self.assertEqual((model_record.kind, model_record.status), ("assistant", "succeeded"))
+                self.assertEqual(self.steps["discovery"].call_count, before)
+                offered = self.model.call_args_list[-1].args[1]
+                self.assertIn("check_live_inventory", {tool["function"]["name"] for tool in offered})
+                prepared = self.conversation(conversation_id)
+                self.assertEqual(len(prepared["actions"]), 1)
+                action = prepared["actions"][0]
+                self.assertEqual((action["tool"], action["state"], action["arguments"]),
+                                 ("check_live_inventory", "pending", {"host_id": "source"}))
+                self.assertNotIn("run_id", action)
+                native = self.finish_query(self.execute(conversation_id, action, actor="operator"))
+                self.assertEqual((native.kind, native.key, native.status),
+                                 ("pipeline", "host:source:pipeline", "succeeded"))
+                self.assertEqual(self.steps["discovery"].call_count, before + 1)
+                body = self.steps["discovery"].call_args.args[2]
+                self.assertIs(body["inventory_receipt"], True)
+                self.assertEqual(body["expected_configuration_sha256"], live_inventory.configuration_digest(self.host))
+                completed = self.conversation(conversation_id)
+                self.assertEqual(completed["actions"][0]["state"], "completed")
+                answer = completed["messages"][-1]["content"]
+                for expected in ("88888888", native.run_id, "/fixture/current-home"):
+                    self.assertIn(expected, answer)
+                self.assertNotIn("11111111", answer)
+                self.assertEqual(self.execute(conversation_id, action, actor="operator")["status"], 409)
+                self.assertEqual(self.steps["discovery"].call_count, before + 1)
+        self.assert_no_mutation()
+
+    def test_live_model_cannot_choose_missing_ambiguous_or_different_user_target(self):
+        self.add_target()
+        for content in ("Is this patch installed?", "Is this patch installed on source and target?",
+                        "Is this patch installed on unknown-host?", "Is this patch installed on target?"):
+            with self.subTest(content=content):
+                self.model_inventory_proposal("source")
+                conversation_id, response = self.query(content)
+                self.finish_query(response)
+                self.assertEqual(self.conversation(conversation_id)["actions"], [])
+                results = [json.loads(message["content"]) for message in self.model.call_args.args[0]
+                           if message["role"] == "tool" and message.get("tool_call_id") == "check-current-inventory"]
+                self.assertEqual(len(results), 1)
+                self.assertIn("select one configured host", results[0]["error"])
+        self.assert_no_native_calls()
+
+    def test_live_newer_invalid_target_selection_cannot_revive_old_host_in_either_path(self):
+        self.add_target()
+        for latest in ("Check patches on unknown-host.", "We are investigating unknown-host.",
+                       "Check patches on source and target.", "Check patches on source or unknown-host.",
+                       "Check patches on unknown-host. Source was the earlier target."):
+            for mode, question in (("automatic", "Show current patch inventory."),
+                                   ("model", "Is patch 39034528 installed?")):
+                with self.subTest(latest=latest, mode=mode):
+                    conversation_id = self.create(actor="operator")["id"]
+                    self.seed_messages(conversation_id, [("user", "We are investigating source."),
+                        ("assistant", "Understood."), ("user", latest), ("assistant", "source")])
+                    self.model.reset_mock()
+                    if mode == "model":
+                        self.model_inventory_proposal("source")
+                    _, response = self.query(question, conversation_id=conversation_id)
+                    self.finish_query(response)
+                    conversation = self.conversation(conversation_id)
+                    self.assertEqual(conversation["actions"], [])
+                    if mode == "automatic":
+                        self.model.assert_not_called()
+                        self.assertIn("Which one configured host", self.answer(conversation))
+                    else:
+                        result = next(json.loads(message["content"]) for message in self.model.call_args.args[0]
+                                      if message.get("tool_call_id") == "check-current-inventory")
+                        self.assertIn("select one configured host", result["error"])
+        self.assert_no_native_calls()
+
+    def test_live_model_requires_operator_and_rechecks_permission_at_confirmation(self):
+        self.model_inventory_proposal()
+        conversation_id, response = self.query("Is patch 39034528 installed on source?", actor="viewer")
+        self.finish_query(response)
+        self.assertEqual(self.conversation(conversation_id, "viewer")["actions"], [])
+        self.assertNotIn("check_live_inventory", {tool["function"]["name"] for tool in self.model.call_args.args[1]})
+        self.model_inventory_proposal()
+        conversation_id, response = self.query("Is patch 39034528 installed on source?")
+        self.finish_query(response)
+        action = self.conversation(conversation_id)["actions"][0]
+        self.roles["operator"] = ["viewer"]
+        self.write_principals()
+        self.assertEqual(self.execute(conversation_id, action, actor="operator")["status"], 403)
+        self.assert_no_native_calls()
+
+    def test_live_model_failure_and_unbound_receipt_never_use_saved_inventory(self):
+        evidence.write_evidence("source", "snapshot", self.snapshot("11111111"))
+        for failure in ("collection", "wrong_run"):
+            with self.subTest(failure=failure):
+                self.model_inventory_proposal()
+                conversation_id, response = self.query("Is patch 39034528 installed on source?")
+                self.finish_query(response)
+                action = self.conversation(conversation_id)["actions"][0]
+                if failure == "collection":
+                    self.steps["discovery"].side_effect = RuntimeError("Fixture collection failed")
+                else:
+                    self.steps["discovery"].side_effect = self.discover
+                    self.receipt_transform = lambda receipt: {**receipt, "run_id": "0" * 12}
+                self.finish_query(self.execute(conversation_id, action, actor="operator"))
+                completed = self.conversation(conversation_id)
+                self.assertEqual(completed["actions"][0]["state"], "failed")
+                answer = completed["messages"][-1]["content"]
+                self.assertIn("No cached inventory was used", answer)
+                self.assertNotIn("11111111", answer)
+                self.assertNotIn("88888888", answer)
+                if failure == "wrong_run":
+                    result = completed["actions"][0]["result"]
+                    self.assertEqual(result["inventory_verification"], "rejected")
+                    self.assertEqual(result["outcome"], {"status": "unverified"})
+                    self.assertEqual(result["run_status"], "succeeded")
+                    self.assertNotIn("88888888", json.dumps(completed["actions"][0]))
+        self.assert_no_mutation()
+
+    def test_live_generic_application_or_model_version_question_never_auto_reuses_database_target(self):
+        for question in ("What version does this tool support?", "Which model version are you?",
+                         "What patch versions does this application support?"):
+            with self.subTest(question=question):
+                conversation_id = self.create(actor="operator")["id"]
+                self.seed_messages(conversation_id, [("user", "Check current patches on source")])
+                _, response = self.query(question, conversation_id=conversation_id)
+                self.finish_query(response)
+                self.assertEqual(self.conversation(conversation_id)["actions"], [])
+        self.assertEqual(self.model.call_count, 3)
+        self.assert_no_native_calls()
+
     def test_live_operator_question_dispatches_exact_native_discovery_and_returns_receipt(self):
         conversation_id, response = self.query()
         record = self.finish_query(response)
@@ -584,6 +725,10 @@ class LiveAssistantApiTests(fixture.AssistantApiTests):
                 self.assertNotEqual(conversation["actions"][0]["state"], "completed")
                 self.assertNotIn("88888888", self.answer(conversation))
                 self.assertTrue(self.answer(conversation))
+                diagnostics = conversation["actions"][0]["result"]
+                self.assertEqual(diagnostics["inventory_verification"], "rejected")
+                self.assertEqual(diagnostics["outcome"], {"status": "unverified"})
+                self.assertNotIn("88888888", json.dumps(conversation["actions"][0]))
         self.model.assert_not_called()
 
     def test_live_stale_or_unproven_collector_cannot_report_installed_patch_ids(self):

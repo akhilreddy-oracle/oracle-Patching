@@ -28,7 +28,7 @@ const DB_BADGE_HINTS = {
   open: "Instance is OPEN.",
 };
 
-export async function renderDiscoverStage(mount, hostId) {
+export async function renderDiscoverStage(mount, hostId, { onEvidenceChanged } = {}) {
   const signal = getReadSignal();
   mount.innerHTML = "";
   mount.appendChild(
@@ -69,6 +69,7 @@ export async function renderDiscoverStage(mount, hostId) {
     try {
       const res = await apiFetch(`/api/hosts/${encodeURIComponent(hostId)}/pipeline`);
       const pipe = await res.json();
+      onEvidenceChanged?.(Array.isArray(pipe.steps) ? pipe.steps : []);
       const disc = (pipe.steps || []).find((s) => s.step === "discovery");
       if (!disc?.done || !disc.evidence) {
         statusEl.textContent = "no evidence";

@@ -27,6 +27,7 @@ SPECS = {
     "inspect_plan": ("Inspect a saved plan and its tasks.", ("plan_id",), "read"),
     "inspect_backup": ("Inspect a saved local recovery summary without SSH. Use an analyze_backup proposal for explicit native inspection.", ("request_id",), "read"),
     "refresh_discovery": ("Propose live SSH discovery. May synchronize collector tools and replace saved discovery evidence.", ("host_id",), "execute"),
+    "check_live_inventory": ("Prepare a current installed-patch inventory check for one user-selected configured host. After human confirmation, run live SSH discovery and return that exact run's verified inventory, collection time and run ID. May synchronize collectors and replace evidence. Never answer a current-state question from inspect_host or saved snapshots.", ("host_id",), "execute"),
     "refresh_readiness": ("Propose refreshing live evidence and readiness using saved requirements/policy. Stops at blockers; may invalidate older evidence-bound plans.", ("host_id",), "execute"),
     "create_patch_plan": ("Propose a patch plan from verified saved requirements and readiness. Does not approve or apply it.", ("host_id", "plan_id", "patch_id", "database", "window_start", "window_end"), "create"),
     "create_backup": ("Propose creating a live backup preparation request, requiring separate review and authorization before execution.", ("host_id", "request_id", "database", "backup_parent", "window_start", "window_end"), "create"),
@@ -493,6 +494,8 @@ def binding(name, args, hosts):
 
 def route(name, args):
     """Exact allowlisted route/body for the existing authenticated command path."""
+    if name == "check_live_inventory":
+        return f"/api/hosts/{args['host_id']}/pipeline/discovery", {"inventory_receipt": True}
     if name in {"refresh_discovery", "refresh_readiness", "select_backup"}:
         step = {"refresh_discovery": "discovery", "refresh_readiness": "readiness-chain", "select_backup": "recovery-collect"}[name]
         return f"/api/hosts/{args['host_id']}/pipeline/{step}", ({"request_id": args["request_id"]} if name == "select_backup" else {})
@@ -509,7 +512,7 @@ def route(name, args):
 
 def expected_run(name, args):
     """The existing dispatcher must return a new run in this exact scope."""
-    if name in {"refresh_discovery", "refresh_readiness", "select_backup"}:
+    if name in {"refresh_discovery", "check_live_inventory", "refresh_readiness", "select_backup"}:
         return "pipeline", f"host:{args['host_id']}:pipeline"
     if name in {"create_patch_plan", "dispatch_plan", "execute_plan"}:
         action = {"create_patch_plan": "create", "dispatch_plan": "dispatch", "execute_plan": "execute"}[name]

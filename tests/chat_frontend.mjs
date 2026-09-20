@@ -113,6 +113,50 @@ test('an incomplete live check launch cannot become a manually repeatable propos
   assert.match(actionAvailability(live).reason, /cannot be manually resubmitted/);
 });
 
+test('model-selected live check has exact confirmation controls and a discovery link', async () => {
+  config.allowed_tools = ['inspect_host', 'check_live_inventory'];
+  conversation.actions = [{ ...pending(), tool: 'check_live_inventory', arguments: { host_id: 'targetdb' },
+    summary: 'Prepare a current installed-patch inventory check. Confirmation starts live discovery.' }];
+  await renderAssistant(mount, 'conversation-1');
+  assert.match(mount.textContent, /Check current patch inventory/);
+  assert.match(mount.textContent, /Confirmation starts live discovery/);
+  assert.equal(button('Confirm and run').disabled, false);
+  assert.equal(mount.all('a').some(link => link.attrs.href === '#/hosts/targetdb/discover'), true);
+  assert.deepEqual(writes, []);
+  await button('Confirm and run').fire('click');
+  assert.deepEqual(writes, [{ url: '/api/assistant/conversations/conversation-1/actions/action-1/execute',
+    body: { digest: 'a'.repeat(64) } }]);
+});
+
+test('confirmed model live check displays exact run identity and partial outcome without another confirmation', async () => {
+  config.allowed_tools = ['check_live_inventory'];
+  conversation.actions = [{ ...pending(), tool: 'check_live_inventory', arguments: { host_id: 'targetdb' },
+    state: 'completed', confirmed_at: new Date().toISOString(), run_id: 'native-model-check',
+    configuration_sha256: 'b'.repeat(64), result: { run_status: 'succeeded', outcome: { status: 'incomplete' } } }];
+  await renderAssistant(mount, 'conversation-1');
+  assert.match(mount.textContent, /Your confirmed action requested live discovery/);
+  assert.match(mount.textContent, /Native result: incomplete/);
+  assert.match(mount.textContent, /Run: native-model-check/);
+  assert.equal(button('Confirm and run'), undefined);
+  assert.deepEqual(writes, []);
+});
+
+test('failed live receipt hides inventory and success badges even in a legacy saved action', async () => {
+  for (const tool of ['check_live_inventory', 'refresh_discovery']) {
+    conversation.actions = [{ ...pending(), tool, origin: tool === 'refresh_discovery' ? 'live_inventory_query' : undefined,
+      arguments: { host_id: 'targetdb' }, state: 'failed', confirmed_at: new Date().toISOString(), run_id: 'rejected-run',
+      error: 'The run did not return a verifiable fresh inventory receipt.',
+      result: { run_id: 'rejected-run', run_status: 'succeeded', outcome: { status: 'complete',
+        nodes: [{ oracle_homes: [{ patches: ['99998888'] }] }] } } }];
+    await renderAssistant(mount, 'conversation-1');
+    assert.match(mount.textContent, /Inventory receipt: unverified/);
+    assert.match(mount.textContent, /Unverified inventory diagnostics/);
+    assert.doesNotMatch(mount.textContent, /Native result: complete|Check finished|99998888/);
+    assert.equal(button('Confirm and run'), undefined);
+  }
+  assert.deepEqual(writes, []);
+});
+
 test('configuration and authentication failures disable chat without loading private conversations', async () => {
   config.can_chat = false; config.reason = 'Sign in with a company or service identity.';
   await renderAssistant(mount);

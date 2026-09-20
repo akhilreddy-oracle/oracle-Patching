@@ -66,7 +66,7 @@ function rememberArtifactDir(hostId, path) {
   localStorage.setItem(ARTIFACT_DIR_KEY, path);
 }
 
-export async function renderReadinessStage(mount, hostId) {
+export async function renderReadinessStage(mount, hostId, { onEvidenceChanged } = {}) {
   mount.innerHTML = "";
   mount.appendChild(
     el("div", { class: "stage-head" }, [
@@ -119,6 +119,7 @@ export async function renderReadinessStage(mount, hostId) {
     // Never paint fake "not run" cards when we do not have pipeline evidence —
     // that is exactly how a missing token looks like an empty inspect step.
     if (loadFailed) return;
+    onEvidenceChanged?.(steps);
     if (!policyLoaded) {
       hydrateBackupPolicy(hostId, savedPolicyFromSteps(steps));
       policyControls.appendChild(backupPolicyChooser(hostId));
@@ -164,7 +165,13 @@ export async function renderReadinessStage(mount, hostId) {
     }
     for (const stepId of READINESS_STEPS) {
       const stepState = steps.find((s) => s.step === stepId) || { step: stepId, done: false };
-      list.appendChild(stepCard(hostId, stepState, steps, refresh, selectedPolicyDraft));
+      list.appendChild(stepCard(hostId, stepState, steps, refresh, selectedPolicyDraft, (step) => {
+        const target = list.querySelector(`#readiness-step-${step}`);
+        const heading = target?.querySelector("h3");
+        if (!heading) return;
+        heading.focus({ preventScroll: true });
+        target.scrollIntoView({ block: "start" });
+      }));
     }
   }
 
@@ -190,19 +197,19 @@ function missingPrereqs(step, allSteps) {
   return need.filter((id) => !byId[id]?.done);
 }
 
-function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft) {
+function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft, onReviewStep) {
   const { step, evidence } = stepState;
   // Evidence presence means the step ran — don't rely only on a top-level status
   // (artifact-inspect nests status under evidence.artifact.status).
   const done = Boolean(stepState.done || evidence);
   const status = effectiveStatus(stepState);
-  const card = el("section", { class: "panel step-card" });
+  const card = el("section", { class: "panel step-card", id: `readiness-step-${step}` });
   const displayStatus = done ? status || "done" : "not run";
   const statusBadge = badge(displayStatus, done ? classifyStatus(displayStatus) : "neutral");
 
   card.appendChild(
     el("div", { class: "step-card-head" }, [
-      el("h3", { text: STEP_LABELS[step] || step }),
+      el("h3", { text: STEP_LABELS[step] || step, tabindex: "-1" }),
       statusBadge,
     ])
   );
@@ -228,7 +235,7 @@ function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft) {
 
   const blocked = done && /blocked|incomplete|failed/i.test(String(status));
   if (blocked) {
-    const findings = step === "readiness-evaluate" ? blockerCards(evidence, allSteps, hostId) : null;
+    const findings = step === "readiness-evaluate" ? blockerCards(evidence, allSteps, hostId, { onReviewStep }) : null;
     if (findings) card.appendChild(findings);
     const summary = summarizeBlockedEvidence(evidence);
     if (summary?.length && !findings) {

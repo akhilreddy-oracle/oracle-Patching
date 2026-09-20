@@ -294,6 +294,50 @@ class LiveRecoveryTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["host_id"], rows[0]["state"]), ("sourcedb", "unreadable"))
 
+    def test_saved_navigation_uses_retained_observation_without_remote_work(self):
+        self.prepared()
+        self.sync.reset_mock()
+        observed_at = recoveryctl._metadata("r1")["last_status_observed_at"]
+        with patch.object(recoveryctl, "_live_status", side_effect=AssertionError("Navigation must not refresh")):
+            self.assertEqual(recoveryctl.list_requests(host_id="targetdb", saved_only=True), [])
+            rows = recoveryctl.list_requests(host_id="sourcedb", saved_only=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["state"], rows[0]["host_id"], rows[0]["evidence_mode"]),
+                         ("awaiting_approval", "sourcedb", "saved"))
+        self.assertEqual(rows[0]["observed_at"], observed_at)
+        self.raw.assert_not_called()
+        self.shell.assert_not_called()
+        self.sync.assert_not_called()
+
+    def test_saved_navigation_does_not_invent_state_or_legacy_observation_time(self):
+        self.prepared()
+        path = recoveryctl.LIVE_DIR / "r1" / "metadata.json"
+        metadata = recoveryctl._metadata("r1")
+        metadata.pop("last_status_observed_at")
+        write_json(path, metadata)
+        row = recoveryctl.list_requests(host_id="sourcedb", saved_only=True)[0]
+        self.assertEqual(row["state"], "awaiting_approval")
+        self.assertIsNone(row["observed_at"])
+        metadata.pop("last_status")
+        write_json(path, metadata)
+        row = recoveryctl.list_requests(host_id="sourcedb", saved_only=True)[0]
+        self.assertEqual(row["state"], "unknown")
+        self.assertIsNone(row["observed_at"])
+        self.raw.assert_not_called()
+        self.shell.assert_not_called()
+
+    def test_saved_fixture_id_collision_cannot_dispatch_to_live_status(self):
+        self.prepared()
+        fixture = recoveryctl.RECOVERY_DIR / "r1"
+        fixture.mkdir(parents=True)
+        write_json(fixture / "webapp-metadata.json", {"host_id": "sourcedb"})
+        with patch.object(recoveryctl, "_run", return_value={"request_id": "r1", "state": "created"}) as local, \
+             patch.object(recoveryctl, "_live_status", side_effect=AssertionError("No SSH")):
+            rows = recoveryctl.list_requests(host_id="sourcedb", saved_only=True)
+        self.assertEqual({(row["mode"], row["state"]) for row in rows},
+                         {("live", "awaiting_approval"), ("test_mode", "created")})
+        local.assert_called_once_with("r1", ["status", "--request-id", "r1"])
+
     def test_full_backup_approval_restore_validation_and_selection_transport(self):
         self.prepared()
         calls = []

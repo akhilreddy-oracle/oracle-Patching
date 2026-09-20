@@ -309,6 +309,10 @@ def reconcile(request_id: str, actor: str) -> dict:
 def status(request_id: str) -> dict:
     if _is_live(request_id):
         return _live_status(request_id)
+    return _fixture_status(request_id)
+
+
+def _fixture_status(request_id: str) -> dict:
     fixture_dir = _fixture_path(request_id)
     result = _run(request_id, ["status", "--request-id", request_id]) or {}
     host_id = None
@@ -362,7 +366,21 @@ def selection_status(request_id: str, *, host_id: str, host: dict) -> dict:
     return current
 
 
-def list_requests(host_id: str | None = None) -> list[dict]:
+def _saved_status(request_id: str) -> dict:
+    """Display the last retained observation without contacting a managed host.
+
+    This view is for navigation only. Selection and mutation admission must
+    continue to use status() and its current native verification.
+    """
+    metadata = _metadata(request_id)
+    observed = metadata.get("last_status")
+    if not isinstance(observed, dict) or observed.get("request_id") != request_id or not observed.get("state"):
+        observed = {"request_id": request_id, "state": "unknown"}
+    return {**_decorate(observed, metadata), "evidence_mode": "saved",
+            "observed_at": metadata.get("last_status_observed_at") if observed.get("state") != "unknown" else None}
+
+
+def list_requests(host_id: str | None = None, *, saved_only: bool = False) -> list[dict]:
     if host_id is not None:
         evidence.validate_host_id(host_id)
     summaries = []
@@ -382,10 +400,15 @@ def list_requests(host_id: str | None = None) -> list[dict]:
             if host_id is not None and attributed_host != host_id:
                 continue
             try:
-                summaries.append(status(entry.name))
+                if saved_only and root == LIVE_DIR:
+                    summaries.append(_saved_status(entry.name))
+                else:
+                    result = _fixture_status(entry.name) if saved_only else status(entry.name)
+                    summaries.append({**result, "evidence_mode": "saved", "observed_at": None} if saved_only else result)
             except (RecoveryError, remote.RemoteError) as exc:
                 summaries.append({"request_id": entry.name, "host_id": attributed_host,
                                   "mode": "live" if root == LIVE_DIR else "test_mode",
+                                  **({"evidence_mode": "saved", "observed_at": None} if saved_only else {}),
                                   "state": "unreadable", "error": exc.to_json()})
     return summaries
 
@@ -434,6 +457,8 @@ def _update_metadata(request_id: str, **values) -> dict:
     base = _live_path(request_id)
     with file_lock(base / ".metadata.lock"):
         current = _metadata(request_id)
+        if "last_status" in values:
+            values["last_status_observed_at"] = datetime.now(timezone.utc).isoformat()
         current.update(values)
         write_json(base / "metadata.json", current)
     return current

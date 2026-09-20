@@ -272,6 +272,7 @@ class AssistantApiTests(unittest.TestCase):
 
     def test_confirmed_host_pipeline_uses_shared_host_key_and_server_owned_context(self):
         for name, step, arguments in (("refresh_discovery", "discovery", {"host_id": "source"}),
+                                     ("check_live_inventory", "discovery", {"host_id": "source"}),
                                      ("refresh_readiness", "readiness-chain", {"host_id": "source"}),
                                      ("select_backup", "recovery-collect", {"host_id": "source", "request_id": "backup-a"})):
             with self.subTest(tool=name):
@@ -286,7 +287,10 @@ class AssistantApiTests(unittest.TestCase):
                     body["_record"] = record
                 if step == "recovery-collect":
                     body["request_id"] = "backup-a"
+                if name == "check_live_inventory":
+                    body["inventory_receipt"] = True
                 self.steps[step].assert_called_once_with("source", self.host, body)
+                self.steps[step].reset_mock()
 
     def test_confirmation_rechecks_current_roles_and_does_not_allow_another_owner(self):
         conversation_id, action = self.prepare("refresh_discovery", {"host_id": "source"}, actor="operator")
@@ -332,6 +336,7 @@ class AssistantApiTests(unittest.TestCase):
     def test_confirmed_host_proposal_rechecks_approved_configuration_before_native_launch(self):
         windows = {"window_start": "2099-01-01T01:00:00Z", "window_end": "2099-01-01T02:00:00Z"}
         cases = [("refresh_discovery", {"host_id": self.host["id"]}, "operator"),
+                 ("check_live_inventory", {"host_id": self.host["id"]}, "operator"),
                  ("refresh_readiness", {"host_id": self.host["id"]}, "operator"),
                  ("select_backup", {"host_id": self.host["id"], "request_id": "backup-a"}, "operator"),
                  ("create_backup", {"host_id": self.host["id"], "request_id": "new-bound-backup",

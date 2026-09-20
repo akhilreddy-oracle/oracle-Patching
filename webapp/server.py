@@ -637,7 +637,12 @@ No socket, HTTP parser or listener is constructed by this class.
             return
 
         if path == "/api/recovery":
-            host_values = parse_qs(urlparse(self.path).query, keep_blank_values=True).get("host_id", [])
+            query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            host_values = query.get("host_id", [])
+            view_values = query.get("view", [])
+            if len(view_values) > 1 or (view_values and view_values[0] not in {"saved", "live"}):
+                self._send_json(400, {"error": "invalid_view", "message": "Provide one view: saved or live"})
+                return
             if len(host_values) > 1 or (host_values and not host_values[0]):
                 self._send_json(400, {"error": "invalid_host", "message": "Provide one nonempty host_id"})
                 return
@@ -647,7 +652,8 @@ No socket, HTTP parser or listener is constructed by this class.
                 return
             try:
                 targets = recoveryctl.target_capabilities(host_id) if host_id is not None else {}
-                self._send_json(200, {"requests": recoveryctl.list_requests(host_id=host_id), **recoveryctl.capability(), **targets})
+                options = {"saved_only": True} if view_values == ["saved"] else {}
+                self._send_json(200, {"requests": recoveryctl.list_requests(host_id=host_id, **options), **recoveryctl.capability(), **targets})
             except ValueError as exc:
                 self._send_json(400, {"error": "invalid_host", "message": str(exc)})
             return

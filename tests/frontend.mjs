@@ -129,7 +129,7 @@ test('plan index and host lifecycle show the newest attributable records', async
     { request_id: 'unattributed', state: 'completed' },
     { request_id: 'local', host_id: 'prod', state: 'awaiting_approval', created_at: '2026-09-13T00:00:00Z' },
   ];
-  fetch = async url => response(url === '/api/plans' ? { plans } : url === '/api/recovery' || url === '/api/recovery?host_id=prod' ? { requests } : { steps: [] });
+  fetch = async url => response(url === '/api/plans' ? { plans } : url === '/api/recovery' || url.startsWith('/api/recovery?host_id=prod') ? { requests } : { steps: [] });
   const list = mount(); await renderPlanList(list);
   assert.match(list.querySelector('tbody').children[0].textContent, /^a-new/);
   const page = mount(); await renderWorkspace(page, 'prod', 'recovery');
@@ -518,6 +518,76 @@ const readmeHint = (media = artifact, identifier = 'README.html') => ({
   artifact_sha256: media.sha256, readme_identifier: identifier,
   readme_sha256: media.readme_files.find(entry => entry.path === identifier).sha256,
   required_opatch_version: '12.2.0.1.49', evidence: 'Use OPatch utility version 12.2.0.1.49 or later.', warnings: [],
+});
+
+test('workspace follows saved procedure and readiness changes without recovery reads or replacing policy drafts', async () => {
+  const media = { ...artifact };
+  const saved = buildProcedure('database_single_instance_opatch', procedureFields, media);
+  const steps = readinessSteps(media, saved, null, [
+    { db_unique_name: 'ORCL', oracle_home: '/oracle/one' }, { db_unique_name: 'OTHER', oracle_home: '/oracle/two' },
+  ]);
+  steps[0].status = 'complete'; steps[0].evidence.collected_at = new Date().toISOString();
+  steps.push(...['reconcile', 'compatibility-collect', 'compatibility-reconcile'].map(step => ({ step, done: true, status: 'passed' })));
+  const ready = { step: 'readiness-evaluate', done: true, status: 'blocked', evidence: { status: 'blocked', gates: [] } };
+  steps.push(ready);
+  const reads = [], posts = [];
+  fetch = async (url, options = {}) => {
+    if (options.method === 'POST') {
+      posts.push(url);
+      if (url.endsWith('/procedure-validate')) {
+        steps[2].evidence.procedure = JSON.parse(options.body).procedure;
+        ready.done = false; ready.status = null; ready.evidence = null;
+      } else if (url.endsWith('/readiness-evaluate')) {
+        ready.done = true; ready.status = 'ready_for_approval'; ready.evidence = { status: ready.status };
+      } else assert.fail(`Unexpected mutation ${url}`);
+      return response({ run_id: 'workflow-refresh' }, 202);
+    }
+    reads.push(url);
+    if (url === '/api/runs/workflow-refresh') return response({ status: 'succeeded' });
+    if (url === '/api/hosts/prod/pipeline') return response({ steps });
+    if (url === '/api/plans') return response({ plans: [] });
+    if (url === '/api/recovery?host_id=prod&view=saved') return response({ requests: [{ host_id: 'prod', state: 'completed', evidence_mode: 'saved' }] });
+    assert.fail(`Unexpected read ${url}`);
+  };
+  const page = mount(); await renderWorkspace(page, 'prod', 'readiness');
+  const readinessBadge = page.querySelectorAll('.stage-rail-item').find(item => item.textContent.startsWith('Readiness')).querySelector('.badge');
+  assert.equal(readinessBadge.textContent, 'blocked');
+  assert.match(page.querySelector('.wizard-target').textContent, /Database: ORCL.*Patch: 12345678/);
+  assert.match(page.querySelector('.stage-rail').textContent, /Saved: completed/);
+  const policyDraft = field(page, 'Filesystem free space reserve (GiB)');
+  policyDraft.value = '321'; await policyDraft.fire('input');
+  const card = procedureCard(page);
+  field(card, 'Database unique name').value = 'OTHER';
+  await button(card, 'Validate procedure').fire('click');
+  assert.match(page.querySelector('.wizard-target').textContent, /Database: OTHER.*Patch: 12345678/);
+  assert.match(page.querySelector('.wizard-target').textContent, /Oracle home: \/oracle\/two/);
+  assert.equal(readinessBadge.textContent, '5/6');
+  assert.equal(field(page, 'Filesystem free space reserve (GiB)'), policyDraft);
+  assert.equal(policyDraft.value, '321');
+  await button(page, 'Evaluate readiness').fire('click');
+  assert.equal(readinessBadge.textContent, 'ready_for_approval');
+  assert.deepEqual(posts, ['/api/hosts/prod/pipeline/procedure-validate', '/api/hosts/prod/pipeline/readiness-evaluate']);
+  assert.deepEqual(reads.filter(url => url.startsWith('/api/recovery')), ['/api/recovery?host_id=prod&view=saved']);
+});
+
+test('readiness blocker reviews focus exact controls without reload, mutation or draft loss', async () => {
+  const steps = readinessSteps();
+  steps.push({ step: 'readiness-evaluate', done: true, status: 'blocked', evidence: { status: 'blocked', gates: [
+    { name: 'artifact', status: 'blocker' }, { name: 'compatibility_contract', status: 'blocker' },
+    { name: 'patch_not_installed', status: 'blocker' }, { name: 'database_invalid_objects', status: 'blocker' },
+  ] } });
+  let reads = 0;
+  fetch = async (url, options = {}) => { assert.equal(options.method || 'GET', 'GET'); assert.equal(url, '/api/hosts/prod/pipeline'); reads++; return response({ steps }); };
+  const page = mount(); await renderReadinessStage(page, 'prod');
+  const draft = field(procedureCard(page), 'Rollback precondition'); draft.value = 'Preserve this unsubmitted condition';
+  for (const [label, step] of [['Review patch media', 'artifact-inspect'], ['Review compatibility checks', 'compatibility-collect'],
+    ['Review installed patch and selection', 'procedure-validate'], ['Review readiness controls', 'readiness-evaluate']]) {
+    await page.querySelectorAll('a').find(link => link.textContent === label).fire('click');
+    assert.equal(document.activeElement, page.querySelector(`#readiness-step-${step}`).querySelector('h3'));
+    assert.equal(field(procedureCard(page), 'Rollback precondition'), draft);
+    assert.equal(draft.value, 'Preserve this unsubmitted condition');
+  }
+  assert.equal(reads, 1);
 });
 
 test('procedure form restores saved validation and marks edits as an unvalidated draft', async () => {

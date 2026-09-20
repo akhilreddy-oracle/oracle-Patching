@@ -9,9 +9,9 @@ const containsName = (text, value) => Boolean(value) && new RegExp(`(?:^|[\\s:])
 const ACTIONS = {
   recovery_backup: ["Prepare backup", "recovery"], recovery_filesystem: ["Select validated backup", "recovery"],
   recovery_fra: ["Review backup capacity", "recovery"], recovery_restore_point: ["Review recovery requirements", "recovery"],
-  patch_not_installed: ["Review installed patch and selection", "readiness"],
-  artifact: ["Inspect patch media", "readiness"], compatibility_contract: ["Refresh compatibility checks", "readiness"],
-  compatibility_home: ["Review compatibility evidence", "readiness"],
+  patch_not_installed: ["Review installed patch and selection", "readiness", "procedure-validate"],
+  artifact: ["Review patch media", "readiness", "artifact-inspect"], compatibility_contract: ["Review compatibility checks", "readiness", "compatibility-collect"],
+  compatibility_home: ["Review compatibility evidence", "readiness", "compatibility-collect"],
 };
 
 /** Values retain their evidence source. Never attribute another node's cached metrics to a blocker. */
@@ -58,22 +58,30 @@ export function readinessBlockers(evidence, steps, hostId) {
         case "authoritative_inventory": required = policy.require_xml_inventory === true ? "Hashed OPatch XML inventory" : null; break;
       }
     }
-    const action = ACTIONS[gate.name] || [/snapshot|inventory|topology/.test(gate.name) ? "Refresh discovery evidence" : "Review evidence and rerun checks", /snapshot|inventory|topology/.test(gate.name) ? "discover" : "readiness"];
+    const action = ACTIONS[gate.name] || (/snapshot|inventory|topology/.test(gate.name)
+      ? ["Review discovery evidence", "discover"] : ["Review readiness controls", "readiness", "readiness-evaluate"]);
     const affectedDatabases = databaseName || (home ? array(snapshot.databases).filter((db) => db.oracle_home === home.path).map((db) => db.db_unique_name).filter(Boolean).join(", ") : null);
-    return { name: gate.name || "Readiness finding", detail, database: display(affectedDatabases), home: display(gate.oracle_home || home?.path || database?.oracle_home), host: gate.node || gate.host || (matchingNode ? snapshot.host.name : hostId), actual: display(actual), required: display(required), observedAt: actual != null && matchingNode ? snapshot.collected_at : null, action: { label: action[0], href: `#/hosts/${encodeURIComponent(hostId)}/${action[1]}` } };
+    return { name: gate.name || "Readiness finding", detail, database: display(affectedDatabases), home: display(gate.oracle_home || home?.path || database?.oracle_home), host: gate.node || gate.host || (matchingNode ? snapshot.host.name : hostId), actual: display(actual), required: display(required), observedAt: actual != null && matchingNode ? snapshot.collected_at : null, action: { label: action[0], href: `#/hosts/${encodeURIComponent(hostId)}/${action[1]}`, step: action[2] } };
   });
 }
 
-export function blockerCards(evidence, steps, hostId) {
+export function blockerCards(evidence, steps, hostId, { onReviewStep } = {}) {
   const cards = readinessBlockers(evidence, steps, hostId);
   if (!cards.length) return null;
-  return el("div", { class: "readiness-findings" }, cards.map((finding) => el("article", { class: "readiness-finding" }, [
+  return el("div", { class: "readiness-findings" }, cards.map((finding) => {
+    const action = el("a", { class: "back-link", href: finding.action.href, text: finding.action.label });
+    if (finding.action.step && onReviewStep) action.addEventListener("click", (event) => {
+      event.preventDefault();
+      onReviewStep(finding.action.step);
+    });
+    return el("article", { class: "readiness-finding" }, [
     el("div", { class: "step-card-head" }, [el("h4", { text: finding.name.replaceAll("_", " ") }), badge("Needs action", "bad")]),
     el("p", { text: `Host: ${finding.host} · Database: ${finding.database}` }),
     el("p", { class: "mono", text: `Oracle home: ${finding.home}` }),
     el("dl", { class: "finding-values" }, [el("dt", { text: "Actual" }), el("dd", { text: finding.actual }), el("dt", { text: "Required" }), el("dd", { text: finding.required })]),
     ...(finding.observedAt ? [el("p", { class: "helper-text", text: `Actual values from cached discovery: ${finding.observedAt}. Refresh and evaluate to update this decision.` })] : []),
     el("p", { class: "helper-text", text: finding.detail }),
-    el("a", { class: "back-link", href: finding.action.href, text: finding.action.label }),
-  ])));
+    action,
+  ]);
+  }));
 }

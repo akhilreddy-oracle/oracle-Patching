@@ -34,6 +34,17 @@ The [execution dashboard](EXECUTION_DASHBOARD.md) and
 
 ## Correcting configuration and blocked workflows
 
+The host lifecycle rail reads host-scoped saved recovery summaries without
+contacting managed servers. It labels the state as saved and shows its observation
+time when recorded; legacy observations retain an unknown time. Opening Recovery
+still performs the existing native status refresh. Saved navigation state never
+authorizes backup selection or execution.
+
+Readiness findings that refer to another section on the same page focus and scroll
+to that section without discarding form drafts. Discovery and readiness updates
+also refresh the workspace's saved target and lifecycle badges, so the header
+does not keep showing a previous database or patch after evidence changes.
+
 Fleet metadata edits require the `admin` role when RBAC or company login is
 enabled. The existing authenticated lab mode can also edit these fields. Values
 are retained in `webapp/var/fleet-metadata.json`; host connection settings are

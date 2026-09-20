@@ -2,6 +2,70 @@ import { test, expect } from './fixtures.mjs';
 
 const main = page => page.locator('#app');
 
+test('readiness reviews focus the relevant controls without losing an unsubmitted draft', async ({ page, fixture }) => {
+  fixture.steps.at(-1).evidence.gates = [
+    { name: 'artifact', status: 'blocker' }, { name: 'compatibility_contract', status: 'blocker' },
+    { name: 'patch_not_installed', status: 'blocker' }, { name: 'database_invalid_objects', status: 'blocker' },
+  ];
+  const reads = [];
+  fixture.custom = async ({ url, method }) => { if (method === 'GET') reads.push(url.pathname + url.search); return false; };
+  await page.goto('/#/hosts/source/readiness');
+  const view = main(page), draft = view.getByLabel('Rollback precondition', { exact: true });
+  await draft.fill('Keep this unsubmitted recovery condition');
+  const readCount = reads.length;
+  for (const [action, heading] of [['Review patch media', 'Artifact inspection'], ['Review compatibility checks', 'OPatch compatibility'],
+    ['Review installed patch and selection', 'Procedure validation'], ['Review readiness controls', 'Readiness evaluation']]) {
+    await view.getByRole('link', { name: action, exact: true }).click();
+    await expect(view.getByRole('heading', { name: heading, exact: true })).toBeFocused();
+    await expect(view.getByRole('heading', { name: heading, exact: true })).toBeInViewport();
+    await expect(draft).toHaveValue('Keep this unsubmitted recovery condition');
+  }
+  expect(reads.length).toBe(readCount);
+  expect(fixture.writes).toEqual([]);
+  await expect(page).toHaveURL(/#\/hosts\/source\/readiness$/);
+});
+
+test('saved workspace target and badges follow validation without extra recovery reads or discarded policy drafts', async ({ page, fixture }) => {
+  fixture.steps[0].evidence.databases.push({ db_unique_name: 'OTHER', oracle_home: '/fixture/oracle/other_home' });
+  fixture.recoveries.push({ request_id: 'saved-backup', host_id: 'source', state: 'completed', evidence_mode: 'saved' });
+  const recoveryReads = [];
+  fixture.custom = async ({ request, url, method, send }) => {
+    if (method === 'GET' && url.pathname === '/api/recovery') recoveryReads.push(url.search);
+    if (method === 'POST' && url.pathname === '/api/hosts/source/pipeline/procedure-validate') {
+      fixture.steps.find(step => step.step === 'procedure-validate').evidence.procedure = request.postDataJSON().procedure;
+      Object.assign(fixture.steps.at(-1), { done: false, status: null, evidence: null });
+      fixture.runs.validate = { status: 'succeeded' };
+      await send({ run_id: 'validate' }, 202); return true;
+    }
+    if (method === 'POST' && url.pathname === '/api/hosts/source/pipeline/readiness-evaluate') {
+      Object.assign(fixture.steps.at(-1), { done: true, status: 'ready_for_approval', evidence: { status: 'ready_for_approval' } });
+      fixture.runs.ready = { status: 'succeeded' };
+      await send({ run_id: 'ready' }, 202); return true;
+    }
+    return false;
+  };
+  await page.goto('/#/hosts/source/readiness');
+  const view = main(page), target = view.getByRole('region', { name: 'Selected patch target', exact: true });
+  const readiness = view.locator('.stage-rail').getByRole('link', { name: /^Readiness/ });
+  await expect(target).toContainText('Database: ORCL');
+  await expect(readiness).toContainText('blocked');
+  await expect(view.locator('.stage-rail')).toContainText('Saved: completed');
+  const reserve = view.getByLabel('Filesystem free space reserve (GiB)', { exact: true });
+  await reserve.fill('17');
+  await view.getByRole('combobox', { name: 'Database unique name', exact: true }).selectOption('OTHER');
+  await view.getByRole('button', { name: 'Validate procedure', exact: true }).click();
+  await expect(target).toContainText('Database: OTHER');
+  await expect(target).toContainText('Patch: 39034528');
+  await expect(target).toContainText('Oracle home: /fixture/oracle/other_home');
+  await expect(readiness).toContainText('5/6');
+  await expect(reserve).toHaveValue('17');
+  await view.getByRole('button', { name: 'Evaluate readiness', exact: true }).click();
+  await expect(readiness).toContainText('ready_for_approval');
+  await expect(reserve).toHaveValue('17');
+  expect(recoveryReads).toEqual(['?host_id=source&view=saved']);
+  expect(fixture.writes.map(row => row.path)).toEqual(['/api/hosts/source/pipeline/procedure-validate', '/api/hosts/source/pipeline/readiness-evaluate']);
+});
+
 test('recovery target requirements distinguish native SPFILE analysis from unsupported or stale discovery', async ({ page, fixture }) => {
   await page.goto('/#/hosts/source/recovery');
   await expect(main(page).getByRole('button', { name: 'Create live recovery request', exact: true })).toBeEnabled();

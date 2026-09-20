@@ -4,6 +4,7 @@ import { startRun, pollRun } from "./runs.js";
 
 const TOOLS = Object.freeze({
   refresh_discovery: { label: "Refresh discovery", required: ["host_id"] },
+  check_live_inventory: { label: "Check current patch inventory", required: ["host_id"] },
   refresh_readiness: { label: "Refresh readiness", required: ["host_id"] },
   create_patch_plan: { label: "Create patch plan", required: ["host_id", "plan_id", "patch_id", "database", "window_start", "window_end"] },
   create_backup: { label: "Create backup request", required: ["host_id", "request_id", "database", "backup_parent", "window_start", "window_end"] },
@@ -69,7 +70,7 @@ export function actionAvailability(action, { canChat = true, allowedTools, busy 
 
 export function actionLinks(action) {
   const args = action?.arguments || {}, links = [];
-  if (identifier(args.host_id)) links.push({ label: "Open host workspace", href: `#/hosts/${encodeURIComponent(args.host_id)}/${isLiveInventory(action) ? "discover" : "readiness"}` });
+  if (identifier(args.host_id)) links.push({ label: "Open host workspace", href: `#/hosts/${encodeURIComponent(args.host_id)}/${isLiveInventory(action) || action.tool === "check_live_inventory" ? "discover" : "readiness"}` });
   if (identifier(args.plan_id) && (action.tool !== "create_patch_plan" || action.state === "completed")) {
     links.push({ label: "Review plan and approvals", href: `#/plans/${encodeURIComponent(args.plan_id)}` });
   }
@@ -204,7 +205,8 @@ export async function renderAssistant(mount, conversationId = null) {
   }
 
   function renderAction(action) {
-    const liveInventory = isLiveInventory(action);
+    const automaticInventory = isLiveInventory(action);
+    const liveInventory = automaticInventory || (action.tool === "check_live_inventory" && Boolean(action.confirmed_at));
     const availability = actionAvailability(action, { canChat, allowedTools: config.allowed_tools, busy: busy() || unresolved() });
     const card = el("article", { class: "assistant-action panel", "aria-label": liveInventory ? `Live inventory check: ${text(action.arguments?.host_id)}` : `Proposed action: ${TOOLS[action.tool]?.label || text(action.tool)}` });
     const title = el("div", { class: "assistant-action-heading" }, [
@@ -212,7 +214,7 @@ export async function renderAssistant(mount, conversationId = null) {
       badge(action.state === "completed" ? liveInventory ? "Check finished" : "Operation finished" : action.state || "unknown", action.state === "completed" ? "neutral" : classifyStatus(action.state)),
     ]);
     card.appendChild(title);
-    card.appendChild(el("p", { class: "assistant-action-summary", text: liveInventory ? "Your question requested live discovery on this host. Its verified inventory and collection time appear in the conversation when the check finishes." : action.summary || "Review the exact action settings before confirming." }));
+    card.appendChild(el("p", { class: "assistant-action-summary", text: liveInventory ? `${automaticInventory ? "Your question" : "Your confirmed action"} requested live discovery on this host. Its verified inventory and collection time appear in the conversation when the check finishes.` : action.summary || "Review the exact action settings before confirming." }));
     const args = action.arguments && typeof action.arguments === "object" && !Array.isArray(action.arguments) ? action.arguments : {};
     const fields = el("dl", { class: "assistant-action-targets" });
     for (const [key, value] of Object.entries(args)) {
@@ -225,9 +227,13 @@ export async function renderAssistant(mount, conversationId = null) {
     if (links.length) card.appendChild(el("nav", { class: "assistant-action-links", "aria-label": "Native workflow review" },
       links.map(link => el("a", { href: link.href, text: link.label }))));
     if (action.result !== undefined) {
-      const resultState = action.result?.outcome?.status || action.result?.outcome?.plan_state || action.result?.outcome?.state || action.result?.status || action.result?.state;
-      if (resultState) card.appendChild(el("p", {}, [document.createTextNode("Native result: "), badge(resultState, classifyStatus(resultState))]));
-      card.appendChild(el("details", {}, [el("summary", { text: "Native operation result" }), el("pre", { text: JSON.stringify(action.result, null, 2) })]));
+      const unverifiedInventory = liveInventory && (action.state !== "completed" || action.result?.inventory_verification === "rejected");
+      const resultState = unverifiedInventory ? "unverified" : action.result?.outcome?.status || action.result?.outcome?.plan_state || action.result?.outcome?.state || action.result?.status || action.result?.state;
+      if (resultState) card.appendChild(el("p", {}, [document.createTextNode(unverifiedInventory ? "Inventory receipt: " : "Native result: "), badge(resultState, classifyStatus(resultState))]));
+      const diagnostics = unverifiedInventory ? { run_id: action.result?.run_id || action.run_id,
+        run_status: action.result?.run_status, inventory_verification: action.result?.inventory_verification || "unverified",
+        error: action.error || action.result?.error } : action.result;
+      card.appendChild(el("details", {}, [el("summary", { text: unverifiedInventory ? "Unverified inventory diagnostics" : "Native operation result" }), el("pre", { text: JSON.stringify(diagnostics, null, 2) })]));
     }
     const actionError = action.error || action.result?.error;
     if (actionError) card.appendChild(el("p", { class: "assistant-action-error", text: typeof actionError === "string" ? actionError : actionError.message || JSON.stringify(actionError) }));
