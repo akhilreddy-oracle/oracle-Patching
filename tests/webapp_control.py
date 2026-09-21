@@ -769,6 +769,97 @@ os._exit(0)
             created = planctl.create("operator-chosen-name", "requester", "host-c", "2026-09-14T00:00:00Z", "2026-09-14T01:00:00Z")
             self.assertEqual(created["host_id"], "host-c")
 
+    def _plan_review_evidence(self, patch_id="39034528", database="ORCL"):
+        procedure = {"patch_id": patch_id, "target": {"database_unique_name": database}}
+        evidence.write_evidence("h", "procedure_input", procedure)
+        evidence.write_evidence("h", "procedure", {"status": "ready_for_planning", "procedure": procedure})
+        evidence.write_evidence("h", "readiness", {"status": "ready_for_approval"})
+
+    def test_plan_review_binds_the_displayed_generation_and_rejects_a_second_sessions_changes(self):
+        self._plan_review_evidence()
+        status, preview_a = self.request("/api/hosts/h/plan-preview", actor="requester", method="GET")
+        self.assertEqual(status, 200)
+        reviewed = next(step for step in preview_a["steps"] if step["step"] == "procedure-validate")
+        self.assertEqual(reviewed["evidence"]["procedure"]["patch_id"], preview_a["confirmation"]["patch_id"])
+        self.assertEqual(preview_a["confirmation"]["database"], "ORCL")
+        # A second operator updates the same host after the first reviewed it.
+        self._plan_review_evidence("99999999", "SECOND")
+        body = {"plan_id": "reviewed-plan", "requester": "requester", "host_id": "h",
+                "window_start": "2099-01-01T01:00:00Z", "window_end": "2099-01-01T02:00:00Z",
+                **preview_a["confirmation"]}
+        queued = []
+        def queue(kind, key, operation):
+            queued.append(operation)
+            return SimpleNamespace(run_id="fixture-preview-create")
+        with patch.object(server, "load_hosts", return_value={"h": {"id": "h"}}), \
+             patch.object(pipeline_runner, "start_run", side_effect=queue), \
+             patch.object(planctl, "_create_from_host_evidence", return_value={"plan_id": "reviewed-plan"}) as seal:
+            self.assertEqual(self.request("/api/plans", actor="requester", body=body)[0], 202)
+            with self.assertRaisesRegex(evidence.EvidenceError, "does not match"):
+                queued.pop()(None)
+            seal.assert_not_called()
+            status, preview_b = self.request("/api/hosts/h/plan-preview", actor="requester", method="GET")
+            self.assertEqual(status, 200)
+            self.assertEqual(preview_b["confirmation"]["database"], "SECOND")
+            self.assertNotEqual(preview_a["confirmation"], preview_b["confirmation"])
+            body.update(preview_b["confirmation"])
+            self.assertEqual(self.request("/api/plans", actor="requester", body=body)[0], 202)
+            queued.pop()(None)
+            seal.assert_called_once()
+            # Read access to a review does not confer create permission.
+            self.assertEqual(self.request("/api/hosts/h/plan-preview", actor="viewer", method="GET")[0], 200)
+            self.assertEqual(self.request("/api/plans", actor="viewer", body={**body, "requester": "viewer"})[0], 403)
+
+    def test_plan_review_excludes_writers_and_withholds_confirmation_for_incomplete_evidence(self):
+        self._plan_review_evidence()
+        original = server.pipeline_steps.pipeline_state
+        excluded = []
+        def pipeline_state(host_id):
+            def competing_writer():
+                try:
+                    with evidence.host_lock(host_id):
+                        self._plan_review_evidence("99999999", "SECOND")
+                except evidence.EvidenceError:
+                    excluded.append(True)
+            writer = threading.Thread(target=competing_writer)
+            writer.start()
+            writer.join(5)
+            self.assertFalse(writer.is_alive())
+            return original(host_id)
+        with patch.object(server.pipeline_steps, "pipeline_state", side_effect=pipeline_state):
+            status, review = self.request("/api/hosts/h/plan-preview", method="GET")
+        self.assertEqual(status, 200)
+        self.assertEqual(excluded, [True])
+        self.assertEqual(review["confirmation"]["database"], "ORCL")
+        # Even if the displayed database/patch stays the same, a changed
+        # policy must invalidate the exact reviewed evidence generation.
+        evidence.write_evidence("h", "policy", {"changed_after_review": True})
+        with patch.object(planctl, "_create_from_host_evidence") as seal:
+            with self.assertRaisesRegex(planctl.PlanError, "changed after confirmation"):
+                planctl.create("same-target", "requester", "h", "2099-01-01T01:00:00Z", "2099-01-01T02:00:00Z",
+                               hosts={"h": {"id": "h"}}, **review["confirmation"])
+            seal.assert_not_called()
+        with patch.object(pipeline_runner, "active_run_id", return_value="unresolved-run"):
+            self.assertEqual(self.request("/api/hosts/h/plan-preview", method="GET")[0], 409)
+        with evidence.host_lock("h"):
+            self.assertEqual(self.request("/api/hosts/h/plan-preview", method="GET")[0], 409)
+        evidence.write_evidence("h", "readiness", {"status": "blocked"})
+        status, blocked = self.request("/api/hosts/h/plan-preview", method="GET")
+        self.assertEqual(status, 200)
+        self.assertIsNone(blocked["confirmation"])
+        self.assertIn("ready_for_approval", blocked["reason"])
+        evidence.write_evidence("h", "readiness", {"status": "ready_for_approval"})
+        evidence.write_evidence("h", "procedure_input", {"patch_id": "unvalidated-edit"})
+        self.assertIsNone(self.request("/api/hosts/h/plan-preview", method="GET")[1]["confirmation"])
+        # Grid procedures deliberately have no database target.
+        self._plan_review_evidence(database=None)
+        grid = self.request("/api/hosts/h/plan-preview", method="GET")[1]
+        self.assertIsNone(grid["confirmation"]["database"])
+        with patch.object(planctl, "_create_from_host_evidence", return_value={}) as seal:
+            planctl.create("grid-review", "requester", "h", "2099-01-01T01:00:00Z", "2099-01-01T02:00:00Z",
+                           hosts={"h": {"id": "h"}}, **grid["confirmation"])
+            seal.assert_called_once()
+
     def test_recovery_list_is_scoped_by_recorded_host(self):
         recoveryctl.RECOVERY_DIR.mkdir()
         for name, host in [("r1", "a"), ("r2", "b"), ("r3", None)]:

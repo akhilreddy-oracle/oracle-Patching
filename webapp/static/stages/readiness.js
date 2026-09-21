@@ -1,5 +1,6 @@
 import { el, badge, classifyStatus } from "../dom.js";
-import { apiFetch } from "../api.js";
+import { apiFetch, getReadSignal } from "../api.js";
+import { liveDiscoveryAccess } from "../actor.js";
 import { runToCompletion, RunStartError } from "../runs.js";
 import {
   field,
@@ -437,6 +438,7 @@ function formatBytes(n) {
  * a zip already present on the host. Clears artifact-bound evidence on success.
  */
 function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
+  const signal = getReadSignal();
   const base = `/api/hosts/${encodeURIComponent(hostId)}`;
   const panel = el("section", { class: "panel panel-warn remediation" });
   panel.appendChild(el("h4", { text: `Fix from here: ${remedy.title}` }));
@@ -450,12 +452,29 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
     el("option", { value: "host", text: "Copy from another managed host" }),
     el("option", { value: "zip", text: "Unpack a zip already on this host" }),
   ]);
-  const sourceSel = el("select", {}, [el("option", { value: "", text: "Probing hosts…" })]);
+  const sourceSel = el("select", {}, [el("option", { value: "", text: "Probe managed hosts to find complete media" })]);
   const zipInput = el("input", { type: "text", placeholder: "/u01/stage/p39034528_190000_Linux-x86-64.zip" });
   const replace = el("input", { type: "checkbox" });
   const status = helperText("", null);
-  const probeBtn = runButton("Probe hosts", () => probe());
+  const probeBtn = runButton("Probe managed hosts", () => probe());
   const btn = runButton("Stage media", () => run());
+  const permissionHint = helperText("", "warn");
+  let probing = false, staging = false, probeRevision = 0;
+  const updateAccess = () => {
+    const access = liveDiscoveryAccess();
+    probeBtn.disabled = probing || staging || !access.allowed;
+    btn.disabled = probing || staging || !access.allowed;
+    permissionHint.hidden = access.allowed;
+    permissionHint.textContent = access.reason;
+    return access.allowed;
+  };
+  updateAccess();
+  dirInput.addEventListener("input", () => {
+    probeRevision++;
+    sourceSel.replaceChildren(el("option", { value: "", text: "Probe managed hosts for the changed path" }));
+    sourceSel.value = "";
+    status.textContent = "Artifact path changed; previous source observations no longer apply.";
+  });
 
   const hostRow = field("Source host", sourceSel, "Only hosts holding complete media at the same path are selectable.");
   const zipRow = field("Zip path on this host", zipInput, "Absolute path; every node of this host must have it.");
@@ -468,6 +487,7 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
 
   async function probe() {
     clearFormError(errBox);
+    if (signal?.aborted || !updateAccess() || probing || staging || !requireToken(errBox)) return;
     const dir = dirInput.value.trim();
     if (!isAbsolutePath(dir)) {
       showFormError(errBox, "Artifact path must be absolute.");
@@ -476,10 +496,13 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
     sourceSel.innerHTML = "";
     sourceSel.appendChild(el("option", { value: "", text: "Probing hosts…" }));
     status.textContent = "";
-    probeBtn.disabled = true;
+    probing = true;
+    const revision = ++probeRevision;
+    updateAccess();
     try {
-      const res = await apiFetch(`${base}/artifact-sources?artifact_dir=${encodeURIComponent(dir)}`);
+      const res = await apiFetch(`${base}/artifact-sources`, { method: "POST", body: JSON.stringify({ artifact_dir: dir }), signal });
       const data = await res.json();
+      if (signal?.aborted || revision !== probeRevision || dir !== dirInput.value.trim()) return;
       if (!res.ok) {
         showFormError(errBox, data.message || "Probe failed");
         return;
@@ -506,14 +529,16 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
       }
       if (complete.length) sourceSel.value = complete[0].host_id;
     } catch (err) {
-      showFormError(errBox, `Probe failed: ${err}`);
+      if (err.name !== "AbortError") showFormError(errBox, `Probe failed: ${err}`);
     } finally {
-      probeBtn.disabled = false;
+      probing = false;
+      updateAccess();
     }
   }
 
   async function run() {
     clearFormError(errBox);
+    if (signal?.aborted || !updateAccess() || probing || staging) return;
     if (!requireToken(errBox)) return;
     const dir = dirInput.value.trim();
     if (!isAbsolutePath(dir)) {
@@ -523,7 +548,7 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
     const body = { artifact_dir: dir, owner: ownerInput.value.trim() || undefined, replace: replace.checked };
     if (mode.value === "host") {
       if (!sourceSel.value) {
-        showFormError(errBox, "Pick a source host with complete media (Probe hosts first).");
+        showFormError(errBox, "Pick a source host with complete media (Probe managed hosts first).");
         return;
       }
       body.source = { host_id: sourceSel.value };
@@ -536,9 +561,17 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
       body.source = { zip_path: zip };
     }
     rememberArtifactDir(hostId, dir);
-    const record = await executeRun(logBox, btn, (onTick) =>
-      runToCompletion(`${base}/pipeline/stage-artifact`, body, { onTick })
-    );
+    staging = true;
+    updateAccess();
+    let record;
+    try {
+      record = await executeRun(logBox, btn, (onTick) =>
+        runToCompletion(`${base}/pipeline/stage-artifact`, body, { onTick })
+      );
+    } finally {
+      staging = false;
+      updateAccess();
+    }
     if (record?.status === "succeeded") {
       const nodes = (record.result?.nodes || []).map((n) => `${n.node}: ${n.status}${n.bytes ? ` (${formatBytes(n.bytes)})` : ""}`).join("; ");
       logBox.textContent = `staged — ${nodes}\n${record.result?.next || ""}`;
@@ -559,11 +592,11 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
     ])
   );
   panel.appendChild(status);
+  panel.appendChild(helperText("Probe managed hosts inspects this path over SSH on this host's nodes and all other configured source hosts. Review the scope before starting the probe."));
+  panel.appendChild(permissionHint);
   panel.appendChild(errBox);
   panel.appendChild(el("div", { class: "pipeline-controls" }, [probeBtn, btn]));
   panel.appendChild(logBox);
-  // Kick off the probe so the source list is ready when the operator looks.
-  probe();
   return panel;
 }
 

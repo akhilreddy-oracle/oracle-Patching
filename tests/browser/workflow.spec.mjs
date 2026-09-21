@@ -106,6 +106,7 @@ test('wizard reviews target, verified README and Advanced fields before acceptin
   await expect(view.locator('.readiness-finding')).toContainText('ActualUnknown — evidence not supplied');
   await expect(view.locator('.readiness-finding')).toContainText('RequiredBackup age ≤ 1440 minutes');
   await page.screenshot({ path: testInfo.outputPath('readiness-wizard.png'), fullPage: true });
+  fixture.steps.at(-1).status = 'ready_for_approval';
   await view.locator('.stage-rail').getByRole('link', { name: 'Plan', exact: false }).click();
   await expect(view.getByText('README bound to validated procedure', { exact: true })).toBeVisible();
   await expect(view.getByLabel('Plan ID', { exact: true })).not.toBeVisible();
@@ -121,6 +122,7 @@ test('wizard reviews target, verified README and Advanced fields before acceptin
 });
 
 test('editing a plan ID during creation cannot redirect away from the submitted plan', async ({ page, fixture }) => {
+  fixture.steps.at(-1).status = 'ready_for_approval';
   let releaseRun;
   fixture.custom = async ({ url, method, send }) => {
     if (method === 'POST' && url.pathname === '/api/plans') {
@@ -147,6 +149,49 @@ test('editing a plan ID during creation cannot redirect away from the submitted 
   await expect(main(page).getByRole('heading', { name: 'submitted-plan', exact: true })).toBeVisible();
   expect(fixture.writes).toHaveLength(1);
   expect(fixture.writes[0].body.plan_id).toBe('submitted-plan');
+});
+
+test('plan creation submits the original reviewed target and binding until the operator reviews again', async ({ page, fixture }) => {
+  fixture.steps.at(-1).status = 'ready_for_approval';
+  let generation = 'a';
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'GET' && url.pathname === '/api/hosts/source/plan-preview') {
+      await send({ steps: fixture.steps, confirmation: {
+        expected_creation_binding_sha256: generation.repeat(64), patch_id: fixture.procedure.patch_id,
+        database: fixture.procedure.target.database_unique_name,
+      } }); return true;
+    }
+    if (method === 'POST' && url.pathname === '/api/plans') {
+      await send({ run_id: 'changed-review' }, 202); return true;
+    }
+    if (method === 'GET' && url.pathname === '/api/runs/changed-review') {
+      await send({ status: 'failed', error: { message: 'Host configuration or evidence changed after confirmation; review a new proposal' } }); return true;
+    }
+    return false;
+  };
+  await page.goto('/#/hosts/source/plan');
+  const view = main(page);
+  await expect(view.getByRole('region', { name: 'Selected patch target' })).toContainText('Database: ORCL');
+  // Simulate another session changing the server while this form stays open.
+  generation = 'b';
+  fixture.procedure.target.database_unique_name = 'SECOND';
+  fixture.steps[0].evidence.databases.push({ db_unique_name: 'SECOND', oracle_home: '/fixture/second-home' });
+  await view.getByRole('button', { name: 'Create plan', exact: true }).click();
+  await expect(view.locator('.run-log')).toContainText('changed after confirmation');
+  expect(fixture.writes[0].body).toMatchObject({ expected_creation_binding_sha256: 'a'.repeat(64), database: 'ORCL' });
+  await page.reload();
+  await expect(view.getByRole('region', { name: 'Selected patch target' })).toContainText('Database: SECOND');
+  await view.getByRole('button', { name: 'Create plan', exact: true }).click();
+  await expect.poll(() => fixture.writes.length).toBe(2);
+  expect(fixture.writes[1].body).toMatchObject({ expected_creation_binding_sha256: 'b'.repeat(64), database: 'SECOND' });
+});
+
+test('plan review remains available but cannot create while readiness is blocked', async ({ page, fixture }) => {
+  await page.goto('/#/hosts/source/plan');
+  await expect(main(page).getByText('README bound to validated procedure', { exact: true })).toBeVisible();
+  await expect(main(page).getByRole('button', { name: 'Create plan', exact: true })).toBeDisabled();
+  await expect(main(page).getByText('Complete readiness evaluation with ready_for_approval before creating a plan.', { exact: true })).toBeVisible();
+  expect(fixture.writes).toEqual([]);
 });
 
 test('discovery controls explain permissions and refresh them on navigation', async ({ page, fixture }) => {

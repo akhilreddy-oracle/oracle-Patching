@@ -160,6 +160,24 @@ test('wizard never presents a stale README binding as reviewed', () => {
   assert.equal(wizardContext(source, 'source').bound, false); assert.equal(wizardContext(source, 'source').readme, null);
 });
 
+test('wizard keeps the reviewed database when discovery lacks it and never borrows a database for Grid', () => {
+  const artifact = { sha256: 'a'.repeat(64), patch_ids: ['39034528'], platforms: [{ id: '226' }], readme_files: [{ path: 'README.html', sha256: 'b'.repeat(64) }] };
+  const procedure = { artifact_sha256: artifact.sha256, patch_id: '39034528', execution: { adapter: 'database_single_instance_opatch' }, target: { family: 'database', platform_id: '226', database_unique_name: 'SECOND' }, oracle_references: [{ kind: 'patch_readme', identifier: 'README.html', sha256: 'b'.repeat(64) }] };
+  const source = [...steps, { step: 'artifact-inspect', evidence: { artifact } }, { step: 'procedure-validate', status: 'ready_for_planning', evidence: { procedure } }];
+  const missing = wizardContext(source, 'source');
+  assert.equal(missing.bound, true);
+  assert.equal(missing.database, 'SECOND');
+  assert.equal(missing.home, 'Unknown until target selection');
+  procedure.target.database_unique_name = 'ORCL';
+  assert.equal(wizardContext(source, 'source').home, '/u01/db');
+  procedure.target = { family: 'grid', platform_id: '226' };
+  procedure.execution.adapter = 'grid_rolling_opatch';
+  const grid = wizardContext(source, 'source');
+  assert.equal(grid.bound, true);
+  assert.equal(grid.database, 'Not applicable (Grid Infrastructure)');
+  assert.equal(grid.home, 'Unknown until target selection');
+});
+
 test('live recovery can start before a readiness decision using an explicit conservative policy', async () => {
   const calls = [];
   fetch = async (url, options) => {

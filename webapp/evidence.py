@@ -140,7 +140,7 @@ def creation_binding(host_id: str, host: dict, patch_id: str, database: str) -> 
     """
     state = {"host": host, "evidence": {key: read_evidence(host_id, key) for key in (
         "snapshot", "snapshot_nodes", "artifact", "procedure_input", "procedure", "policy", "readiness", "recovery",
-        "recovery_selection", "compatibility_reconciliation", "reconciliation")}}
+        "recovery_selection", "compatibility_reconciliation", "reconciliation", "dataguard_order")}}
     procedure = state["evidence"]["procedure_input"]
     target = procedure.get("target") if isinstance(procedure, dict) else None
     if (not isinstance(procedure, dict) or not isinstance(target, dict)

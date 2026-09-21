@@ -100,6 +100,22 @@ class ControllerEvidenceIntegrity(unittest.TestCase):
             self.assertEqual(result['plan_id'], 'p1')
             create.assert_called_once()
 
+    def test_create_rejects_changed_dataguard_order_after_review(self):
+        evidence.write_evidence('cluster', 'procedure_input', {'patch_id': '12345', 'target': {'database_unique_name': 'ORCL'}})
+        evidence.write_evidence('cluster', 'dataguard_order', {'members': ['STANDBY', 'PRIMARY']})
+        digest = evidence.creation_binding('cluster', self.host, '12345', 'ORCL')
+        for changed in ({'members': ['PRIMARY', 'STANDBY']}, None):
+            with self.subTest(order=changed):
+                if changed is None:
+                    evidence.clear_evidence('cluster', 'dataguard_order')
+                else:
+                    evidence.write_evidence('cluster', 'dataguard_order', changed)
+                with patch.object(planctl, '_create_from_host_evidence') as create:
+                    with self.assertRaisesRegex(planctl.PlanError, 'changed after confirmation'):
+                        planctl.create('p1', 'requester', 'cluster', 'start', 'end', patch_id='12345', database='ORCL',
+                            expected_creation_binding_sha256=digest, hosts={'cluster': self.host})
+                    create.assert_not_called()
+
     def test_create_rejects_unresolved_host_pipeline_before_native_creation(self):
         with patch.object(pipeline_runner, 'active_run_id', return_value='old-run'), \
              patch.object(planctl, '_create_from_host_evidence') as create:

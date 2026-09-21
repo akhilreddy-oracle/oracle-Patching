@@ -446,13 +446,22 @@ test('creation pages open the submitted record even if its editable ID changes w
     fetch = async (url, options) => {
       if (options.method === 'POST') { posted.push({ url, body: JSON.parse(options.body) }); return response({ run_id: 'create-run' }, 202); }
       if (url === '/api/runs/create-run') return new Promise(resolve => { finish = () => resolve(response({ status: 'succeeded' })); });
-      if (url.endsWith('/pipeline')) return response({ steps: [
+      if (url.endsWith('/pipeline') || url.endsWith('/plan-preview')) return response({ confirmation: {
+        expected_creation_binding_sha256: 'c'.repeat(64), patch_id: procedure.patch_id,
+        database: procedure.target.database_unique_name,
+      }, steps: [
         { step: 'artifact-inspect', done: true, evidence: { artifact } },
         { step: 'procedure-validate', done: true, status: 'ready_for_planning', evidence: { procedure } },
       ] });
       return response({ plans: [], tasks: [] });
     };
     const page = mount(); await renderer(page, target);
+    if (renderer === renderPlanNew) {
+      const reviewedTarget = page.querySelector('.wizard-target');
+      assert.match(reviewedTarget.textContent, /Host: source/);
+      assert.match(reviewedTarget.textContent, /Patch: 12345678/);
+      assert.match(reviewedTarget.textContent, /Database: ORCL/);
+    }
     const id = field(page, label); id.value = 'submitted-record';
     const pending = button(page, action).fire('click');
     await new Promise(resolve => setImmediate(resolve));
@@ -1450,4 +1459,68 @@ test('a matching in-flight inspection can be joined and mismatched poll identity
       assert.match(page.textContent, /they do not prove the host is unchanged now/);
     }
   }
+});
+
+test('artifact remediation is passive until an admitted operator explicitly probes hosts', async () => {
+  const steps = [{ step: 'discovery', done: true, evidence: { databases: [] } },
+    { step: 'artifact-inspect', done: true, status: 'blocked', evidence: { artifact: {
+      path: '/fixture/patch', status: 'blocked', reason: 'artifact is incomplete' } } }];
+  for (const allowed of [false, true]) {
+    actor.setSessionIdentity({ mode: 'company', actor: 'fixture-operator', rbac_enabled: true,
+      permissions: { live_discovery: allowed }, csrf_token: 'probe-csrf', expires_at: Date.now() / 1000 + 600 });
+    api.setSessionCsrf('probe-csrf');
+    const calls = [];
+    fetch = async (url, options = {}) => {
+      calls.push({ url, options });
+      if (url === '/api/hosts/prod/pipeline') return response({ steps });
+      assert.equal(url, '/api/hosts/prod/artifact-sources');
+      assert.equal(options.method, 'POST');
+      assert.equal(options.headers['X-CSRF-Token'], 'probe-csrf');
+      assert.deepEqual(JSON.parse(options.body), { artifact_dir: '/fixture/patch' });
+      return response({ targets: [{ node: 'prod', state: 'incomplete' }], sources: [{ host_id: 'source', label: 'Source', state: 'complete' }] });
+    };
+    const page = mount(); await renderReadinessStage(page, 'prod');
+    assert.deepEqual(calls.map(call => call.url), ['/api/hosts/prod/pipeline']);
+    assert.match(page.textContent, /all other configured source hosts/);
+    const probe = button(page, 'Probe managed hosts');
+    assert.equal(probe.disabled, !allowed);
+    assert.equal(button(page, 'Stage media').disabled, !allowed);
+    await probe.fire('click');
+    assert.equal(calls.length, allowed ? 2 : 1);
+    if (allowed) assert.equal(field(page, 'Source host').value, 'source');
+    actor.setSessionIdentity({ mode: 'principal', actor: 'fixture-operator', rbac_enabled: true, permissions: { live_discovery: false } });
+    await probe.fire('click');
+    await button(page, 'Stage media').fire('click');
+    assert.equal(calls.length, allowed ? 2 : 1, 'Revoked permission must not issue more host operations');
+  }
+});
+
+test('artifact path edits invalidate a pending source probe and prevent stale staging selection', async () => {
+  actor.setSessionIdentity({ mode: 'principal', actor: 'fixture-operator', rbac_enabled: true, permissions: { live_discovery: true } });
+  let releaseProbe;
+  const calls = [];
+  fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    if (url === '/api/hosts/prod/pipeline') return response({ steps: [
+      { step: 'discovery', done: true, evidence: { databases: [] } },
+      { step: 'artifact-inspect', done: true, status: 'blocked', evidence: { artifact: {
+        path: '/fixture/old', status: 'blocked', reason: 'artifact is incomplete' } } },
+    ] });
+    assert.equal(url, '/api/hosts/prod/artifact-sources');
+    return new Promise(resolve => { releaseProbe = () => resolve(response({
+      targets: [{ node: 'prod', state: 'incomplete' }], sources: [{ host_id: 'old-source', label: 'Old source', state: 'complete' }],
+    })); });
+  };
+  const page = mount(); await renderReadinessStage(page, 'prod');
+  const pending = button(page, 'Probe managed hosts').fire('click');
+  while (!releaseProbe) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(button(page, 'Stage media').disabled, true);
+  field(page, 'Artifact path on this host').value = '/fixture/new';
+  await field(page, 'Artifact path on this host').fire('input');
+  releaseProbe(); await pending;
+  assert.equal(field(page, 'Source host').value, '');
+  assert.doesNotMatch(page.textContent, /Old source/);
+  await button(page, 'Stage media').fire('click');
+  assert.match(page.textContent, /Pick a source host with complete media/);
+  assert.equal(calls.length, 2, 'Staging cannot reuse a source from the previous path');
 });

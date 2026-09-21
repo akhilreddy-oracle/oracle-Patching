@@ -17,9 +17,9 @@ import {
 } from "../ux.js";
 import { backupPolicyChooser, getBackupPolicy, hydrateBackupPolicy, savedPolicyFromSteps } from "../backup_policy.js";
 
-import { wizardContext, planReview, maintenanceWindowError } from "../patch_wizard.js";
+import { wizardContext, targetSummary, planReview, maintenanceWindowError } from "../patch_wizard.js";
 
-export async function renderPlanStage(mount, hostId) {
+export async function renderPlanStage(mount, hostId, { onEvidenceChanged, showTargetSummary = false } = {}) {
   mount.innerHTML = "";
   mount.appendChild(
     el("div", { class: "stage-head" }, [
@@ -31,10 +31,12 @@ export async function renderPlanStage(mount, hostId) {
     ])
   );
 
-  const pipeline = await apiFetch(`/api/hosts/${encodeURIComponent(hostId)}/pipeline`);
+  const pipeline = await apiFetch(`/api/hosts/${encodeURIComponent(hostId)}/plan-preview`);
   const pipelineData = await pipeline.json();
   if (!pipeline.ok) throw new Error(pipelineData.message || "Could not load readiness evidence");
   const context = wizardContext(pipelineData.steps || [], hostId);
+  onEvidenceChanged?.(pipelineData.steps || []);
+  if (showTargetSummary) mount.appendChild(targetSummary(context));
   mount.appendChild(planReview(context));
   hydrateBackupPolicy(hostId, savedPolicyFromSteps(pipelineData.steps || []));
   mount.appendChild(backupPolicyChooser(hostId));
@@ -51,7 +53,7 @@ export async function renderPlanStage(mount, hostId) {
   const createPanel = el("section", { class: "panel" });
   createPanel.appendChild(el("h3", { class: "panel-title", text: "Create sealed plan" }));
   mount.appendChild(createPanel);
-  mountCreateForm(createPanel, hostId, context);
+  mountCreateForm(createPanel, hostId, context, pipelineData.confirmation, pipelineData.reason);
 
   const listPanel = el("section", { class: "panel" });
   listPanel.appendChild(el("h3", { class: "panel-title", text: "Plans for this host" }));
@@ -99,7 +101,7 @@ export async function renderPlanStage(mount, hostId) {
   );
 }
 
-function mountCreateForm(panel, hostId, context) {
+function mountCreateForm(panel, hostId, context, confirmation, reviewReason) {
   const planId = el("input", { type: "text", value: `${hostId}-${Date.now().toString(36)}` });
   const requester = el("input", { type: "text", value: getActor() });
   bindActorField(requester);
@@ -115,11 +117,17 @@ function mountCreateForm(panel, hostId, context) {
   const errBox = formErrorBox();
   const logBox = el("pre", { class: "run-log", style: "display:none" });
   const btn = el("button", { type: "button", text: "Create plan" });
+  const reviewed = Boolean(context.bound && confirmation
+    && /^[a-f0-9]{64}$/.test(confirmation.expected_creation_binding_sha256)
+    && confirmation.patch_id === context.procedure?.patch_id
+    && confirmation.database === (context.procedure?.target?.database_unique_name ?? null));
+  btn.disabled = !reviewed;
+  if (!reviewed) panel.appendChild(helperText(reviewReason || "Reload Plan to review the current evidence before creating a plan.", "warn"));
 
   btn.addEventListener("click", async () => {
     clearFormError(errBox);
     if (!requireToken(errBox)) return;
-    if (!context.bound) { showFormError(errBox, "Validate the selected artifact and README procedure before creating a plan."); return; }
+    if (!reviewed) { showFormError(errBox, reviewReason || "Reload Plan and review the current evidence before creating a plan."); return; }
     const windowError = maintenanceWindowError(windowStart.value.trim(), windowEnd.value.trim());
     if (windowError) { showFormError(errBox, windowError); return; }
     const submittedId = requireNonEmpty(planId, errBox, "Plan ID");
@@ -135,6 +143,7 @@ function mountCreateForm(panel, hostId, context) {
         plan_id: submittedId,
         requester: actor,
         host_id: hostId,
+        ...confirmation,
         window_start: windowStart.value,
         window_end: windowEnd.value,
       });

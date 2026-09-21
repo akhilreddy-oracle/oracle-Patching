@@ -291,8 +291,19 @@ No socket, HTTP parser or listener is constructed by this class.
         return hosts.get(host_id)
 
     def _live_discovery_get(self, path: str) -> bool:
-        return ((path.startswith("/api/hosts/") and path.endswith("/discovery"))
+        return ((path.startswith("/api/hosts/") and path.endswith(("/discovery", "/artifact-sources")))
                 or (path == "/api/estate" and "1" in parse_qs(urlparse(self.path).query).get("live", [])))
+
+    def _send_artifact_sources(self, host_id: str, artifact_dir: str) -> None:
+        hosts = load_hosts()
+        host = hosts.get(host_id)
+        if host is None:
+            self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
+            return
+        try:
+            self._send_json(200, pipeline_steps.artifact_sources(host_id, host, hosts, artifact_dir))
+        except remote.RemoteError as exc:
+            self._send_json(400 if exc.error == "invalid_input" else 502, exc.to_json())
 
     def _require_api_auth(self) -> bool:
         try:
@@ -560,6 +571,39 @@ No socket, HTTP parser or listener is constructed by this class.
                 self._send_json(500, {"error": "discovery_failed", "message": str(exc)})
             return
 
+        if path.startswith("/api/hosts/") and path.endswith("/plan-preview"):
+            host_id = path[len("/api/hosts/"):-len("/plan-preview")]
+            host = self._resolved_host(host_id)
+            if host is None:
+                self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
+                return
+            try:
+                # The rendered review and its confirmation must observe one
+                # generation, excluded from every managed evidence writer.
+                with evidence.host_lock(host_id):
+                    if pipeline_runner.active_run_id(f"host:{host_id}:pipeline"):
+                        self._send_json(409, {"error": "evidence_in_use", "message": "Host evidence has an active or unresolved pipeline; wait or reconcile before reviewing a plan."})
+                        return
+                    steps = pipeline_steps.pipeline_state(host_id)
+                    by_step = {entry["step"]: entry for entry in steps}
+                    validated = by_step.get("procedure-validate", {})
+                    procedure = validated.get("input")
+                    confirmation = None
+                    reason = "Validate the selected artifact and README procedure before creating a plan."
+                    if (validated.get("status") == "ready_for_planning" and isinstance(procedure, dict)
+                            and procedure == (validated.get("evidence") or {}).get("procedure")):
+                        reason = "Complete readiness evaluation with ready_for_approval before creating a plan."
+                        if by_step.get("readiness-evaluate", {}).get("status") == "ready_for_approval":
+                            patch_id = procedure.get("patch_id")
+                            database = (procedure.get("target") or {}).get("database_unique_name")
+                            binding = evidence.creation_binding(host_id, host, patch_id, database)
+                            confirmation = {"expected_creation_binding_sha256": binding, "patch_id": patch_id, "database": database}
+                            reason = None
+                    self._send_json(200, {"steps": steps, "confirmation": confirmation, "reason": reason})
+            except evidence.EvidenceError as exc:
+                self._send_json(409, {"error": "review_unavailable", "message": str(exc)})
+            return
+
         if path.startswith("/api/hosts/") and path.endswith("/pipeline"):
             host_id = path[len("/api/hosts/"):-len("/pipeline")]
             if self._resolved_host(host_id) is None:
@@ -587,19 +631,11 @@ No socket, HTTP parser or listener is constructed by this class.
 
         if path.startswith("/api/hosts/") and path.endswith("/artifact-sources"):
             host_id = path[len("/api/hosts/"):-len("/artifact-sources")]
-            hosts = load_hosts()
-            host = hosts.get(host_id)
-            if host is None:
-                self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
+            directories = parse_qs(urlparse(self.path).query, keep_blank_values=True).get("artifact_dir", [])
+            if len(directories) != 1 or not directories[0]:
+                self._send_json(400, {"error": "invalid_input", "message": "Provide one nonempty artifact_dir"})
                 return
-            artifact_dir = ""
-            for part in urlparse(self.path).query.split("&"):
-                if part.startswith("artifact_dir="):
-                    artifact_dir = unquote(part.split("=", 1)[1])
-            try:
-                self._send_json(200, pipeline_steps.artifact_sources(host_id, host, hosts, artifact_dir))
-            except remote.RemoteError as exc:
-                self._send_json(400 if exc.error == "invalid_input" else 502, exc.to_json())
+            self._send_artifact_sources(host_id, directories[0])
             return
 
         if path.startswith("/api/runs/"):
@@ -771,6 +807,14 @@ No socket, HTTP parser or listener is constructed by this class.
             except ValueError as exc:
                 self._send_json(403, {"error": "fixtures_disabled", "message": str(exc)})
                 return
+
+        if path.startswith("/api/hosts/") and path.endswith("/artifact-sources"):
+            if submitted_body_fields != {"artifact_dir"}:
+                self._send_json(400, {"error": "invalid_body", "message": "Only artifact_dir is accepted"})
+                return
+            host_id = path[len("/api/hosts/"):-len("/artifact-sources")]
+            self._send_artifact_sources(host_id, body["artifact_dir"])
+            return
 
         if path.startswith("/api/fleet/hosts/") and path.endswith("/metadata"):
             host_id = unquote(path[len("/api/fleet/hosts/"):-len("/metadata")])

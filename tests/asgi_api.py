@@ -526,6 +526,50 @@ class AsgiApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.request("/api/estate?live=0", actor=None, headers={"Cookie": cookie})).status_code, 200)
             estate.assert_called_once_with(live=False)
 
+    async def test_artifact_probe_requires_explicit_operator_access_and_exact_body(self):
+        path = "/api/hosts/source/artifact-sources"
+        body = {"artifact_dir": "/fixture/patch"}
+        with patch.object(server.pipeline_steps, "artifact_sources", return_value={"targets": [], "sources": []}) as probe:
+            for actor, expected in ((None, 401), ("viewer", 403), ("requester", 403), ("approver", 403)):
+                for method in ("GET", "POST"):
+                    route = path + "?artifact_dir=%2Ffixture%2Fpatch" if method == "GET" else path
+                    reply = await self.request(route, actor=actor, method=method, body=body if method == "POST" else None)
+                    self.assertEqual(reply.status_code, expected)
+            probe.assert_not_called()
+            for malformed in ({}, {**body, "command": "untrusted"}, {"artifact_dir": []}):
+                reply = await self.request(path, method="POST", body=malformed)
+                self.assertEqual(reply.status_code, 400)
+            self.assertEqual((await self.request("/api/hosts/missing/artifact-sources", method="POST", body=body)).status_code, 404)
+            probe.assert_not_called()
+            self.assertEqual((await self.request(path, method="POST", body=body)).status_code, 200)
+            self.assertEqual(probe.call_args.args[0], "source")
+            self.assertEqual(probe.call_args.args[3], "/fixture/patch")
+            probe.reset_mock()
+            self.assertEqual((await self.request(path + "?artifact_dir=/a&artifact_dir=/b")).status_code, 400)
+            probe.assert_not_called()
+
+    async def test_artifact_probe_company_auth_requires_csrf_even_for_legacy_get(self):
+        path = "/api/hosts/source/artifact-sources"
+        _, cookie, session = self.company_session()
+        with patch.object(server.pipeline_steps, "artifact_sources", return_value={"targets": [], "sources": []}) as probe:
+            for method in ("GET", "POST"):
+                route = path + "?artifact_dir=%2Ffixture%2Fpatch" if method == "GET" else path
+                body = {"artifact_dir": "/fixture/patch"} if method == "POST" else None
+                for headers in ({"Cookie": cookie}, {**self.mutation_headers(cookie, session), "X-CSRF-Token": "wrong"}):
+                    reply = await self.request(route, actor=None, method=method, headers=headers, body=body)
+                    self.assertEqual(reply.status_code, 403)
+                probe.assert_not_called()
+                reply = await self.request(route, actor=None, method=method, headers=self.mutation_headers(cookie, session), body=body)
+                self.assertEqual(reply.status_code, 200)
+                probe.assert_called_once()
+                probe.reset_mock()
+        _, cookie, session = self.company_session(["readers"])
+        with patch.object(server.pipeline_steps, "artifact_sources") as probe:
+            reply = await self.request(path, actor=None, method="POST", headers=self.mutation_headers(cookie, session),
+                                       body={"artifact_dir": "/fixture/patch"})
+            self.assertEqual(reply.status_code, 403)
+            probe.assert_not_called()
+
     async def test_company_callback_preserves_both_set_cookie_headers_and_logout(self):
         fixture, _, _ = self.company_session()
         begin = await self.request("/auth/login", actor=None)

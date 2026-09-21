@@ -64,7 +64,7 @@ export async function renderWorkspace(mount, hostId, stage) {
   };
   if (stage === "discover") await renderDiscoverStage(stageMount, hostId, { onEvidenceChanged });
   else if (stage === "readiness") await renderReadinessStage(stageMount, hostId, { onEvidenceChanged });
-  else if (stage === "plan") await renderPlanStage(stageMount, hostId);
+  else if (stage === "plan") await renderPlanStage(stageMount, hostId, { onEvidenceChanged });
   else if (stage === "execute") await renderExecuteStage(stageMount, hostId);
   else if (stage === "recovery") await renderRecoveryStage(stageMount, hostId);
   else await renderDiscoverStage(stageMount, hostId, { onEvidenceChanged });

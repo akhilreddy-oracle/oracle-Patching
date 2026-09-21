@@ -79,3 +79,23 @@ Those tests start an ephemeral loopback HTTP simulator and exercise the actual
 production transport. Their receipts use `--deterministic-simulator`, which
 only labels the evidence; it neither starts a simulator nor selects an endpoint.
 They do not establish that a real LLM has been installed or evaluated.
+
+## Observed local result: 2026-09-21
+
+With the configured `qwen3:4b-instruct` loopback service and the assistant policy
+from revision `1417ba2`, the six-case protocol assessment passed four cases and
+failed `inspect_target` and `missing_evidence`. Its result is **failed**.
+The receipt is retained locally as
+`webapp/var/mac-local/model-protocol-current-1417ba2-20260921.json`.
+
+A separate reproduction of the two failures returned `list_estate({})` in each
+case: the first expected direct saved-host inspection and the second expected a
+specified needs-input object. No native action was dispatched. The original
+receipt intentionally omits raw responses; the reproduction explains those
+reproduced responses, not an independently captured original response.
+
+Four earlier targeted scenarios passed through the actual conversation loop,
+including inventory-proposal targeting and missing-target handling. They have
+different coverage and do not override the failed protocol assessment. Neither
+assessment qualifies unattended patching or a complete live backup-to-patch
+workflow.

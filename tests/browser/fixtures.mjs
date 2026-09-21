@@ -65,6 +65,14 @@ export const test = base.extend({
         if (url.pathname === '/api/estate') return send(state.estate);
         if (url.pathname === '/api/fleet') return send(state.fleet);
         if (url.pathname === '/api/hosts/source/pipeline') return send({ steps: state.steps });
+        if (url.pathname === '/api/hosts/source/plan-preview') {
+          const procedure = state.steps.find(row => row.step === 'procedure-validate')?.evidence?.procedure;
+          const ready = state.steps.find(row => row.step === 'readiness-evaluate')?.status === 'ready_for_approval';
+          return send({ steps: state.steps, confirmation: ready && procedure ? {
+            expected_creation_binding_sha256: 'c'.repeat(64), patch_id: procedure.patch_id,
+            database: procedure.target?.database_unique_name ?? null,
+          } : null, reason: ready ? null : 'Complete readiness evaluation with ready_for_approval before creating a plan.' });
+        }
         if (url.pathname === '/api/recovery') return send({ requests: state.recoveries, live_available: true, live_reason: 'Fixture capability response only', supported_adapter: 'standalone_primary_noarchivelog_spfile', target_capability_context: { host_id: 'source' }, target_capabilities: state.recoveryCapabilities });
         if (url.pathname === '/api/plans') return send({ plans: state.plans });
         const recovery = state.recoveries.find(row => url.pathname === `/api/recovery/${row.request_id}`);
