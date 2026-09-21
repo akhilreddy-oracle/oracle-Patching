@@ -7,7 +7,7 @@ import { renderPlanStage } from "./stages/plan.js";
 import { renderExecuteStage } from "./stages/execute.js";
 import { renderRecoveryStage } from "./stages/recovery.js";
 
-import { WIZARD_STAGES as STAGES, wizardContext, targetSummary } from "./patch_wizard.js";
+import { WIZARD_STAGES as STAGES, wizardContext, targetSummary, readinessExpiryMessage } from "./patch_wizard.js";
 
 export async function renderWorkspace(mount, hostId, stage) {
   const signal = getReadSignal();
@@ -60,6 +60,7 @@ export async function renderWorkspace(mount, hostId, stage) {
       const state = stageStatuses[id], node = stageBadges.get(id);
       node.textContent = state.text;
       node.className = badge("", state.kind).className;
+      node.title = state.detail || "";
     }
   };
   if (stage === "discover") await renderDiscoverStage(stageMount, hostId, { onEvidenceChanged });
@@ -84,7 +85,9 @@ function updatePipelineStatuses(out, steps) {
   const midSteps = ["reconcile", "artifact-inspect", "procedure-validate", "compatibility-collect", "compatibility-reconcile"];
   const midDone = midSteps.filter((id) => byId[id]?.done).length;
   if (ready?.done) {
-    out.readiness = { kind: classifyStatus(ready.status), text: String(ready.status || "done") };
+    const expired = ready.status === "ready_for_approval" && readinessExpiryMessage(ready.evidence);
+    out.readiness = expired ? { kind: "warn", text: "refresh required", detail: expired }
+      : { kind: classifyStatus(ready.status), text: String(ready.status || "done") };
   } else if (midDone > 0) {
     out.readiness = { kind: "warn", text: `${midDone}/6` };
   }

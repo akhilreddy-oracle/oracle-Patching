@@ -38,7 +38,7 @@ test('saved workspace target and badges follow validation without extra recovery
       await send({ run_id: 'validate' }, 202); return true;
     }
     if (method === 'POST' && url.pathname === '/api/hosts/source/pipeline/readiness-evaluate') {
-      Object.assign(fixture.steps.at(-1), { done: true, status: 'ready_for_approval', evidence: { status: 'ready_for_approval' } });
+      Object.assign(fixture.steps.at(-1), { done: true, status: 'ready_for_approval', evidence: { status: 'ready_for_approval', valid_until: '2099-01-01T00:00:00Z' } });
       fixture.runs.ready = { status: 'succeeded' };
       await send({ run_id: 'ready' }, 202); return true;
     }
@@ -107,6 +107,7 @@ test('wizard reviews target, verified README and Advanced fields before acceptin
   await expect(view.locator('.readiness-finding')).toContainText('RequiredBackup age ≤ 1440 minutes');
   await page.screenshot({ path: testInfo.outputPath('readiness-wizard.png'), fullPage: true });
   fixture.steps.at(-1).status = 'ready_for_approval';
+  fixture.steps.at(-1).evidence.valid_until = '2099-01-01T00:00:00Z';
   await view.locator('.stage-rail').getByRole('link', { name: 'Plan', exact: false }).click();
   await expect(view.getByText('README bound to validated procedure', { exact: true })).toBeVisible();
   await expect(view.getByLabel('Plan ID', { exact: true })).not.toBeVisible();
@@ -123,6 +124,7 @@ test('wizard reviews target, verified README and Advanced fields before acceptin
 
 test('editing a plan ID during creation cannot redirect away from the submitted plan', async ({ page, fixture }) => {
   fixture.steps.at(-1).status = 'ready_for_approval';
+  fixture.steps.at(-1).evidence.valid_until = '2099-01-01T00:00:00Z';
   let releaseRun;
   fixture.custom = async ({ url, method, send }) => {
     if (method === 'POST' && url.pathname === '/api/plans') {
@@ -153,6 +155,7 @@ test('editing a plan ID during creation cannot redirect away from the submitted 
 
 test('plan creation submits the original reviewed target and binding until the operator reviews again', async ({ page, fixture }) => {
   fixture.steps.at(-1).status = 'ready_for_approval';
+  fixture.steps.at(-1).evidence.valid_until = '2099-01-01T00:00:00Z';
   let generation = 'a';
   fixture.custom = async ({ url, method, send }) => {
     if (method === 'GET' && url.pathname === '/api/hosts/source/plan-preview') {
@@ -191,6 +194,29 @@ test('plan review remains available but cannot create while readiness is blocked
   await expect(main(page).getByText('README bound to validated procedure', { exact: true })).toBeVisible();
   await expect(main(page).getByRole('button', { name: 'Create plan', exact: true })).toBeDisabled();
   await expect(main(page).getByText('Complete readiness evaluation with ready_for_approval before creating a plan.', { exact: true })).toBeVisible();
+  expect(fixture.writes).toEqual([]);
+});
+
+test('expired readiness loses its green handoff and expiry during plan review stops submission', async ({ page, fixture }) => {
+  fixture.steps.at(-1).status = 'ready_for_approval';
+  fixture.steps.at(-1).evidence.valid_until = '2000-01-01T00:00:00Z';
+  await page.goto('/#/hosts/source/readiness');
+  const view = main(page);
+  await expect(view.locator('.stage-rail').getByRole('link', { name: /^Readiness/ })).toContainText('refresh required');
+  const card = view.locator('#readiness-step-readiness-evaluate');
+  await expect(card.locator('.badge').first()).toHaveText('refresh required');
+  await expect(card.getByText(/Readiness expired at/)).toBeVisible();
+  await expect(card.getByRole('link', { name: 'Continue to Plan →', exact: true })).toHaveCount(0);
+  await view.locator('.stage-rail').getByRole('link', { name: /^Plan/ }).click();
+  await expect(view.getByRole('button', { name: 'Create plan', exact: true })).toBeDisabled();
+  const expiry = Date.now() + 3600_000;
+  fixture.steps.at(-1).evidence.valid_until = new Date(expiry).toISOString();
+  await page.reload();
+  await expect(view.getByRole('button', { name: 'Create plan', exact: true })).toBeEnabled();
+  await page.evaluate(value => { Date.now = () => value; }, expiry);
+  await view.getByRole('button', { name: 'Create plan', exact: true }).click();
+  await expect(view.getByText(/Readiness expired at/)).toBeVisible();
+  await expect(view.getByRole('button', { name: 'Create plan', exact: true })).toBeDisabled();
   expect(fixture.writes).toEqual([]);
 });
 

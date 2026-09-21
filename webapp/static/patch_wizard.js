@@ -9,6 +9,20 @@ export const WIZARD_STAGES = [
   { id: "execute", label: "Execute", hint: "5 · Apply and verify" },
 ];
 
+/** A saved successful evaluation is usable only until its explicit expiry. */
+export function readinessExpiryMessage(readiness, now = Date.now()) {
+  const value = readiness?.valid_until;
+  const calendar = typeof value === "string" ? value.slice(0, 19) : "";
+  const stamp = typeof value === "string" ? Date.parse(value) : NaN;
+  const valid = typeof value === "string"
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    && Number(value.slice(0, 4)) > 0 && Number.isFinite(stamp)
+    && Number.isFinite(Date.parse(`${calendar}Z`))
+    && new Date(`${calendar}Z`).toISOString().slice(0, 19) === calendar;
+  if (!valid) return "Readiness has no verified expiry. Refresh evidence and evaluate readiness again before creating a plan.";
+  return stamp <= now ? `Readiness expired at ${value}. Refresh evidence and evaluate readiness again before creating a plan.` : null;
+}
+
 export function wizardContext(steps, hostId) {
   const byId = Object.fromEntries((steps || []).map((s) => [s.step, s]));
   const discovery = byId.discovery?.evidence;

@@ -153,6 +153,19 @@ are never deleted. Evidence from an earlier generation cannot complete a new
 claim. `task-status --plan-id ID --task-id ID` returns a verified task and
 rechecks terminal controller custody for recovery and queue reconciliation.
 
+Controller live completion and detached-run reconciliation additionally compare
+the verified task's definition hash and retry generation with the launch record.
+A valid result from another attempt cannot resolve the earlier run. Legacy
+launch records missing this binding remain unresolved and require operator
+investigation; this check does not infer a match from the current task status.
+
+Native UI execution captures one host-inventory snapshot before its first live
+task and retains it through all remaining tasks. Per-task preflight and target
+selection use that same snapshot. This prevents a configuration edit during the
+operation from redirecting later tasks; it does not add a click-time approval
+binding to legacy native UI requests. Chat confirmations retain their separate
+admission and worker-start binding checks.
+
 All managed mutation adapters also share a host-local kernel lock, independently
 of their plan and adapter state directories. The mutation child retains that
 lock if its supervisor dies. The production lock defaults to

@@ -19,7 +19,7 @@ import tempfile
 import uuid
 from contextvars import ContextVar
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 from datetime import datetime, timezone
 from pathlib import Path
@@ -826,8 +826,10 @@ def _task_execution_node(plan: dict, task: dict) -> str:
 
 
 def _resolve_live_host_for_task(plan: dict, task: dict) -> dict:
-    preflight_live_plan_nodes(plan)
-    return _resolve_node_host(_task_execution_node(plan, task))
+    hosts = _PINNED_HOSTS.get()
+    with pinned_hosts(_load_hosts() if hosts is None else hosts):
+        preflight_live_plan_nodes(plan)
+        return _resolve_node_host(_task_execution_node(plan, task))
 
 
 def _remote_plan_root(host: dict) -> str:
@@ -1037,6 +1039,8 @@ def _execute_live(plan_id: str, plan: dict, task: dict, actor: str) -> dict:
         raise _unverified_remote_terminal(returncode, verified, stderr)
     if (returncode == 0) != (verified["status"] == "succeeded"):
         raise PlanError("remote exit contradicts the verified terminal task result")
+    _verify_launched_attempt(plan_id, task["task_id"], verified,
+                             task.get("task_definition_sha256"), task.get("retry_count", 0))
     if status(plan_id).get("state") == "succeeded":
         _run(["reconcile", "--plan-id", plan_id, "--actor", actor])
     pipeline_runner.set_execution_context(detached_terminal=True)
@@ -1197,6 +1201,8 @@ def reconcile_detached_run(record: dict) -> dict:
             return {"status": "unknown", "error": _unverified_remote_terminal(returncode, verified, stderr).to_json()}
         if (returncode == 0) != (verified["status"] == "succeeded"):
             raise PlanError("remote exit contradicts verified task custody")
+        _verify_launched_attempt(plan_id, task_id, verified,
+                                 context.get("task_definition_sha256"), context.get("task_retry_count"))
         if status(plan_id).get("state") == "succeeded":
             reconciliation_actor = record.get("reconciliation_actor")
             if not isinstance(reconciliation_actor, str) or not _ID_RE.fullmatch(reconciliation_actor):
@@ -1209,6 +1215,18 @@ def reconcile_detached_run(record: dict) -> dict:
         return {"status": "succeeded", "result": {"task_result": result, "reconciled": True, "plan_id": plan_id, "task_id": task_id}}
     except (PlanError, remote.RemoteError, ValueError, OSError) as exc:
         return {"status": "unknown", "error": {"message": str(exc)}}
+
+
+def _verify_launched_attempt(plan_id, task_id, verified, definition, retry_count):
+    """Native custody must belong to this launch, not a later valid retry."""
+    if (not isinstance(definition, str) or not re.fullmatch(r"[a-f0-9]{64}", definition)
+            or type(retry_count) is not int or not 0 <= retry_count <= 1000000):
+        raise PlanError("Persisted launch has no verified task-attempt binding; keep this run unresolved")
+    if (verified.get("plan_id") != plan_id or verified.get("task_id") != task_id
+            or verified.get("task_definition_sha256") != definition
+            or type(verified.get("retry_count", 0)) is not int
+            or verified.get("retry_count", 0) != retry_count):
+        raise PlanError("Verified terminal task belongs to a different definition or retry attempt; keep this run unresolved")
 
 def _parse_executor_result(task_id: str, returncode: int, stdout: str, stderr: str) -> dict:
     payload = None
@@ -1261,27 +1279,35 @@ def execute_remaining_tasks(plan_id: str, actor: str, *, max_tasks: int = 200) -
         raise PlanError("max_tasks must be between 1 and 500")
     results: list[dict] = []
     stopped_reason = "succeeded_or_idle"
-    for _ in range(max_tasks):
-        plan = status(plan_id)
-        state = plan.get("state")
-        if state == "succeeded":
-            stopped_reason = "succeeded"
-            break
-        if state != "running":
-            stopped_reason = f"plan_state_{state}"
-            break
-        result = execute_next_task(plan_id, actor)
-        if result is None:
-            stopped_reason = "no_pending_task"
-            break
-        results.append(result)
-        # Stop after a failed/blocked task so operators can intervene.
-        task_status = (result.get("status") if isinstance(result, dict) else None) or ""
-        if str(task_status).lower() in {"failed", "blocked", "error"}:
-            stopped_reason = f"task_{task_status}"
-            break
-    else:
-        stopped_reason = "max_tasks_reached"
+    with ExitStack() as execution_scope:
+        hosts_pinned = _PINNED_HOSTS.get() is not None
+        for _ in range(max_tasks):
+            plan = status(plan_id)
+            state = plan.get("state")
+            if state == "succeeded":
+                stopped_reason = "succeeded"
+                break
+            if state != "running":
+                stopped_reason = f"plan_state_{state}"
+                break
+            if not hosts_pinned and _fixture_dir_for_plan(plan, plan_id) is None:
+                # Native UI actions have no chat proposal snapshot. Capture the
+                # inventory once before the first live task and retain it for
+                # this entire operation, including preflights and later tasks.
+                execution_scope.enter_context(pinned_hosts(_load_hosts()))
+                hosts_pinned = True
+            result = execute_next_task(plan_id, actor)
+            if result is None:
+                stopped_reason = "no_pending_task"
+                break
+            results.append(result)
+            # Stop after a failed/blocked task so operators can intervene.
+            task_status = (result.get("status") if isinstance(result, dict) else None) or ""
+            if str(task_status).lower() in {"failed", "blocked", "error"}:
+                stopped_reason = f"task_{task_status}"
+                break
+        else:
+            stopped_reason = "max_tasks_reached"
     final = status(plan_id)
     if final.get("state") == "succeeded":
         stopped_reason = "succeeded"

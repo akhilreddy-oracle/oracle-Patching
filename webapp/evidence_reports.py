@@ -29,6 +29,23 @@ _FINAL_STAGES = {
     'oop_final_validate', 'oop_switchback_final_validate',
 }
 
+# Out-of-place stages inspect both the workflow's subject home and the home
+# retained for comparison/recovery. Only this native artifact describes the
+# intended inventory; custody file ordering cannot select an Oracle home.
+_OOP_INVENTORY_ARTIFACTS = {
+    'oop_precheck': 'precheck-lspatches.log',
+    'oop_clone_home': 'clone-lspatches.log',
+    'oop_patch_clone': 'patch-clone-after-lspatches.log',
+    'oop_validate_clone': 'validate-clone-lspatches.log',
+    'oop_switch_home': 'switch-clone-lspatches.log',
+    'oop_datapatch': 'datapatch-lspatches.log',
+    'oop_final_validate': 'final-lspatches.log',
+    'oop_switchback_precheck': 'switchback-precheck-clone-lspatches.log',
+    'oop_switch_back': 'switch-back-original-lspatches.log',
+    'oop_switchback_datapatch': 'switchback-datapatch-lspatches.log',
+    'oop_switchback_final_validate': 'switchback-final-lspatches.log',
+}
+
 
 def _checked(path, expected, maximum=64 * 1024 * 1024):
     path = Path(path)
@@ -102,7 +119,9 @@ def _text_facts(name, text, source, facts, target):
         # describe a completed stage's resulting inventory or database health.
         return
     if name.endswith('lspatches.log'):
-        _inventory_facts(text, source, facts)
+        expected = _OOP_INVENTORY_ARTIFACTS.get(source.get('stage'))
+        if expected is None or name == expected:
+            _inventory_facts(text, source, facts)
     values = dict(re.findall(r'(?m)^([A-Z_]+)=(.*?)\s*$', text))
     if name.endswith('health.log'):
         if values.get('DATABASE_UNIQUE_NAME') != target.get('database_unique_name'):
@@ -170,7 +189,7 @@ def build(plan_id):
                     or native.get('stage') != task.get('stage')):
                 raise ValueError('native evidence scope differs from its verified task')
             native_target = native.get('target') or {}
-            if not isinstance(native_target, dict) or any(target.get(key) and native_target.get(key) != target[key] for key in ('database_unique_name', 'oracle_home', 'grid_home')):
+            if not isinstance(native_target, dict) or any(target.get(key) and native_target.get(key) != target[key] for key in ('database_unique_name', 'oracle_home', 'grid_home', 'clone_home')):
                 raise ValueError('native evidence targets another database/home')
             # Failed tasks retain diagnostics but cannot overwrite healthy facts
             # with incomplete checks or pre-failure console output.
@@ -197,7 +216,10 @@ def build(plan_id):
                     if name != ('report-before.json' if _precheck(stage) else 'report-after.json'):
                         continue
                     document = json.loads(raw)
-                    if not isinstance(document, dict) or not isinstance(document.get('target'), dict) or document['target'].get('database_unique_name') != target.get('database_unique_name') or document['target'].get('oracle_home') != target.get('oracle_home'):
+                    if (not isinstance(document, dict) or not isinstance(document.get('target'), dict)
+                            or document['target'].get('database_unique_name') != target.get('database_unique_name')
+                            or document['target'].get('oracle_home') != target.get('oracle_home')
+                            or any(target.get(key) and document['target'].get(key) != target[key] for key in ('grid_home', 'clone_home'))):
                         raise ValueError('reporting observation targets another database/home')
                     for key in _METRICS:
                         _set(task_facts, key, (document.get('observations') or {}).get(key), source)

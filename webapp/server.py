@@ -593,7 +593,14 @@ No socket, HTTP parser or listener is constructed by this class.
                     if (validated.get("status") == "ready_for_planning" and isinstance(procedure, dict)
                             and procedure == (validated.get("evidence") or {}).get("procedure")):
                         reason = "Complete readiness evaluation with ready_for_approval before creating a plan."
-                        if by_step.get("readiness-evaluate", {}).get("status") == "ready_for_approval":
+                        readiness_step = by_step.get("readiness-evaluate", {})
+                        if readiness_step.get("status") == "ready_for_approval":
+                            ready = readiness_step.get("evidence") or {}
+                            expiry = fleet.epoch(ready.get("valid_until"))
+                            reason = "Readiness has expired or has no verified expiry. Refresh evidence and evaluate readiness again before creating a plan."
+                        else:
+                            expiry = None
+                        if expiry is not None and expiry > time.time():
                             patch_id = procedure.get("patch_id")
                             database = (procedure.get("target") or {}).get("database_unique_name")
                             binding = evidence.creation_binding(host_id, host, patch_id, database)

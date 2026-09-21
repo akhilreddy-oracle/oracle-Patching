@@ -375,6 +375,7 @@ def _digest(action):
 
 
 def _proposal(owner, conversation_id, name, arguments, hosts, turn_record=None):
+    arguments = capabilities.validate(name, arguments, hosts)
     binding = capabilities.binding(name, arguments, hosts)
     action = {"id": uuid.uuid4().hex[:24], "tool": name, "arguments": arguments,
         "summary": capabilities.SPECS[name][0], "binding": binding, "state": "pending",
@@ -566,7 +567,7 @@ def send(owner, conversation_id, content, allowed, load_hosts, *, submit=None):
                             name = call["function"]["name"]
                             arguments = json.loads(call["function"]["arguments"])
                             hosts = load_hosts()
-                            capabilities.validate(name, arguments, hosts)
+                            arguments = capabilities.validate(name, arguments, hosts)
                             if capabilities.SPECS[name][2] not in allowed:
                                 raise capabilities.ToolError("Your current role does not permit this tool")
                             if name == "check_live_inventory" and _inventory_target(
@@ -672,6 +673,19 @@ def action(owner, conversation_id, action_id, *, dismiss=False, digest=None, all
         if capabilities.SPECS[selected["tool"]][2] not in allowed:
             raise AssistantError("Your current role does not permit this action", 403)
         verified_hosts = load_hosts()
+        # Older saved cards may contain offset timestamps accepted before the
+        # native UTC contract was enforced. Never rewrite reviewed arguments at
+        # confirmation; require a fresh card with its own exact digest instead.
+        try:
+            normalized = capabilities.validate(selected["tool"], selected["arguments"], verified_hosts)
+        except capabilities.ToolError as exc:
+            selected.update(state="expired", error="Proposal inputs are no longer valid. Prepare a new proposal; no operation was started.")
+            _save(path, data)
+            raise AssistantError(selected["error"], 409) from exc
+        if normalized != selected["arguments"]:
+            selected.update(state="expired", error="Review the maintenance window in UTC on a new proposal; no operation was started.")
+            _save(path, data)
+            raise AssistantError(selected["error"], 409)
         try:
             current_binding = capabilities.binding(selected["tool"], selected["arguments"], verified_hosts)
         except capabilities.PreparationRequired as exc:

@@ -59,6 +59,7 @@ def definitions(allowed):
 def validate(name, arguments, hosts):
     if name not in SPECS or not isinstance(arguments, dict) or set(arguments) != set(SPECS[name][1]):
         raise ToolError("Unsupported tool or unexpected arguments")
+    arguments = dict(arguments)
     for key, value in arguments.items():
         if not isinstance(value, str) or not value or len(value) > 512 or any(ord(c) < 32 for c in value):
             raise ToolError(f"Invalid {key}")
@@ -73,11 +74,19 @@ def validate(name, arguments, hosts):
             start, end = [datetime.fromisoformat(arguments[key].replace("Z", "+00:00")) for key in ("window_start", "window_end")]
             if start.tzinfo is None or end.tzinfo is None or start >= end:
                 raise ValueError()
-        except ValueError:
-            raise ToolError("Maintenance window needs ordered ISO timestamps with an explicit timezone") from None
+            # Native plan and recovery commands accept UTC at second precision.
+            # Normalize before the review card is persisted, never only after
+            # confirmation, so its digest covers the exact dispatched window.
+            for key, value in (("window_start", start), ("window_end", end)):
+                value = value.astimezone(timezone.utc)
+                if value.microsecond:
+                    raise ValueError()
+                arguments[key] = value.isoformat(timespec="seconds").replace("+00:00", "Z")
+        except (ValueError, OverflowError):
+            raise ToolError("Maintenance window needs ordered ISO timestamps with an explicit timezone and whole-second precision") from None
     if "backup_parent" in arguments and not re.fullmatch(r"/[A-Za-z0-9_./-]+", arguments["backup_parent"]):
         raise ToolError("Backup parent must be an absolute server path")
-    return dict(arguments)
+    return arguments
 
 
 def _fields(value, names):

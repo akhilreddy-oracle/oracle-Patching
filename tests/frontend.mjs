@@ -452,6 +452,7 @@ test('creation pages open the submitted record even if its editable ID changes w
       }, steps: [
         { step: 'artifact-inspect', done: true, evidence: { artifact } },
         { step: 'procedure-validate', done: true, status: 'ready_for_planning', evidence: { procedure } },
+        { step: 'readiness-evaluate', done: true, status: 'ready_for_approval', evidence: { status: 'ready_for_approval', valid_until: '2099-01-01T00:00:00Z' } },
       ] });
       return response({ plans: [], tasks: [] });
     };
@@ -523,6 +524,51 @@ const readinessSteps = (media = artifact, saved = null, input = null, databases 
   { step: 'artifact-inspect', done: true, status: 'ready_for_catalog', evidence: { artifact: media } },
   { step: 'procedure-validate', done: Boolean(saved), status: saved ? 'ready_for_planning' : null, evidence: saved ? { procedure: saved } : null, input },
 ];
+
+test('expired or undated readiness cannot appear current in the workspace or offer a plan handoff', async () => {
+  for (const valid_until of [undefined, '2000-01-01T00:00:00Z', 'bad timestamp', '2099-01-01T00:00:00', '2099-02-30T00:00:00Z']) {
+    const steps = readinessSteps();
+    steps.push({ step: 'readiness-evaluate', done: true, status: 'ready_for_approval', evidence: { status: 'ready_for_approval', valid_until } });
+    fetch = async url => response(url.endsWith('/pipeline') ? { steps } : { plans: [], requests: [] });
+    const page = mount(); await renderWorkspace(page, 'prod', 'readiness');
+    const state = page.querySelectorAll('.stage-rail-item').find(item => item.textContent.startsWith('Readiness')).querySelector('.badge');
+    assert.equal(state.textContent, 'refresh required');
+    assert.equal(state.classList.contains('is-ok'), false);
+    const card = page.querySelector('#readiness-step-readiness-evaluate');
+    assert.equal(card.querySelector('.badge').textContent, 'refresh required');
+    assert.match(card.textContent, /Refresh evidence and evaluate readiness again/);
+    assert.equal(card.querySelectorAll('a').some(link => link.textContent === 'Continue to Plan →'), false);
+  }
+});
+
+test('plan creation rechecks readiness expiry after review before issuing any POST', async () => {
+  const procedure = buildProcedure('database_single_instance_opatch', procedureFields, artifact);
+  const steps = readinessSteps(artifact, procedure);
+  const observedAt = Date.parse('2030-01-01T01:00:00Z');
+  const expiresAt = observedAt + 60_000;
+  steps.push({ step: 'readiness-evaluate', done: true, status: 'ready_for_approval', evidence: { status: 'ready_for_approval', valid_until: new Date(expiresAt).toISOString() } });
+  const posts = [];
+  fetch = async (url, options) => {
+    if (options.method === 'POST') posts.push(url);
+    return response(url.endsWith('/plan-preview') ? { steps, confirmation: {
+      expected_creation_binding_sha256: 'c'.repeat(64), patch_id: procedure.patch_id, database: procedure.target.database_unique_name,
+    } } : { plans: [] });
+  };
+  const originalNow = Date.now;
+  try {
+    Date.now = () => observedAt;
+    const page = mount(); await renderPlanStage(page, 'prod');
+    const submit = button(page, 'Create plan');
+    assert.equal(submit.disabled, false);
+    Date.now = () => expiresAt;
+    await submit.fire('click');
+    assert.deepEqual(posts, []);
+    assert.equal(submit.disabled, true);
+    assert.match(page.textContent, /Readiness expired at/);
+    const reloaded = mount(); await renderPlanStage(reloaded, 'prod');
+    assert.equal(button(reloaded, 'Create plan').disabled, true);
+  } finally { Date.now = originalNow; }
+});
 const readmeHint = (media = artifact, identifier = 'README.html') => ({
   artifact_sha256: media.sha256, readme_identifier: identifier,
   readme_sha256: media.readme_files.find(entry => entry.path === identifier).sha256,
@@ -547,7 +593,7 @@ test('workspace follows saved procedure and readiness changes without recovery r
         steps[2].evidence.procedure = JSON.parse(options.body).procedure;
         ready.done = false; ready.status = null; ready.evidence = null;
       } else if (url.endsWith('/readiness-evaluate')) {
-        ready.done = true; ready.status = 'ready_for_approval'; ready.evidence = { status: ready.status };
+        ready.done = true; ready.status = 'ready_for_approval'; ready.evidence = { status: ready.status, valid_until: '2099-01-01T00:00:00Z' };
       } else assert.fail(`Unexpected mutation ${url}`);
       return response({ run_id: 'workflow-refresh' }, 202);
     }
@@ -1289,6 +1335,34 @@ test('live recovery remains unavailable unless the server explicitly exposes the
   assert.equal(field(page, 'Backup parent directory').disabled, true);
   await button(page, 'Create live recovery request').fire('click');
   assert.equal(writes, 0);
+});
+
+test('failed or interrupted backup selection removes the old planning handoff', async () => {
+  for (const outcome of ['failed', 'unknown', 'poll-error', 'unconfirmed-success']) {
+    let started = false;
+    fetch = async (url, options = {}) => {
+      if (options.method === 'POST') { started = true; return response({ run_id: 'replacement' }); }
+      if (url.startsWith('/api/runs/')) {
+        if (outcome === 'poll-error') throw new Error('Connection lost');
+        return response({ run_id: 'replacement', status: outcome === 'unconfirmed-success' ? 'succeeded' : outcome,
+          result: { status: 'passed' }, error: { message: 'Backup validation failed' } });
+      }
+      if (url === '/api/recovery?host_id=prod') return response({ ...recoveryCapability(), requests: [
+        { request_id: 'backup-B', host_id: 'prod', mode: 'live', state: 'completed' },
+      ] });
+      const steps = recoverySteps();
+      steps.find(step => step.step === 'readiness-evaluate').recovery_selection = started ? null : { request_id: 'backup-A', host_id: 'prod' };
+      return response({ steps });
+    };
+    const page = mount(); await renderRecoveryStage(page, 'prod');
+    const summary = page.querySelector('.recovery-selection');
+    assert.match(summary.textContent, /Selected request: backup-A/, outcome);
+    assert.equal(summary.querySelectorAll('a').length, 1, outcome);
+    await button(page, 'Validate for patch planning').fire('click');
+    assert.doesNotMatch(summary.textContent, /Selected request: backup-A/, outcome);
+    assert.match(summary.textContent, /Backup selection is not confirmed/, outcome);
+    assert.equal(summary.querySelectorAll('a').length, 0, outcome);
+  }
 });
 
 function inspectionFixture() {

@@ -68,6 +68,95 @@ class PlanTransportTests(unittest.TestCase):
                     self.assertEqual(planctl._resolve_live_host_for_task(plan, {"node": name + ".two"})["id"], name + ".two")
                     self.assertEqual(planctl._resolve_live_host_for_task(plan, {"node": name})["id"], name + ".one")
 
+    def test_native_single_task_preflight_and_selection_use_one_inventory_snapshot(self):
+        first = {"id": "node", "ssh_alias": "reviewed.invalid"}
+        changed = {**first, "ssh_alias": "changed.invalid"}
+        with patch.object(planctl, "_load_hosts", side_effect=[{"node": first}, {"node": changed}]) as load:
+            selected = planctl._resolve_live_host_for_task({"nodes": ["node"]}, {"node": "node"})
+        self.assertEqual(selected["ssh_alias"], "reviewed.invalid")
+        load.assert_called_once()
+        self.assertIsNone(planctl._PINNED_HOSTS.get())
+
+    def test_native_remaining_tasks_pin_routes_even_without_a_chat_confirmation(self):
+        host = {"id": "node", "ssh_alias": "initial.invalid", "nodes": [{"name": "node", "ssh_alias": "initial.invalid"}]}
+        hosts = {"node": host}
+        plan = {"plan_id": "plan", "nodes": ["node"], "state": "running"}
+        tasks = [{"task_id": "first", "node": "node"}, {"task_id": "second", "node": "node"}]
+        selected = []
+        def execute(plan_id, current_plan, task, actor):
+            selected.append(planctl._resolve_live_host_for_task(current_plan, task)["ssh_alias"])
+            host["nodes"][0]["ssh_alias"] = "changed.invalid"
+            if len(selected) == 2:
+                plan["state"] = "succeeded"
+            return {"task_id": task["task_id"], "status": "succeeded"}
+        with patch.object(planctl, "_load_hosts", return_value=hosts) as load, \
+             patch.object(planctl, "status", return_value=plan), \
+             patch.object(planctl, "next_task", side_effect=tasks), \
+             patch.object(planctl, "_fixture_dir_for_plan", return_value=None), \
+             patch.object(planctl, "_require_controller_transport"), \
+             patch.object(planctl, "_execute_live", side_effect=execute):
+            result = planctl.execute_remaining_tasks("plan", "operator")
+            self.assertEqual(result["executed_count"], 2)
+            self.assertEqual(selected, ["initial.invalid", "initial.invalid"])
+            load.assert_called_once()
+            self.assertIsNone(planctl._PINNED_HOSTS.get())
+            self.assertEqual(planctl._resolve_live_host_for_task(plan, tasks[0])["ssh_alias"], "changed.invalid")
+
+    def test_reconciliation_requires_the_exact_launched_task_definition_and_retry(self):
+        host = {"id": "node", "node_name": "node", "ssh_alias": "never-connect", "remote_root": "/fixture"}
+        context = {"plan_id": "plan", "task_id": "task", "node": "node", "host_id": "node",
+            "ssh_alias": "never-connect", "remote_root": "/fixture",
+            "remote_run_dir": "/fixture/var/webapp-runs/plan/task/" + "a" * 32,
+            "task_definition_sha256": "b" * 64, "task_retry_count": 1}
+        terminal = {"plan_id": "plan", "task_id": "task", "status": "succeeded",
+                    "task_definition_sha256": "b" * 64, "retry_count": 1}
+        for difference in ({}, {"retry_count": 2}, {"retry_count": True}, {"task_definition_sha256": "c" * 64},
+                           {"plan_id": "other"}, {"task_id": "other"}):
+            with self.subTest(difference=difference), \
+                 patch.object(planctl, "_resolve_node_host", return_value=host), \
+                 patch.object(planctl.remote, "run_remote_shell", return_value=SimpleNamespace(returncode=0, stdout="RC\n0\n")), \
+                 patch.object(planctl.remote, "run_remote_raw", side_effect=[
+                     SimpleNamespace(returncode=0, stdout='{"task_id":"task","status":"succeeded"}'),
+                     SimpleNamespace(returncode=0, stdout="")]), \
+                 patch.object(planctl, "_sync_plan_from_host"), \
+                 patch.object(planctl, "_run", return_value={**terminal, **difference}), \
+                 patch.object(planctl, "status", return_value={"state": "running"}) as status:
+                result = planctl.reconcile_detached_run({"context": context})
+                self.assertEqual(result["status"], "unknown" if difference else "succeeded")
+                if difference:
+                    self.assertIn("different definition or retry", result["error"]["message"])
+                    status.assert_not_called()
+        for missing in ("task_definition_sha256", "task_retry_count"):
+            legacy = {key: value for key, value in context.items() if key != missing}
+            with self.subTest(missing=missing), \
+                 patch.object(planctl, "_resolve_node_host", return_value=host), \
+                 patch.object(planctl.remote, "run_remote_shell", return_value=SimpleNamespace(returncode=0, stdout="RC\n0\n")), \
+                 patch.object(planctl.remote, "run_remote_raw", side_effect=[
+                     SimpleNamespace(returncode=0, stdout='{"task_id":"task","status":"succeeded"}'),
+                     SimpleNamespace(returncode=0, stdout="")]), \
+                 patch.object(planctl, "_sync_plan_from_host"), \
+                 patch.object(planctl, "_run", return_value=terminal):
+                result = planctl.reconcile_detached_run({"context": legacy})
+                self.assertEqual(result["status"], "unknown")
+                self.assertIn("no verified task-attempt binding", result["error"]["message"])
+
+    def test_live_completion_cannot_mark_another_valid_retry_terminal(self):
+        task = {"task_id": "task", "adapter": "database_single_instance_opatch",
+                "task_definition_sha256": "b" * 64, "retry_count": 1}
+        terminal = {**task, "plan_id": "plan", "status": "succeeded", "retry_count": 2}
+        with patch.object(planctl.production, "require_live_mutation_allowed"), \
+             patch.object(planctl, "_resolve_live_host_for_task", return_value=self.host), \
+             patch.object(planctl, "_sync_plan_to_host", return_value=("/fixture/plans", runtime_receipt(self.host["ssh_alias"], self.host["remote_root"]))), \
+             patch.object(planctl, "_run_detached_remote", return_value=(0, '{"task_id":"task","status":"succeeded"}', "")), \
+             patch.object(planctl, "_sync_plan_from_host"), \
+             patch.object(planctl, "_run", return_value=terminal), \
+             patch.object(planctl, "status") as status:
+            with self.assertRaisesRegex(planctl.PlanError, "different definition or retry"):
+                planctl._execute_live("plan", {}, task, "operator")
+            status.assert_not_called()
+        self.assertFalse(any(call.kwargs.get("detached_terminal") is True
+                             for call in planctl.pipeline_runner.set_execution_context.call_args_list))
+
     def test_launch_does_not_fork_when_directory_preparation_fails(self):
         for failure in ("mkdir", "cd"):
             with self.subTest(failure=failure):

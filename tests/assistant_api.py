@@ -280,6 +280,21 @@ class AssistantApiTests(unittest.TestCase):
         self.native["recoveryctl.approve"].assert_not_called()
         self.native["recoveryctl.authorize"].assert_not_called()
 
+    def test_offset_backup_window_reaches_native_handler_as_reviewed_utc(self):
+        arguments = {"host_id": "source", "request_id": "offset-backup", "database": "ORCL",
+            "backup_parent": "/fixture/backup", "window_start": "2099-01-01T06:30:00+05:30",
+            "window_end": "2099-01-01T07:30:00+05:30"}
+        conversation_id, action = self.prepare("create_backup", arguments, actor="requester")
+        self.assertEqual(action["arguments"]["window_start"], "2099-01-01T01:00:00Z")
+        self.assertEqual(action["arguments"]["window_end"], "2099-01-01T02:00:00Z")
+        response = self.execute(conversation_id, action, actor="requester")
+        self.assertEqual(response["status"], 202, response)
+        record = self.wait_run(response["body"]["run_id"])
+        self.assertEqual(record.status, "succeeded", record.error)
+        self.native["recoveryctl.create_live"].assert_called_once_with("offset-backup", "requester",
+            host=self.host, host_id="source", database="ORCL", backup_parent="/fixture/backup",
+            window_start="2099-01-01T01:00:00Z", window_end="2099-01-01T02:00:00Z", policy=None)
+
     def test_confirmed_host_pipeline_uses_shared_host_key_and_server_owned_context(self):
         for name, step, arguments in (("refresh_discovery", "discovery", {"host_id": "source"}),
                                      ("check_live_inventory", "discovery", {"host_id": "source"}),

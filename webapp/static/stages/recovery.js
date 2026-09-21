@@ -36,10 +36,10 @@ export async function renderRecoveryStage(mount, hostId) {
   if (!liveAvailable && data.live_reason) mount.appendChild(helperText(data.live_reason, "warn"));
   const selection = steps.find((step) => step.step === "readiness-evaluate")?.recovery_selection;
   const selectedSummary = el("section", { class: "panel recovery-selection" });
-  const showSelection = (selected) => {
+  const showSelection = (selected, unconfirmed = false) => {
     selectedSummary.innerHTML = "";
     selectedSummary.appendChild(el("h3", { class: "panel-title", text: "Backup selected for patch readiness" }));
-    selectedSummary.appendChild(helperText(selected?.request_id ? `Selected request: ${selected.request_id}. Readiness will verify freshness, target and policy again.` : "No validated backup is selected. Complete a live recovery request, then validate it for patch planning.", selected?.request_id ? null : "warn"));
+    selectedSummary.appendChild(helperText(selected?.request_id ? `Selected request: ${selected.request_id}. Readiness will verify freshness, target and policy again.` : unconfirmed ? "Backup selection is not confirmed. Wait for validation; if it fails or disconnects, refresh this page to inspect the saved selection before continuing." : "No validated backup is selected. Complete a live recovery request, then validate it for patch planning.", selected?.request_id ? null : "warn"));
     if (selected?.request_id) selectedSummary.appendChild(el("a", { class: "back-link", href: `#/hosts/${encodeURIComponent(hostId)}/readiness`, text: "Continue to readiness evaluation →" }));
   };
   showSelection(selection?.host_id === hostId ? selection : null);
@@ -59,6 +59,10 @@ export async function renderRecoveryStage(mount, hostId) {
           btn.addEventListener("click", async () => {
             if (!liveAvailable) return;
             btn.disabled = true;
+            // Collection clears the previous selection before validating the
+            // new request. A failed or interrupted run must not keep the old
+            // backup displayed as authority to continue planning.
+            showSelection(null, true);
             logBox.style.display = "block";
             logBox.classList.remove("run-log-error");
             logBox.textContent = "Validating the completed backup against current discovery…";

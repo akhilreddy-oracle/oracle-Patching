@@ -773,7 +773,7 @@ os._exit(0)
         procedure = {"patch_id": patch_id, "target": {"database_unique_name": database}}
         evidence.write_evidence("h", "procedure_input", procedure)
         evidence.write_evidence("h", "procedure", {"status": "ready_for_planning", "procedure": procedure})
-        evidence.write_evidence("h", "readiness", {"status": "ready_for_approval"})
+        evidence.write_evidence("h", "readiness", {"status": "ready_for_approval", "valid_until": "2099-01-01T00:00:00Z"})
 
     def test_plan_review_binds_the_displayed_generation_and_rejects_a_second_sessions_changes(self):
         self._plan_review_evidence()
@@ -809,6 +809,18 @@ os._exit(0)
             # Read access to a review does not confer create permission.
             self.assertEqual(self.request("/api/hosts/h/plan-preview", actor="viewer", method="GET")[0], 200)
             self.assertEqual(self.request("/api/plans", actor="viewer", body={**body, "requester": "viewer"})[0], 403)
+
+    def test_plan_review_withholds_confirmation_when_readiness_expiry_is_not_current(self):
+        self._plan_review_evidence()
+        for expiry in (None, "2000-01-01T00:00:00Z", "invalid", "2099-01-01T00:00:00", 123):
+            with self.subTest(expiry=expiry):
+                evidence.write_evidence("h", "readiness", {"status": "ready_for_approval", "valid_until": expiry})
+                status, preview = self.request("/api/hosts/h/plan-preview", method="GET")
+                self.assertEqual(status, 200)
+                self.assertIsNone(preview["confirmation"])
+                self.assertIn("Refresh", preview["reason"])
+        evidence.write_evidence("h", "readiness", {"status": "ready_for_approval", "valid_until": "2099-01-01T00:00:00Z"})
+        self.assertIsNotNone(self.request("/api/hosts/h/plan-preview", method="GET")[1]["confirmation"])
 
     def test_plan_review_excludes_writers_and_withholds_confirmation_for_incomplete_evidence(self):
         self._plan_review_evidence()
@@ -872,8 +884,10 @@ os._exit(0)
 
     def test_remote_reconciliation_inspects_existing_launch_only(self):
         host = {"id": "h", "node_name": "n", "ssh_alias": "alias", "remote_root": "/opt/opu"}
-        context = {"plan_id": "p", "task_id": "t", "node": "n", "host_id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu", "remote_run_dir": "/opt/opu/var/webapp-runs/p/t/" + "a" * 32}
-        with patch.object(planctl, "_resolve_node_host", return_value=host), patch.object(planctl.remote, "run_remote_shell", return_value=SimpleNamespace(returncode=0, stdout="RC\n0\n")) as shell, patch.object(planctl.remote, "run_remote_raw", side_effect=[SimpleNamespace(returncode=0, stdout='{"status":"succeeded","task_id":"t"}'), SimpleNamespace(returncode=0, stdout="")]), patch.object(planctl, "_sync_plan_from_host") as sync, patch.object(planctl, "status", return_value={"state": "running"}), patch.object(planctl, "_run", return_value={"status": "succeeded"}) as verified:
+        context = {"plan_id": "p", "task_id": "t", "node": "n", "host_id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu", "remote_run_dir": "/opt/opu/var/webapp-runs/p/t/" + "a" * 32,
+                   "task_definition_sha256": "b" * 64, "task_retry_count": 0}
+        terminal = {"plan_id": "p", "task_id": "t", "status": "succeeded", "task_definition_sha256": "b" * 64, "retry_count": 0}
+        with patch.object(planctl, "_resolve_node_host", return_value=host), patch.object(planctl.remote, "run_remote_shell", return_value=SimpleNamespace(returncode=0, stdout="RC\n0\n")) as shell, patch.object(planctl.remote, "run_remote_raw", side_effect=[SimpleNamespace(returncode=0, stdout='{"status":"succeeded","task_id":"t"}'), SimpleNamespace(returncode=0, stdout="")]), patch.object(planctl, "_sync_plan_from_host") as sync, patch.object(planctl, "status", return_value={"state": "running"}), patch.object(planctl, "_run", return_value=terminal) as verified:
             result = planctl.reconcile_detached_run({"context": context})
             self.assertEqual(result["status"], "succeeded")
             self.assertNotIn("nohup", shell.call_args.args[1])
@@ -907,12 +921,13 @@ os._exit(0)
     def test_live_verified_terminal_result_is_unchanged(self):
         host = {"id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu"}
         task = {"task_id": "t", "adapter": "database_single_instance_opatch", "task_definition_sha256": "a" * 64, "retry_count": 1}
+        terminal = {**task, "plan_id": "p", "status": "succeeded"}
         with patch.object(planctl.production, "require_live_mutation_allowed"), \
              patch.object(planctl, "_resolve_live_host_for_task", return_value=host), \
              patch.object(planctl, "_sync_plan_to_host", return_value=("/opt/opu/plans", runtime_receipt(host["ssh_alias"], host["remote_root"]))), \
              patch.object(planctl, "_run_detached_remote", return_value=(0, '{"status":"succeeded","task_id":"t"}', "")) as launch, \
              patch.object(planctl, "_sync_plan_from_host"), \
-             patch.object(planctl, "_run", return_value={"status": "succeeded"}) as verified, \
+             patch.object(planctl, "_run", return_value=terminal) as verified, \
              patch.object(planctl, "status", return_value={"state": "running"}), \
              patch.object(pipeline_runner, "set_execution_context") as context:
             self.assertEqual(planctl._execute_live("p", {}, task, "operator"), {"status": "succeeded", "task_id": "t"})

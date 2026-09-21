@@ -17,7 +17,7 @@ import {
 } from "../ux.js";
 import { backupPolicyChooser, getBackupPolicy, hydrateBackupPolicy, savedPolicyFromSteps } from "../backup_policy.js";
 
-import { wizardContext, targetSummary, planReview, maintenanceWindowError } from "../patch_wizard.js";
+import { wizardContext, targetSummary, planReview, maintenanceWindowError, readinessExpiryMessage } from "../patch_wizard.js";
 
 export async function renderPlanStage(mount, hostId, { onEvidenceChanged, showTargetSummary = false } = {}) {
   mount.innerHTML = "";
@@ -117,17 +117,20 @@ function mountCreateForm(panel, hostId, context, confirmation, reviewReason) {
   const errBox = formErrorBox();
   const logBox = el("pre", { class: "run-log", style: "display:none" });
   const btn = el("button", { type: "button", text: "Create plan" });
+  const expiryMessage = confirmation ? readinessExpiryMessage(context.readiness) : null;
   const reviewed = Boolean(context.bound && confirmation
     && /^[a-f0-9]{64}$/.test(confirmation.expected_creation_binding_sha256)
     && confirmation.patch_id === context.procedure?.patch_id
     && confirmation.database === (context.procedure?.target?.database_unique_name ?? null));
-  btn.disabled = !reviewed;
-  if (!reviewed) panel.appendChild(helperText(reviewReason || "Reload Plan to review the current evidence before creating a plan.", "warn"));
+  btn.disabled = !reviewed || Boolean(expiryMessage);
+  if (!reviewed || expiryMessage) panel.appendChild(helperText(expiryMessage || reviewReason || "Reload Plan to review the current evidence before creating a plan.", "warn"));
 
   btn.addEventListener("click", async () => {
     clearFormError(errBox);
     if (!requireToken(errBox)) return;
     if (!reviewed) { showFormError(errBox, reviewReason || "Reload Plan and review the current evidence before creating a plan."); return; }
+    const expired = readinessExpiryMessage(context.readiness);
+    if (expired) { btn.disabled = true; showFormError(errBox, expired); return; }
     const windowError = maintenanceWindowError(windowStart.value.trim(), windowEnd.value.trim());
     if (windowError) { showFormError(errBox, windowError); return; }
     const submittedId = requireNonEmpty(planId, errBox, "Plan ID");

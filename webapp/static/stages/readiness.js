@@ -20,6 +20,7 @@ import { backupPolicyChooser, policyRecoveryBlock, getBackupPolicy, hydrateBacku
 import { PROCEDURE_ADAPTERS, REQUIRED_PRECHECKS, REQUIRED_POSTCHECKS, buildProcedure, procedureMatchesArtifact } from "../procedure_adapters.js";
 
 import { blockerCards } from "../readiness_blockers.js";
+import { readinessExpiryMessage } from "../patch_wizard.js";
 
 const STEP_LABELS = {
   reconcile: "Topology reconciliation",
@@ -204,9 +205,10 @@ function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft, onR
   // (artifact-inspect nests status under evidence.artifact.status).
   const done = Boolean(stepState.done || evidence);
   const status = effectiveStatus(stepState);
+  const expiryMessage = step === "readiness-evaluate" && status === "ready_for_approval" ? readinessExpiryMessage(evidence) : null;
   const card = el("section", { class: "panel step-card", id: `readiness-step-${step}` });
-  const displayStatus = done ? status || "done" : "not run";
-  const statusBadge = badge(displayStatus, done ? classifyStatus(displayStatus) : "neutral");
+  const displayStatus = expiryMessage ? "refresh required" : done ? status || "done" : "not run";
+  const statusBadge = badge(displayStatus, expiryMessage ? "warn" : done ? classifyStatus(displayStatus) : "neutral");
 
   card.appendChild(
     el("div", { class: "step-card-head" }, [
@@ -215,7 +217,7 @@ function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft, onR
     ])
   );
 
-  const explained = explainStatus(status, { done });
+  const explained = expiryMessage ? { text: expiryMessage, kind: "warn" } : explainStatus(status, { done });
   const statusExplanation = helperText(
     explained.text,
     explained.kind === "ok" ? null : explained.kind === "error" ? "error" : explained.kind === "warn" ? "warn" : null
@@ -279,7 +281,7 @@ function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft, onR
 
   buildControls(hostId, step, controls, logBox, refresh, allSteps, evidence, { statusBadge, statusExplanation, status, selectedPolicyDraft });
 
-  if (step === "readiness-evaluate" && status === "ready_for_approval") {
+  if (step === "readiness-evaluate" && status === "ready_for_approval" && !expiryMessage) {
     card.appendChild(
       el("p", { class: "stage-next" }, [
         el("a", { href: `#/hosts/${encodeURIComponent(hostId)}/plan`, text: "Continue to Plan →" }),

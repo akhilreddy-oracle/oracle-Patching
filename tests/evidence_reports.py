@@ -114,6 +114,46 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(fact['value'], 0)
         self.assertTrue(fact['source']['label'].endswith('datapatch-dictionary.log'))
 
+    def test_out_of_place_inventory_uses_the_stage_subject_not_the_comparison_home(self):
+        cases = (
+            ('oop_patch_clone', 'patch-clone-after-lspatches.log', 'patch-clone-active-lspatches.log', 'after', ['39034528']),
+            ('oop_validate_clone', 'validate-clone-lspatches.log', 'validate-clone-active-lspatches.log', 'after', ['39034528']),
+            ('oop_final_validate', 'final-lspatches.log', 'final-original-lspatches.log', 'after', ['39034528']),
+            ('oop_switchback_precheck', 'switchback-precheck-clone-lspatches.log', 'switchback-precheck-original-lspatches.log', 'before', ['39034528']),
+            ('oop_switch_back', 'switch-back-original-lspatches.log', 'switch-back-clone-lspatches.log', 'after', ['123']),
+        )
+        for stage, subject, comparison, side, expected in cases:
+            # The custody order must never decide which Oracle home a metric describes.
+            for reverse in (False, True):
+                with self.subTest(stage=stage, reverse=reverse):
+                    self.tasks.clear()
+                    other = ['123'] if expected == ['39034528'] else ['39034528']
+                    files = [(subject, expected[0] + ';workflow subject\n'), (comparison, other[0] + ';comparison home\n')]
+                    self.task('oop-' + stage, stage, files=dict(reversed(files) if reverse else files))
+                    fact = self.comparison(reports.build('p'), 'binary_inventory')[side]
+                    self.assertEqual(fact['value'], expected)
+                    self.assertTrue(fact['source']['label'].endswith(subject))
+
+    def test_out_of_place_comparison_home_cannot_replace_a_missing_or_invalid_subject(self):
+        for subject in (None, 'Inventory unavailable\n'):
+            with self.subTest(subject=subject):
+                self.tasks.clear()
+                files = {'final-original-lspatches.log': '123;original home\n'}
+                if subject is not None:
+                    files['final-lspatches.log'] = subject
+                self.task('final', 'oop_final_validate', files=files)
+                fact = self.comparison(reports.build('p'), 'binary_inventory')['after']
+                self.assertEqual((fact['status'], fact['value']), ('unknown', None))
+
+    def test_out_of_place_evidence_for_another_clone_cannot_establish_completion(self):
+        self.plan.update(state='succeeded', target={**self.target, 'clone_home': '/u02/reviewed-clone'})
+        self.target['clone_home'] = '/u03/different-clone'
+        self.task('final', 'oop_final_validate', files={'final-lspatches.log': '39034528;RU\n'})
+        report = reports.build('p')
+        self.assertFalse(report['completion_verified'])
+        self.assertEqual(report['rollback']['status'], 'not_available')
+        self.assertEqual(self.comparison(report, 'binary_inventory')['after']['status'], 'unknown')
+
     def test_successful_rollback_inventory_can_be_empty_without_retaining_applied_patches(self):
         for output in ('', 'OPatch succeeded.\n', 'There are no Interim patches installed in this Oracle Home.\nOPatch succeeded.\n'):
             with self.subTest(output=output):
@@ -208,7 +248,8 @@ class ReportTests(unittest.TestCase):
                       'ojvm_rollback_precheck', 'oop_precheck', 'oop_switchback_precheck'):
             with self.subTest(stage=stage):
                 self.tasks.clear()
-                self.task('before-' + stage, stage, files={'precheck-lspatches.log': '123;baseline\n'})
+                name = 'switchback-precheck-clone-lspatches.log' if stage == 'oop_switchback_precheck' else 'precheck-lspatches.log'
+                self.task('before-' + stage, stage, files={name: '123;baseline\n'})
                 row = self.comparison(reports.build('p'), 'binary_inventory')
                 self.assertEqual(row['before']['value'], ['123'])
                 self.assertEqual(row['after']['status'], 'unknown')

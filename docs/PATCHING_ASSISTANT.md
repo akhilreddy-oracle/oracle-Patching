@@ -145,6 +145,12 @@ and retries from repeating work; a lost launch result becomes unknown and
 requires native inspection/reconciliation. Restart does not auto-confirm or
 auto-resume proposals. Conversations and tool rounds have bounded limits.
 
+Explicit timezone-qualified maintenance windows are converted to the same
+instant in UTC before a proposal is displayed and hashed. Native commands use
+whole seconds; fractional instants are rejected rather than rounded. Older
+pending proposals requiring timestamp normalization expire on confirmation and
+must be prepared again, so confirmed arguments are never silently rewritten.
+
 Use [REMOTE_DEPLOYMENT.md](REMOTE_DEPLOYMENT.md) for a Linux controller with
 versioned code, stable state, TLS and same-server inference. Existing sealed
 plans with workstation paths are not automatically migrated or resumed.

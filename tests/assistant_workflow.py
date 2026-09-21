@@ -342,6 +342,63 @@ class AssistantTests(unittest.TestCase):
         names = {row['function']['name'] for row in capabilities.definitions({'read', 'create', 'execute', 'approve', 'authorize'})}
         self.assertFalse({'approve_plan', 'authorize_plan', 'run_shell', 'execute_sql'} & names)
 
+    def test_proposals_normalize_explicit_timezones_before_review_and_dispatch(self):
+        for tool in ('create_backup', 'create_patch_plan'):
+            with self.subTest(tool=tool):
+                arguments = {'host_id': 'fixture', 'database': 'ORCL',
+                    'window_start': '2099-01-01T06:30:00+05:30',
+                    'window_end': '2098-12-31T21:00:00-05:00'}
+                arguments.update({'request_id': 'backup-offset', 'backup_parent': '/fixture/backups'}
+                                 if tool == 'create_backup' else
+                                 {'plan_id': 'plan-offset', 'patch_id': '39034528'})
+                proposal = self.proposal(tool, arguments)
+                self.assertEqual(proposal['arguments']['window_start'], '2099-01-01T01:00:00Z')
+                self.assertEqual(proposal['arguments']['window_end'], '2099-01-01T02:00:00Z')
+                # Normalization must not alter the caller's inputs or silently
+                # shift an instant; the reviewed card is the dispatched value.
+                self.assertEqual(arguments['window_start'], '2099-01-01T06:30:00+05:30')
+                def submit(route, body):
+                    self.assertEqual(body['window_start'], proposal['arguments']['window_start'])
+                    self.assertEqual(body['window_end'], proposal['arguments']['window_end'])
+                    return 202, {'run_id': self.new_run(proposal).run_id}
+                self.submit.side_effect = submit
+                self.confirm(proposal)
+                # Finish this synthetic launch before checking the other tool.
+                runner.RUNS['a' * 12].status = 'succeeded'
+                assistant.get(self.owner, self.conversation)
+
+    def test_unsupported_window_precision_and_utc_overflow_do_not_mint_proposals(self):
+        arguments = {'host_id': 'fixture', 'request_id': 'backup-window',
+            'database': 'ORCL', 'backup_parent': '/fixture/backups',
+            'window_start': '2099-01-01T01:00:00Z', 'window_end': '2099-01-01T02:00:00Z'}
+        cases = [dict(window_start='2099-01-01T01:00:00.500Z'),
+                 dict(window_start='0001-01-01T00:00:00+14:00'),
+                 dict(window_end='9999-12-31T23:00:00-14:00')]
+        for overrides in cases:
+            with self.subTest(overrides=overrides), self.assertRaises(capabilities.ToolError):
+                self.proposal('create_backup', {**arguments, **overrides})
+        self.assertEqual(assistant.get(self.owner, self.conversation)['actions'], [])
+        self.submit.assert_not_called()
+
+    def test_legacy_window_proposals_expire_instead_of_rewriting_confirmed_arguments(self):
+        for start in ('2099-01-01T06:30:00+05:30', '2099-01-01T01:00:00.500Z'):
+            with self.subTest(start=start):
+                proposal = self.proposal('create_backup', {'host_id': 'fixture', 'request_id': 'legacy-window',
+                    'database': 'ORCL', 'backup_parent': '/fixture/backups',
+                    'window_start': '2099-01-01T01:00:00Z', 'window_end': '2099-01-01T02:00:00Z'})
+                data = self.conversation_data()
+                legacy = next(item for item in data['actions'] if item['id'] == proposal['id'])
+                legacy['arguments']['window_start'] = start
+                legacy['digest'] = assistant._digest(legacy)
+                self.save(data)
+                with self.assertRaises(assistant.AssistantError) as blocked:
+                    self.confirm(legacy)
+                self.assertEqual(blocked.exception.status, 409)
+                stored = next(item for item in assistant.get(self.owner, self.conversation)['actions'] if item['id'] == legacy['id'])
+                self.assertEqual(stored['state'], 'expired')
+                self.assertEqual(stored['arguments']['window_start'], start)
+        self.submit.assert_not_called()
+
     def cached_record(self, request_id='backup-a', host_id='fixture', **changes):
         base = capabilities.recoveryctl.LIVE_DIR / request_id
         base.mkdir(parents=True, exist_ok=True)
