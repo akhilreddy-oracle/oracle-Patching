@@ -120,8 +120,9 @@ verify_open_window() {
 acquire_executor_lock() {
   local lock_path="$NODE_RUN_DIR/executor.lock"
   if command -v flock >/dev/null 2>&1; then
-    exec 8>"$lock_path"
+    opu_execution_open_lock_file "$lock_path" 8 || die "unsafe executor lock"
     flock -n 8 || die "another Grid OPatchAuto executor owns node $LOCAL_NODE for this plan"
+    opu_execution_validate_lock "$lock_path" 8 || die "unsafe executor lock"
     EXECUTOR_LOCK_USES_FLOCK=1
   elif [ "$TEST_MODE" = 1 ]; then
     EXECUTOR_LOCK_DIR="$lock_path.d"
@@ -412,6 +413,29 @@ collect_cluster_runtime() {
   CLUSTER_RELEASE_PATCH_LEVEL=$(sed -nE 's/.*\[([0-9]+)\].*/\1/p' <<<"$release_output" | tail -n1)
   [ -n "$CLUSTER_RELEASE_PATCH_LEVEL" ] || CLUSTER_RELEASE_PATCH_LEVEL=$(grep -Eo '[0-9]+' <<<"$release_output" | tail -n1 || true)
   [[ "$CLUSTER_RELEASE_PATCH_LEVEL" =~ ^[0-9]+$ ]] || die 'local Clusterware release patch level output is incomplete'
+  # Stages run in a child process. Persist this attempt's observations so the
+  # parent cannot accidentally report the sealed pre-patch baseline as current.
+  jq -cn --arg version "$CLUSTER_ACTIVE_VERSION" --arg upgrade "$CLUSTER_UPGRADE_STATE" \
+    --arg active "$CLUSTER_ACTIVE_PATCH_LEVEL" --arg release "$CLUSTER_RELEASE_PATCH_LEVEL" \
+    '{active_version:$version,upgrade_state:$upgrade,active_patch_level:$active,release_patch_level:$release}' \
+    >"$TASK_DIR/cluster-runtime.tmp"
+  mv "$TASK_DIR/cluster-runtime.tmp" "$TASK_DIR/cluster-runtime.json"
+}
+
+load_task_cluster_runtime() {
+  CLUSTER_ACTIVE_VERSION=unknown; CLUSTER_UPGRADE_STATE=unknown
+  CLUSTER_ACTIVE_PATCH_LEVEL=unknown; CLUSTER_RELEASE_PATCH_LEVEL=unknown
+  [ -f "$TASK_DIR/cluster-runtime.json" ] || return 0
+  [ ! -L "$TASK_DIR/cluster-runtime.json" ] && jq -e '
+    (.active_version | type == "string" and test("^[0-9]+(\\.[0-9]+){3,4}$")) and
+    .upgrade_state == "NORMAL" and
+    (.active_patch_level | type == "string" and test("^[0-9]+$")) and
+    (.release_patch_level | type == "string" and test("^[0-9]+$"))
+  ' "$TASK_DIR/cluster-runtime.json" >/dev/null || die 'task Clusterware runtime evidence is invalid'
+  CLUSTER_ACTIVE_VERSION=$(jq -r '.active_version' "$TASK_DIR/cluster-runtime.json")
+  CLUSTER_UPGRADE_STATE=$(jq -r '.upgrade_state' "$TASK_DIR/cluster-runtime.json")
+  CLUSTER_ACTIVE_PATCH_LEVEL=$(jq -r '.active_patch_level' "$TASK_DIR/cluster-runtime.json")
+  CLUSTER_RELEASE_PATCH_LEVEL=$(jq -r '.release_patch_level' "$TASK_DIR/cluster-runtime.json")
 }
 
 check_cluster_health() {
@@ -427,9 +451,9 @@ check_cluster_health() {
   printf '%s\n' "$voting_output" >"$prefix-votedisk.log"
   grep -Eiq '(^|[[:space:]])ONLINE([[:space:]]|$)' <<<"$voting_output" || die 'voting-disk evidence contains no ONLINE disk'
   asm_output=$({ as_grid "$GRID_HOME_TARGET/bin/srvctl" status asm -node "$LOCAL_NODE"; } 2>&1) || { printf '%s\n' "$asm_output" >"$prefix-asm.log"; die 'ASM is not healthy on the local node'; }
-  printf '%s\n' "$asm_output" >"$prefix-asm.log"; grep -Eiq 'running|online' <<<"$asm_output" || die 'ASM status is not running/online'
+  printf '%s\n' "$asm_output" >"$prefix-asm.log"; opu_service_status_running "$asm_output" || die 'ASM status is not running/online'
   listener_output=$({ as_grid "$GRID_HOME_TARGET/bin/srvctl" status listener -node "$LOCAL_NODE"; } 2>&1) || { printf '%s\n' "$listener_output" >"$prefix-listener.log"; die 'local Grid listener health check failed'; }
-  printf '%s\n' "$listener_output" >"$prefix-listener.log"; grep -Eiq 'running|online' <<<"$listener_output" || die 'local Grid listener status is not running/online'
+  printf '%s\n' "$listener_output" >"$prefix-listener.log"; opu_service_status_running "$listener_output" || die 'local Grid listener status is not running/online'
 }
 
 observe_inventory() {
@@ -727,15 +751,6 @@ run_typed_stage() {
   esac
 }
 
-heartbeat() {
-  local stage_pid=$1 interval=$((LEASE_SECONDS / 3)) elapsed=0
-  [ "$interval" -le 60 ] || interval=60; [ "$interval" -ge 10 ] || interval=10
-  while kill -0 "$stage_pid" 2>/dev/null; do
-    sleep 1; kill -0 "$stage_pid" 2>/dev/null || break
-    elapsed=$((elapsed + 1)); [ "$elapsed" -ge "$interval" ] || continue; elapsed=0
-    if ! env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" renew --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --lease-seconds "$LEASE_SECONDS" >/dev/null 2>"$TASK_DIR/heartbeat-error.log"; then : >"$TASK_DIR/heartbeat-failed"; return 1; fi
-  done
-}
 
 collect_task_artifacts() {
   local artifact_path artifact_sha unexpected_entry
@@ -780,7 +795,7 @@ emit_evidence() {
 }
 
 execute_task() {
-  local claim_output stage_pid heartbeat_pid stage_rc finished status postcondition detail outcome complete_rc
+  local heartbeat_failed=0 claim_output stage_pid stage_rc finished status postcondition detail outcome complete_rc
   require_root; opu_execution_host_lock || return $?; load_plan
   RUN_DIR="$EXECUTION_STATE_DIR/plans/$PLAN_ID"; opu_execution_prepare_attempt "$RUN_DIR/tasks" "$PLAN_STATE_DIR/plans/$PLAN_ID/tasks/$TASK_ID.json" "$TASK_ID" || return $?; mkdir -p "$RUN_DIR/tasks"
   [ ! -e "$TASK_DIR" ] || die "Grid OPatchAuto execution evidence already exists for task $TASK_ID"
@@ -791,12 +806,11 @@ execute_task() {
   STARTED_AT=$(opu_now_utc)
   set +e
   (set -e; close_inherited_executor_lock; run_typed_stage) >"$TASK_DIR/stdout.log" 2>"$TASK_DIR/stderr.log" & stage_pid=$!
-  (exec 7>&-; close_inherited_executor_lock; heartbeat "$stage_pid") & heartbeat_pid=$!
+  opu_execution_start_heartbeat || return $?
   wait "$stage_pid"; stage_rc=$?
-  kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true
   set -e
   finished=$(opu_now_utc)
-  if [ -f "$TASK_DIR/heartbeat-failed" ]; then status=failed; postcondition=unknown; detail='task lease heartbeat failed; Grid outcome requires reconciliation'; stage_rc=75
+  if [ -f "$TASK_DIR/heartbeat-failed" ]; then heartbeat_failed=1; status=failed; postcondition=unknown; detail='task lease heartbeat failed; Grid outcome requires reconciliation'; stage_rc=75
   elif [ "$stage_rc" -eq 0 ]; then status=succeeded; postcondition=passed; detail="$STAGE postcondition passed"
   elif [ -f "$TASK_DIR/binary-state-unknown" ] || [ -f "$TASK_DIR/inventory-unknown" ] || [ -f "$TASK_DIR/grid-state-unknown" ]; then status=failed; postcondition=unknown; detail="$STAGE outcome is ambiguous; retry is prohibited"
   else status=failed; postcondition=failed; detail="$STAGE failed; inspect sealed task logs"; fi
@@ -811,10 +825,9 @@ execute_task() {
   if [ "$OPERATION" = rollback ]; then
     verify_source_apply_lineage metadata || die 'source apply lineage became invalid before evidence emission'
   fi
-  if [ -f "$BINDING_FILE" ] && verify_sealed_json "$BINDING_FILE" record_sha256; then
-    CLUSTER_ACTIVE_VERSION=$(jq -r '.baseline.active_version' "$BINDING_FILE"); CLUSTER_UPGRADE_STATE=$(jq -r '.baseline.upgrade_state' "$BINDING_FILE"); CLUSTER_ACTIVE_PATCH_LEVEL=$(jq -r '.baseline.active_patch_level' "$BINDING_FILE"); CLUSTER_RELEASE_PATCH_LEVEL=$(jq -r '.baseline.release_patch_level' "$BINDING_FILE")
-  fi
+  load_task_cluster_runtime
   emit_evidence "$status" "$postcondition" "$stage_rc" "$detail" "$finished" "$outcome"
+  opu_execution_finish_heartbeat "$status" "$postcondition" "$heartbeat_failed" || return $?
   set +e
   env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" complete --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" --status "$status" --evidence "$TASK_DIR/evidence.json"
   complete_rc=$?; set -e

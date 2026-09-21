@@ -110,6 +110,9 @@ if tool --patch-dir "$PATCH_DIR" --mode apply >/dev/null 2>&1; then
 fi
 
 # --- analyze (read-only) ---
+OPU_GRID_ROLLING_TEST_MODE=1 "$TOOL" --grid-home "$GRID_HOME" --log-root "$TMP/discovery-logs" \
+  --patch-dir "$PATCH_DIR" --mode analyze >"$TMP/discovered-analyze.log"
+grep -q 'checking patch conflicts' "$TMP/discovered-analyze.log"
 tool --patch-dir "$PATCH_DIR" --mode analyze >"$TMP/analyze.log"
 grep -q 'checking patch conflicts' "$TMP/analyze.log"
 [ ! -f "$RUNTIME/patch.state" ]

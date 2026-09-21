@@ -21,6 +21,11 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[2]
+# The runtime package carries this module alongside the exact code generation.
+# State is bound to its deployment root; commands still use ROOT below.
+sys.path.insert(0, str(ROOT / 'webapp'))
+from runtime_paths import deployment_root
+
 HOST_LOCK = Path('/var/lib/oracle-patching-utility/locks/host-mutation.lock')
 AUDIT_ROOT = Path('/var/lib/oracle-patching-utility/lock-recovery')
 NATIVE_ROOT = Path('/var/lib/oracle-patching-utility/single-instance/plans')
@@ -75,9 +80,13 @@ def safe_file(path, *, root_owned=True):
 
 def _read_checked_file(path, validator):
     before = validator(path)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    # An allowed controller-owned authority path can change after lstat. A
+    # substituted FIFO must not block before the descriptor can be verified.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        require(identity(before) == identity(os.fstat(fd)), f'file changed while opening: {path}')
+        opened = os.fstat(fd)
+        require(stat.S_ISREG(opened.st_mode) and identity(before) == identity(opened),
+                f'file changed while opening: {path}')
         with os.fdopen(fd, 'rb', closefd=False) as stream:
             data = stream.read(8 * 1024 * 1024 + 1)
         require(len(data) <= 8 * 1024 * 1024, 'record exceeds size limit')
@@ -490,9 +499,25 @@ select 'OPU_RMAN|' || count(*) from v$rman_status where status like 'RUNNING%';
                 'listener_ready': True, 'observed_at': now()}
 
 
+def require_open_window(plan):
+    window = plan.get('maintenance_window')
+    require(isinstance(window, dict) and isinstance(window.get('start'), str)
+            and isinstance(window.get('end'), str), 'maintenance window is missing or invalid')
+    try:
+        start = dt.datetime.fromisoformat(window['start'].replace('Z', '+00:00'))
+        end = dt.datetime.fromisoformat(window['end'].replace('Z', '+00:00'))
+    except ValueError as exc:
+        raise Blocked('maintenance window is invalid') from exc
+    require(start.tzinfo is not None and end.tzinfo is not None
+            and start.utcoffset() == end.utcoffset() == dt.timedelta(0),
+            'maintenance window must use UTC timestamps')
+    require(start <= dt.datetime.now(dt.timezone.utc) < end, 'maintenance window is not open')
+
+
 def target_context(args, runner):
-    plan_root = Path(os.environ.get('OPU_PLAN_STATE_DIR', str(ROOT / 'var/webapp-plans')))
-    require(plan_root == ROOT / 'var/webapp-plans', 'plan state directory must be this deployed tool root/var/webapp-plans')
+    expected_root = deployment_root(ROOT) / 'var/webapp-plans'
+    plan_root = Path(os.environ.get('OPU_PLAN_STATE_DIR', str(expected_root)))
+    require(plan_root == expected_root, 'plan state directory must be this deployment root/var/webapp-plans')
     plan_dir = plan_root / 'plans' / args.plan_id
     # Native status verifies plan seal; task-status also verifies definition,
     # result seals and complete custody of the preceding apply evidence.
@@ -500,10 +525,7 @@ def target_context(args, runner):
     require(plan.get('state') == 'running' and plan.get('intent', 'patch_apply') == 'patch_apply', 'plan must be running patch_apply')
     require(plan['procedure']['adapter'] == 'database_single_instance_opatch' and len(plan['nodes']) == 1,
             'only standalone single-node OPatch apply plans are supported')
-    window = plan['maintenance_window']
-    epoch = dt.datetime.now(dt.timezone.utc)
-    require(dt.datetime.fromisoformat(window['start'].replace('Z', '+00:00')) <= epoch < dt.datetime.fromisoformat(window['end'].replace('Z', '+00:00')),
-            'maintenance window is not open')
+    require_open_window(plan)
     auth_bytes = read_controller_authority(plan_dir / 'authorization.json', plan_dir)
     auth = sealed(json.loads(auth_bytes))
     require(auth.get('actor') == args.actor and auth.get('decision') == 'execution_authorized'
@@ -571,7 +593,7 @@ def inspect(args, runner):
         plan, task, target = target_context(args, runner)
         result.update(plan_sha256=plan['plan_sha256'], task_definition_sha256=task['task_definition_sha256'],
                       original_task_status=task['status'], target=target)
-        result['wrapper'] = validate_wrapper(ROOT / 'var/webapp-runs' / args.plan_id / args.task_id / args.run_id)
+        result['wrapper'] = validate_wrapper(deployment_root(ROOT) / 'var/webapp-runs' / args.plan_id / args.task_id / args.run_id)
         require_no_executor()
         fd, lock_identity = open_lock(HOST_LOCK)
         try:
@@ -654,7 +676,7 @@ def recover(args, runner):
             plan, task, fresh_target = target_context(args, runner)
             require(plan['plan_sha256'] == checked['plan_sha256'] and fresh_target == target
                     and task['task_definition_sha256'] == checked['task_definition_sha256'], 'sealed recovery scope changed')
-            require(validate_wrapper(ROOT / 'var/webapp-runs' / args.plan_id / args.task_id / args.run_id) == checked['wrapper'], 'launch records changed')
+            require(validate_wrapper(deployment_root(ROOT) / 'var/webapp-runs' / args.plan_id / args.task_id / args.run_id) == checked['wrapper'], 'launch records changed')
             host_fd, lock_identity = open_lock(HOST_LOCK)
             require(lock_identity == checked['lock']['identity'] and lock_held(host_fd), 'host lock changed or became free')
             fresh_holders = holders(lock_identity, target)
@@ -664,6 +686,9 @@ def recover(args, runner):
             require(fresh_eligible == checked['holders'], 'lock holder or session identities changed before recovery')
             result['session_checks_before_outage'] = fresh_sessions
             require_no_executor()
+            # Session queries and process scans may consume the remainder of
+            # the approved window. Recheck before the first service mutation.
+            require_open_window(plan)
             write_once(audit / 'outage-started.json', {'started_at': now(), 'target': target})
             # Stop only the exact sealed listener and SID. Never signal PIDs.
             stopped = True

@@ -33,6 +33,7 @@ class Element {
   set textContent(value) { this.replaceChildren(); this._text = String(value ?? ''); }
   set innerHTML(value) { assert.equal(value, '', 'The UI must render data as text'); this.replaceChildren(); }
   appendChild(child) { if (child.parentElement) child.parentElement.children = child.parentElement.children.filter(item => item !== child); child.parentElement = this; this.children.push(child); return child; }
+  remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(child => child !== this); this.parentElement = null; }
   replaceChildren(...children) { for (const child of this.children) child.parentElement = null; this.children = []; this._text = ''; children.forEach(child => this.appendChild(child)); }
   addEventListener(name, listener) { const handlers = this.listeners.get(name) || []; handlers.push(listener); this.listeners.set(name, handlers); }
   async fire(name) { for (const listener of this.listeners.get(name) || []) await listener({ target: this, preventDefault() {} }); }
@@ -75,19 +76,24 @@ const api = await import('../webapp/static/api.js');
 const actor = await import('../webapp/static/actor.js');
 const { classifyStatus } = await import('../webapp/static/dom.js');
 const { belongsToHost, newestFirst } = await import('../webapp/static/host_scope.js');
-const { renderPlanList, renderPlanDetail } = await import('../webapp/static/plans.js');
-const { renderRecoveryList, renderRecoveryDetail } = await import('../webapp/static/recovery_pages.js');
+const { renderPlanList, renderPlanDetail, renderPlanNew, renderPlanDemoNew, renderRollbackNew } = await import('../webapp/static/plans.js');
+const { renderRecoveryList, renderRecoveryDetail, renderRecoveryNew } = await import('../webapp/static/recovery_pages.js');
 const { renderWorkspace } = await import('../webapp/static/workspace.js');
 const { renderExecuteStage } = await import('../webapp/static/stages/execute.js');
+const { renderDiscoverStage } = await import('../webapp/static/stages/discover.js');
+const { renderPlanStage } = await import('../webapp/static/stages/plan.js');
 const { renderReadinessStage } = await import('../webapp/static/stages/readiness.js');
 const { renderRecoveryStage } = await import('../webapp/static/stages/recovery.js');
 const { hydrateBackupPolicy, policyRecoveryBlock, backupPolicyChooser } = await import('../webapp/static/backup_policy.js');
 const { createPageRenderer } = await import('../webapp/static/navigation.js');
+const { renderValidation } = await import('../webapp/static/validation.js');
+const { renderEstate } = await import('../webapp/static/estate.js');
 const { startRun, pollRun, runToCompletion } = await import('../webapp/static/runs.js');
 const { reconciliationCard } = await import('../webapp/static/run_reconciliation.js');
-const { refreshSession } = await import('../webapp/static/shell.js');
+const { refreshSession, refreshHostNav } = await import('../webapp/static/shell.js');
 const { executionWindow } = await import('../webapp/static/plan_window.js');
 const { evidenceReport } = await import('../webapp/static/report_view.js');
+const { executionConsole } = await import('../webapp/static/execution_console.js');
 const { canInspectExtjob, extjobInspection } = await import('../webapp/static/extjob_inspection.js');
 const { buildProcedure, PROCEDURE_ADAPTERS, REQUIRED_PRECHECKS } = await import('../webapp/static/procedure_adapters.js');
 
@@ -123,7 +129,7 @@ test('plan index and host lifecycle show the newest attributable records', async
     { request_id: 'unattributed', state: 'completed' },
     { request_id: 'local', host_id: 'prod', state: 'awaiting_approval', created_at: '2026-09-13T00:00:00Z' },
   ];
-  fetch = async url => response(url === '/api/plans' ? { plans } : url === '/api/recovery' || url === '/api/recovery?host_id=prod' ? { requests } : { steps: [] });
+  fetch = async url => response(url === '/api/plans' ? { plans } : url === '/api/recovery' || url.startsWith('/api/recovery?host_id=prod') ? { requests } : { steps: [] });
   const list = mount(); await renderPlanList(list);
   assert.match(list.querySelector('tbody').children[0].textContent, /^a-new/);
   const page = mount(); await renderWorkspace(page, 'prod', 'recovery');
@@ -144,6 +150,110 @@ test('real list renderers surface authentication failures through the page bound
   }
 });
 
+test('discovery exposes authentication recovery instead of swallowing an expired session', async () => {
+  fetch = async () => response({ message: 'Session expired' }, 401);
+  const page = mount(); const render = createPageRenderer(page, view => renderDiscoverStage(view, 'prod'));
+  await render();
+  assert.match(page.textContent, /Authentication required/);
+  assert.ok(page.querySelector('.auth-recovery-form'));
+  render.cancel();
+});
+
+test('discovery refresh cannot retain green success when its evidence reload is missing or fails', async () => {
+  actor.setSessionIdentity({ mode: 'lab', permissions: { live_discovery: true } });
+  for (const reload of [response({ steps: [] }), response({ message: 'Evidence read failed' }, 503)]) {
+    let pipelineReads = 0;
+    fetch = async (url, options = {}) => {
+      if (options.method === 'POST') return response({ run_id: 'discover-refresh' }, 202);
+      if (url.startsWith('/api/runs/')) return response({ status: 'succeeded' });
+      assert.equal(url, '/api/hosts/prod/pipeline');
+      return ++pipelineReads === 1 ? response({ steps: [{ step: 'discovery', done: true, status: 'ok', evidence: { host: { name: 'previous-host' } } }] }) : reload;
+    };
+    const page = mount(); await renderDiscoverStage(page, 'prod');
+    assert.equal(page.querySelector('#discover-status').textContent, 'ok');
+    await button(page, 'Run live discovery').fire('click');
+    const status = page.querySelector('#discover-status');
+    assert.equal(status.classList.contains('is-ok'), false);
+    assert.equal(status.textContent, reload.status === 503 ? 'unavailable' : 'no evidence');
+    assert.doesNotMatch(page.textContent, /previous-host/);
+    assert.equal(button(page, 'Run live discovery').disabled, false);
+  }
+});
+
+test('discovery controls prevent denied or unavailable sessions from issuing a POST', async () => {
+  const identities = [
+    null,
+    { mode: 'principal', actor: 'requester', roles: ['requester'], rbac_enabled: true, permissions: { live_discovery: false } },
+    { mode: 'principal', actor: 'operator', roles: ['operator'], rbac_enabled: true, permissions: { live_discovery: false } },
+    { mode: 'company', actor: 'requester', roles: ['requester'], rbac_enabled: true, csrf_token: 'fixture', expires_at: Date.now() / 1000 + 600, permissions: { live_discovery: false } },
+    { mode: 'company', actor: 'operator', roles: ['operator'], rbac_enabled: true, csrf_token: 'fixture', expires_at: Date.now() / 1000 - 1, permissions: { live_discovery: true } },
+  ];
+  for (const session of identities) {
+    actor.setSessionIdentity(session);
+    const posts = [];
+    fetch = async (url, options = {}) => {
+      if (options.method === 'POST') posts.push(url);
+      return response(url === '/api/estate' ? { hosts: [{ id: 'prod', status: 'pending' }] } : url === '/api/fleet' ? { databases: [] } : { steps: [] });
+    };
+    for (const [render, label] of [[renderEstate, 'Refresh live SSH'], [page => renderDiscoverStage(page, 'prod'), 'Run live discovery']]) {
+      const page = mount(); await render(page); const control = button(page, label);
+      assert.equal(control.disabled, true);
+      const hint = page.querySelector('#' + control.getAttribute('aria-describedby'));
+      assert.ok(hint.textContent); assert.equal(hint.hidden, false);
+      await control.fire('click'); // Even a synthetic event cannot bypass the UI admission guard.
+    }
+    assert.deepEqual(posts, []);
+  }
+});
+
+test('server-admitted discovery works for principal, company and lab sessions', async () => {
+  for (const mode of ['principal', 'company', 'lab']) {
+    actor.setSessionIdentity({ mode, actor: 'fixture-operator', rbac_enabled: mode !== 'lab', permissions: { live_discovery: true },
+      csrf_token: 'fixture-csrf', expires_at: Date.now() / 1000 + 600 });
+    for (const [render, label] of [[renderEstate, 'Refresh live SSH'], [page => renderDiscoverStage(page, 'prod'), 'Run live discovery']]) {
+      const posts = [];
+      fetch = async (url, options = {}) => {
+        if (options.method === 'POST') { posts.push(url); return response({ run_id: 'discovery' }, 202); }
+        if (url.startsWith('/api/runs/')) return response({ status: 'succeeded' });
+        return response(url === '/api/estate' ? { hosts: [{ id: 'prod', status: 'pending' }] } : url === '/api/fleet' ? { databases: [] } : { steps: [] });
+      };
+      const page = mount(); await render(page); const control = button(page, label);
+      assert.equal(control.disabled, false, mode);
+      assert.equal(page.querySelector('#' + control.getAttribute('aria-describedby')).hidden, true);
+      await control.fire('click');
+      assert.deepEqual(posts, ['/api/hosts/prod/pipeline/discovery']);
+      assert.equal(control.disabled, false);
+    }
+  }
+});
+
+test('authentication recovery exposes a blank password form and only replaces the credential on explicit sign-in', async () => {
+  storage.set('opu-webapp-token', 'old-shared-token');
+  fetch = async url => response(url === '/api/auth/config' ? { configured: false } : { message: 'Missing or invalid principal credential' }, url === '/api/auth/config' ? 200 : 401);
+  const page = mount(); const render = createPageRenderer(page, renderPlanList); await render();
+  const form = page.querySelector('.auth-recovery-form'); const input = form.querySelector('input');
+  assert.equal(input.getAttribute('type'), 'password'); assert.equal(input.value, '');
+  assert.equal(button(form, 'Sign in').getAttribute('type'), 'submit');
+  input.value = ' personal-principal-token '; await input.fire('input');
+  assert.equal(api.getApiToken(), 'old-shared-token');
+  let changed = 0; const handler = () => { changed++; }; window.addEventListener(api.TOKEN_EVENT, handler);
+  await form.fire('submit'); window.removeEventListener(api.TOKEN_EVENT, handler);
+  assert.equal(api.getApiToken(), 'personal-principal-token'); assert.equal(changed, 1);
+  assert.equal(input.value, ''); assert.doesNotMatch(page.textContent, /personal-principal-token|old-shared-token/);
+  assert.equal(location.hash, '#/estate'); render.cancel();
+});
+
+test('authentication recovery retains company login and can retry an unchanged token', async () => {
+  let attempts = 0;
+  fetch = async () => response({ configured: true, login_url: '/api/auth/login', label: 'Company sign in' });
+  const page = mount(); const render = createPageRenderer(page, async () => { attempts++; throw new api.ApiError({ message: 'Company sign in is required.' }, 401); });
+  await render(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(page.querySelector('a').getAttribute('href'), '/api/auth/login');
+  assert.match(page.textContent, /Company sign in is required/);
+  const form = page.querySelector('form'); form.querySelector('input').value = api.getApiToken();
+  await form.fire('submit'); assert.equal(attempts, 2); render.cancel();
+});
+
 test('navigation aborts old reads and prevents stale results or errors replacing a new page', async () => {
   let release; let firstSignal; let call = 0;
   const page = mount();
@@ -153,6 +263,155 @@ test('navigation aborts old reads and prevents stale results or errors replacing
   });
   const first = render(); await render(); assert.equal(firstSignal.aborted, true); release(); await first;
   assert.equal(page.textContent, 'current'); render.cancel();
+});
+
+test('cancelled execution view cannot start a native log refresh from a late saved response', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  let reads = 0, release; const posts = [];
+  const data = { guidance: 'Original execution history', runs: [{ run_id: 'native-run', can_observe: true, status: 'running' }] };
+  fetch = async (url, options = {}) => {
+    if (options.method === 'POST') { posts.push(url); return response({ run_id: 'unexpected-observe' }); }
+    assert.equal(url, '/api/plans/P1/execution');
+    return ++reads === 1 ? response(data) : { ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) };
+  };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  panel.querySelector('input').checked = true;
+  const refresh = button(panel, 'Refresh timeline').fire('click');
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); api.setReadSignal(new AbortController().signal);
+  release({ ...data, guidance: 'Stale response' }); await refresh;
+  assert.deepEqual(posts, []);
+  assert.match(panel.textContent, /Original execution history/);
+  assert.doesNotMatch(panel.textContent, /Stale response/);
+});
+
+test('replaced execution panel cannot start native log following while its page remains active', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  let reads = 0, release; const posts = [];
+  const data = { guidance: 'Execution history', runs: [{ run_id: 'native-run', can_observe: true, status: 'running' }] };
+  fetch = async (url, options = {}) => {
+    if (options.method === 'POST') { posts.push(url); return response({ run_id: 'unexpected-observe' }); }
+    assert.equal(url, '/api/plans/P1/execution');
+    return ++reads === 1 ? response(data) : { ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) };
+  };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  panel.querySelector('input').checked = true;
+  const refresh = button(panel, 'Refresh timeline').fire('click');
+  await new Promise(resolve => setImmediate(resolve));
+  panel.remove(); release(data); await refresh;
+  assert.equal(controller.signal.aborted, false, 'a same-page panel refresh does not cancel the route');
+  assert.deepEqual(posts, [], 'a detached follow widget must not start SSH observation');
+  controller.abort();
+});
+
+test('unbound legacy execution keeps saved logs and recovery guidance without offering a fresh observation', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  const posts = [];
+  const data = { guidance: 'Inspect and reconcile the existing execution before starting another task.', runs: [
+    { run_id: 'older-bound-run', status: 'succeeded', can_observe: true,
+      observation: { logs: { 'stdout.log': { text: 'Older completed execution output' } } } },
+    { run_id: 'legacy-run', status: 'running', can_observe: false,
+      observe_blocked_reason: 'This launch has no verified host configuration binding. Only saved logs are available.',
+      observation: { logs: { 'stdout.log': { text: 'Saved original launch output' } } } },
+  ] };
+  fetch = async (url, options = {}) => {
+    if (options.method === 'POST') { posts.push(url); return response({ run_id: 'unexpected-observe' }); }
+    assert.equal(url, '/api/plans/P1/execution'); return response(data);
+  };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(panel.textContent, /no verified host configuration binding/);
+  assert.match(panel.textContent, /Saved original launch output/);
+  assert.match(panel.textContent, /Inspect and reconcile/);
+  assert.doesNotMatch(panel.textContent, /Older completed execution output/);
+  const observe = button(panel, 'Refresh native logs');
+  assert.equal(observe.disabled, true); await observe.fire('click');
+  const follow = panel.querySelector('input');
+  assert.equal(follow.disabled, true);
+  follow.checked = true; await follow.fire('change');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(follow.checked, false);
+  assert.deepEqual(posts, []);
+  controller.abort();
+});
+
+test('obsolete estate discovery completion cannot clear the new active host or launch new reads', async () => {
+  actor.setSessionIdentity({ mode: 'lab', permissions: { live_discovery: true } });
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  const rail = document.body.appendChild(new Element('nav')); rail.setAttribute('id', 'rail-hosts');
+  let release; const calls = [];
+  const hosts = [{ id: 'prod', label: 'Production', status: 'ok' }];
+  fetch = async (url, options = {}) => {
+    calls.push([url, options.method || 'GET']);
+    if (options.method === 'POST') {
+      assert.equal(url, '/api/hosts/prod/pipeline/discovery');
+      return new Promise(resolve => { release = () => resolve(response({ run_id: 'accepted-discovery' }, 202)); });
+    }
+    if (url === '/api/fleet') return response({ databases: [] });
+    assert.equal(url, '/api/estate'); return response({ hosts });
+  };
+  const page = mount(); await renderEstate(page);
+  const refresh = button(page, 'Refresh live SSH').fire('click');
+  controller.abort(); api.setReadSignal(new AbortController().signal); page.remove();
+  await refreshHostNav('prod');
+  const count = calls.length; release(); await refresh;
+  assert.equal(calls.length, count, 'old refresh must not poll or reload data under the new route identity');
+  assert.equal(rail.querySelector('a').getAttribute('aria-current'), 'page');
+});
+
+test('host navigation ignores a cancelled response even when its JSON body completes late', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  const rail = document.body.appendChild(new Element('nav')); rail.setAttribute('id', 'rail-hosts');
+  rail.textContent = 'Current host navigation';
+  let release;
+  fetch = async () => ({ ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) });
+  const pending = refreshHostNav(null);
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); api.setReadSignal(new AbortController().signal);
+  release({ hosts: [{ id: 'obsolete', status: 'ok' }] });
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(rail.textContent, 'Current host navigation');
+});
+
+test('execution timeline retains the newest refresh when older responses arrive later', async () => {
+  const pending = []; let reads = 0;
+  fetch = async () => ++reads === 1 ? response({ guidance: 'Initial history' })
+    : { ok: true, status: 200, json: () => new Promise(resolve => pending.push(resolve)) };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  const first = button(panel, 'Refresh timeline').fire('click');
+  const second = button(panel, 'Refresh timeline').fire('click');
+  await new Promise(resolve => setImmediate(resolve));
+  pending[1]({ guidance: 'Current history' }); await second;
+  pending[0]({ guidance: 'Stale history' }); await first;
+  assert.match(panel.textContent, /Current history/);
+  assert.doesNotMatch(panel.textContent, /Stale history/);
+});
+
+test('release validation stops loading after its response and retains every evidence level', async () => {
+  let release;
+  fetch = async url => {
+    assert.equal(url, '/api/validation');
+    return new Promise(resolve => { release = () => resolve(response({
+      fixture_tested: { status: 'unknown', reason: 'Source changed after validation.' },
+      live_lab_verified: { status: 'unverified', reason: 'No live lab evidence recorded.' },
+      production_approved: { status: 'unverified', reason: 'No production approval recorded.' },
+    })); });
+  };
+  const page = mount(); const render = createPageRenderer(page, renderValidation);
+  const pending = render();
+  assert.match(page.textContent, /Loading…/);
+  assert.equal(page.querySelector('.route-view').getAttribute('aria-busy'), 'true');
+  release(); await pending;
+  assert.doesNotMatch(page.textContent, /Loading…/);
+  assert.equal(page.querySelector('.route-view').getAttribute('aria-busy'), 'false');
+  assert.deepEqual(page.querySelectorAll('h2').map(node => node.textContent), ['Fixture tests', 'Live lab verification', 'Production approval']);
+  assert.deepEqual(page.querySelectorAll('.badge').map(node => node.textContent), ['unknown', 'unverified', 'unverified']);
+  for (const reason of ['Source changed after validation.', 'No live lab evidence recorded.', 'No production approval recorded.']) assert.ok(page.textContent.includes(reason));
+  assert.equal(page.querySelectorAll('.badge-ok').length, 0);
+  render.cancel();
 });
 
 test('API sends the acting identity only on writes and still joins an active run conflict', async () => {
@@ -174,6 +433,76 @@ test('unknown outcomes and a navigation during launch cannot poll forever or rep
   };
   const run = runToCompletion('/operation', {}); controller.abort(); api.setReadSignal(new AbortController().signal); release();
   await assert.rejects(run, error => error.name === 'AbortError'); assert.equal(reads, 0);
+});
+
+test('a cancelled run response cannot publish completion after another page is opened', async () => {
+  const controller = new AbortController(); let release; const ticks = [];
+  fetch = async () => ({ ok: true, status: 200, json: () => new Promise(resolve => { release = resolve; }) });
+  const pending = pollRun('previous-page-run', { signal: controller.signal, onTick: record => ticks.push(record) });
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort(); release({ status: 'succeeded', run_id: 'previous-page-run' });
+  await assert.rejects(pending, error => error.name === 'AbortError');
+  assert.deepEqual(ticks, []);
+});
+
+test('a late authentication failure from cancelled navigation cannot clear the newer identity or CSRF', async () => {
+  const previous = new AbortController(); api.setReadSignal(previous.signal);
+  let release;
+  fetch = async () => new Promise(resolve => { release = resolve; });
+  const oldSession = refreshSession();
+  previous.abort(); api.setReadSignal(new AbortController().signal);
+  fetch = async () => response({ rbac_enabled: true, actor: 'new-operator', roles: ['operator'], csrf_token: 'new-fixture-csrf' });
+  await refreshSession();
+  release(response({ message: 'Old session expired' }, 401));
+  await assert.rejects(oldSession, error => error.status === 401);
+  assert.equal(actor.authenticatedActor(), 'new-operator');
+  let headers;
+  fetch = async (_url, options) => { headers = options.headers; return response({}); };
+  await api.apiFetch('/fixture-write', { method: 'POST', body: '{}' });
+  assert.equal(headers['X-CSRF-Token'], 'new-fixture-csrf');
+  assert.equal(headers['X-OPU-Actor'], 'new-operator');
+});
+
+test('creation pages open the submitted record even if its editable ID changes while the run finishes', async () => {
+  const cases = [
+    [renderPlanNew, 'source', 'Plan ID', 'Create plan', '/api/plans', 'plan_id', 'plans'],
+    [renderPlanDemoNew, null, 'Plan ID', 'Build fixture and create plan', '/api/plans/testmode-demo', 'plan_id', 'plans'],
+    [renderRollbackNew, 'source-plan', 'Rollback plan ID', 'Create rollback plan', '/api/plans/source-plan/create-rollback', 'plan_id', 'plans'],
+    [renderPlanStage, 'source', 'Plan ID', 'Create plan', '/api/plans', 'plan_id', 'plans'],
+    [renderRecoveryNew, null, 'Request ID', 'Build fixture and create request', '/api/recovery/testmode-demo', 'request_id', 'recovery'],
+  ];
+  const procedure = buildProcedure('database_single_instance_opatch', procedureFields, artifact);
+  for (const [renderer, target, label, action, route, key, index] of cases) {
+    let finish; const posted = []; location.hash = '#/estate';
+    fetch = async (url, options) => {
+      if (options.method === 'POST') { posted.push({ url, body: JSON.parse(options.body) }); return response({ run_id: 'create-run' }, 202); }
+      if (url === '/api/runs/create-run') return new Promise(resolve => { finish = () => resolve(response({ status: 'succeeded' })); });
+      if (url.endsWith('/pipeline') || url.endsWith('/plan-preview')) return response({ confirmation: {
+        expected_creation_binding_sha256: 'c'.repeat(64), patch_id: procedure.patch_id,
+        database: procedure.target.database_unique_name,
+      }, steps: [
+        { step: 'artifact-inspect', done: true, evidence: { artifact } },
+        { step: 'procedure-validate', done: true, status: 'ready_for_planning', evidence: { procedure } },
+        { step: 'readiness-evaluate', done: true, status: 'ready_for_approval', evidence: { status: 'ready_for_approval', valid_until: '2099-01-01T00:00:00Z' } },
+      ] });
+      return response({ plans: [], tasks: [] });
+    };
+    const page = mount(); await renderer(page, target);
+    if (renderer === renderPlanNew) {
+      const reviewedTarget = page.querySelector('.wizard-target');
+      assert.match(reviewedTarget.textContent, /Host: source/);
+      assert.match(reviewedTarget.textContent, /Patch: 12345678/);
+      assert.match(reviewedTarget.textContent, /Database: ORCL/);
+    }
+    const id = field(page, label); id.value = 'submitted-record';
+    const pending = button(page, action).fire('click');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof finish, 'function', `${renderer.name} should have submitted its run`);
+    id.value = 'edited-after-submit'; finish(); await pending;
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].url, route); assert.equal(posted[0].body[key], 'submitted-record');
+    assert.equal(location.hash, `#/${index}/submitted-record`, renderer.name);
+  }
 });
 
 const artifact = { sha256: 'a'.repeat(64), patch_ids: ['12345678'], platforms: [{ id: '226' }], readme_files: [{ path: 'README.html', sha256: 'b'.repeat(64) }] };
@@ -206,6 +535,7 @@ test('actual readiness form can submit every adapter and does not require a data
     };
     const page = mount(); await renderReadinessStage(page, 'grid-host');
     const card = page.querySelectorAll('.step-card').find(card => card.querySelector('h3')?.textContent === 'Procedure validation');
+    assert.match(card.textContent, /support non-CDB databases only; CDB\/PDB patching is unavailable/);
     const adapter = field(card, 'Adapter'); adapter.value = name; await adapter.fire('change');
     field(card, 'Patch ID').value = '12345678'; field(card, 'Platform ID').value = '226';
     field(card, 'Required OPatch').value = '12.2.0.1.49'; field(card, 'README identifier').value = 'README.html';
@@ -225,10 +555,125 @@ const readinessSteps = (media = artifact, saved = null, input = null, databases 
   { step: 'artifact-inspect', done: true, status: 'ready_for_catalog', evidence: { artifact: media } },
   { step: 'procedure-validate', done: Boolean(saved), status: saved ? 'ready_for_planning' : null, evidence: saved ? { procedure: saved } : null, input },
 ];
+
+test('expired or undated readiness cannot appear current in the workspace or offer a plan handoff', async () => {
+  for (const valid_until of [undefined, '2000-01-01T00:00:00Z', 'bad timestamp', '2099-01-01T00:00:00', '2099-02-30T00:00:00Z']) {
+    const steps = readinessSteps();
+    steps.push({ step: 'readiness-evaluate', done: true, status: 'ready_for_approval', evidence: { status: 'ready_for_approval', valid_until } });
+    fetch = async url => response(url.endsWith('/pipeline') ? { steps } : { plans: [], requests: [] });
+    const page = mount(); await renderWorkspace(page, 'prod', 'readiness');
+    const state = page.querySelectorAll('.stage-rail-item').find(item => item.textContent.startsWith('Readiness')).querySelector('.badge');
+    assert.equal(state.textContent, 'refresh required');
+    assert.equal(state.classList.contains('is-ok'), false);
+    const card = page.querySelector('#readiness-step-readiness-evaluate');
+    assert.equal(card.querySelector('.badge').textContent, 'refresh required');
+    assert.match(card.textContent, /Refresh evidence and evaluate readiness again/);
+    assert.equal(card.querySelectorAll('a').some(link => link.textContent === 'Continue to Plan →'), false);
+  }
+});
+
+test('plan creation rechecks readiness expiry after review before issuing any POST', async () => {
+  const procedure = buildProcedure('database_single_instance_opatch', procedureFields, artifact);
+  const steps = readinessSteps(artifact, procedure);
+  const observedAt = Date.parse('2030-01-01T01:00:00Z');
+  const expiresAt = observedAt + 60_000;
+  steps.push({ step: 'readiness-evaluate', done: true, status: 'ready_for_approval', evidence: { status: 'ready_for_approval', valid_until: new Date(expiresAt).toISOString() } });
+  const posts = [];
+  fetch = async (url, options) => {
+    if (options.method === 'POST') posts.push(url);
+    return response(url.endsWith('/plan-preview') ? { steps, confirmation: {
+      expected_creation_binding_sha256: 'c'.repeat(64), patch_id: procedure.patch_id, database: procedure.target.database_unique_name,
+    } } : { plans: [] });
+  };
+  const originalNow = Date.now;
+  try {
+    Date.now = () => observedAt;
+    const page = mount(); await renderPlanStage(page, 'prod');
+    const submit = button(page, 'Create plan');
+    assert.equal(submit.disabled, false);
+    Date.now = () => expiresAt;
+    await submit.fire('click');
+    assert.deepEqual(posts, []);
+    assert.equal(submit.disabled, true);
+    assert.match(page.textContent, /Readiness expired at/);
+    const reloaded = mount(); await renderPlanStage(reloaded, 'prod');
+    assert.equal(button(reloaded, 'Create plan').disabled, true);
+  } finally { Date.now = originalNow; }
+});
 const readmeHint = (media = artifact, identifier = 'README.html') => ({
   artifact_sha256: media.sha256, readme_identifier: identifier,
   readme_sha256: media.readme_files.find(entry => entry.path === identifier).sha256,
   required_opatch_version: '12.2.0.1.49', evidence: 'Use OPatch utility version 12.2.0.1.49 or later.', warnings: [],
+});
+
+test('workspace follows saved procedure and readiness changes without recovery reads or replacing policy drafts', async () => {
+  const media = { ...artifact };
+  const saved = buildProcedure('database_single_instance_opatch', procedureFields, media);
+  const steps = readinessSteps(media, saved, null, [
+    { db_unique_name: 'ORCL', oracle_home: '/oracle/one' }, { db_unique_name: 'OTHER', oracle_home: '/oracle/two' },
+  ]);
+  steps[0].status = 'complete'; steps[0].evidence.collected_at = new Date().toISOString();
+  steps.push(...['reconcile', 'compatibility-collect', 'compatibility-reconcile'].map(step => ({ step, done: true, status: 'passed' })));
+  const ready = { step: 'readiness-evaluate', done: true, status: 'blocked', evidence: { status: 'blocked', gates: [] } };
+  steps.push(ready);
+  const reads = [], posts = [];
+  fetch = async (url, options = {}) => {
+    if (options.method === 'POST') {
+      posts.push(url);
+      if (url.endsWith('/procedure-validate')) {
+        steps[2].evidence.procedure = JSON.parse(options.body).procedure;
+        ready.done = false; ready.status = null; ready.evidence = null;
+      } else if (url.endsWith('/readiness-evaluate')) {
+        ready.done = true; ready.status = 'ready_for_approval'; ready.evidence = { status: ready.status, valid_until: '2099-01-01T00:00:00Z' };
+      } else assert.fail(`Unexpected mutation ${url}`);
+      return response({ run_id: 'workflow-refresh' }, 202);
+    }
+    reads.push(url);
+    if (url === '/api/runs/workflow-refresh') return response({ status: 'succeeded' });
+    if (url === '/api/hosts/prod/pipeline') return response({ steps });
+    if (url === '/api/plans') return response({ plans: [] });
+    if (url === '/api/recovery?host_id=prod&view=saved') return response({ requests: [{ host_id: 'prod', state: 'completed', evidence_mode: 'saved' }] });
+    assert.fail(`Unexpected read ${url}`);
+  };
+  const page = mount(); await renderWorkspace(page, 'prod', 'readiness');
+  const readinessBadge = page.querySelectorAll('.stage-rail-item').find(item => item.textContent.startsWith('Readiness')).querySelector('.badge');
+  assert.equal(readinessBadge.textContent, 'blocked');
+  assert.match(page.querySelector('.wizard-target').textContent, /Database: ORCL.*Patch: 12345678/);
+  assert.match(page.querySelector('.stage-rail').textContent, /Saved: completed/);
+  const policyDraft = field(page, 'Filesystem free space reserve (GiB)');
+  policyDraft.value = '321'; await policyDraft.fire('input');
+  const card = procedureCard(page);
+  field(card, 'Database unique name').value = 'OTHER';
+  await button(card, 'Validate procedure').fire('click');
+  assert.match(page.querySelector('.wizard-target').textContent, /Database: OTHER.*Patch: 12345678/);
+  assert.match(page.querySelector('.wizard-target').textContent, /Oracle home: \/oracle\/two/);
+  assert.equal(readinessBadge.textContent, '5/6');
+  assert.equal(field(page, 'Filesystem free space reserve (GiB)'), policyDraft);
+  assert.equal(policyDraft.value, '321');
+  await button(page, 'Evaluate readiness').fire('click');
+  assert.equal(readinessBadge.textContent, 'ready_for_approval');
+  assert.deepEqual(posts, ['/api/hosts/prod/pipeline/procedure-validate', '/api/hosts/prod/pipeline/readiness-evaluate']);
+  assert.deepEqual(reads.filter(url => url.startsWith('/api/recovery')), ['/api/recovery?host_id=prod&view=saved']);
+});
+
+test('readiness blocker reviews focus exact controls without reload, mutation or draft loss', async () => {
+  const steps = readinessSteps();
+  steps.push({ step: 'readiness-evaluate', done: true, status: 'blocked', evidence: { status: 'blocked', gates: [
+    { name: 'artifact', status: 'blocker' }, { name: 'compatibility_contract', status: 'blocker' },
+    { name: 'patch_not_installed', status: 'blocker' }, { name: 'database_invalid_objects', status: 'blocker' },
+  ] } });
+  let reads = 0;
+  fetch = async (url, options = {}) => { assert.equal(options.method || 'GET', 'GET'); assert.equal(url, '/api/hosts/prod/pipeline'); reads++; return response({ steps }); };
+  const page = mount(); await renderReadinessStage(page, 'prod');
+  const draft = field(procedureCard(page), 'Rollback precondition'); draft.value = 'Preserve this unsubmitted condition';
+  for (const [label, step] of [['Review patch media', 'artifact-inspect'], ['Review compatibility checks', 'compatibility-collect'],
+    ['Review installed patch and selection', 'procedure-validate'], ['Review readiness controls', 'readiness-evaluate']]) {
+    await page.querySelectorAll('a').find(link => link.textContent === label).fire('click');
+    assert.equal(document.activeElement, page.querySelector(`#readiness-step-${step}`).querySelector('h3'));
+    assert.equal(field(procedureCard(page), 'Rollback precondition'), draft);
+    assert.equal(draft.value, 'Preserve this unsubmitted condition');
+  }
+  assert.equal(reads, 1);
 });
 
 test('procedure form restores saved validation and marks edits as an unvalidated draft', async () => {
@@ -391,6 +836,67 @@ test('an artifact change while editing cannot silently rebind a saved procedure 
 });
 
 const openWindow = () => ({ start: new Date(Date.now() - 60000).toISOString(), end: new Date(Date.now() + 3600000).toISOString() });
+const actionReview = (plan, tasks = [], digest = 'a'.repeat(64)) => ({ plan, tasks, confirmation: {
+  source: 'controller', plan_id: plan.plan_id, expected_action_binding_sha256: digest,
+  targets: (plan.nodes || []).map(node => ({ node, host_id: 'prod', ssh_alias: 'reviewed-ssh', remote_root: '/reviewed/tools', sudo: true, available: true })),
+} });
+
+test('detail and host execution submit exactly the displayed review for all native launch actions', async () => {
+  for (const hostView of [false, true]) for (const action of ['dispatch', 'execute-next', 'execute-remaining']) {
+    let generation = 'a'; const calls = [], writes = [];
+    const plan = { plan_id: 'review-plan', host_id: 'prod', nodes: ['node-one'], state: action === 'dispatch' ? 'execution_authorized' : 'running', maintenance_window: openWindow() };
+    const reviewed = () => {
+      const value = actionReview(plan, [{ task_id: `task-${generation}`, stage: 'validate', node: 'node-one', status: 'pending' }], generation.repeat(64));
+      value.confirmation.targets[0].ssh_alias = `route-${generation}`;
+      return value;
+    };
+    fetch = async (url, options) => {
+      calls.push(url);
+      if (options.method === 'POST') { writes.push({ url, body: JSON.parse(options.body) }); return response({ error: 'review_changed', message: 'Reviewed target changed; review again.' }, 409); }
+      if (url === '/api/plans') return response({ plans: [plan] });
+      if (url.endsWith('/action-review')) return response(reviewed());
+      if (url.endsWith('/execution')) return response({ tasks: [], runs: [] });
+      throw new Error(`Unexpected independent read: ${url}`);
+    };
+    const page = mount();
+    if (hostView) await renderExecuteStage(page, 'prod'); else await renderPlanDetail(page, plan.plan_id);
+    assert.match(page.textContent, /route-a/);
+    if (action !== 'dispatch' || hostView) assert.match(page.querySelector('tbody').textContent, /task-a/);
+    generation = 'b';
+    const label = action === 'dispatch' ? 'Dispatch' : action === 'execute-next' ? hostView ? 'Execute next' : 'Execute next task' : hostView ? 'Execute remaining' : 'Execute remaining tasks';
+    await button(page, label).fire('click');
+    assert.deepEqual(writes, [{ url: `/api/plans/review-plan/${action}`, body: { actor: 'fixture-operator', expected_action_binding_sha256: 'a'.repeat(64) } }]);
+    assert.equal(calls.filter(url => url.endsWith('/action-review')).length, 2, 'Only rendering and rejection refresh read a review');
+    assert.equal(calls.some(url => url.endsWith('/tasks')), false, 'Displayed tasks must come from the bound review');
+    assert.match(page.textContent, /Reviewed target changed/);
+    assert.match(page.textContent, /route-b/);
+    page.remove(); actor.setActor('fixture-operator');
+  }
+});
+
+test('missing or malformed native action reviews cannot dispatch or execute even through synthetic clicks', async () => {
+  for (const hostView of [false, true]) for (const state of ['execution_authorized', 'running']) for (const corrupt of [
+    value => { value.confirmation = null; },
+    value => { value.confirmation.source = 'model'; },
+    value => { value.confirmation.plan_id = 'another-plan'; },
+    value => { value.confirmation.expected_action_binding_sha256 = 'bad'; },
+    value => { value.confirmation.targets[0].node = 'unreviewed-node'; },
+  ]) {
+    const plan = { plan_id: 'review-plan', host_id: 'prod', nodes: ['node-one'], state, maintenance_window: openWindow() };
+    const review = actionReview(plan); corrupt(review); const writes = [];
+    fetch = async (url, options) => {
+      if (options.method === 'POST') writes.push(url);
+      return response(url === '/api/plans' ? { plans: [plan] } : url.endsWith('/action-review') ? review : { tasks: [], runs: [] });
+    };
+    const page = mount();
+    if (hostView) await renderExecuteStage(page, 'prod'); else await renderPlanDetail(page, plan.plan_id);
+    assert.match(page.textContent, /Execution review is unavailable or incomplete/);
+    const labels = state === 'execution_authorized' ? ['Dispatch'] : hostView ? ['Execute next', 'Execute remaining'] : ['Execute next task', 'Execute remaining tasks'];
+    for (const label of labels) { const control = button(page, label); assert.equal(control.disabled, true); await control.fire('click'); }
+    assert.deepEqual(writes, []);
+    page.remove(); actor.setActor('fixture-operator');
+  }
+});
 
 test('execution window rejects missing, impossible and closed bounds and preserves the native 30 second limit', () => {
   const now = Date.parse('2030-01-01T12:00:00Z');
@@ -410,6 +916,7 @@ test('paused plans with expired or absent windows preserve completed tasks and c
     fetch = async (url, options) => {
       if (options.method === 'POST') { writes.push(url); throw new Error('Unexpected retry'); }
       if (url === '/api/plans') return response({ plans: [plan] });
+      if (url.endsWith('/action-review')) return response(actionReview(plan, [{ task_id: '002-apply', stage: 'apply', status: 'succeeded' }, { task_id: '005-final', stage: 'final_validate', status: 'failed' }]));
       if (url.endsWith('/tasks')) return response({ tasks: [{ task_id: '002-apply', stage: 'apply', status: 'succeeded' }, { task_id: '005-final', stage: 'final_validate', status: 'failed' }] });
       return response(plan);
     };
@@ -430,7 +937,7 @@ test('execution controls recheck window expiry after the page has rendered', asy
   const writes = [];
   fetch = async (url, options) => {
     if (options.method === 'POST') { writes.push(url); throw new Error('Unexpected execution'); }
-    return response(url.endsWith('/tasks') ? { tasks: [] } : plan);
+    return response(url.endsWith('/action-review') ? actionReview(plan) : url.endsWith('/tasks') ? { tasks: [] } : plan);
   };
   const page = mount(); await renderPlanDetail(page, plan.plan_id);
   assert.equal(button(page, 'Execute next task').disabled, false);
@@ -459,6 +966,7 @@ test('Execute preserves a failed operation while refreshing task and plan status
     if (options.method === 'POST') { state = 'paused'; return response({ run_id: 'failure-run' }); }
     if (url.startsWith('/api/runs/')) return response({ status: 'failed', error: { message: 'Native prerequisite failed', stderr: 'OPatch conflict' } });
     if (url === '/api/plans') return response({ plans: [{ plan_id: 'CHG-42', host_id: 'prod', state }] });
+    if (url.endsWith('/action-review')) return response(actionReview({ plan_id: 'CHG-42', state, maintenance_window: openWindow() }));
     if (url.endsWith('/tasks')) return response({ tasks: [] });
     return response({ plan_id: 'CHG-42', state, maintenance_window: openWindow() });
   };
@@ -480,6 +988,7 @@ test('unknown run preserves native diagnostics and offers only reconciliation un
       return response(terminal ? { status: 'succeeded' } : unknown);
     }
     if (url.endsWith('/tasks')) return response({ tasks: [{ task_id: '003-validate', stage: 'validate', status: 'pending' }] });
+    if (url.endsWith('/action-review')) return response(actionReview({ plan_id: 'P1', state: 'running', maintenance_window: openWindow(), unresolved_run: terminal ? null : unknown }, [{ task_id: '003-validate', stage: 'validate', status: 'pending' }]));
     return response({ plan_id: 'P1', state: 'running', maintenance_window: openWindow(), unresolved_run: terminal ? null : unknown });
   };
   const page = mount(); await renderPlanDetail(page, 'P1');
@@ -506,6 +1015,7 @@ test('an unknown poll retains run identity and the host Execute page offers reco
   fetch = async (url, options) => {
     if (options.method === 'POST') { writes.push(url); return response(unknown); }
     if (url === '/api/plans') return response({ plans: [{ plan_id: 'P1', state: 'running', host_id: 'prod' }] });
+    if (url.endsWith('/action-review')) return response(actionReview({ plan_id: 'P1', state: 'running', unresolved_run: unknown }));
     if (url.endsWith('/tasks')) return response({ tasks: [] });
     return response({ plan_id: 'P1', state: 'running', unresolved_run: unknown });
   };
@@ -630,21 +1140,34 @@ test('host lock operations retain token and actor requirements', async () => {
   assert.match(page.textContent, /actor/i);
 });
 
-test('token changes refresh the real app and authenticated actor inputs cannot impersonate another principal', async () => {
+test('token changes refresh the real app permissions and authenticated actor inputs cannot impersonate another principal', async () => {
+  location.hash = '#/estate';
   for (const id of ['app', 'rail-session', 'rail-hosts']) { const node = new Element('div'); node.setAttribute('id', id); document.body.appendChild(node); }
   let sessions = 0;
   fetch = async (url, options) => {
-    if (url === '/api/session') { sessions++; const who = options.headers.Authorization === 'Bearer bob-token' ? 'bob' : 'alice'; return response({ actor: who, roles: ['operator'], rbac_enabled: true }); }
-    return response({ hosts: [] });
+    if (url === '/api/session') {
+      sessions++; const who = options.headers.Authorization === 'Bearer bob-token' ? 'bob' : 'alice';
+      return response({ actor: who, mode: 'principal', roles: [who === 'bob' ? 'operator' : 'requester'], rbac_enabled: true,
+        permissions: { live_discovery: who === 'bob' } });
+    }
+    return response(url === '/api/estate' ? { hosts: [{ id: 'prod', status: 'pending' }] } : url === '/api/fleet' ? { databases: [] } : { steps: [] });
   };
   await import('../webapp/static/app.js');
   const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
   await settle(); assert.equal(actor.getActor(), 'alice');
+  assert.equal(button(document.getElementById('app'), 'Refresh live SSH').disabled, true);
   const input = document.getElementById('session-acting-as'); assert.equal(input.readOnly, true);
   actor.setActor('mallory'); assert.equal(actor.getActor(), 'alice');
   api.setApiToken('bob-token'); await settle();
   assert.equal(actor.getActor(), 'bob'); assert.equal(input.value, 'bob'); assert.ok(sessions >= 2);
   assert.match(document.getElementById('rail-session').textContent, /Authenticated as bob/);
+  assert.equal(button(document.getElementById('app'), 'Refresh live SSH').disabled, false);
+  location.hash = '#/hosts/prod/discover'; window.dispatchEvent(new Event('hashchange')); await settle();
+  assert.equal(button(document.getElementById('app'), 'Run live discovery').disabled, false);
+  api.setApiToken('alice-token'); await settle();
+  assert.equal(actor.getActor(), 'alice');
+  assert.equal(button(document.getElementById('app'), 'Run live discovery').disabled, true);
+  location.hash = '#/estate'; window.dispatchEvent(new Event('hashchange')); await settle();
 });
 
 
@@ -855,6 +1378,26 @@ test('failed recovery analysis refresh clears previously passed approval evidenc
   assert.equal(calls.filter(url => url.endsWith('/approve')).length, 0);
 });
 
+test('recovery analysis cannot relaunch while a running or unknown operation awaits resolution', async () => {
+  const posts = [];
+  for (const status of ['pending', 'queued', 'running', 'unknown']) {
+    for (const analysis of [null, { status: 'passed' }]) {
+      fetch = async (url, options = {}) => {
+        if (options.method === 'POST') posts.push(url);
+        return response({ request_id: 'live-1', state: 'awaiting_approval', mode: 'live', analysis,
+          latest_run: { run_id: 'existing-run', status } });
+      };
+      const page = mount(); await renderRecoveryDetail(page, 'live-1');
+      const analyze = button(page, analysis ? 'Refresh analysis' : 'Analyze recovery');
+      assert.equal(analyze.disabled, true, status);
+      await analyze.fire('click');
+      assert.match(page.textContent, /Existing operation must finish or be reconciled/);
+      assert.equal(page.querySelectorAll('button').some(node => node.textContent === 'Approve'), false);
+    }
+  }
+  assert.deepEqual(posts, []);
+});
+
 test('live recovery execution describes real downtime and fixtures are never offered as host planning evidence', async () => {
   fetch = async () => response({ request_id: 'live-1', host_id: 'prod', mode: 'live', state: 'authorized', authorization: { actor: 'fixture-operator' } });
   const page = mount(); await renderRecoveryDetail(page, 'live-1');
@@ -888,6 +1431,34 @@ test('live recovery remains unavailable unless the server explicitly exposes the
   assert.equal(field(page, 'Backup parent directory').disabled, true);
   await button(page, 'Create live recovery request').fire('click');
   assert.equal(writes, 0);
+});
+
+test('failed or interrupted backup selection removes the old planning handoff', async () => {
+  for (const outcome of ['failed', 'unknown', 'poll-error', 'unconfirmed-success']) {
+    let started = false;
+    fetch = async (url, options = {}) => {
+      if (options.method === 'POST') { started = true; return response({ run_id: 'replacement' }); }
+      if (url.startsWith('/api/runs/')) {
+        if (outcome === 'poll-error') throw new Error('Connection lost');
+        return response({ run_id: 'replacement', status: outcome === 'unconfirmed-success' ? 'succeeded' : outcome,
+          result: { status: 'passed' }, error: { message: 'Backup validation failed' } });
+      }
+      if (url === '/api/recovery?host_id=prod') return response({ ...recoveryCapability(), requests: [
+        { request_id: 'backup-B', host_id: 'prod', mode: 'live', state: 'completed' },
+      ] });
+      const steps = recoverySteps();
+      steps.find(step => step.step === 'readiness-evaluate').recovery_selection = started ? null : { request_id: 'backup-A', host_id: 'prod' };
+      return response({ steps });
+    };
+    const page = mount(); await renderRecoveryStage(page, 'prod');
+    const summary = page.querySelector('.recovery-selection');
+    assert.match(summary.textContent, /Selected request: backup-A/, outcome);
+    assert.equal(summary.querySelectorAll('a').length, 1, outcome);
+    await button(page, 'Validate for patch planning').fire('click');
+    assert.doesNotMatch(summary.textContent, /Selected request: backup-A/, outcome);
+    assert.match(summary.textContent, /Backup selection is not confirmed/, outcome);
+    assert.equal(summary.querySelectorAll('a').length, 0, outcome);
+  }
 });
 
 function inspectionFixture() {
@@ -1058,4 +1629,68 @@ test('a matching in-flight inspection can be joined and mismatched poll identity
       assert.match(page.textContent, /they do not prove the host is unchanged now/);
     }
   }
+});
+
+test('artifact remediation is passive until an admitted operator explicitly probes hosts', async () => {
+  const steps = [{ step: 'discovery', done: true, evidence: { databases: [] } },
+    { step: 'artifact-inspect', done: true, status: 'blocked', evidence: { artifact: {
+      path: '/fixture/patch', status: 'blocked', reason: 'artifact is incomplete' } } }];
+  for (const allowed of [false, true]) {
+    actor.setSessionIdentity({ mode: 'company', actor: 'fixture-operator', rbac_enabled: true,
+      permissions: { live_discovery: allowed }, csrf_token: 'probe-csrf', expires_at: Date.now() / 1000 + 600 });
+    api.setSessionCsrf('probe-csrf');
+    const calls = [];
+    fetch = async (url, options = {}) => {
+      calls.push({ url, options });
+      if (url === '/api/hosts/prod/pipeline') return response({ steps });
+      assert.equal(url, '/api/hosts/prod/artifact-sources');
+      assert.equal(options.method, 'POST');
+      assert.equal(options.headers['X-CSRF-Token'], 'probe-csrf');
+      assert.deepEqual(JSON.parse(options.body), { artifact_dir: '/fixture/patch' });
+      return response({ targets: [{ node: 'prod', state: 'incomplete' }], sources: [{ host_id: 'source', label: 'Source', state: 'complete' }] });
+    };
+    const page = mount(); await renderReadinessStage(page, 'prod');
+    assert.deepEqual(calls.map(call => call.url), ['/api/hosts/prod/pipeline']);
+    assert.match(page.textContent, /all other configured source hosts/);
+    const probe = button(page, 'Probe managed hosts');
+    assert.equal(probe.disabled, !allowed);
+    assert.equal(button(page, 'Stage media').disabled, !allowed);
+    await probe.fire('click');
+    assert.equal(calls.length, allowed ? 2 : 1);
+    if (allowed) assert.equal(field(page, 'Source host').value, 'source');
+    actor.setSessionIdentity({ mode: 'principal', actor: 'fixture-operator', rbac_enabled: true, permissions: { live_discovery: false } });
+    await probe.fire('click');
+    await button(page, 'Stage media').fire('click');
+    assert.equal(calls.length, allowed ? 2 : 1, 'Revoked permission must not issue more host operations');
+  }
+});
+
+test('artifact path edits invalidate a pending source probe and prevent stale staging selection', async () => {
+  actor.setSessionIdentity({ mode: 'principal', actor: 'fixture-operator', rbac_enabled: true, permissions: { live_discovery: true } });
+  let releaseProbe;
+  const calls = [];
+  fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    if (url === '/api/hosts/prod/pipeline') return response({ steps: [
+      { step: 'discovery', done: true, evidence: { databases: [] } },
+      { step: 'artifact-inspect', done: true, status: 'blocked', evidence: { artifact: {
+        path: '/fixture/old', status: 'blocked', reason: 'artifact is incomplete' } } },
+    ] });
+    assert.equal(url, '/api/hosts/prod/artifact-sources');
+    return new Promise(resolve => { releaseProbe = () => resolve(response({
+      targets: [{ node: 'prod', state: 'incomplete' }], sources: [{ host_id: 'old-source', label: 'Old source', state: 'complete' }],
+    })); });
+  };
+  const page = mount(); await renderReadinessStage(page, 'prod');
+  const pending = button(page, 'Probe managed hosts').fire('click');
+  while (!releaseProbe) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(button(page, 'Stage media').disabled, true);
+  field(page, 'Artifact path on this host').value = '/fixture/new';
+  await field(page, 'Artifact path on this host').fire('input');
+  releaseProbe(); await pending;
+  assert.equal(field(page, 'Source host').value, '');
+  assert.doesNotMatch(page.textContent, /Old source/);
+  await button(page, 'Stage media').fire('click');
+  assert.match(page.textContent, /Pick a source host with complete media/);
+  assert.equal(calls.length, 2, 'Staging cannot reuse a source from the previous path');
 });

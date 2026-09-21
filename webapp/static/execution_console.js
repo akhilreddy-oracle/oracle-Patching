@@ -35,6 +35,7 @@ export function executionConsole(planId) {
   let selectedRun = null;
   let lastNative = 0;
   let pending = false;
+  let loadRevision = 0;
   let timer;
   const signal = getReadSignal();
   controls.appendChild(refresh); controls.appendChild(observe);
@@ -48,14 +49,19 @@ export function executionConsole(planId) {
   function draw(data) {
     content.innerHTML = "";
     status.textContent = data.guidance;
-    const runs = (data.runs || []).filter(run => run.can_observe);
+    const runs = (data.runs || []).filter(run => run.can_observe === true || run.observe_blocked_reason || run.observation);
     selectedRun = runs.at(-1) || null;
-    observe.disabled = !selectedRun || pending;
+    observe.disabled = selectedRun?.can_observe !== true || pending;
+    follow.disabled = selectedRun?.can_observe !== true;
+    if (follow.disabled) follow.checked = false;
     if (selectedRun) {
       const heartbeat = heartbeatSummary(selectedRun);
       content.appendChild(el("p", { text: `Run ${selectedRun.run_id} · ${selectedRun.status} · elapsed ${duration(selectedRun.elapsed_seconds)}` }));
       content.appendChild(el("p", { class: "helper-text", text: `Controller contact: ${heartbeat.controller}. ${heartbeat.worker}.` }));
       content.appendChild(el("p", { class: "helper-text", text: "Logs and heartbeat observations do not verify task completion. Use Inspect and reconcile after a disconnect or unknown outcome." }));
+      if (typeof selectedRun.observe_blocked_reason === "string") content.appendChild(el("p", {
+        class: "helper-text warn", text: selectedRun.observe_blocked_reason.slice(0, 800),
+      }));
     }
     const tasks = el("ol", { "aria-label": "Persistent task timeline" });
     for (const task of data.tasks || []) {
@@ -77,7 +83,7 @@ export function executionConsole(planId) {
     showLog();
   }
   async function native() {
-    if (!selectedRun || pending) return;
+    if (selectedRun?.can_observe !== true || pending || signal?.aborted || !section.isConnected) return;
     pending = true; observe.disabled = true;
     try {
       const result = await runToCompletion(`/api/plans/${encodeURIComponent(planId)}/execution-observe`, { run_id: selectedRun.run_id });
@@ -87,14 +93,17 @@ export function executionConsole(planId) {
     } catch (error) {
       status.textContent = `Native observation unavailable: ${error.message}. Existing execution continues independently.`;
       follow.checked = false;
-    } finally { pending = false; observe.disabled = !selectedRun; }
+    } finally { pending = false; observe.disabled = selectedRun?.can_observe !== true; }
   }
   async function load(schedule = true) {
     if (signal?.aborted) return;
+    const revision = ++loadRevision;
     clearTimeout(timer);
     try {
       const response = await apiFetch(`/api/plans/${encodeURIComponent(planId)}/execution`, { signal });
-      const data = await response.json(); draw(data);
+      const data = await response.json();
+      if (signal?.aborted || revision !== loadRevision) return;
+      draw(data);
       const active = selectedRun && ["queued", "running"].includes(selectedRun.status);
       if (active && follow.checked && !pending && Date.now() - lastNative > 15000) await native();
       if (schedule && section.isConnected) {
@@ -102,7 +111,7 @@ export function executionConsole(planId) {
         timer?.unref?.();
       }
     } catch (error) {
-      if (error.name !== "AbortError") status.textContent = `Saved execution view unavailable: ${error.message}`;
+      if (!signal?.aborted && revision === loadRevision && error.name !== "AbortError") status.textContent = `Saved execution view unavailable: ${error.message}`;
     }
   }
   refresh.addEventListener("click", () => load());

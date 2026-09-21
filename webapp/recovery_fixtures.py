@@ -20,8 +20,6 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-BIN = REPO_ROOT / "bin"
 SHIMS_DIR = Path(__file__).resolve().parent / "recovery_fixtures"
 
 
@@ -97,7 +95,7 @@ def build(base_dir: Path, request_id: str) -> dict:
             "db_unique_name": "ORCL", "oracle_home": str(oracle_home),
             "runtime": {
                 "status": "complete", "instance": "ORCL", "database_role": "PRIMARY",
-                "open_mode": "READ WRITE", "log_mode": "NOARCHIVELOG", "instance_state": "OPEN",
+                "open_mode": "READ WRITE", "log_mode": "NOARCHIVELOG", "instance_state": "OPEN", "cdb": "NO",
             },
         }],
         "warnings": [],

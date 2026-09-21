@@ -17,8 +17,13 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
+from contextvars import ContextVar
+from copy import deepcopy
+from contextlib import ExitStack, contextmanager
+from functools import wraps
 from datetime import datetime, timezone
 from pathlib import Path
+import runtime_paths
 
 import evidence
 import production
@@ -26,16 +31,18 @@ import remote
 import testmode_fixtures
 import tools_sync
 import pipeline_runner
-from durable import write_json
+from durable import file_lock, write_json
 from adapters import EXECUTOR_PATHS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLAN_TOOL = REPO_ROOT / "bin" / "opu-patch-plan"
-PLAN_STATE_DIR = Path(__file__).resolve().parent / "var" / "plans"
-TESTMODE_DIR = Path(__file__).resolve().parent / "var" / "testmode"
-HOSTS_FILE = Path(__file__).resolve().parent / "hosts.json"
+PLAN_STATE_DIR = runtime_paths.state_dir() / "plans"
+TESTMODE_DIR = runtime_paths.state_dir() / "testmode"
+HOSTS_FILE = runtime_paths.hosts_file()
 DEFAULT_TIMEOUT_SECONDS = 30
 LIVE_EXECUTE_TIMEOUT_SECONDS = 3600
+_PINNED_HOSTS: ContextVar[dict | None] = ContextVar("plan_execution_hosts", default=None)
+_CONFIRMED_ACTION: ContextVar[dict | None] = ContextVar("plan_confirmed_action", default=None)
 
 # Matches lib/opu/common.sh opu_validate_identifier.
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -97,9 +104,67 @@ def _unverified_remote_terminal(returncode: int, verified, stderr: str) -> PlanE
 
 
 def validate_plan_id(plan_id: str) -> str:
-    if not plan_id or not _ID_RE.match(plan_id):
+    if not isinstance(plan_id, str) or not _ID_RE.fullmatch(plan_id):
         raise PlanError(f"plan_id contains unsupported characters: {plan_id!r}")
     return plan_id
+
+
+@contextmanager
+def transport_lock(plan_id: str):
+    """Serialize controller/queue admission before either can copy task state.
+
+    Native task locks protect an individual store. They cannot protect a remote
+    store while another transport overwrites it from a stale controller copy.
+    This lock is held through controller execution and shared by publication.
+    """
+    validate_plan_id(plan_id)
+    acquired = False
+    try:
+        with file_lock(PLAN_STATE_DIR / ".transport-locks" / f"{plan_id}.lock", timeout=0):
+            acquired = True
+            yield
+    except TimeoutError as exc:
+        if acquired:
+            raise
+        raise PlanError("Another controller operation owns this plan's execution transport; inspect its existing run") from exc
+
+
+def _require_controller_transport(plan_id: str) -> None:
+    import agent_queue
+    try:
+        agent_queue.assert_no_unresolved_plan_tasks(plan_id)
+    except agent_queue.QueueError as exc:
+        raise PlanError(str(exc)) from exc
+
+
+@contextmanager
+def confirmed_action(plan_id, verify):
+    """Recheck reviewed state under the first native transport admission lock.
+
+    One Execute remaining action advances its own task state after admission;
+    later stages retain the reviewed host snapshot and native execution guards.
+    """
+    token = _CONFIRMED_ACTION.set({"plan_id": plan_id, "verify": verify, "admitted": False})
+    try:
+        yield
+    finally:
+        _CONFIRMED_ACTION.reset(token)
+
+
+def _controller_plan_operation(fn):
+    @wraps(fn)
+    def guarded(plan_id, *args, **kwargs):
+        with transport_lock(plan_id):
+            _require_controller_transport(plan_id)
+            review = _CONFIRMED_ACTION.get()
+            if review is not None:
+                if review["plan_id"] != plan_id:
+                    raise PlanError("Reviewed action belongs to another plan")
+                if not review["admitted"]:
+                    review["verify"]()
+                    review["admitted"] = True
+            return fn(plan_id, *args, **kwargs)
+    return guarded
 
 
 def _record_host(plan_id: str, host_id: str | None) -> None:
@@ -160,8 +225,11 @@ def _run(args: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict | None
 
     if result.stdout.strip():
         try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
+            payload = json.loads(result.stdout)
+            if not isinstance(payload, dict):
+                raise ValueError("plan command result must be an object")
+            return payload
+        except ValueError as exc:
             raise PlanError(
                 f"opu-patch-plan produced unparsable output: {exc}",
                 stderr=result.stdout[-2000:],
@@ -169,7 +237,29 @@ def _run(args: list[str], timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict | None
     return None
 
 
-def create(plan_id: str, requester: str, host_id: str, window_start: str, window_end: str) -> dict:
+def create(plan_id: str, requester: str, host_id: str, window_start: str, window_end: str, *,
+           expected_creation_binding_sha256: str | None = None, patch_id: str | None = None,
+           database: str | None = None, hosts: dict | None = None) -> dict:
+    validate_plan_id(plan_id)
+    evidence.validate_host_id(host_id)
+    with evidence.host_lock(host_id):
+        active = pipeline_runner.active_run_id(f"host:{host_id}:pipeline")
+        if active:
+            raise PlanError("Host evidence has an active or unresolved pipeline; wait or reconcile before creating a plan")
+        if expected_creation_binding_sha256 is not None:
+            if (not isinstance(expected_creation_binding_sha256, str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", expected_creation_binding_sha256)
+                    or not isinstance(hosts, dict) or host_id not in hosts):
+                raise PlanError("Plan creation confirmation is incomplete; review the proposal again")
+            current = evidence.creation_binding(host_id, hosts[host_id], patch_id, database)
+            if current != expected_creation_binding_sha256:
+                raise PlanError("Host configuration or evidence changed after confirmation; review a new proposal")
+        elif patch_id is not None or database is not None:
+            raise PlanError("An explicit patch/database requires a bound creation confirmation")
+        return _create_from_host_evidence(plan_id, requester, host_id, window_start, window_end)
+
+
+def _create_from_host_evidence(plan_id: str, requester: str, host_id: str, window_start: str, window_end: str) -> dict:
     validate_plan_id(plan_id)
     evidence.validate_host_id(host_id)
     args = [
@@ -205,6 +295,16 @@ def create(plan_id: str, requester: str, host_id: str, window_start: str, window
 
 
 def create_rollback(plan_id: str, requester: str, source_plan_id: str, window_start: str, window_end: str) -> dict:
+    # Live rollback creation mirrors the source plan onto a task node too.
+    with transport_lock(source_plan_id):
+        _require_controller_transport(source_plan_id)
+        active = pipeline_runner.active_run_id(f"plan:{source_plan_id}:execute")
+        if active:
+            raise PlanError("Source plan has an active or unresolved execution; reconcile it before creating rollback")
+        return _create_rollback(plan_id, requester, source_plan_id, window_start, window_end)
+
+
+def _create_rollback(plan_id: str, requester: str, source_plan_id: str, window_start: str, window_end: str) -> dict:
     validate_plan_id(plan_id)
     validate_plan_id(source_plan_id)
     args = [
@@ -253,8 +353,8 @@ def _create_rollback_live(
     local_new = PLAN_STATE_DIR / "plans" / plan_id
     if local_new.exists():
         raise PlanError(f"plan already exists locally: {plan_id}")
-    remote_root = _sync_plan_to_host(host, source_plan_id)
-    remote_tool = f"{host['remote_root'].rstrip('/')}/bin/opu-patch-plan"
+    remote_root, runtime = _sync_plan_to_host(host, source_plan_id)
+    remote_tool = tools_sync.tool_path(host, [runtime], "bin/opu-patch-plan")
     remote_argv = [
         "env", f"OPU_PLAN_STATE_DIR={remote_root}", remote_tool,
         "create-rollback",
@@ -295,18 +395,21 @@ def _create_rollback_live(
     return status(plan_id)
 
 
+@_controller_plan_operation
 def approve(plan_id: str, actor: str, approval_ticket: str) -> dict:
     validate_plan_id(plan_id)
     _run(["approve", "--plan-id", plan_id, "--actor", actor, "--approval-ticket", approval_ticket])
     return status(plan_id)
 
 
+@_controller_plan_operation
 def authorize(plan_id: str, actor: str) -> dict:
     validate_plan_id(plan_id)
     _run(["authorize", "--plan-id", plan_id, "--actor", actor])
     return status(plan_id)
 
 
+@_controller_plan_operation
 def dispatch(plan_id: str, actor: str) -> dict:
     validate_plan_id(plan_id)
     _run(["dispatch", "--plan-id", plan_id, "--actor", actor])
@@ -316,17 +419,52 @@ def dispatch(plan_id: str, actor: str) -> dict:
 def retry_task(plan_id: str, task_id: str, actor: str) -> dict:
     """Re-open a plan paused by this task's failure so it can be executed again."""
     validate_plan_id(plan_id)
-    if not task_id or not _ID_RE.match(task_id):
+    if not isinstance(task_id, str) or not _ID_RE.fullmatch(task_id):
         raise PlanError(f"task_id contains unsupported characters: {task_id!r}")
-    plan = status(plan_id)
-    task = next((t for t in list_tasks(plan_id) if t.get("task_id") == task_id), None)
-    if task is None:
-        raise PlanError(f"task {task_id} not found on plan {plan_id}")
-    result = _run([
-        "retry-task", "--plan-id", plan_id, "--task-id", task_id, "--actor", actor,
-    ])
-    # Executors allocate an attempt generation; previous evidence is immutable.
-    return result if isinstance(result, dict) else status(plan_id)
+    if not isinstance(actor, str) or not _ID_RE.fullmatch(actor):
+        raise PlanError("retry actor contains unsupported characters")
+    import agent_queue
+
+    try:
+        with transport_lock(plan_id), agent_queue.retry_admission(plan_id, task_id) as job:
+            if pipeline_runner.active_run_id(f"plan:{plan_id}:execute"):
+                raise PlanError("Controller execution is active or unresolved; reconcile it before retrying a task")
+            plan = status(plan_id)
+            if job is None:
+                task = next((t for t in list_tasks(plan_id) if t.get("task_id") == task_id), None)
+                if task is None:
+                    raise PlanError(f"task {task_id} not found on plan {plan_id}")
+                result = _run(["retry-task", "--plan-id", plan_id, "--task-id", task_id, "--actor", actor])
+                return result if isinstance(result, dict) else status(plan_id)
+
+            # The native verifier checks custody. The queue's failed result
+            # additionally binds the exact attempt that is being reopened.
+            previous = job["result"]["task"]
+            digest = previous.get("task_result_sha256")
+            if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+                raise PlanError("Queue retry has no bound previous task result")
+            def verified_task():
+                value = _run(["task-status", "--plan-id", plan_id, "--task-id", task_id])
+                if (not isinstance(value, dict) or value.get("plan_id") != plan_id or value.get("task_id") != task_id
+                        or value.get("adapter") != job["adapter"] or type(value.get("retry_count", 0)) is not int):
+                    raise PlanError("Native task differs from this queue retry")
+                return value
+
+            task = verified_task()
+            if task.get("status") == "failed" and task.get("retry_count", 0) == job["attempt"] and task.get("task_result_sha256") == digest:
+                _run(["retry-task", "--plan-id", plan_id, "--task-id", task_id, "--actor", actor])
+                task = verified_task()
+                plan = status(plan_id)
+            # Recovery from a controller failure after native retry but before
+            # queue publication must not increment the native attempt again.
+            if (task.get("status") != "pending" or task.get("retry_count") != job["attempt"] + 1
+                    or task.get("previous_attempt_result_sha256") != digest or plan.get("state") != "running"):
+                raise PlanError("Native retry is not a verified pending successor of this failed queue attempt")
+            agent_queue.publish_task(plan_id=plan_id, task_id=task_id, node=job["node"], adapter=job["adapter"],
+                                     payload={**job["payload"], "task": task})
+            return task
+    except agent_queue.QueueError as exc:
+        raise PlanError(str(exc)) from exc
 
 
 def next_task(plan_id: str) -> dict | None:
@@ -346,7 +484,15 @@ def next_task(plan_id: str) -> dict | None:
         )
     if not result.stdout.strip():
         raise PlanError(f"opu-patch-plan next exited {result.returncode} with no output", stderr=result.stderr.strip())
-    return json.loads(result.stdout)
+    try:
+        task = json.loads(result.stdout)
+        if (not isinstance(task, dict) or task.get("plan_id") != plan_id
+                or not isinstance(task.get("task_id"), str) or not _ID_RE.fullmatch(task["task_id"])
+                or task.get("status") != "pending" or task.get("adapter") not in EXECUTOR_BY_ADAPTER):
+            raise ValueError("next task is not a pending supported task for this plan")
+        return task
+    except ValueError as exc:
+        raise PlanError(f"opu-patch-plan next returned an invalid task: {exc}") from exc
 
 
 def status(plan_id: str) -> dict:
@@ -543,6 +689,7 @@ def _create_testmode_plan(plan_id: str, requester: str, window_start: str, windo
     """
     validate_plan_id(plan_id)
     TESTMODE_DIR.mkdir(parents=True, exist_ok=True)
+    runtime_paths.require_fixtures_allowed()
     fixture_dir = (TESTMODE_DIR / plan_id).resolve()
     if TESTMODE_DIR.resolve() not in fixture_dir.parents and fixture_dir != TESTMODE_DIR.resolve():
         raise PlanError(f"plan_id escapes testmode root: {plan_id!r}")
@@ -601,14 +748,35 @@ def _short_host(name: str) -> str:
 
 
 def _load_hosts() -> dict[str, dict]:
-    data = json.loads(HOSTS_FILE.read_text())
-    return {host["id"]: host for host in data["hosts"]}
+    import host_config
+    try:
+        return host_config.load(HOSTS_FILE)
+    except host_config.HostConfigError as exc:
+        raise PlanError(str(exc)) from exc
+
+
+@contextmanager
+def pinned_hosts(hosts: dict | None):
+    """Keep one reviewed inventory snapshot for every task in this worker.
+
+    Context-local storage prevents concurrent runs from sharing target maps.
+    Copy nested node entries too: an inventory refresh or caller mutation must
+    not silently redirect a later task in a confirmed multi-node operation.
+    """
+    token = _PINNED_HOSTS.set(deepcopy(hosts))
+    try:
+        yield
+    finally:
+        _PINNED_HOSTS.reset(token)
 
 
 def _iter_host_nodes() -> list[tuple[dict, dict]]:
-    """Yield (host, node) pairs from hosts.json."""
+    """Yield reviewed worker targets, or current hosts for a native UI action."""
     pairs = []
-    for host in _load_hosts().values():
+    hosts = _PINNED_HOSTS.get()
+    if hosts is None:
+        hosts = _load_hosts()
+    for host in hosts.values():
         nodes = host.get("nodes") or [{"name": host.get("id"), "ssh_alias": host.get("ssh_alias")}]
         for node in nodes:
             pairs.append((host, node))
@@ -617,34 +785,65 @@ def _iter_host_nodes() -> list[tuple[dict, dict]]:
 
 def _resolve_node_host(node_name: str) -> dict:
     """Map a sealed plan/task node name to a hosts.json entry with ssh_alias."""
-    want = _short_host(node_name)
+    want = str(node_name or "").lower()
     if not want:
         raise PlanError("task/plan node name is empty")
-    for host, node in _iter_host_nodes():
-        name = _short_host(node.get("name") or "")
-        # Explicit null means "not wired for SSH" (fail closed). Missing key
-        # inherits the host-level ssh_alias.
-        if "ssh_alias" in node:
-            alias = node.get("ssh_alias")
-        else:
-            alias = host.get("ssh_alias")
-        if name == want:
-            if not alias:
-                raise PlanError(
-                    f"hosts.json node {node.get('name')!r} has no ssh_alias; "
-                    "multi-node live execute requires SSH to every plan node"
-                )
-            resolved = dict(host)
-            resolved["ssh_alias"] = alias
-            resolved["node_name"] = name
-            return resolved
-    # Fall back to host id match (standalone estates).
-    for host in _load_hosts().values():
-        if _short_host(host.get("id") or "") == want and host.get("ssh_alias"):
-            resolved = dict(host)
-            resolved["node_name"] = want
-            return resolved
-    raise PlanError(f"No hosts.json SSH mapping for node {node_name!r}")
+    pairs = _iter_host_nodes()
+    host_pairs = [(host, {"name": host["id"], "ssh_alias": host.get("ssh_alias")})
+                  for host in {host["id"]: host for host, _ in pairs}.values()]
+    # Prefer the complete configured identity. A short DNS alias is usable
+    # only when unique; never let configuration ordering choose the target.
+    matches = [(host, node) for host, node in pairs if str(node.get("name") or "").lower() == want]
+    if not matches:
+        matches = [(host, node) for host, node in host_pairs if str(node["name"]).lower() == want]
+    if not matches:
+        matches = [(host, node) for host, node in pairs
+                   if _short_host(node.get("name")) == _short_host(want)
+                   and ("." not in want or "." not in str(node.get("name") or ""))]
+    if not matches:
+        matches = [(host, node) for host, node in host_pairs
+                   if _short_host(node["name"]) == _short_host(want)
+                   and ("." not in want or "." not in str(node["name"]))]
+    if len(matches) > 1:
+        raise PlanError(f"Ambiguous hosts.json SSH mapping for node {node_name!r}; use its complete configured identity")
+    if not matches:
+        raise PlanError(f"No hosts.json SSH mapping for node {node_name!r}")
+    host, node = matches[0]
+    # Explicit null means "not wired for SSH"; only a missing key inherits.
+    alias = node.get("ssh_alias") if "ssh_alias" in node else host.get("ssh_alias")
+    if not alias:
+        raise PlanError(f"hosts.json node {node.get('name')!r} has no ssh_alias; "
+                        "multi-node live execute requires SSH to every plan node")
+    return {**host, "ssh_alias": alias, "node_name": str(node["name"]).lower()}
+
+
+def execution_host_binding(host: dict) -> str:
+    """Bind a detached launch to the complete effective host configuration.
+
+    Keep future transport options and nested node configuration in the seal,
+    rather than maintaining an allowlist that can silently omit a new option.
+    Only the digest is persisted; configuration values stay out of run records.
+    """
+    effective = {**host, "node_name": host.get("node_name") or host.get("id"),
+                 "sudo": bool(host.get("sudo"))}
+    return hashlib.sha256(json.dumps(effective, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+
+
+def resolve_bound_execution_host(context: dict) -> dict:
+    """Resolve an existing launch without inferring its original configuration."""
+    expected = context.get("execution_host_configuration_sha256")
+    if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+        raise PlanError("persisted launch has no verified execution-host configuration binding; "
+                        "keep it unresolved and inspect the original launch configuration")
+    host = _resolve_node_host(str(context.get("node") or ""))
+    if (host.get("ssh_alias") != context.get("ssh_alias")
+            or host.get("remote_root") != context.get("remote_root")
+            or host.get("id") != context.get("host_id")
+            or execution_host_binding(host) != expected):
+        raise PlanError("host configuration changed since the persisted launch; "
+                        "cannot safely inspect it using the current configuration")
+    return host
 
 
 def preflight_live_plan_nodes(plan: dict) -> None:
@@ -665,7 +864,7 @@ def preflight_live_plan_nodes(plan: dict) -> None:
 def _task_execution_node(plan: dict, task: dict) -> str:
     """Pick the hostname the executor must run on for this sealed task."""
     node = task.get("node")
-    if node and _short_host(node) not in {"", "local", "cluster"}:
+    if node and str(node).lower() not in {"", "local", "cluster"}:
         return str(node)
     target = plan.get("target") or {}
     coordinator = target.get("coordinator_node")
@@ -678,8 +877,10 @@ def _task_execution_node(plan: dict, task: dict) -> str:
 
 
 def _resolve_live_host_for_task(plan: dict, task: dict) -> dict:
-    preflight_live_plan_nodes(plan)
-    return _resolve_node_host(_task_execution_node(plan, task))
+    hosts = _PINNED_HOSTS.get()
+    with pinned_hosts(_load_hosts() if hosts is None else hosts):
+        preflight_live_plan_nodes(plan)
+        return _resolve_node_host(_task_execution_node(plan, task))
 
 
 def _remote_plan_root(host: dict) -> str:
@@ -734,54 +935,82 @@ def _sync_sealed_inputs_to_host(host: dict, plan_id: str) -> None:
             ) from exc
 
 
-def _sync_plan_to_host(host: dict, plan_id: str) -> str:
+def _temporary_remote_archive(host: dict) -> str:
+    """Reserve private transfer storage without opening predictable /tmp files."""
+    response = remote.run_remote_shell(host["ssh_alias"],
+        "umask 077; mktemp -d /tmp/opu-plan-transfer.XXXXXXXXXXXX",
+        timeout=60, sudo=bool(host.get("sudo")))
+    directory = response.stdout.strip()
+    if response.returncode != 0 or not re.fullmatch(r"/tmp/opu-plan-transfer\.[A-Za-z0-9]{12}", directory):
+        raise PlanError("could not allocate a private remote plan transfer directory", stderr=response.stderr)
+    return directory
+
+
+def _remove_remote_archive(host: dict, directory: str) -> None:
+    # Remove only the known file and its empty private directory. A failed
+    # cleanup must not hide a verified result or the original transfer error.
+    try:
+        remote.run_remote_checked(host["ssh_alias"], ["rm", "-f", "--", directory + "/plan.tar"],
+                                  timeout=30, sudo=bool(host.get("sudo")))
+        remote.run_remote_checked(host["ssh_alias"], ["rmdir", "--", directory],
+                                  timeout=30, sudo=bool(host.get("sudo")))
+    except remote.RemoteError:
+        pass
+
+
+def _sync_plan_to_host(host: dict, plan_id: str) -> tuple[str, dict]:
     local_plan = PLAN_STATE_DIR / "plans" / plan_id
     if not local_plan.is_dir():
         raise PlanError(f"local plan directory missing for {plan_id}")
     remote_root = _remote_plan_root(host)
     sudo = bool(host.get("sudo"))
     # Executors on the host must match this checkout before any task runs.
-    tools_sync.ensure_tools(host["ssh_alias"], str(host.get("remote_root") or ""), sudo)
+    runtime = tools_sync.ensure_tools(host["ssh_alias"], str(host.get("remote_root") or ""), sudo)
+    tools_sync.runtime_for_host(host, [runtime])
     # mkdir/tar/rm succeed with empty stdout — do not use run_remote (requires output).
     # Use sudo when the host executor runs as root: prior task files are root-owned.
     remote.run_remote_checked(
         host["ssh_alias"], ["mkdir", "-p", f"{remote_root}/plans"], timeout=60, sudo=sudo,
     )
-    with tempfile.NamedTemporaryFile(suffix=".tar") as handle:
-        with tarfile.open(fileobj=handle, mode="w") as archive:
-            archive.add(local_plan, arcname=plan_id)
-        handle.flush()
-        handle.seek(0)
-        remote_tar = f"/tmp/opu-plan-{plan_id}.tar"
-        remote.push_file(host["ssh_alias"], remote_tar, Path(handle.name).read_bytes(), timeout=120)
-    remote.run_remote_checked(
-        host["ssh_alias"],
-        ["tar", "-xf", remote_tar, "-C", f"{remote_root}/plans"],
-        timeout=120,
-        sudo=sudo,
-    )
-    remote.run_remote_checked(host["ssh_alias"], ["rm", "-f", remote_tar], timeout=30, sudo=sudo)
+    directory = _temporary_remote_archive(host)
+    remote_tar = directory + "/plan.tar"
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".tar") as handle:
+            with tarfile.open(fileobj=handle, mode="w") as archive:
+                archive.add(local_plan, arcname=plan_id,
+                            filter=lambda member: None if Path(member.name).name == ".task-lock" else member)
+            handle.flush()
+            handle.seek(0)
+            remote.push_file(host["ssh_alias"], remote_tar, Path(handle.name).read_bytes(), timeout=120, sudo=sudo)
+        remote.run_remote_checked(
+            host["ssh_alias"], ["tar", "-xf", remote_tar, "-C", f"{remote_root}/plans"],
+            timeout=120, sudo=sudo,
+        )
+    finally:
+        _remove_remote_archive(host, directory)
     _sync_sealed_inputs_to_host(host, plan_id)
-    return remote_root
+    return remote_root, runtime
 
 
 def _sync_plan_from_host(host: dict, plan_id: str, remote_root: str) -> None:
-    remote_tar = f"/tmp/opu-plan-{plan_id}-back.tar"
     sudo = bool(host.get("sudo"))
-    # Executor (sudo/root) writes task JSON with mode 0600 root:root; pull must use sudo.
-    remote.run_remote_checked(
-        host["ssh_alias"],
-        ["tar", "-cf", remote_tar, "-C", f"{remote_root}/plans", plan_id],
-        timeout=120,
-        sudo=sudo,
-    )
+    directory = _temporary_remote_archive(host)
+    remote_tar = directory + "/plan.tar"
     try:
+        # Executor writes task JSON with mode 0600 root:root; tar and pull
+        # use the same privilege as the private directory reservation.
+        remote.run_remote_checked(
+            host["ssh_alias"], ["tar", "--exclude", f"{plan_id}/.task-lock", "-cf", remote_tar, "-C", f"{remote_root}/plans", plan_id],
+            timeout=120, sudo=sudo,
+        )
         payload = remote.pull_file(host["ssh_alias"], remote_tar, timeout=120, sudo=sudo)
     except remote.RemoteError as exc:
         raise PlanError(
             f"failed to pull plan state from {host['ssh_alias']}",
             stderr=exc.stderr,
         ) from exc
+    finally:
+        _remove_remote_archive(host, directory)
     local_plans = PLAN_STATE_DIR / "plans"
     local_plans.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=".tar") as handle:
@@ -793,10 +1022,9 @@ def _sync_plan_from_host(host: dict, plan_id: str, remote_root: str) -> None:
             for member in members:
                 parts = Path(member.name).parts
                 target = (local_plans / member.name).resolve()
-                if not parts or parts[0] != plan_id or ".." in parts or root not in target.parents or not (member.isfile() or member.isdir()):
+                if not parts or parts[0] != plan_id or ".." in parts or ".task-lock" in parts or root not in target.parents or not (member.isfile() or member.isdir()):
                     raise PlanError("remote plan archive contains an unsafe or unrelated member")
             archive.extractall(local_plans, members=members)
-    remote.run_remote_checked(host["ssh_alias"], ["rm", "-f", remote_tar], timeout=30, sudo=sudo)
 
 
 def _execute_testmode(plan_id: str, task: dict, actor: str, fixture_dir: Path) -> dict:
@@ -804,6 +1032,7 @@ def _execute_testmode(plan_id: str, task: dict, actor: str, fixture_dir: Path) -
     executor = EXECUTOR_BY_ADAPTER.get(adapter)
     if executor is None:
         raise PlanError(f"No TEST_MODE executor is wired up for adapter: {adapter}")
+    runtime_paths.require_fixtures_allowed()
     fx_env = testmode_fixtures.env_for(fixture_dir)
     exec_env = os.environ.copy()
     exec_env["OPU_PLAN_STATE_DIR"] = str(PLAN_STATE_DIR)
@@ -839,14 +1068,15 @@ def _execute_live(plan_id: str, plan: dict, task: dict, actor: str) -> dict:
         )
     host = _resolve_live_host_for_task(plan, task)
     pipeline_runner.record_event('task_selected', 'Preparing the next sealed task', task_id=task['task_id'], stage=task.get('stage'), node=task.get('node'))
-    remote_root = _sync_plan_to_host(host, plan_id)
-    remote_executor = f"{host['remote_root'].rstrip('/')}/{rel_executor}"
+    remote_root, runtime = _sync_plan_to_host(host, plan_id)
+    remote_executor = tools_sync.tool_path(host, [runtime], rel_executor)
     remote_argv = [
         "env", f"OPU_PLAN_STATE_DIR={remote_root}", "OPU_PLAN_WORKER_SNAPSHOT=1", remote_executor,
         "execute", "--plan-id", plan_id, "--task-id", task["task_id"],
         "--actor", actor, "--lease-seconds", "3600",
     ]
-    pipeline_runner.set_execution_context(task_definition_sha256=task.get('task_definition_sha256'),
+    pipeline_runner.set_execution_context(runtime_root=runtime["runtime_root"], runtime_fingerprint=runtime["fingerprint"],
+                                          task_definition_sha256=task.get('task_definition_sha256'),
                                           task_retry_count=task.get('retry_count', 0))
     returncode, stdout, stderr = _run_detached_remote(host, plan_id, task["task_id"], remote_argv)
 
@@ -860,6 +1090,8 @@ def _execute_live(plan_id: str, plan: dict, task: dict, actor: str) -> dict:
         raise _unverified_remote_terminal(returncode, verified, stderr)
     if (returncode == 0) != (verified["status"] == "succeeded"):
         raise PlanError("remote exit contradicts the verified terminal task result")
+    _verify_launched_attempt(plan_id, task["task_id"], verified,
+                             task.get("task_definition_sha256"), task.get("retry_count", 0))
     if status(plan_id).get("state") == "succeeded":
         _run(["reconcile", "--plan-id", plan_id, "--actor", actor])
     pipeline_runner.set_execution_context(detached_terminal=True)
@@ -895,9 +1127,10 @@ def _run_detached_remote(host: dict, plan_id: str, task_id: str, remote_argv: li
     q_cmd = " ".join(shlex.quote(a) for a in remote_argv)
     # The wrapper records its own PID (setsid may fork), and rc is written
     # last, so its presence means stdout/stderr are complete.
-    wrapper = f"echo $$ >pid; {q_cmd} >stdout 2>stderr </dev/null; echo $? >rc.tmp && mv rc.tmp rc"
+    wrapper = f"umask 077; echo $$ >pid.tmp && mv pid.tmp pid || exit 1; {q_cmd} >stdout 2>stderr </dev/null; echo $? >rc.tmp && mv rc.tmp rc"
+    q_parent = shlex.quote(str(Path(run_dir).parent))
     launch = (
-        f"mkdir -p {q_run} && cd {q_run} && "
+        f"set -eu; umask 077; mkdir -p {q_parent}; mkdir {q_run}; cd {q_run}; "
         f"if command -v setsid >/dev/null 2>&1; then SETSID=setsid; else SETSID=; fi; "
         f"nohup $SETSID bash -c {shlex.quote(wrapper)} >/dev/null 2>&1 </dev/null & "
         f"for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s {q_run}/pid ] && break; sleep 1; done; cat {q_run}/pid"
@@ -907,6 +1140,7 @@ def _run_detached_remote(host: dict, plan_id: str, task_id: str, remote_argv: li
         task_id=task_id, node=host.get("node_name") or host.get("id"),
         host_id=host.get("id"), ssh_alias=ssh_alias,
         remote_root=host["remote_root"], remote_run_dir=run_dir,
+        execution_host_configuration_sha256=execution_host_binding(host),
     )
     pipeline_runner.record_event('remote_launch', 'Launching the sealed worker', task_id=task_id, node=host.get('node_name') or host.get('id'))
     try:
@@ -989,9 +1223,7 @@ def reconcile_detached_run(record: dict) -> dict:
         task_id = str(context.get("task_id") or "")
         if not _ID_RE.fullmatch(task_id):
             raise PlanError("invalid persisted task identity")
-        host = _resolve_node_host(str(context.get("node") or ""))
-        if host.get("ssh_alias") != context.get("ssh_alias") or host.get("remote_root") != context.get("remote_root") or host.get("id") != context.get("host_id"):
-            raise PlanError("host configuration changed; cannot safely reconcile the persisted launch")
+        host = resolve_bound_execution_host(context)
         run_dir = str(context.get("remote_run_dir") or "")
         prefix = _remote_run_dir(host, plan_id, task_id) + "/"
         if not run_dir.startswith(prefix) or not re.fullmatch(r"[a-f0-9]{32}", run_dir[len(prefix):]):
@@ -1019,6 +1251,8 @@ def reconcile_detached_run(record: dict) -> dict:
             return {"status": "unknown", "error": _unverified_remote_terminal(returncode, verified, stderr).to_json()}
         if (returncode == 0) != (verified["status"] == "succeeded"):
             raise PlanError("remote exit contradicts verified task custody")
+        _verify_launched_attempt(plan_id, task_id, verified,
+                                 context.get("task_definition_sha256"), context.get("task_retry_count"))
         if status(plan_id).get("state") == "succeeded":
             reconciliation_actor = record.get("reconciliation_actor")
             if not isinstance(reconciliation_actor, str) or not _ID_RE.fullmatch(reconciliation_actor):
@@ -1031,6 +1265,18 @@ def reconcile_detached_run(record: dict) -> dict:
         return {"status": "succeeded", "result": {"task_result": result, "reconciled": True, "plan_id": plan_id, "task_id": task_id}}
     except (PlanError, remote.RemoteError, ValueError, OSError) as exc:
         return {"status": "unknown", "error": {"message": str(exc)}}
+
+
+def _verify_launched_attempt(plan_id, task_id, verified, definition, retry_count):
+    """Native custody must belong to this launch, not a later valid retry."""
+    if (not isinstance(definition, str) or not re.fullmatch(r"[a-f0-9]{64}", definition)
+            or type(retry_count) is not int or not 0 <= retry_count <= 1000000):
+        raise PlanError("Persisted launch has no verified task-attempt binding; keep this run unresolved")
+    if (verified.get("plan_id") != plan_id or verified.get("task_id") != task_id
+            or verified.get("task_definition_sha256") != definition
+            or type(verified.get("retry_count", 0)) is not int
+            or verified.get("retry_count", 0) != retry_count):
+        raise PlanError("Verified terminal task belongs to a different definition or retry attempt; keep this run unresolved")
 
 def _parse_executor_result(task_id: str, returncode: int, stdout: str, stderr: str) -> dict:
     payload = None
@@ -1050,9 +1296,12 @@ def _parse_executor_result(task_id: str, returncode: int, stdout: str, stderr: s
         )
     if payload is None:
         raise PlanError(f"executor exited 0 with no output for task {task_id}", stderr=stderr.strip())
+    if not isinstance(payload, dict) or payload.get("task_id") != task_id or payload.get("status") != "succeeded":
+        raise PlanError(f"executor output is not a successful result for task {task_id}", stderr=stderr.strip())
     return payload
 
 
+@_controller_plan_operation
 def execute_next_task(plan_id: str, actor: str) -> dict | None:
     """Run the next pending task via TEST_MODE fixture or live SSH executor."""
     validate_plan_id(plan_id)
@@ -1080,26 +1329,38 @@ def execute_remaining_tasks(plan_id: str, actor: str, *, max_tasks: int = 200) -
         raise PlanError("max_tasks must be between 1 and 500")
     results: list[dict] = []
     stopped_reason = "succeeded_or_idle"
-    for _ in range(max_tasks):
-        plan = status(plan_id)
-        state = plan.get("state")
-        if state == "succeeded":
-            stopped_reason = "succeeded"
-            break
-        if state != "running":
-            stopped_reason = f"plan_state_{state}"
-            break
-        result = execute_next_task(plan_id, actor)
-        if result is None:
-            stopped_reason = "no_pending_task"
-            break
-        results.append(result)
-        # Stop after a failed/blocked task so operators can intervene.
-        task_status = (result.get("status") if isinstance(result, dict) else None) or ""
-        if str(task_status).lower() in {"failed", "blocked", "error"}:
-            stopped_reason = f"task_{task_status}"
-            break
+    with ExitStack() as execution_scope:
+        hosts_pinned = _PINNED_HOSTS.get() is not None
+        for _ in range(max_tasks):
+            plan = status(plan_id)
+            state = plan.get("state")
+            if state == "succeeded":
+                stopped_reason = "succeeded"
+                break
+            if state != "running":
+                stopped_reason = f"plan_state_{state}"
+                break
+            if not hosts_pinned and _fixture_dir_for_plan(plan, plan_id) is None:
+                # Native UI actions have no chat proposal snapshot. Capture the
+                # inventory once before the first live task and retain it for
+                # this entire operation, including preflights and later tasks.
+                execution_scope.enter_context(pinned_hosts(_load_hosts()))
+                hosts_pinned = True
+            result = execute_next_task(plan_id, actor)
+            if result is None:
+                stopped_reason = "no_pending_task"
+                break
+            results.append(result)
+            # Stop after a failed/blocked task so operators can intervene.
+            task_status = (result.get("status") if isinstance(result, dict) else None) or ""
+            if str(task_status).lower() in {"failed", "blocked", "error"}:
+                stopped_reason = f"task_{task_status}"
+                break
+        else:
+            stopped_reason = "max_tasks_reached"
     final = status(plan_id)
+    if final.get("state") == "succeeded":
+        stopped_reason = "succeeded"
     return {
         "plan_id": plan_id,
         "executed_count": len(results),
@@ -1113,10 +1374,17 @@ def publish_agent_queue(plan_id: str) -> list[dict]:
     """Publish pending sealed tasks into the lab pull-agent queue."""
     import agent_queue
 
-    validate_plan_id(plan_id)
-    plan = status(plan_id)
-    tasks = list_tasks(plan_id)
-    return agent_queue.publish_plan_tasks(plan, tasks)
+    with transport_lock(plan_id):
+        if pipeline_runner.active_run_id(f"plan:{plan_id}:execute"):
+            raise PlanError("Controller execution is active or unresolved; inspect/reconcile that run before publishing agent work")
+        plan = status(plan_id)
+        if _fixture_dir_for_plan(plan, plan_id) is not None:
+            runtime_paths.require_fixtures_allowed()
+        tasks = list_tasks(plan_id)
+        try:
+            return agent_queue.publish_plan_tasks(plan, tasks)
+        except agent_queue.QueueError as exc:
+            raise PlanError(str(exc)) from exc
 
 
 def list_plans() -> list[dict]:

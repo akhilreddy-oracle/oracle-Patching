@@ -110,7 +110,8 @@ export async function renderRecoveryNew(mount) {
   btn.addEventListener("click", async () => {
     clearFormError(errBox);
     if (!requireToken(errBox)) return;
-    if (!requireNonEmpty(requestId, errBox, "Request ID")) return;
+    const submittedId = requireNonEmpty(requestId, errBox, "Request ID");
+    if (!submittedId) return;
     const actor = requireActor(requester, errBox, "Requester");
     if (!actor) return;
     btn.disabled = true;
@@ -119,14 +120,14 @@ export async function renderRecoveryNew(mount) {
     logBox.textContent = "building fixture…";
     try {
       const record = await runToCompletion("/api/recovery/testmode-demo", {
-        request_id: requestId.value.trim(),
+        request_id: submittedId,
         requester: actor,
       });
       if (record.status === "failed") {
         logBox.classList.add("run-log-error");
         logBox.textContent = formatRunFailure(record);
       } else {
-        location.hash = `#/recovery/${encodeURIComponent(requestId.value.trim())}`;
+        location.hash = `#/recovery/${encodeURIComponent(submittedId)}`;
       }
     } catch (err) {
       logBox.classList.add("run-log-error");
@@ -216,7 +217,7 @@ function renderRequest(body, requestId, req, refresh) {
   body.appendChild(helperText("Workflow: analyze capacity → approve preparation → authorize → prepare backup and run RMAN restore validation → verify database and listener → select backup for patch readiness."));
   body.appendChild(helperText("Restore validation checks that RMAN can read the backup for restoration. It does not perform a test restore to another database."));
   if (req.state === "awaiting_approval") {
-    body.appendChild(analysisPanel(requestId, req.analysis, refresh));
+    body.appendChild(analysisPanel(requestId, req.analysis, refresh, req.operation_blocked));
   } else if (req.approval?.analysis) {
     body.appendChild(analysisSummary(req.approval.analysis, "Analysis recorded with approval"));
     body.appendChild(helperText("This analysis records the approval checks. Execution repeats live checks before stopping services."));
@@ -352,13 +353,15 @@ function analysisSummary(analysis, title = "Recovery analysis") {
   return panel;
 }
 
-function analysisPanel(requestId, analysis, refresh) {
+function analysisPanel(requestId, analysis, refresh, operationBlocked = false) {
   const panel = analysisSummary(analysis || {});
   panel.appendChild(helperText("Analysis probes SPFILE use, live database identity, role, open and log modes, capacity and the backup location before approval. Execution checks them again before stopping services."));
   const errBox = formErrorBox();
   const logBox = el("pre", { class: "run-log", style: "display:none" });
   const btn = el("button", { type: "button", text: analysis ? "Refresh analysis" : "Analyze recovery" });
+  btn.disabled = operationBlocked;
   btn.addEventListener("click", async () => {
+    if (operationBlocked || btn.disabled) return;
     clearFormError(errBox);
     if (!requireToken(errBox)) return;
     await runAction(logBox, btn, `/api/recovery/${encodeURIComponent(requestId)}/analyze`, {}, refresh, errBox);

@@ -8,6 +8,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/dataguard.sh"
 
 OBSERVE=""; POLICY=""; OUT=""
 declare -a GATES=()
@@ -45,7 +46,7 @@ parse() {
     opu_validate_absolute_path "${pair%%|*}" "${pair#*|}" || exit $?
     [ -f "${pair%%|*}" ] && [ ! -L "${pair%%|*}" ] || { opu_error "${pair#*|} missing"; exit 66; }
   done
-  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  opu_dataguard_validate_output "$OUT" || exit $?
   command -v jq >/dev/null || die 'jq is required'
 }
 
@@ -178,8 +179,11 @@ emit() {
   evidence=$(jq -cn --arg observe "$(opu_hash_file "$OBSERVE")" --arg policy "$(opu_hash_file "$POLICY")" \
     '{observe_sha256:$observe,policy_sha256:$policy}')
   jq -cn --arg status "$status" --arg evaluated_at "$evaluated_at" \
-    --argjson gates "$(gate_json)" --argjson evidence "$evidence" \
-    '{schema_version:"1.0",status:$status,evaluated_at:$evaluated_at,gates:$gates,evidence:$evidence}' >"$file"
+    --argjson gates "$(gate_json)" --argjson evidence "$evidence" --slurpfile observe "$OBSERVE" \
+    '{schema_version:"1.0",status:$status,evaluated_at:$evaluated_at,gates:$gates,evidence:$evidence,
+      target:{db_unique_name:($observe[0].target.db_unique_name // $observe[0].primary.db_unique_name // null),
+        oracle_home:$observe[0].target.oracle_home,oracle_sid:$observe[0].target.oracle_sid,
+        database_role:$observe[0].primary.database_role},observed_at:$observe[0].collected_at}' >"$file"
   local canonical hash
   canonical=$(jq -cS . "$file"); hash=$(opu_hash_string "$canonical")
   jq --arg hash "$hash" '.record_sha256=$hash' "$file" >"${file}.hashed"
@@ -191,16 +195,10 @@ main() {
   check_contracts
   evaluate
   local tmp
-  if [ -n "$OUT" ]; then
-    mkdir -p "$(dirname "$OUT")"
-    [ ! -L "$OUT" ] || die 'output cannot be a symbolic link'
-    tmp=$OUT
-  else
-    tmp=$(mktemp "${TMPDIR:-/tmp}/opu-dg-eval.XXXXXX")
-    trap 'rm -f "${tmp:-}"' EXIT
-  fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/opu-dg-result.XXXXXX")
+  trap 'rm -f "${tmp:-}" "${tmp:-}.hashed"' EXIT
   emit "$tmp"
-  cat "$tmp"
+  opu_dataguard_publish "$tmp" "$OUT"
   if has_blocker; then exit 2; fi
   exit 0
 }

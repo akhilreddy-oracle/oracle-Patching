@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / 'webapp'))
 import agent_queue as queue
 import agent_enroll
 import agent_worker
+import planctl
 from adapters import EXECUTOR_PATHS
 
 
@@ -32,6 +33,10 @@ class QueueSafety(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.addCleanup(self.tmp.cleanup)
+        self.enterContext(patch.object(planctl, 'PLAN_STATE_DIR', self.base / 'plans'))
+        self.enterContext(patch.object(planctl.pipeline_runner, 'RUNS_DIR', self.base / 'runs'))
+        self.enterContext(patch.object(planctl.pipeline_runner, 'RUNS', {}))
+        self.enterContext(patch.object(planctl.pipeline_runner, '_ACTIVE_KEYS', {}))
 
     def publish(self, attempt=0, task='task1'):
         return queue.publish_task(plan_id='plan1', task_id=task, node='node1',
@@ -52,6 +57,54 @@ class QueueSafety(unittest.TestCase):
         claim = next(c for c in claims if c)
         self.assertNotIn(claim['claim_token'], json.dumps(queue.list_jobs()))
         self.assertNotIn(claim['claim_token'], queue._job_path(claim['job_id']).read_text())
+
+    def test_http_transport_is_fenced_by_every_unresolved_queue_state(self):
+        job = self.publish()
+        path = queue._job_path(job['job_id'])
+        original = json.loads(path.read_text())
+        for status in ('queued', 'claimed', 'running', 'reconciliation_required', 'unknown'):
+            value = {**original, 'status': status}
+            if status in ('claimed', 'running'):
+                value.update(claimed_by='agent1', claim_token_sha256='a' * 64, lease_expires_epoch=2000000000)
+            path.write_text(json.dumps(value))
+            with self.subTest(status=status), self.assertRaises(queue.QueueError) as caught:
+                queue.assert_no_unresolved_plan_tasks('plan1')
+            self.assertEqual(caught.exception.status, 409)
+        path.write_text(json.dumps(original))
+        queue.assert_no_unresolved_plan_tasks('different-plan')
+
+    def test_http_transport_requires_verified_terminal_attempt_outside_fixture_mode(self):
+        job = self.publish()
+        path = queue._job_path(job['job_id'])
+        value = {**json.loads(path.read_text()), 'status': 'completed', 'result': {'status': 'success'}}
+        path.write_text(json.dumps(value))
+        with patch.dict(os.environ, {'OPU_AGENT_TEST_MODE': '0'}):
+            with self.assertRaises(queue.QueueError):
+                queue.assert_no_unresolved_plan_tasks('plan1')
+            for outcome in ('succeeded', 'failed'):
+                task = self.native_fixture(status=outcome)
+                value['result'] = {'status': outcome, 'source': 'sealed_plan_task', 'task': task}
+                path.write_text(json.dumps(value))
+                queue.assert_no_unresolved_plan_tasks('plan1')
+                task['retry_count'] = 1
+                path.write_text(json.dumps(value))
+                with self.assertRaises(queue.QueueError):
+                    queue.assert_no_unresolved_plan_tasks('plan1')
+
+    def test_malformed_queue_cannot_bypass_transport_fence_or_crash_claim(self):
+        job = self.publish()
+        path = queue._job_path(job['job_id'])
+        original = json.loads(path.read_text())
+        for changes in ({'status': []}, {'node': []}, {'plan_id': 'other'}, {'attempt': '../escape'},
+                        {'lease_expires_epoch': 'never'}, {'result': []}, {'result': {'status': []}}, {'adapter': 'unknown'}):
+            path.write_text(json.dumps({**original, **changes}))
+            for operation in (lambda: queue.assert_no_unresolved_plan_tasks('plan1'),
+                              lambda: queue.claim('node1', 'agent1')):
+                with self.subTest(changes=changes), self.assertRaises(queue.QueueError):
+                    operation()
+        path.unlink(); os.mkfifo(path)
+        with self.assertRaises(queue.QueueError):
+            queue.assert_no_unresolved_plan_tasks('plan1')
 
     def test_retry_fences_old_claim_and_terminal_replay(self):
         self.publish()
@@ -93,6 +146,23 @@ class QueueSafety(unittest.TestCase):
         with self.assertRaises(queue.QueueError):
             queue.complete(owned['job_id'], 'agent1', agent_token=token, claim_token=owned['claim_token'])
 
+    def test_malformed_or_unsafe_enrollment_registry_fails_without_authentication(self):
+        enrolled = agent_enroll.enroll(node='node1', agent_id='agent1')
+        registry = agent_enroll.registry_path()
+        original = json.loads(registry.read_text())
+        for entry in ([], None, {**original['agents']['agent1'], 'revoked': 'false'},
+                      {**original['agents']['agent1'], 'token_sha256': 'invalid'}):
+            registry.write_text(json.dumps({'agents': {'agent1': entry}}))
+            self.assertFalse(agent_enroll.verify('agent1', enrolled['agent_token']))
+            with self.assertRaises(agent_enroll.EnrollError):
+                agent_enroll.list_agents()
+        registry.write_bytes(b'\xff')
+        self.assertFalse(agent_enroll.verify('agent1', enrolled['agent_token']))
+        registry.unlink(); os.mkfifo(registry)
+        self.assertFalse(agent_enroll.verify('agent1', enrolled['agent_token']))
+        registry.unlink(); registry.write_text(json.dumps(original)); registry.chmod(0o666)
+        self.assertFalse(agent_enroll.verify('agent1', enrolled['agent_token']))
+
     def test_worker_renews_during_long_executor(self):
         self.publish()
         class Process:
@@ -110,6 +180,20 @@ class QueueSafety(unittest.TestCase):
         self.assertEqual(job['status'], 'completed')
         self.assertEqual(renew.call_count, 3)
         self.assertTrue(all(c.kwargs['claim_token'] for c in renew.call_args_list))
+
+    def test_worker_redacts_failed_executor_diagnostics_before_persistence(self):
+        self.publish()
+        class Process:
+            returncode = 1
+            def communicate(self, timeout):
+                return 'unpublished stdout', 'password=fixture-secret\nAuthorization: Bearer private-token\nfailed task'
+        with patch.object(agent_worker.subprocess, 'Popen', return_value=Process()):
+            job, code = agent_worker.run_once('node1', 'agent1')
+        self.assertEqual(code, 1)
+        self.assertIn('failed task', job['result']['stderr_tail'])
+        persisted = queue._job_path(job['job_id']).read_text()
+        for secret in ('fixture-secret', 'private-token', 'unpublished stdout'):
+            self.assertNotIn(secret, persisted)
 
     def test_worker_never_reports_success_after_lost_ownership(self):
         self.publish()
@@ -304,6 +388,145 @@ class QueueSafety(unittest.TestCase):
                     with self.assertRaisesRegex(queue.QueueError, 'attempt changed'):
                         queue.reconcile(first['job_id'], 'operator')
                 self.assertEqual(queue.list_jobs()[0]['status'], 'reconciliation_required')
+
+    def test_expired_managed_prelaunch_can_be_requeued_and_late_tokens_cannot_launch(self):
+        self.publish()
+        with patch.object(queue.time, 'time', return_value=100):
+            old = queue.claim('node1', 'agent1', 30, managed=True)
+        with patch.object(queue.time, 'time', return_value=131), patch.object(queue, 'native_task', return_value=self.native_fixture()):
+            restored = queue.reconcile(old['job_id'], 'operator')
+            self.assertEqual(restored['status'], 'queued')
+            self.assertEqual(restored['reconciled_by'], 'operator')
+            for operation in (queue.admit_launch, queue.complete):
+                with self.assertRaises(queue.QueueError):
+                    operation(old['job_id'], 'agent1', claim_token=old['claim_token'])
+            newer = queue.claim('node1', 'agent1', 30, managed=True)
+            self.assertGreater(newer['claim_generation'], old['claim_generation'])
+            with self.assertRaises(queue.QueueError):
+                queue.admit_launch(old['job_id'], 'agent1', claim_token=old['claim_token'])
+            queue.admit_launch(newer['job_id'], 'agent1', claim_token=newer['claim_token'])
+
+    def test_admitted_or_manual_pending_claims_remain_unresolved(self):
+        for managed in (True, False):
+            with self.subTest(managed=managed), patch.dict(os.environ, {'OPU_AGENT_QUEUE_DIR': str(self.base / str(managed))}):
+                self.publish()
+                with patch.object(queue.time, 'time', return_value=100):
+                    job = queue.claim('node1', 'agent1', 30, managed=managed)
+                    if managed:
+                        queue.admit_launch(job['job_id'], 'agent1', claim_token=job['claim_token'])
+                with patch.object(queue.time, 'time', return_value=131), patch.object(queue, 'native_task', return_value=self.native_fixture()):
+                    with self.assertRaises(queue.QueueError):
+                        queue.reconcile(job['job_id'], 'operator')
+                    self.assertIsNone(queue.claim('node1', 'other-agent'))
+                    self.assertEqual(queue.list_jobs()[0]['status'], 'reconciliation_required')
+
+    def test_worker_cannot_launch_after_operator_releases_its_expired_prelaunch(self):
+        self.publish()
+        original = queue.admit_launch
+        def delayed(job_id, agent_id, **credentials):
+            with patch.object(queue.time, 'time', return_value=10**12), \
+                 patch.object(queue, 'native_task', return_value=self.native_fixture()):
+                self.assertEqual(queue.reconcile(job_id, 'operator')['status'], 'queued')
+            return original(job_id, agent_id, **credentials)
+        with patch.object(queue, 'admit_launch', side_effect=delayed), patch.object(agent_worker.subprocess, 'Popen') as process:
+            with self.assertRaises(queue.QueueError):
+                agent_worker.run_once('node1', 'agent1')
+        process.assert_not_called()
+
+    def failed_pair(self):
+        self.enterContext(patch.dict(os.environ, {'OPU_AGENT_TEST_MODE': '0'}))
+        self.publish(); self.publish(task='task2')
+        self.old_claim = queue.claim('node1', 'agent1')
+        self.native = {**self.native_fixture('failed'), 'task_result_sha256': 'a' * 64}
+        with patch.object(queue, 'native_task', return_value=dict(self.native)):
+            queue.complete(self.old_claim['job_id'], 'agent1', claim_token=self.old_claim['claim_token'])
+        self.enterContext(patch.object(planctl, 'status', side_effect=lambda _: {'state': 'paused' if self.native['status'] == 'failed' else 'running'}))
+        self.native_retry_calls = 0
+
+    def native_retry(self, args):
+        if args[0] == 'task-status':
+            return dict(self.native)
+        self.assertEqual(args[0], 'retry-task')
+        self.native_retry_calls += 1
+        self.native = {**self.native_fixture('pending', 1), 'previous_attempt_result_sha256': 'a' * 64}
+        return dict(self.native)
+
+    def test_failed_queue_retry_preserves_future_jobs_and_fences_concurrent_claim(self):
+        self.failed_pair()
+        entered, release = threading.Event(), threading.Event()
+        def native(args):
+            if args[0] == 'retry-task':
+                entered.set()
+                if not release.wait(5): raise AssertionError('retry barrier was not released')
+            return self.native_retry(args)
+        queue.publish_task(plan_id='other-plan', task_id='task1', node='node2', adapter=self.native['adapter'])
+        with patch.object(planctl, '_run', side_effect=native), ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(planctl.retry_task, 'plan1', 'task1', 'operator')
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertIsNone(queue.claim('node1', 'late-worker'))
+                self.assertIsNotNone(queue.claim('node2', 'independent-worker'))
+                with self.assertRaises(queue.QueueError):
+                    queue.assert_no_unresolved_plan_tasks('plan1')
+            finally:
+                release.set()
+            self.assertEqual(future.result(timeout=3)['retry_count'], 1)
+        jobs = [job for job in queue.list_jobs() if job['plan_id'] == 'plan1']
+        self.assertEqual([(job['task_id'], job['status'], job['attempt']) for job in jobs], [('task1', 'queued', 1), ('task2', 'queued', 0)])
+        with self.assertRaises(queue.QueueError):
+            queue.extend_lease(self.old_claim['job_id'], 'agent1', 60, claim_token=self.old_claim['claim_token'])
+        self.assertEqual(queue.claim('node1', 'agent1')['task_id'], 'task1')
+
+    def test_queue_retry_recovers_publication_failure_without_second_native_retry(self):
+        self.failed_pair()
+        original = queue._write_job
+        failed = False
+        def interrupted(path, job):
+            nonlocal failed
+            if path.parent.name == 'jobs' and job['attempt'] == 1 and not failed:
+                failed = True
+                raise OSError('simulated crash after attempt archive before queue publication')
+            return original(path, job)
+        with patch.object(planctl, '_run', side_effect=self.native_retry), patch.object(queue, '_write_job', side_effect=interrupted):
+            with self.assertRaises(OSError):
+                planctl.retry_task('plan1', 'task1', 'operator')
+            self.assertEqual(queue.list_jobs()[0]['status'], 'completed')
+            self.assertIsNone(queue.claim('node1', 'agent1'))
+            self.assertEqual(planctl.retry_task('plan1', 'task1', 'operator')['retry_count'], 1)
+        self.assertEqual(self.native_retry_calls, 1)
+        self.assertEqual(queue.list_jobs()[0]['status'], 'queued')
+
+    def test_queue_retry_preserves_current_operator_authority(self):
+        self.failed_pair()
+        with patch.object(planctl, '_read_sealed_actor', return_value='original-authorizer'), \
+             patch.object(planctl, '_run', side_effect=self.native_retry) as native:
+            self.assertEqual(planctl.retry_task('plan1', 'task1', 'current-operator')['retry_count'], 1)
+        self.assertIn(unittest.mock.call(['retry-task', '--plan-id', 'plan1', '--task-id', 'task1',
+                                         '--actor', 'current-operator']), native.call_args_list)
+        self.assertEqual(queue.list_jobs()[0]['status'], 'queued')
+
+    def test_native_retry_refusal_or_wrong_attempt_never_reopens_queue(self):
+        self.failed_pair()
+        with patch.object(planctl, '_run', side_effect=lambda args: dict(self.native) if args[0] == 'task-status' else (_ for _ in ()).throw(planctl.PlanError('native retry is unsafe'))):
+            with self.assertRaisesRegex(planctl.PlanError, 'unsafe'):
+                planctl.retry_task('plan1', 'task1', 'operator')
+        for changes in ({'status': 'running'}, {'retry_count': 2}, {'task_result_sha256': 'b' * 64}):
+            original = dict(self.native)
+            self.native.update(changes)
+            with self.subTest(changes=changes), patch.object(planctl, '_run', side_effect=self.native_retry):
+                with self.assertRaises(planctl.PlanError):
+                    planctl.retry_task('plan1', 'task1', 'operator')
+            self.native = original
+        self.assertEqual(self.native_retry_calls, 0)
+        self.assertEqual(queue.list_jobs()[0]['status'], 'completed')
+
+    def test_unknown_http_execution_prevents_queue_retry(self):
+        self.failed_pair()
+        with patch.object(planctl.pipeline_runner, 'active_run_id', return_value='existing-run'), \
+             patch.object(planctl, '_run') as native:
+            with self.assertRaisesRegex(planctl.PlanError, 'active or unresolved'):
+                planctl.retry_task('plan1', 'task1', 'operator')
+        native.assert_not_called()
 
 
 if __name__ == '__main__':

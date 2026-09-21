@@ -111,6 +111,28 @@ next task can run. Failed work pauses the plan. `reconcile` turns an expired
 task into `unknown` and pauses the plan; it deliberately does not return the
 task to pending or invoke a retry.
 
+Executors keep renewing while they capture and seal stage evidence, then stop
+and join the heartbeat and synchronously renew before handing completion to
+the controller. A renewal failure during that handoff preserves the evidence
+and blocks completion. A heartbeat failure already recorded as an unknown
+stage outcome retains the existing failed-evidence reconciliation path.
+
+`complete` records `completion_admitted_at_epoch` when it acquires the exclusive
+plan task lock. It checks lease ownership at that admission time and retains
+the lock throughout evidence verification and custody, preventing a competing
+renewal, reconciliation, or claim. `completed_at_epoch` records the later
+verified persistence time. For new results, `completed_after_lease` means the
+lease had expired at admission; verification duration alone cannot make an
+on-time completion late. Historical results without an admission timestamp
+retain their original recorded meaning and are not rewritten.
+
+Renewal likewise checks the existing lease at lock admission, then rechecks the
+actual current maintenance window before persisting a bounded new expiry.
+It cannot revive ownership already expired at admission. A new claim requires
+at least 30 seconds left in the window. An already-valid owner may renew with
+as little as one second left; that renewal still ends at the sealed window
+deadline and cannot succeed once the window closes.
+
 Dispatch now records a sealed manifest of the complete expected task set and
 atomically reserves every target host. Overlapping plans, including database
 and Grid plans, cannot dispatch concurrently. Reservations persist across
@@ -130,6 +152,21 @@ task results are preserved under `attempts/`, and previous logs and evidence
 are never deleted. Evidence from an earlier generation cannot complete a new
 claim. `task-status --plan-id ID --task-id ID` returns a verified task and
 rechecks terminal controller custody for recovery and queue reconciliation.
+
+Controller live completion and detached-run reconciliation additionally compare
+the verified task's definition hash and retry generation with the launch record.
+A valid result from another attempt cannot resolve the earlier run. Legacy
+launch records missing this binding remain unresolved and require operator
+investigation; this check does not infer a match from the current task status.
+
+Native UI execution reviews one plan/task/host snapshot and submits its binding
+for Dispatch, Execute next and Execute remaining. HTTP admission, queued worker
+startup and the first transport-lock admission verify that binding. Per-task
+preflight and target selection retain the reviewed host snapshot through later
+tasks. See [the HTTP contract](WEBAPP_CONTROL_PLANE.md#reviewed-plan-execution).
+This replaces the earlier worker-start-only route snapshot. It does not approve
+a plan or waive separation of duties. Chat confirmations use the same admission
+and worker-start binding checks.
 
 All managed mutation adapters also share a host-local kernel lock, independently
 of their plan and adapter state directories. The mutation child retains that

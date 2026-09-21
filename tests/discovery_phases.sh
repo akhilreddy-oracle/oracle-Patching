@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$ROOT/webapp"
 python3 - <<'PY'
-import json
-import sys
+import tempfile
+from unittest.mock import patch
 from pathlib import Path
 
 import discovery_phases
@@ -128,46 +128,31 @@ empty = discovery_phases.derive_discovery_phases(None)
 assert len(empty) == 5
 assert all(p["status"] == "unavailable" for p in empty), empty
 
-# Cached live evidence (if present) must produce structured phases — no crash
-for host_id in ("oracle-test-rac", "targetdb"):
-    path = Path("var/hosts") / host_id / "evidence" / "snapshot.json"
-    if not path.is_file():
-        continue
-    snap = json.loads(path.read_text())
-    phases = discovery_phases.derive_discovery_phases(snap)
-    assert len(phases) == 5, host_id
-    ids = [p["id"] for p in phases]
-    assert ids == [
-        "host_identity",
-        "oracle_homes",
-        "cluster",
-        "databases",
-        "patch_inventory",
-    ], ids
-    if host_id == "oracle-test-rac":
-        m = by_id(phases)
-        assert m["cluster"]["status"] == "pass", m["cluster"]
-        assert m["patch_inventory"]["status"] == "pass", m["patch_inventory"]
-    if host_id == "targetdb":
-        m = by_id(phases)
-        assert m["cluster"]["status"] == "not_applicable", m["cluster"]
-        assert m["databases"]["status"] == "pass", m["databases"]
+# Unknown values and malformed nested payloads must not become green phases.
+for field in ("owner", "opatch_version"):
+    document = si_snapshot()
+    document["oracle_homes"][0][field] = "unknown"
+    assert by_id(discovery_phases.derive_discovery_phases(document))["oracle_homes"]["status"] != "pass"
+for value in ("bad-digest", [], None):
+    document = si_snapshot()
+    document["oracle_homes"][0]["platform"]["source_sha256"] = value
+    assert by_id(discovery_phases.derive_discovery_phases(document))["patch_inventory"]["status"] == "fail"
+for document in ({"host": [1]}, {"oracle_homes": [None]}, {"cluster": [1]}, {"databases": [None]}):
+    phases = discovery_phases.derive_discovery_phases(document)
+    assert len(phases) == 5 and any(p["status"] == "fail" for p in phases), phases
 
-# pipeline_state attaches phases
+# pipeline_state consumes isolated persisted fixtures, never a developer's
+# mutable host evidence or real inventory.
 import evidence
 import pipeline_steps
-
-# Use an isolated host id under the existing evidence root by writing temp evidence
-# only if the helper APIs allow — prefer calling derive via pipeline_state on known hosts.
-for host_id in ("oracle-test-rac", "targetdb"):
-    if evidence.read_evidence(host_id, "snapshot") is None:
-        continue
-    state = pipeline_steps.pipeline_state(host_id)
-    disc = next(s for s in state if s["step"] == "discovery")
-    assert disc["done"] is True
-    assert isinstance(disc.get("phases"), list) and len(disc["phases"]) == 5
-    assert disc.get("phases_status") in ("pass", "partial", "fail", "unavailable")
-    assert disc.get("status") == disc.get("phases_status")
+with tempfile.TemporaryDirectory() as temporary, patch.object(evidence, "VAR_DIR", Path(temporary)):
+    for host_id, snapshot in (("rac-fixture", rac_snapshot()), ("standalone-fixture", si_snapshot())):
+        evidence.write_evidence(host_id, "snapshot", snapshot)
+        state = pipeline_steps.pipeline_state(host_id)
+        discovery = next(step for step in state if step["step"] == "discovery")
+        assert discovery["done"] is True
+        assert len(discovery["phases"]) == 5
+        assert discovery["status"] == discovery["phases_status"] == "pass"
 
 print("discovery_phases_ok")
 PY

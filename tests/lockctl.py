@@ -8,6 +8,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from runtime_fixture import runtime_receipt, host_runtime_receipts
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "webapp"))
 import lockctl
@@ -31,14 +32,15 @@ class LockBridgeTests(unittest.TestCase):
         self.original.status = "unknown"
         self.original.context = {"detached_execution": True, "plan_id": "p", "task_id": "003-validate-source",
                                  "node": "source", "host_id": "source", "ssh_alias": "source", "remote_root": "/opt/opu",
-                                 "remote_run_dir": "/opt/opu/var/webapp-runs/p/003-validate-source/" + "b" * 32}
+                                 "remote_run_dir": "/opt/opu/var/webapp-runs/p/003-validate-source/" + "b" * 32,
+                                 "execution_host_configuration_sha256": lockctl.planctl.execution_host_binding(self.host)}
         pipeline_runner.RUNS[self.original.run_id] = self.original
         self.plan = {"state": "running", "plan_sha256": "c" * 64, "procedure": {"adapter": "database_single_instance_opatch"}}
         self.enterContext(patch.object(lockctl.planctl, "_resolve_node_host", return_value=self.host))
         self.enterContext(patch.object(lockctl.planctl, "status", return_value=self.plan))
         self.enterContext(patch.object(lockctl.planctl, "_read_sealed_actor", return_value="operator"))
         self.native = self.enterContext(patch.object(lockctl.planctl, "_run", return_value={"status": "pending", "stage": "validate"}))
-        self.sync = self.enterContext(patch.object(lockctl.tools_sync, "ensure_host_tools"))
+        self.sync = self.enterContext(patch.object(lockctl.tools_sync, "ensure_host_tools", side_effect=host_runtime_receipts))
         self.ssh = self.enterContext(patch.object(lockctl.remote, "run_remote_raw"))
         self.pull = self.enterContext(patch.object(lockctl.remote, "pull_file"))
         self.launch = self.enterContext(patch.object(lockctl.planctl, "_run_detached_remote"))
@@ -94,7 +96,7 @@ class LockBridgeTests(unittest.TestCase):
         result = lockctl.inspect("p", "operator", self.original.run_id)
         self.assertTrue(result["recovery_eligible"])
         self.assertEqual(result["execution_run_id"], self.original.run_id)
-        self.assertEqual(self.ssh.call_args.args[1], ["/usr/bin/env", "OPU_PLAN_STATE_DIR=/opt/opu/var/webapp-plans", "/opt/opu/bin/opu-database-lock-recover",
+        self.assertEqual(self.ssh.call_args.args[1], ["/usr/bin/env", "OPU_PLAN_STATE_DIR=/opt/opu/var/webapp-plans", runtime_receipt("source", "/opt/opu")["runtime_root"] + "/bin/opu-database-lock-recover",
                                                     "inspect", "--plan-id", "p", "--task-id", "003-validate-source", "--run-id", "b" * 32, "--actor", "operator"])
         self.launch.assert_not_called()
 
@@ -116,6 +118,36 @@ class LockBridgeTests(unittest.TestCase):
     def test_audit_tamper_and_cross_run_rejected(self):
         for report in ({**self.report, "actor": "other"}, seal({**self.report, "run_id": "f" * 32}), seal({**self.report, "plan_sha256": "0" * 64})):
             with self.assertRaises(lockctl.LockError): lockctl._verify_report(report, self.scope())
+
+    def test_lock_inspection_refuses_configuration_drift_and_legacy_binding_before_network(self):
+        for change in ({"sudo": False}, {"future_transport_option": "changed"}):
+            with self.subTest(change=change), patch.dict(self.host, change):
+                with self.assertRaisesRegex(lockctl.LockError, "host configuration changed"):
+                    lockctl.inspect("p", "operator", self.original.run_id)
+        del self.original.context["execution_host_configuration_sha256"]
+        with self.assertRaisesRegex(lockctl.LockError, "no verified execution-host configuration binding"):
+            lockctl.inspect("p", "operator", self.original.run_id)
+        self.ssh.assert_not_called()
+        self.sync.assert_not_called()
+        self.pull.assert_not_called()
+        self.launch.assert_not_called()
+
+    def test_maintenance_needs_its_own_host_binding_even_when_original_is_valid(self):
+        maintenance = self.maintenance()
+        for binding in (None, "f" * 64):
+            with self.subTest(binding=binding):
+                if binding is None:
+                    maintenance.context.pop("execution_host_configuration_sha256", None)
+                else:
+                    maintenance.context["execution_host_configuration_sha256"] = binding
+                for reconcile, record in ((lockctl.reconcile_detached_run, maintenance),
+                                          (lockctl.reconcile_execution_run, self.original)):
+                    result = reconcile({**record.to_json(), "reconciliation_actor": "operator"})
+                    self.assertEqual(result["status"], "unknown")
+                    self.assertIn("configuration", result["error"]["message"])
+        self.ssh.assert_not_called()
+        self.pull.assert_not_called()
+        self.launch.assert_not_called()
 
     def test_completed_requires_health_inode_and_pending_proof(self):
         report = self.completed()
@@ -156,6 +188,35 @@ class LockBridgeTests(unittest.TestCase):
         persisted = json.loads((Path(self.temp.name) / self.original.run_id / "run.json").read_text())
         self.assertEqual(persisted["context"]["lock_recovery_run_id"], maintenance.run_id)
         self.assertEqual(self.original.status, "unknown")
+
+    def test_tool_sync_failure_leaves_original_available_for_safe_recovery(self):
+        maintenance = self.ready_recovery()
+        self.sync.side_effect = lockctl.LockError("installation connection failed")
+        with self.assertRaises(lockctl.LockError):
+            lockctl.recover("p", "operator", self.original.run_id, maintenance_run_id=maintenance.run_id)
+        self.assertNotIn("lock_recovery_run_id", self.original.context)
+        self.launch.assert_not_called()
+        self.sync.side_effect = host_runtime_receipts
+        outcome = lockctl.recover("p", "operator", self.original.run_id, maintenance_run_id=maintenance.run_id)
+        self.assertEqual(outcome["status"], "completed")
+        self.launch.assert_called_once()
+
+    def test_tool_sync_cannot_continue_after_scope_or_maintenance_owner_changes(self):
+        for changed in ("task", "maintenance"):
+            with self.subTest(changed=changed):
+                maintenance = self.ready_recovery()
+                self.native.return_value = {"status": "pending", "stage": "validate"}
+                def alter(_host):
+                    if changed == "task":
+                        self.native.return_value = {"status": "running", "stage": "validate"}
+                    else:
+                        maintenance.status = "failed"
+                    return host_runtime_receipts(_host)
+                self.sync.side_effect = alter
+                with self.assertRaises(lockctl.LockError):
+                    lockctl.recover("p", "operator", self.original.run_id, maintenance_run_id=maintenance.run_id)
+                self.assertNotIn("lock_recovery_run_id", self.original.context)
+                self.launch.assert_not_called()
 
     def test_maintenance_reconcile_after_original_closed_survives_controller_restart(self):
         maintenance = self.maintenance()

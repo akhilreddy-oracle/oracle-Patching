@@ -71,9 +71,9 @@ except (OSError, ValueError) as exc:
 PY
 }
 
-opu_execution_lock_file() {
-  local path=$1 descriptor=$2 timeout=${3:-0} result
-  case "$descriptor" in 6|7) ;; *) opu_error 'unsupported execution lock descriptor'; return 64;; esac
+opu_execution_open_lock_file() {
+  local path=$1 descriptor=$2 result
+  case "$descriptor" in 6|7|8|9) ;; *) opu_error 'unsupported execution lock descriptor'; return 64;; esac
   opu_execution_validate_lock "$path" || return $?
   # O_RDWR without O_TRUNC preserves any existing contents. Opening a raced
   # FIFO read/write also cannot block waiting for another endpoint. No data is
@@ -81,14 +81,27 @@ opu_execution_lock_file() {
   case "$descriptor" in
     6) exec 6<>"$path" || return 73 ;;
     7) exec 7<>"$path" || return 73 ;;
+    8) exec 8<>"$path" || return 73 ;;
+    9) exec 9<>"$path" || return 73 ;;
   esac
-  if opu_execution_validate_lock "$path" "$descriptor" &&
-     opu_execution_flock "$descriptor" "$timeout" &&
+  if opu_execution_validate_lock "$path" "$descriptor"; then
+    return 0
+  else
+    result=$?
+    case "$descriptor" in 6) exec 6>&- ;; 7) exec 7>&- ;; 8) exec 8>&- ;; 9) exec 9>&- ;; esac
+    return "$result"
+  fi
+}
+
+opu_execution_lock_file() {
+  local path=$1 descriptor=$2 timeout=${3:-0} result
+  opu_execution_open_lock_file "$path" "$descriptor" || return $?
+  if opu_execution_flock "$descriptor" "$timeout" &&
      opu_execution_validate_lock "$path" "$descriptor"; then
     return 0
   else
     result=$?
-    case "$descriptor" in 6) exec 6>&- ;; 7) exec 7>&- ;; esac
+    case "$descriptor" in 6) exec 6>&- ;; 7) exec 7>&- ;; 8) exec 8>&- ;; 9) exec 9>&- ;; esac
     return "$result"
   fi
 }
@@ -130,4 +143,82 @@ opu_execution_seal_attempt() {
   local file=$1
   jq --argjson generation "$TASK_RETRY_COUNT" '.retry_count=$generation' "$file" >"$file.attempt" &&
     mv "$file.attempt" "$file"
+}
+
+# Keep the lease while the supervisor captures and seals stage evidence, not
+# only while the Oracle child is alive. Successful renewals do not rewrite the
+# log: distributed adapters include every task file in their sealed manifest.
+# shellcheck disable=SC2153 # TASK_ID is supplied by the calling typed adapter.
+opu_execution_renew_lease() {
+  local error
+  if error=$(env OPU_PLAN_STATE_DIR="$PLAN_STATE_DIR" "$PLAN_TOOL" renew \
+    --plan-id "$PLAN_ID" --task-id "$TASK_ID" --actor "$ACTOR" \
+    --lease-seconds "$LEASE_SECONDS" 2>&1 >/dev/null); then
+    return 0
+  fi
+  printf '%s\n' "$error" >"$TASK_DIR/heartbeat-error.log"
+  : >"$TASK_DIR/heartbeat-failed"
+  return 75
+}
+
+opu_execution_heartbeat() {
+  local supervisor=$1 interval=$((LEASE_SECONDS / 3)) elapsed=0 stopping=0
+  # Let an in-flight renew finish before the parent enters complete. Killing
+  # only its supervising shell could otherwise orphan a controller lock holder.
+  trap 'stopping=1' TERM
+  [ "$interval" -le 60 ] || interval=60
+  [ "$interval" -ge 10 ] || interval=10
+  while [ "$stopping" -eq 0 ] && kill -0 "$supervisor" 2>/dev/null; do
+    sleep 1
+    [ "$stopping" -eq 0 ] && kill -0 "$supervisor" 2>/dev/null || break
+    elapsed=$((elapsed + 1))
+    [ "$elapsed" -ge "$interval" ] || continue
+    elapsed=0
+    opu_execution_renew_lease || return $?
+  done
+}
+
+opu_execution_stop_heartbeat() {
+  [ -n "${OPU_EXECUTION_HEARTBEAT_PID:-}" ] || return 0
+  kill "$OPU_EXECUTION_HEARTBEAT_PID" 2>/dev/null || true
+  wait "$OPU_EXECUTION_HEARTBEAT_PID" 2>/dev/null || true
+  OPU_EXECUTION_HEARTBEAT_PID=""
+}
+
+opu_execution_cleanup_heartbeat() {
+  local result=$1
+  trap - EXIT
+  opu_execution_stop_heartbeat
+  # Preserve the adapters' development-only directory-lock cleanup.
+  [ -z "${EXECUTOR_LOCK_DIR:-}" ] || rmdir "$EXECUTOR_LOCK_DIR" 2>/dev/null || true
+  return "$result"
+}
+
+opu_execution_start_heartbeat() {
+  # Called after spawning the stage, so the stage cannot inherit this cleanup
+  # trap or stop its supervisor's heartbeat when its own subprocess exits.
+  : >"$TASK_DIR/heartbeat-error.log" || return 74
+  (exec 7>&- 8>&-; opu_execution_heartbeat "$$") &
+  OPU_EXECUTION_HEARTBEAT_PID=$!
+  trap 'opu_execution_cleanup_heartbeat "$?"' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+}
+
+opu_execution_finish_heartbeat() {
+  local status=$1 postcondition=$2 failed_before_sealing=$3
+  opu_execution_stop_heartbeat
+  if [ -f "$TASK_DIR/heartbeat-failed" ]; then
+    # Preserve the existing failed/unknown evidence path, including its bounded
+    # late-completion grace. A failure appearing while success evidence was
+    # sealed must never be promoted to success by the completion handoff.
+    [ "$failed_before_sealing" -eq 1 ] && [ "$status" = failed ] && [ "$postcondition" = unknown ] && return 0
+    opu_error 'task lease heartbeat failed during evidence capture; reconcile the plan'
+    return 75
+  fi
+  if ! opu_execution_renew_lease; then
+    opu_error 'task evidence was written but lease handoff failed; reconcile the plan'
+    return 75
+  fi
 }

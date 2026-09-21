@@ -9,7 +9,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=lib/opu/python.sh
 . "$ROOT/lib/opu/python.sh"
-NODE=""; AGENT=""; LEASE=120; TOKEN=""; QUEUE_DIR=${OPU_AGENT_QUEUE_DIR:-"$ROOT/webapp/var/agent-queue"}
+NODE=""; AGENT=""; LEASE=120; TOKEN=""
 
 usage() {
   printf '%s\n' 'Usage: opu-agent-work-pull --node NAME --agent-id ID [--lease-seconds N] [--agent-token TOKEN] [--once]'
@@ -28,7 +28,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$NODE" ] && [ -n "$AGENT" ] || { usage >&2; exit 64; }
-export OPU_AGENT_QUEUE_DIR="$QUEUE_DIR"
+# Python resolves the default queue against the stable deployment root. An
+# explicitly configured OPU_AGENT_QUEUE_DIR remains in the inherited environment.
 OPU_WP_ROOT="$ROOT" OPU_WP_NODE="$NODE" OPU_WP_AGENT="$AGENT" \
 OPU_WP_LEASE="$LEASE" OPU_WP_TOKEN="$TOKEN" opu_python - <<'PYTHON'
 import json, os, sys

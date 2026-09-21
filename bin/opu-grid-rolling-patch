@@ -4,6 +4,10 @@ set -euo pipefail
 umask 077
 export LC_ALL=C LANG=C
 
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+. "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/execution.sh"
+
 PROGRAM=${0##*/}; GRID_HOME=""; PATCH_DIR=""; PATCH_ID=""; MODE=""; NODE_FILE=""; LOG_ROOT=/var/tmp; REMOTE_USER=root; APPROVED=0; MIN_FREE_MB=4096
 LOCAL_HOST=$(hostname -s 2>/dev/null || hostname); GRID_OWNER=""; STATE_DIR=""; DONE_FILE=""; FAILED_FILE=""; MAIN_LOG=""; CURRENT_NODE=""
 TEST_MODE=${OPU_GRID_ROLLING_TEST_MODE:-0}
@@ -39,18 +43,18 @@ is_local() { [[ "$(short_host "$1")" == "$(short_host "$LOCAL_HOST")" ]]; }
 run_root() {
   local node=$1; shift
   if is_local "$node"; then "$@"
-  elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$node" -- "$@"
-  else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$node" -- sudo -n "$@"; fi
+  elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$node" -- "$(opu_shell_join "$@")"
+  else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$node" -- "$(opu_shell_join sudo -n "$@")"; fi
 }
-# Positional parameters avoid evaluating node, path, or patch input as shell text.
+# Local calls retain argv; remote calls quote argv for SSH's login shell.
 run_grid() {
   local node=$1; shift
   # runuser preserves the command's positional arguments; unlike a shell -c
   # wrapper it cannot drop the OPatch subcommand or reinterpret an argument.
   if [[ "$TEST_MODE" == 1 ]] && is_local "$node"; then "$@"
   elif is_local "$node"; then runuser -u "$GRID_OWNER" -- "$@"
-  elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$node" -- runuser -u "$GRID_OWNER" -- "$@"
-  else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$node" -- sudo -n runuser -u "$GRID_OWNER" -- "$@"; fi
+  elif [[ "$REMOTE_USER" == root ]]; then ssh -o BatchMode=yes -o ConnectTimeout=30 "root@$node" -- "$(opu_shell_join runuser -u "$GRID_OWNER" -- "$@")"
+  else sudo -u "$REMOTE_USER" ssh -o BatchMode=yes -o ConnectTimeout=30 "$REMOTE_USER@$node" -- "$(opu_shell_join sudo -n runuser -u "$GRID_OWNER" -- "$@")"; fi
 }
 acquire_lock() {
   local dir=$1 flock_command=flock
@@ -59,8 +63,9 @@ acquire_lock() {
     [[ -x "$flock_command" ]] || die 'test flock command is not executable'
   fi
   if [[ "$flock_command" != flock ]] || command -v flock >/dev/null 2>&1; then
-    exec 9>"$dir/.lock"
+    opu_execution_open_lock_file "$dir/.lock" 9 || die "unsafe executor lock"
     "$flock_command" -n 9 || die "another run owns $dir"
+    opu_execution_validate_lock "$dir/.lock" 9 || die "unsafe executor lock"
   else
     die 'flock is required for Grid rolling patch execution'
   fi
@@ -201,7 +206,7 @@ main() {
   if [[ "$MODE" == rollback ]]; then valid_patch_id "$PATCH_ID" || die "rollback requires numeric --patch-id"; else valid_path "$PATCH_DIR" || die "--patch-dir must be a normalized absolute path"; fi
   [[ "$MODE" == analyze || $APPROVED -eq 1 ]] || die "$MODE is destructive; pass --approve after change approval"
   [[ -d "$GRID_HOME" ]] || die "local Grid home is missing"; detect_grid_owner
-  detect_patch_id; read_nodes; STATE_DIR="${LOG_ROOT%/}/opu-grid-rolling-${MODE}-${PATCH_ID}"; mkdir -p "$STATE_DIR"; DONE_FILE="$STATE_DIR/completed.steps"; FAILED_FILE="$STATE_DIR/last.failure"; MAIN_LOG="$STATE_DIR/$PROGRAM.log"; touch "$DONE_FILE" "$MAIN_LOG"; write_manifest
+  detect_patch_id; STATE_DIR="${LOG_ROOT%/}/opu-grid-rolling-${MODE}-${PATCH_ID}"; mkdir -p "$STATE_DIR"; DONE_FILE="$STATE_DIR/completed.steps"; FAILED_FILE="$STATE_DIR/last.failure"; MAIN_LOG="$STATE_DIR/$PROGRAM.log"; touch "$DONE_FILE" "$MAIN_LOG"; read_nodes; write_manifest
   acquire_lock "$STATE_DIR"
   log "mode=$MODE patch_id=$PATCH_ID grid_home=$GRID_HOME nodes=${NODES[*]} minimum_free_mb=$MIN_FREE_MB"
   validate_cluster_membership

@@ -121,17 +121,3 @@ export function validateRecoveryPolicy(block) {
   }
   return null;
 }
-
-/**
- * Parse mandatory prechecks CSV for the procedure contract.
- * Always keep backup_or_restore — opu-procedure-validate requires it.
- * Backup waiver is expressed only via readiness policy.require_backup=false.
- */
-export function filterPrechecks(_hostId, prechecksCsv) {
-  const list = String(prechecksCsv || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (!list.includes("backup_or_restore")) list.push("backup_or_restore");
-  return list;
-}

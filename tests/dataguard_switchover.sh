@@ -108,9 +108,17 @@ set -e
 # Orchestrate with a sealed switchover gate delegates the step to the executor.
 "$ROOT/bin/opu-dataguard-orchestrate" \
   --observe "$TMP/observe.json" --evaluation "$TMP/eval.json" --order "$TMP/order.json" \
-  --switchover-gate "$TMP/sw.json" --reinstate-gate "$TMP/re.json" --output "$TMP/orch-gated.json" >/dev/null
+  --switchover-gate "$TMP/sw.json" --output "$TMP/orch-gated.json" >/dev/null
 jq -e 'any(.steps[]; .step == "switchover" and .operator_executed == false and .executor == "opu-dataguard-switchover" and .mode == "test_mode_or_live")' "$TMP/orch-gated.json" >/dev/null
-jq -e 'any(.steps[]; .step == "reinstate_former_primary" and .operator_executed == false and .executor == "opu-dataguard-reinstate")' "$TMP/orch-gated.json" >/dev/null
+# Post-role-change reinstate evidence cannot be mixed into pre-switch topology.
+if "$ROOT/bin/opu-dataguard-orchestrate" --observe "$TMP/observe.json" --evaluation "$TMP/eval.json" \
+  --order "$TMP/order.json" --reinstate-gate "$TMP/re.json" >/dev/null 2>&1; then
+  printf '%s\n' 'mismatched reinstate evidence was accepted' >&2; exit 1
+fi
+"$ROOT/bin/opu-dataguard-plan-order" --observe "$TMP/observe-stby.json" --evaluation "$TMP/eval-stby.json" --output "$TMP/order-stby.json" >/dev/null
+"$ROOT/bin/opu-dataguard-orchestrate" --observe "$TMP/observe-stby.json" --evaluation "$TMP/eval-stby.json" \
+  --order "$TMP/order-stby.json" --reinstate-gate "$TMP/re.json" --output "$TMP/orch-reinstate.json" >/dev/null
+jq -e 'any(.steps[]; .step == "reinstate_former_primary" and .operator_executed == false and .executor == "opu-dataguard-reinstate")' "$TMP/orch-reinstate.json" >/dev/null
 
 # Orchestrate without gates keeps switchover/reinstate operator-executed.
 "$ROOT/bin/opu-dataguard-orchestrate" \

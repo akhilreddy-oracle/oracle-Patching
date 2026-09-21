@@ -42,11 +42,25 @@ target `db_unique_name` to appear in the observe members, and call the
 production certification gate (`OPU_PRODUCTION_MODE=1` without a valid
 certification marker refuses with exit 77). In
 `OPU_DATAGUARD_TEST_MODE=1` the broker command is simulated and the sealed
-evidence carries `simulated:true`. In live mode `dgmgrl` must exist on
-`PATH` or at `$ORACLE_HOME/bin/dgmgrl` (missing → exit 69); the broker
-command output is captured to a log whose path and digest are sealed into
-the evidence, and a nonzero exit or `ORA-`/`error` output yields
-`status:failed` (exit 2).
+evidence carries `simulated:true`. Gates also seal their validation mode;
+simulated and older unclassified gates cannot authorize a live broker command.
+Live execution requires the explicit operator-override gate and uses only
+`dgmgrl` from the observed Oracle home, with its observed SID. Missing tooling
+returns exit 69. Both the observation and gate must be current (300 seconds by
+default; `OPU_DATAGUARD_MAX_EXECUTION_AGE_SECONDS` accepts 1–3600 seconds).
+
+The command must report the expected success and subsequent `SHOW CONFIGURATION`
+and `SHOW DATABASE` must report success and the expected target role. This follows
+the [Oracle broker verification sequence](https://docs.oracle.com/en/database/oracle/oracle-database/19/dgbkr/examples-using-data-guard-broker-DGMGRL-utility.html).
+Ambiguous replies, disconnects, broker errors or an unverified role produce
+`status:unknown` with exit 2; inspect the existing broker outcome before retrying.
+Native logs use newly reserved files, with paths and digests retained in the
+result. Caller-selected JSON reports are replaced atomically.
+
+Evidence consumers verify document seals. Optional orchestration gates must
+bind the same observation and evaluation supplied for that orchestration;
+post-role-change evidence must be collected and used in its own phase. Standby
+orders retain the observed role while using `STANDBY` as the orchestration role.
 
 A sealed `opu-dataguard-plan-order` result can now be bound into an immutable
 apply plan: `opu-patch-plan create --dataguard-order ORDER_JSON` verifies the

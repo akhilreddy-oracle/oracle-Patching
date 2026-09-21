@@ -91,7 +91,19 @@ def main():
         from connected_fixture import install
         install(base, checkout)
 
+        # The model is a deterministic protocol simulator, not an installed
+        # Ollama model. The actual client validates its responses and the actual
+        # controller handles reads/proposals/confirmation/native dispatch.
+        socket.getfqdn = lambda _name="": "127.0.0.1"
+        from model_fixture import start as start_model, PORT as MODEL_PORT
+        model_server, model_config = start_model(base)
+        os.environ["OPU_ASSISTANT_CONFIG"] = str(model_config)
+
         def audit(event, args):
+            if event == "socket.connect" and args[1] == ("127.0.0.1", MODEL_PORT):
+                return
+            if event == "socket.getaddrinfo" and args[0] == "127.0.0.1" and args[1] == MODEL_PORT:
+                return
             if event in {"socket.connect", "socket.getaddrinfo", "socket.gethostbyaddr", "socket.gethostbyname"}:
                 forbidden()
             if event == "subprocess.Popen" and Path(str(args[0])).name in DENIED_PROGRAMS:
@@ -105,8 +117,12 @@ def main():
         # fixtures are bounded; successful tests wait for every run to finish.
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: sys.exit(0))
-        print("Integration boundary: actual HTTP/RBAC/controller; fixture Oracle; simulated managed-host transport; no live hosts", flush=True)
-        server.main()
+        print("Integration boundary: actual HTTP/RBAC/controller; fixture Oracle/model; simulated managed-host transport; no live hosts", flush=True)
+        try:
+            server.main()
+        finally:
+            model_server.shutdown()
+            model_server.server_close()
 
 
 if __name__ == "__main__":

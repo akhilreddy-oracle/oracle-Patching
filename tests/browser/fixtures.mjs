@@ -1,6 +1,10 @@
 import { test as base, expect } from '@playwright/test';
 
 export const origin = 'http://127.0.0.1:18765';
+export const actionReviewFixture = (plan, tasks = [], digest = 'a'.repeat(64)) => ({ plan, tasks, confirmation: {
+  source: 'controller', plan_id: plan.plan_id, expected_action_binding_sha256: digest,
+  targets: (plan.nodes || []).map(node => ({ node, host_id: 'source', ssh_alias: 'fixture-reviewed-host', remote_root: '/fixture/tools', sudo: true, available: true })),
+} });
 export function fixtureState() {
   const now = new Date().toISOString();
   const artifact = { sha256: 'a'.repeat(64), status: 'ready_for_catalog', patch_ids: ['39034528'], platforms: [{ id: '226' }], path: '/fixture/stage/39034528', readme_files: [{ path: 'README.html', sha256: 'b'.repeat(64) }] };
@@ -18,7 +22,7 @@ export function fixtureState() {
   ];
   return {
     artifact, procedure, policy, steps, writes: [], unexpected: [], pageErrors: [],
-    session: { rbac_enabled: false, actor: 'fixture-operator', roles: ['operator'] },
+    session: { mode: 'lab', rbac_enabled: false, actor: 'fixture-operator', roles: [], permissions: { live_discovery: true } },
     estate: { hosts: [{ id: 'source', label: 'Source lab fixture', status: 'ok', cluster_status: 'not_applicable', databases: [{ db_unique_name: 'ORCL', instance_state: 'OPEN' }], active_version: '19.3', node_count: 1, oracle_home_count: 1 }] },
     fleet: { generated_at: now, databases: [
       { host_id: 'source', database: 'ORCL', oracle_home: '/fixture/oracle/dbhome_1', environment: 'lab', oracle_version: '19.3', patch_baseline: '19.3', desired_patch_baseline: '39034528', baseline_status: 'behind', backup_status: 'missing', readiness: 'blocked', evidence_status: 'fresh', evidence_at: now, blockers: 1 },
@@ -31,7 +35,7 @@ export function fixtureState() {
         required: 'Database is using an SPFILE', status: 'unknown', stage: 'native_analysis',
         next_action: 'Create the request and run Analyze recovery; approval remains blocked until the native probe passes' }],
       next_action: 'Create a request for native analysis; this is not approval to execute' }],
-    recoveries: [], plans: [], runs: {}, custom: null,
+    recoveries: [], plans: [], planTasks: {}, runs: {}, custom: null,
   };
 }
 
@@ -65,12 +69,22 @@ export const test = base.extend({
         if (url.pathname === '/api/estate') return send(state.estate);
         if (url.pathname === '/api/fleet') return send(state.fleet);
         if (url.pathname === '/api/hosts/source/pipeline') return send({ steps: state.steps });
+        if (url.pathname === '/api/hosts/source/plan-preview') {
+          const procedure = state.steps.find(row => row.step === 'procedure-validate')?.evidence?.procedure;
+          const ready = state.steps.find(row => row.step === 'readiness-evaluate')?.status === 'ready_for_approval';
+          return send({ steps: state.steps, confirmation: ready && procedure ? {
+            expected_creation_binding_sha256: 'c'.repeat(64), patch_id: procedure.patch_id,
+            database: procedure.target?.database_unique_name ?? null,
+          } : null, reason: ready ? null : 'Complete readiness evaluation with ready_for_approval before creating a plan.' });
+        }
         if (url.pathname === '/api/recovery') return send({ requests: state.recoveries, live_available: true, live_reason: 'Fixture capability response only', supported_adapter: 'standalone_primary_noarchivelog_spfile', target_capability_context: { host_id: 'source' }, target_capabilities: state.recoveryCapabilities });
         if (url.pathname === '/api/plans') return send({ plans: state.plans });
         const recovery = state.recoveries.find(row => url.pathname === `/api/recovery/${row.request_id}`);
         if (recovery) return send(recovery);
         const plan = state.plans.find(row => url.pathname === `/api/plans/${row.plan_id}`);
         if (plan) return send(plan);
+        const reviewed = state.plans.find(row => url.pathname === `/api/plans/${row.plan_id}/action-review`);
+        if (reviewed) return send(actionReviewFixture(reviewed, state.planTasks[reviewed.plan_id] || []));
         if (url.pathname.startsWith('/api/runs/')) {
           const run = state.runs[url.pathname.split('/').at(-1)]; if (run) return send(run);
         }

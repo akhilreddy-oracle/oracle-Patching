@@ -34,11 +34,15 @@ mkdir -p "$TEST_DB_PATH/bin" "$TEST_DB_PATH/OPatch" "$TEST_DB_PATH/jdk/bin" \
   "$TEST_GRID_PATH/bin" "$PATCH_DIR/etc/config" "$BACKUP_ROOT" "$RUNTIME_ROOT"
 printf 'running\n' >"$RUNTIME_ROOT/node1.state"
 printf 'running\n' >"$RUNTIME_ROOT/node2.state"
+: >"$RUNTIME_ROOT/native-mutations.log"
 
 cat >"$TEST_GRID_PATH/bin/srvctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 command_name=${1:-}; object_name=${2:-}
+case "$command_name" in
+  relocate|stop|start) printf '%s\n' "$*" >>"$OPU_TEST_RAC_RUNTIME/native-mutations.log" ;;
+esac
 shift 2 || true
 node_name=""; instance_name=""; database_name=""
 while [ "$#" -gt 0 ]; do
@@ -96,11 +100,20 @@ if grep -q 'SQLPATCH_LATEST_ACTION=' <<<"$input"; then
   printf 'SQLPATCH_LATEST_ACTION=%s\n' "$(cat "$OPU_TEST_RAC_RUNTIME/datapatch.state")"
   printf '%s\n' 'SQLPATCH_LATEST_STATUS=SUCCESS'
 else
+  database_name=ORCL; instance_name=$ORACLE_SID; database_role=PRIMARY; cdb=NO
+  case "$(cat "$OPU_TEST_RAC_RUNTIME/health-drift" 2>/dev/null || true)" in
+    database) database_name=UNREVIEWED ;;
+    instance) instance_name=OTHER ;;
+    role) database_role='PHYSICAL STANDBY' ;;
+    cdb) cdb=YES ;;
+    unknown-cdb) cdb='' ;;
+  esac
   printf '%s\n' \
-    "INSTANCE_NAME=$ORACLE_SID" \
+    "INSTANCE_NAME=$instance_name" \
     'INSTANCE_STATUS=OPEN' \
-    'DATABASE_UNIQUE_NAME=ORCL' \
-    'DATABASE_ROLE=PRIMARY' \
+    "DATABASE_UNIQUE_NAME=$database_name" \
+    "CDB=$cdb" \
+    "DATABASE_ROLE=$database_role" \
     'OPEN_MODE=READ WRITE' \
     'INVALID_OBJECTS=0'
 fi
@@ -111,6 +124,9 @@ cat >"$TEST_DB_PATH/OPatch/opatch" <<'EOF'
 set -euo pipefail
 node_name=${OPU_RAC_DATABASE_TEST_HOSTNAME:-node1}
 patch_state="$OPU_TEST_RAC_RUNTIME/patch-$node_name.state"
+case "${1:-}" in
+  apply|rollback) printf 'opatch %s\n' "$*" >>"$OPU_TEST_RAC_RUNTIME/native-mutations.log" ;;
+esac
 case "${1:-}" in
   version) printf '%s\n' 'OPatch Version: 12.2.0.1.51' ;;
   lspatches) [ -f "$patch_state" ] && printf '%s\n' '39034528;Database Release Update' || true ;;
@@ -307,11 +323,47 @@ verify_artifact_manifest() {
   done < <(jq -c '.artifacts[]' <<<"$evidence_json")
 }
 
+assert_health_drift_blocks() {
+  local plan_id=$1 stage=$2 node=$3 mode=$4 task task_id drift before rc
+  shift 4
+  task=$(plan next --plan-id "$plan_id")
+  task_id=$(jq -r '.task_id' <<<"$task")
+  [ "$(jq -r '.stage' <<<"$task")" = "$stage" ]
+  for drift in "$@"; do
+    before=$(wc -l <"$RUNTIME_ROOT/native-mutations.log")
+    printf '%s\n' "$drift" >"$RUNTIME_ROOT/health-drift"
+    set +e
+    if [ "$mode" = apply ]; then
+      execute_task "$plan_id" "$task_id" "$node" >"$TMP/$plan_id-$stage-$drift.json" 2>"$TMP/drift.stderr"
+    else
+      execute_rollback_task "$plan_id" "$task_id" "$node" >"$TMP/$plan_id-$stage-$drift.json" 2>"$TMP/drift.stderr"
+    fi
+    rc=$?
+    set -e
+    rm "$RUNTIME_ROOT/health-drift"
+    # Apply preserves the stage exit code; the rollback CLI returns 1 for any
+    # failed task. Both must publish the exact guard failure in sealed evidence.
+    if [ "$rc" -eq 0 ] || ! jq -e '.status == "failed" and .exit_code == 65 and .outcome_class == "no_mutation"' "$TMP/$plan_id-$stage-$drift.json" >/dev/null; then
+      printf '%s rejected live %s with unexpected rc=%s or evidence\n' "$stage" "$drift" "$rc" >&2
+      cat "$TMP/$plan_id-$stage-$drift.json" "$TMP/drift.stderr" >&2
+      exit 1
+    fi
+    [ "$(wc -l <"$RUNTIME_ROOT/native-mutations.log")" -eq "$before" ]
+    [ "$(cat "$RUNTIME_ROOT/node1.state")" = running ] && [ "$(cat "$RUNTIME_ROOT/node2.state")" = running ]
+    plan status --plan-id "$plan_id" | jq -e '.state == "paused"' >/dev/null
+    # The rejection made no new service/binary mutation; retain that attempt
+    # and prove the normal task can still proceed after a supported retry.
+    plan retry-task --plan-id "$plan_id" --task-id "$task_id" --actor retry-operator >/dev/null
+  done
+}
+
 # A nonzero OPatch result after mutation starts must pause with unknown binary
 # state and must not restart the stopped instance automatically.
 create_plan rac-opatch-failure
 run_expected rac-opatch-failure rac_precheck node1 >/dev/null
+assert_health_drift_blocks rac-opatch-failure rac_drain node1 apply database instance role cdb unknown-cdb
 run_expected rac-opatch-failure rac_drain node1 >/dev/null
+assert_health_drift_blocks rac-opatch-failure rac_stop node1 apply role
 run_expected rac-opatch-failure rac_stop node1 >/dev/null
 touch "$FAIL_OPATCH"
 failure_task=$(plan next --plan-id rac-opatch-failure)
@@ -371,7 +423,9 @@ jq -e '.procedure.adapter == "database_rac_opatch_rollback" and .nodes == ["node
   "$PLAN_STATE/plans/rac-rollback-failure/plan.json" >/dev/null
 
 run_rollback_expected rac-rollback-failure rac_rollback_precheck node2 >/dev/null
+assert_health_drift_blocks rac-rollback-failure rac_rollback_drain node2 rollback database instance role cdb unknown-cdb
 run_rollback_expected rac-rollback-failure rac_rollback_drain node2 >/dev/null
+assert_health_drift_blocks rac-rollback-failure rac_rollback_stop node2 rollback role
 run_rollback_expected rac-rollback-failure rac_rollback_stop node2 >/dev/null
 touch "$FAIL_ROLLBACK"
 rollback_failure_task=$(plan next --plan-id rac-rollback-failure)

@@ -117,8 +117,12 @@ OPatch runs; otherwise OPatch reports them as the opaque "one-level down" /
 the evidence chain). It stages complete media at the same absolute path on
 every node of a host via `bin/opu-artifact-stage`, either by replicating from
 another managed host that already holds complete media, or by unpacking a
-patch zip already on the node. `GET /api/hosts/<id>/artifact-sources` probes
-where complete media exists. The tool is fail-closed: it extracts into a
+patch zip already on the node. Explicitly choosing **Probe managed hosts** sends
+`POST /api/hosts/<id>/artifact-sources` with `{"artifact_dir":"/absolute/path"}`
+to inspect the target nodes and other configured source hosts over SSH. Opening
+Readiness does not trigger the probe. Both this endpoint and the legacy GET
+require operator access and company-session CSRF proof; changing the path clears
+previous source selections. The staging tool is fail-closed: it extracts into a
 private work directory, requires `etc/config/{inventory,actions}.xml` plus a
 non-empty `files/` payload, requires the inventory patch ID to equal the
 directory name, sets ownership to the Oracle Home owner, moves a metadata-only
@@ -143,6 +147,13 @@ adapter re-runs both applicability and conflict checks immediately before the
 first service outage and again at the binary-apply boundary. A failure before
 shutdown ends the task as `no_mutation`; it must not stop the database or
 listener.
+Standalone binary apply also probes the bound SID immediately before shutdown:
+the database and instance identities must still match, with an open, primary,
+read-write, non-CDB database. A successful earlier precheck cannot authorize an
+outage after those live conditions change.
+RAC apply and rollback repeat their local database identity, role and non-CDB
+health checks before service drain and again before instance shutdown. Binary
+stages retain their expected stopped-instance checks.
 
 ## Policy example
 

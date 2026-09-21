@@ -32,10 +32,21 @@ case "$input" in
   *OPU_RECOVERY_PREP_PROBE*)
     state=$(cat "$state_file")
     if [ "$state" = OPEN ]; then
-      printf 'ORCL|ORCL|PRIMARY|READ WRITE|NOARCHIVELOG|OPEN|12345|%s/spfileORCL.ora|1024\n' "$OPU_TEST_RUNTIME"
+      row="ORCL|ORCL|PRIMARY|READ WRITE|NOARCHIVELOG|OPEN|12345|$OPU_TEST_RUNTIME/spfileORCL.ora|1024|${OPU_TEST_CDB-NO}"
     else
-      printf 'ORCL|ORCL|PRIMARY|MOUNTED|NOARCHIVELOG|MOUNTED|12345|%s/spfileORCL.ora|1024\n' "$OPU_TEST_RUNTIME"
+      row="ORCL|ORCL|PRIMARY|MOUNTED|NOARCHIVELOG|MOUNTED|12345|$OPU_TEST_RUNTIME/spfileORCL.ora|1024|${OPU_TEST_CDB-NO}"
     fi
+    case "${OPU_TEST_RECOVERY_PROBE_OUTPUT:-normal}" in
+      duplicate) printf '%s\n%s\n' "$row" "$row" ;;
+      conflicting) printf '%s|YES\n%s\n' "${row%|*}" "$row" ;;
+      diagnostic) printf 'SP2-0734: unknown command beginning invalid\n%s\n' "$row" ;;
+      truncated) printf '%s\n' "${row%|*}" ;;
+      trailing-delimiter) printf '%s|\n' "$row" ;;
+      extra-field) printf '%s|unexpected\n' "$row" ;;
+      empty) : ;;
+      whitespace) printf '\n  %s  \n \t\n' "$row" ;;
+      *) printf '%s\n' "$row" ;;
+    esac
     ;;
   *OPU_RECOVERY_PREP_CAPACITY*)
     printf 'META|19.0.0|0|12345|1|1024|512\nFILE|1|1024|1024|LOCAL|512|AVAILABLE|ONLINE|ONLINE|%s/oradata/system01.dbf|1\n' "$OPU_TEST_RUNTIME"
@@ -95,6 +106,7 @@ if grep -Eiq '^[[:space:]]*whenever([[:space:]]|$)' "$command_file"; then
 fi
 printf 'rman:%s:%s\n' "$check_syntax" "$(printf '%s' "$input" | tr '\n' ' ')" >>"$OPU_TEST_RUNTIME/order.log"
 if [ "$check_syntax" -eq 1 ]; then
+  if [ -n "${OPU_TEST_CLOCK_FILE:-}" ]; then printf '%s\n' "$OPU_TEST_CLOCK_END" >"$OPU_TEST_CLOCK_FILE"; fi
   printf 'The cmdfile has no syntax errors\n'
   exit 0
 fi
@@ -180,7 +192,13 @@ tool() {
   OPU_TEST_RUNTIME="$RUNTIME" \
   OPU_TEST_SUCCESS_ROOT="$BACKUP_PARENT_CANONICAL/recovery-ok" \
   OPU_TEST_SNAPSHOT="$TMP/snapshot.json" \
-    bash "$TOOL" "$@"
+    bash -c '
+      date() {
+        if [ "$*" = "-u +%s" ] && [ -n "${OPU_TEST_CLOCK_FILE:-}" ]; then cat "$OPU_TEST_CLOCK_FILE"
+        else command date "$@"; fi
+      }
+      . "$1" "${@:2}"
+    ' fixture "$TOOL" "$@"
 }
 
 create_request() {
@@ -206,6 +224,38 @@ tool status --request-id recovery-inventory-overlap | jq -e '.state == "awaiting
 [ "$(cat "$RUNTIME/database.state")" = OPEN ]
 
 create_request recovery-ok
+for scope in YES ''; do
+  if OPU_TEST_CDB="$scope" tool analyze --request-id recovery-ok >"$TMP/cdb-analysis.json"; then
+    echo 'recovery analysis accepted CDB or unknown container scope' >&2; exit 1
+  fi
+  jq -e '.status == "blocked" and (.reason | contains("non-CDB databases only"))' "$TMP/cdb-analysis.json" >/dev/null
+  [ "$(cat "$RUNTIME/database.state")" = OPEN ]
+done
+# The same live parser guards read-only analysis and execution after approval.
+# Malformed output must be rejected before any listener/database stop or backup.
+for output_case in duplicate conflicting diagnostic truncated trailing-delimiter extra-field empty; do
+  request_id="recovery-probe-$output_case"
+  create_request "$request_id"
+  order_before=$(wc -l <"$RUNTIME/order.log" | tr -d ' ')
+  if OPU_TEST_RECOVERY_PROBE_OUTPUT="$output_case" tool analyze --request-id "$request_id" >"$TMP/probe-analysis.json"; then
+    echo "recovery analysis accepted $output_case probe output" >&2; exit 1
+  fi
+  jq -e '.status == "blocked" and (.reason | contains("exactly one complete ten-field row"))' "$TMP/probe-analysis.json" >/dev/null
+  approve_authorize "$request_id"
+  if OPU_TEST_RECOVERY_PROBE_OUTPUT="$output_case" tool execute --request-id "$request_id" --actor patch-operator >"$TMP/probe-execute.out" 2>"$TMP/probe-execute.err"; then
+    echo "recovery execution accepted $output_case probe output" >&2; exit 1
+  fi
+  grep -q 'exactly one complete ten-field row' "$TMP/probe-execute.err"
+  tool status --request-id "$request_id" | jq -e '.state == "authorized" and .execution == null' >/dev/null
+  [ "$(cat "$RUNTIME/database.state")" = OPEN ]
+  [ ! -e "$RUNTIME/listener-stopped" ]
+  [ ! -e "$BACKUP_PARENT/$request_id" ]
+  if tail -n "+$((order_before + 1))" "$RUNTIME/order.log" | grep -Eq 'rman:|sql:.*shutdown|listener:stop'; then
+    echo "rejected $output_case probe output allowed Oracle mutation" >&2; exit 1
+  fi
+  grep -q '^whenever oserror exit failure$' "$STATE_ROOT/$request_id/evidence/live-probe.sql"
+done
+OPU_TEST_RECOVERY_PROBE_OUTPUT=whitespace tool analyze --request-id recovery-ok | jq -e '.status == "passed"' >/dev/null
 find "$STATE_ROOT/recovery-ok" -type f -exec sha256sum {} \; | sort >"$TMP/request-before.sha256"
 tool analyze --request-id recovery-ok | jq -e '.status == "passed" and .capacity.capacity_basis == "allocated" and .capacity.allocated_database_bytes == 1024 and .capacity.database_budget_bytes == 1024 and .capacity.admitted == true' >/dev/null
 find "$STATE_ROOT/recovery-ok" -type f -exec sha256sum {} \; | sort >"$TMP/request-after.sha256"
@@ -371,6 +421,23 @@ mv "$TMP/tampered.tmp" "$TMP/tampered-snapshot.json"
 if tool approve --request-id recovery-tamper --actor dba-approver --approval-ticket TAMPER >/dev/null 2>&1; then
   printf '%s\n' 'tampered snapshot was accepted' >&2; exit 1
 fi
+
+# A window that expires during read-only RMAN validation must never admit
+# listener/database shutdown. Advance only the fixture clock, not system time.
+create_request recovery-window-expired
+approve_authorize recovery-window-expired
+printf '%s\n' "$((NOW + 1799))" >"$RUNTIME/window-clock"
+if OPU_TEST_CLOCK_FILE="$RUNTIME/window-clock" OPU_TEST_CLOCK_END="$((NOW + 1800))"   tool execute --request-id recovery-window-expired --actor patch-operator >"$TMP/window.stdout" 2>"$TMP/window.stderr"; then
+  echo 'recovery execution continued after its maintenance window expired' >&2; exit 1
+fi
+grep -q 'maintenance window is not open' "$TMP/window.stderr"
+tool status --request-id recovery-window-expired | jq -e '.state == "blocked" and .failure.phase == "validating_rman" and .failure.services_restored == true' >/dev/null
+[ -s "$STATE_ROOT/recovery-window-expired/evidence/backup-rman-syntax.log" ]
+[ ! -e "$STATE_ROOT/recovery-window-expired/evidence/listener-stop.log" ]
+[ ! -e "$STATE_ROOT/recovery-window-expired/evidence/shutdown.sql" ]
+[ "$(cat "$RUNTIME/database.state")" = OPEN ]
+[ ! -e "$RUNTIME/listener-stopped" ]
+[ -e "$BACKUP_PARENT/recovery-window-expired/INCOMPLETE" ]
 
 python3 -B "$ROOT/tests/recovery_capacity.py"
 printf '%s\n' 'database recovery preparation test passed'

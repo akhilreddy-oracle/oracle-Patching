@@ -9,7 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+import runtime_paths
+from pathlib import PurePosixPath
 import re
 import stat
 
@@ -19,7 +20,7 @@ import remote
 import tools_sync
 
 ExtjobError = planctl.PlanError
-REFERENCE_DIR = Path(__file__).resolve().parent / "var" / "extjob-references"
+REFERENCE_DIR = runtime_paths.state_dir() / "extjob-references"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 _RUN_ID = re.compile(r"[a-f0-9]{12}\Z")
@@ -262,10 +263,10 @@ def _verify_report(report, scope, returncode):
 def inspect(plan_id, actor, *, inspection_run_id):
     scope = _scope(plan_id, actor, inspection_run_id)
     host, reference = scope["host"], scope["reference"]
-    tools_sync.ensure_host_tools(host)
+    runtimes = tools_sync.ensure_host_tools(host)
     _require(_scope(plan_id, actor, inspection_run_id) == scope, "inspection scope changed during tool synchronization")
     argv = ["/usr/bin/env", f"OPU_PLAN_STATE_DIR={planctl._remote_plan_root(host)}",
-            host["remote_root"].rstrip("/") + "/bin/opu-extjob-provenance-inspect",
+            tools_sync.tool_path(host, runtimes, "bin/opu-extjob-provenance-inspect"),
             "--plan-id", plan_id, "--actor", actor,
             "--archive", reference["archive_path"], "--archive-sha256", reference["archive_sha256"]]
     response = remote.run_remote_raw(host["ssh_alias"], argv, timeout=900, sudo=bool(host.get("sudo")))

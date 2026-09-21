@@ -13,12 +13,14 @@ import os
 import re
 import secrets
 import time
+import stat
 from pathlib import Path
+import runtime_paths
 from functools import wraps
 from durable import file_lock, write_json
 
 REGISTRY_FILE_ENV = "OPU_AGENT_REGISTRY_FILE"
-DEFAULT_REGISTRY_FILE = Path(__file__).resolve().parent / "var" / "agent-registry" / "agents.json"
+DEFAULT_REGISTRY_FILE = runtime_paths.state_dir() / "agent-registry" / "agents.json"
 
 # Matches lib/opu/common.sh opu_validate_identifier.
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -51,14 +53,31 @@ def _load() -> dict:
     path = registry_path()
     if path.is_symlink():
         raise EnrollError(f"registry file must not be a symlink: {path}", status=500)
-    if not path.is_file():
+    if not path.exists():
         return {"schema_version": "1.0", "agents": {}}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o022):
+                raise ValueError("unsafe registry file")
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("oversized registry")
+        data = json.loads(raw)
+    except (OSError, ValueError) as exc:
         raise EnrollError(f"registry file is unreadable: {path}: {exc}", status=500)
     if not isinstance(data, dict) or not isinstance(data.get("agents"), dict):
         raise EnrollError(f"registry file is malformed: {path}", status=500)
+    for agent_id, entry in data["agents"].items():
+        if (not isinstance(entry, dict) or not _ID_RE.fullmatch(agent_id)
+                or entry.get("agent_id") != agent_id or not isinstance(entry.get("node"), str)
+                or not _ID_RE.fullmatch(entry["node"])
+                or not isinstance(entry.get("token_sha256"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", entry["token_sha256"])
+                or type(entry.get("revoked")) is not bool):
+            raise EnrollError("agent registry contains a malformed identity", status=500)
     return data
 
 

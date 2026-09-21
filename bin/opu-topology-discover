@@ -98,9 +98,13 @@ home_json() {
     if [ -n "$xml_dir" ]; then
       if [ "$(id -u)" -eq 0 ]; then chown "$owner" "$xml_dir" 2>/dev/null || true; chmod 700 "$xml_dir" 2>/dev/null || true; fi
       xml_file="$xml_dir/lsinventory.xml"
-      opatch_as_owner "$owner" "$home" lsinventory -xml "$xml_file" -oh "$home" >/dev/null 2>&1 || true
-      [ -f "$xml_file" ] && xml_inventory=$(<"$xml_file") || xml_inventory=""
-      if grep -q '<' <<<"$xml_inventory"; then
+      # Failed OPatch commands may leave partial or stale-looking XML behind.
+      # Only successful collection of a complete XML document can establish
+      # authoritative inventory provenance; lspatches remains a labeled fallback.
+      if opatch_as_owner "$owner" "$home" lsinventory -xml "$xml_file" -oh "$home" >/dev/null 2>&1 &&
+         [ -f "$xml_file" ] && [ ! -L "$xml_file" ] &&
+         xmllint --nonet --noout "$xml_file" >/dev/null 2>&1; then
+        xml_inventory=$(<"$xml_file")
         platform_source=opatch_lsinventory_xml
         xml_status=collected
         if platform_record=$(opu_extract_opatch_platform "$xml_file"); then
@@ -143,14 +147,18 @@ discover_databases() {
   done </etc/oratab
 }
 grid_runtime_json() {
-  local active health version upgrade patch_level health_state
+  local active health version upgrade patch_level health_state active_rc=0 health_rc=0
   [ -x "${GRID_HOME:-/nonexistent}/bin/crsctl" ] || { printf '{"status":"unavailable"}'; return 0; }
-  active=$("$GRID_HOME/bin/crsctl" query crs activeversion -f 2>&1 || true)
-  health=$("$GRID_HOME/bin/crsctl" check crs 2>&1 || true)
+  active=$("$GRID_HOME/bin/crsctl" query crs activeversion -f 2>&1) || active_rc=$?
+  health=$("$GRID_HOME/bin/crsctl" check crs 2>&1) || health_rc=$?
   version=$(sed -nE 's/.*active version on the cluster is \[([^]]+)\].*/\1/p' <<<"$active" | head -n1)
   upgrade=$(sed -nE 's/.*upgrade state is \[([^]]+)\].*/\1/p' <<<"$active" | head -n1)
   patch_level=$(sed -nE 's/.*active patch level is \[([^]]+)\].*/\1/p' <<<"$active" | head -n1)
-  grep -qi 'online\|running' <<<"$health" && health_state=healthy || health_state=unknown
+  health_state=unknown
+  if [ "$active_rc" -eq 0 ] && [ "$health_rc" -eq 0 ] &&
+     opu_service_status_running "$health"; then
+    health_state=healthy
+  fi
   printf '{"status":%s,"active_version":%s,"upgrade_state":%s,"active_patch_level":%s,"evidence":%s}' \
     "$(opu_json_string "$health_state")" "$(opu_json_nullable_string "$version")" "$(opu_json_nullable_string "$upgrade")" "$(opu_json_nullable_string "$patch_level")" "$(opu_json_string "$active")"
 }
@@ -224,4 +232,4 @@ emit() {
   } >"$file"
 }
 main() { parse "$@"; discover_grid; discover_homes; discover_nodes; discover_databases; local tmp; if [ -n "$OUT" ]; then mkdir -p "$(dirname "$OUT")"; [ ! -L "$OUT" ] || { echo 'output cannot be a symbolic link' >&2; exit 64; }; tmp=$OUT; else tmp=$(mktemp "${TMPDIR:-/tmp}/opu-topology.XXXXXX"); trap 'rm -f "${tmp:-}"' EXIT; fi; emit "$tmp"; if [ "$PRETTY" -eq 1 ]; then command -v jq >/dev/null || { echo 'jq is required for --pretty' >&2; exit 69; }; jq . "$tmp"; else cat "$tmp"; fi; }
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

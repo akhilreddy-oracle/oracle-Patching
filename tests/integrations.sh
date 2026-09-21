@@ -14,6 +14,7 @@ export PYTHONPATH="$ROOT/webapp${PYTHONPATH:+:$PYTHONPATH}"
 python3 - <<PY
 import json, os, time
 from pathlib import Path
+from unittest.mock import patch
 
 import itsm
 import notifications
@@ -80,6 +81,36 @@ for bad in ("CHG00999", "CHG-missing", ""):
         assert exc.status == 403
         assert exc.to_json()["error"] == "itsm_rejected"
 
+# An approved first entry must not hide a conflicting duplicate or a malformed
+# registry. Exercise the actual gate, not a normalized replacement fixture.
+registry = Path(os.environ["OPU_ITSM_TICKETS_FILE"])
+approved = {"ticket": "CHG00123", "state": "approved"}
+for entries in ([approved, {"ticket": "CHG00123", "state": "revoked"}],
+                [approved, {"ticket": " CHG00123 ", "state": "draft"}],
+                [approved, None], [approved, {"ticket": "other", "state": []}]):
+    registry.write_text(json.dumps({"tickets": entries}))
+    try:
+        itsm.validate_ticket("CHG00123")
+        raise SystemExit("ambiguous or malformed registry must fail closed")
+    except itsm.ItsmError:
+        pass
+    assert itsm.list_tickets() == []
+registry.write_text('{"tickets":[{"ticket":"CHG00123","state":"revoked","state":"approved"}]}')
+try:
+    itsm.validate_ticket("CHG00123")
+    raise SystemExit("duplicate JSON authority fields must fail closed")
+except itsm.ItsmError:
+    pass
+registry.unlink()
+os.mkfifo(registry)
+try:
+    itsm.validate_ticket("CHG00123")
+    raise SystemExit("nonregular registry must fail closed without blocking")
+except itsm.ItsmError:
+    pass
+finally:
+    registry.unlink()
+
 # corrupt registry with enforcement on: fail-closed
 Path(os.environ["OPU_ITSM_TICKETS_FILE"]).write_text("{not json")
 try:
@@ -110,6 +141,36 @@ assert notifications.deadletter_count() == 2
 assert [e["event"] for e in notifications.tail_events(2)] == ["plan.created", "run.failed"]
 run_counts = pipeline_runner.status_counts()
 assert run_counts.get("failed", 0) >= 1
+
+# Persisted events and outbound bodies cannot carry credential-shaped values;
+# an opaque webhook path must not leak into failed-delivery diagnostics.
+hook_secret = "private-hook-path"
+Path(os.environ["OPU_NOTIFICATIONS_FILE"]).write_text(json.dumps({"webhooks": [
+    {"url": "http://127.0.0.1/" + hook_secret, "events": ["private.*"]}]}))
+with patch.object(notifications, "_post_webhook", side_effect=RuntimeError(hook_secret)) as post:
+    notifications.emit("private.failed", {"password": "private-password", "message": "Authorization: Bearer private-token"})
+    delivered = json.dumps(post.call_args.args[1])
+    assert "private-password" not in delivered and "private-token" not in delivered
+persisted = events_file.read_text() + dead_file.read_text()
+for secret in (hook_secret, "private-password", "private-token"):
+    assert secret not in persisted
+assert events_file.stat().st_mode & 0o777 == 0o600
+assert dead_file.stat().st_mode & 0o777 == 0o600
+
+# Unsafe log targets fail without altering a victim or waiting for a FIFO peer.
+victim = events_file.parent / "log-victim"
+victim.write_text("keep")
+for kind in ("symlink", "hardlink", "fifo"):
+    events_file.unlink()
+    if kind == "symlink": events_file.symlink_to(victim)
+    elif kind == "hardlink": os.link(victim, events_file)
+    else: os.mkfifo(events_file)
+    notifications.emit("private.failed", {})
+    assert victim.read_text() == "keep"
+events_file.unlink()
+for malformed in ([], {"webhooks": {}}, {"webhooks": [None, {"url": "x", "events": "plan.*"}]}):
+    Path(os.environ["OPU_NOTIFICATIONS_FILE"]).write_text(json.dumps(malformed))
+    assert notifications.load_config() == {"webhooks": []}
 
 print("integrations test passed")
 PY

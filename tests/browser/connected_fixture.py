@@ -43,7 +43,9 @@ def install(base: Path, checkout: Path) -> None:
     backup_parent = fixture / "backups"
     backup_parent.mkdir()
     remote_root = base / "simulated-node"
-    (remote_root / "bin").mkdir(parents=True)
+    runtime_fingerprint = "a" * 64
+    runtime_root = remote_root / ".opu-runtimes" / runtime_fingerprint
+    (runtime_root / "bin").mkdir(parents=True)
     remote_state = base / "simulated-native-recovery-state"
 
     # Both workflows mutate the SAME database/listener state and Oracle home.
@@ -79,16 +81,22 @@ def install(base: Path, checkout: Path) -> None:
         "OPU_TEST_SUCCESS_ROOT": str(backup_parent / REQUEST_ID)}
     transport_env["OPU_TEST_DATABASE_STATE"] = str(patch["state"]["database"])
 
-    # Source-only native executables run under the fixture environment even
-    # when the managed controller correctly invokes them with env -i.
-    native_names = {"opu-database-recovery-prepare", "opu-recovery-evidence-collect", "opu-opatch-compatibility-collect"}
+    # Native executors run under the fixture environment even when the managed
+    # controller invokes them with env -i. Topology is an explicit simulated
+    # Oracle observation; the real discovery step still publishes and binds it.
+    native_names = {"opu-database-recovery-prepare", "opu-recovery-evidence-collect", "opu-opatch-compatibility-collect",
+                    "opu-topology-discover"}
     for name in native_names:
-        wrapper = remote_root / "bin" / name
+        wrapper = runtime_root / "bin" / name
         exports = {key: value for key, value in transport_env.items()
                    if key.startswith("OPU_") or key in {"PATH", "PYTHONDONTWRITEBYTECODE", "TMPDIR"}}
+        command = [str(checkout / "bin" / name)]
+        if name == "opu-topology-discover":
+            command = [recovery["env"]["OPU_RECOVERY_PREP_TEST_TOPOLOGY_TOOL"],
+                       "--output", str(runtime / "discovery.json")]
         wrapper.write_text("#!/bin/bash\nset -eu\n" + "\n".join(
             f"export {key}={shlex.quote(value)}" for key, value in exports.items()) +
-            f"\nexec {shlex.quote(str(checkout / 'bin' / name))} \"$@\"\n")
+            f"\nexec {shlex.join(command)} \"$@\"\n")
         wrapper.chmod(0o750)
     # macOS has no setsid binary. This shim performs the actual OS operation;
     # the production detached launch, PID/rc polling and import remain intact.
@@ -120,7 +128,7 @@ def install(base: Path, checkout: Path) -> None:
             executable = command[6]
         else:
             executable = command[0]
-        if executable not in {str(remote_root / "bin" / name) for name in native_names}:
+        if executable not in {str(runtime_root / "bin" / name) for name in native_names}:
             raise RuntimeError("Unexpected native command at fixture transport boundary")
         for item in command[command.index(executable) + 1:]:
             if item.startswith("/"):
@@ -157,24 +165,26 @@ def install(base: Path, checkout: Path) -> None:
 
     def ensure_tools(ssh_alias, root, sudo=False, **kwargs):
         alias(ssh_alias)
-        if root != str(remote_root) or not all((remote_root / "bin" / n).is_file() for n in native_names):
+        if root != str(remote_root) or not all((runtime_root / "bin" / n).is_file() for n in native_names):
             raise RuntimeError("Fixture package deployment target is not the isolated node")
+        return {"ssh_alias": ssh_alias, "runtime_root": str(runtime_root), "fingerprint": runtime_fingerprint, "synced": False, "cached": False}
 
     remote.run_remote_raw = raw
     remote.run_remote_shell = shell
     remote.push_file = push
     remote.pull_file = pull
     tools_sync.ensure_tools = ensure_tools
-    tools_sync.ensure_host_tools = lambda host, **kwargs: ensure_tools(host["ssh_alias"], host["remote_root"])
+    tools_sync.ensure_host_tools = lambda host, **kwargs: [ensure_tools(host["ssh_alias"], host["remote_root"])]
     recoveryctl.REMOTE_STATE_DIR = str(remote_state)
     pipeline_steps.REMOTE_SCRATCH_DIR = str(base / "scratch" / "{host_id}")
     host = {"id": HOST_ID, "label": "SIMULATED connected Oracle fixture — no live SSH", "ssh_alias": ALIAS,
             "remote_root": str(remote_root), "sudo": True, "nodes": [{"name": "testnode", "ssh_alias": ALIAS}]}
     (checkout / "webapp/hosts.json").write_text(json.dumps({"hosts": [host]}))
 
-    # Seed discovered Oracle observations and patch media, then derive every
-    # pure controller result using the actual native tools. The demo builder's
-    # synthetic backup/readiness documents are not admitted to host evidence.
+    # Supply simulated Oracle observations through the normal discovery
+    # publisher, including its per-node index and primary view. Derive later
+    # controller results using native tools; never seed completed recovery or
+    # readiness evidence from the demo builder.
     snapshot = json.loads(recovery["snapshot"].read_text())
     snapshot["host"]["name"] = "testnode.example"
     snapshot["oracle_homes"][0].update(path=str(home), patch_inventory_source="opatch_lsinventory_xml",
@@ -184,7 +194,7 @@ def install(base: Path, checkout: Path) -> None:
         pdb_not_read_write=0, backup_age_minutes=0, fra_space_limit_bytes=0, fra_space_used_bytes=0,
         guaranteed_restore_points=0)
     recovery["snapshot"].write_text(json.dumps(snapshot, indent=2))
-    evidence.write_evidence(HOST_ID, "snapshot", snapshot)
+    pipeline_steps.step_discovery(HOST_ID, host, {})
     artifact = json.loads(patch["evidence"]["artifact"].read_text())
     evidence.write_evidence(HOST_ID, "artifact", artifact)
     policy = json.loads(patch["evidence"]["policy"].read_text())

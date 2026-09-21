@@ -64,6 +64,14 @@ test('connected controller acceptance: prepare one fixture backup, select it, ev
   const oracleHome = snapshot.databases[0].oracle_home;
   expect(snapshot.databases[0].db_unique_name).toBe('ORCL');
   expect(snapshot.databases[0].runtime.log_mode).toBe('NOARCHIVELOG');
+  const capabilityResponse = await page.request.get(`${origin}/api/recovery?host_id=${host}`, { headers: headers('requester') });
+  expect(capabilityResponse.ok()).toBe(true);
+  const capabilities = (await capabilityResponse.json()).target_capabilities;
+  expect(capabilities).toHaveLength(1);
+  expect(capabilities[0]).toMatchObject({ database: 'ORCL', can_create: true });
+  expect(capabilities[0].requirements.find(row => row.id === 'discovery_routing')).toMatchObject({
+    status: 'passed', observed: 'testnode via simulated-offline-transport-only',
+  });
   expect(before.find(step => step.step === 'readiness-evaluate').done).toBe(false);
   expect(before.find(step => step.step === 'readiness-evaluate').recovery_selection).toBeFalsy();
   const backupParent = oracleHome.replace(/\/oracle\/dbhome_1$/, '/backups');
@@ -71,7 +79,9 @@ test('connected controller acceptance: prepare one fixture backup, select it, ev
   await main(page).getByLabel(/^Backup parent directory/).fill(backupParent);
   await main(page).getByText('Advanced settings — request identity and policy', { exact: true }).click();
   await main(page).getByLabel('Request ID', { exact: true }).fill(recoveryId);
-  await main(page).getByRole('button', { name: 'Create live recovery request', exact: true }).click();
+  const createRecovery = main(page).getByRole('button', { name: 'Create live recovery request', exact: true });
+  await expect(createRecovery).toBeEnabled();
+  await createRecovery.click();
   await expect(main(page).getByRole('heading', { name: recoveryId, exact: true })).toBeVisible({ timeout: 30_000 });
   await main(page).getByRole('button', { name: 'Analyze recovery', exact: true }).click();
   await expect(main(page).locator('.recovery-analysis')).toContainText('passed', { timeout: 45_000 });

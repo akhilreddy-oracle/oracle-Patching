@@ -15,6 +15,11 @@ Status meanings (fail-closed where downstream gates need the field):
 from __future__ import annotations
 
 from typing import Any
+import re
+
+
+def _known_text(value):
+    return isinstance(value, str) and value.strip().lower() not in {"", "unknown", "unavailable", "n/a"}
 
 # Order matches operator-facing discovery → what later steps consume.
 PHASE_DEFS: tuple[dict[str, str], ...] = (
@@ -120,9 +125,9 @@ def _oracle_homes(snapshot: dict) -> dict[str, Any]:
     missing_owner = []
     for home in homes:
         path = home.get("path") or "?"
-        if not (home.get("owner") or "").strip():
+        if not _known_text(home.get("owner")):
             missing_owner.append(path)
-        if not (home.get("opatch_version") or "").strip():
+        if not _known_text(home.get("opatch_version")):
             missing_opatch.append(path)
     if missing_owner:
         return _phase(
@@ -131,7 +136,7 @@ def _oracle_homes(snapshot: dict) -> dict[str, Any]:
             summary=f"{len(homes)} home(s); owner missing on {len(missing_owner)}.",
             detail=", ".join(missing_owner[:4]),
         )
-    with_version = sum(1 for h in homes if (h.get("version") or "").strip())
+    with_version = sum(1 for h in homes if _known_text(h.get("version")))
     if missing_opatch:
         return _phase(
             definition,
@@ -299,10 +304,10 @@ def _patch_inventory(snapshot: dict) -> dict[str, Any]:
         if plat_status == "collected":
             # Reconcile requires numeric id, name, XML source, and sha256.
             if (
-                platform.get("id")
-                and platform.get("name")
+                re.fullmatch(r"[0-9]+", str(platform.get("id") or ""))
+                and _known_text(platform.get("name"))
                 and platform.get("source") == "opatch_lsinventory_xml"
-                and platform.get("source_sha256")
+                and re.fullmatch(r"[a-f0-9]{64}", str(platform.get("source_sha256") or ""))
             ):
                 collected += 1
             else:
@@ -372,7 +377,14 @@ def derive_discovery_phases(snapshot: dict | None) -> list[dict[str, Any]]:
             )
             for definition in PHASE_DEFS
         ]
-    return [evaluate(snapshot) for evaluate in _EVALUATORS]
+    phases = []
+    for definition, evaluate in zip(PHASE_DEFS, _EVALUATORS):
+        try:
+            phases.append(evaluate(snapshot))
+        except (AttributeError, TypeError, ValueError):
+            phases.append(_phase(definition, status="fail", summary="Snapshot fields are malformed.",
+                                 detail="Refresh discovery to collect valid evidence for this phase."))
+    return phases
 
 
 def discovery_phases_rollup(phases: list[dict[str, Any]]) -> str:

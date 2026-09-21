@@ -15,9 +15,9 @@ collected=$(date -u -r "$now" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '@
 oracle_home="$TMP/oracle/dbhome_1"
 owner=$(id -un)
 
-# Single-node standalone database evidence set (create-only, no executor).
-jq -n --arg collected "$collected" \
-  '{schema_version:"1.0",collector:{name:"oracle.topology.discover",version:"1"},collected_at:$collected,host:{name:"node1.example"},cluster:{status:"unavailable",grid_home:null,runtime:{status:"unavailable"},nodes:[]},oracle_homes:[],databases:[],warnings:[]}' >"$TMP/node1-snapshot.json"
+# Single-node non-CDB database evidence set; real readiness -> plan admission.
+jq -n --arg collected "$collected" --arg home "$oracle_home" --arg owner "$owner" --arg digest "$digest" \
+  '{schema_version:"1.0",collector:{name:"oracle.topology.discover",version:"1"},collected_at:$collected,host:{name:"node1.example"},cluster:{status:"unavailable",grid_home:null,runtime:{status:"unavailable"},nodes:[]},oracle_homes:[{path:$home,owner:$owner,version:"19.0.0.0.0",opatch_version:"12.2.0.1.51",platform:{status:"collected",id:"226",name:"Linux x86-64",source:"opatch_lsinventory_xml",source_sha256:$digest},patch_inventory_source:"opatch_lsinventory_xml",opatch_inventory_xml_sha256:$digest,patches:[]}],databases:[{db_unique_name:"ORCL",oracle_home:$home,runtime:{status:"complete",cdb:"NO",database_role:"PRIMARY",open_mode:"READ WRITE",instance_state:"OPEN",invalid_objects:0,sqlpatch_non_success:0,pdb_not_read_write:0,backup_age_minutes:0,fra_space_limit_bytes:100,fra_space_used_bytes:0,guaranteed_restore_points:0}}],warnings:[]}' >"$TMP/node1-snapshot.json"
 snapshot_sha=$(sha256sum "$TMP/node1-snapshot.json" | awk '{print $1}')
 jq -n --arg home "$oracle_home" --arg owner "$owner" --arg snapshot "$TMP/node1-snapshot.json" --arg snapshot_sha "$snapshot_sha" \
   '{schema_version:"1.0",status:"consistent",expected_nodes:["node1"],oracle_homes:[{path:$home,owner:$owner,version:"19.0.0.0.0",opatch_version:"12.2.0.1.51",platform:{status:"collected",id:"226",name:"Linux x86-64",source:"opatch_lsinventory_xml"},patches:[]}],databases:[{db_unique_name:"ORCL",oracle_home:$home}],snapshot_evidence:[{path:$snapshot,sha256:$snapshot_sha}]}' >"$TMP/reconciliation.json"
@@ -47,16 +47,11 @@ yhash=$(sha256sum "$TMP/policy.json" | awk '{print $1}')
 jq -n --arg r "$rhash" --arg a "$ahash" --arg p "$phash" --arg c "$chash" --arg y "$yhash" \
   --arg evaluated "$collected" --arg valid "$end" --arg snapshot "$TMP/node1-snapshot.json" --arg snapshot_sha "$snapshot_sha" \
   '{schema_version:"1.0",status:"ready_for_approval",patch_id:"12345678",target:{family:"database",method:"opatch",platform_id:"226"},evaluated_at:$evaluated,valid_until:$valid,snapshot_evidence:[{path:$snapshot,sha256:$snapshot_sha,host:"node1",collected_at:$evaluated,valid_until:$valid}],evidence:{reconciliation_sha256:$r,artifact_manifest_sha256:$a,procedure_validation_sha256:$p,compatibility_sha256:$c,policy_sha256:$y}}' >"$TMP/readiness-nogates.json"
-# The gated variant carries the dataguard_standby_first pass emitted by
-# opu-readiness-evaluate when a ready_for_standby_first evaluation is bound.
-jq '.gates=[{name:"dataguard_standby_first",status:"pass",detail:"node1 PRIMARY is bound to a ready Data Guard standby-first evaluation."}]' \
-  "$TMP/readiness-nogates.json" >"$TMP/readiness-gated.json"
-
 # Sealed Data Guard observe → evaluate → plan-order chain (real tools; the
 # observe fixture sealing pattern is copied from tests/dataguard.sh).
 jq -n --arg home "$oracle_home" --arg now "$collected" '
   {schema_version:"1.0",collector:{name:"oracle.dataguard.observe",version:"1"},collected_at:$now,
-   target:{oracle_home:$home,oracle_sid:"ORCL"},
+   target:{oracle_home:$home,oracle_sid:"ORCL",db_unique_name:"ORCL"},
    primary:{database_role:"PRIMARY",open_mode:"READ WRITE",protection_mode:"MAXIMIZE PERFORMANCE"},
    broker:{status:"configured"},
    members:[{db_unique_name:"ORCL_STBY",status:"APPLYING_LOG",transport_lag_seconds:2,apply_lag_seconds:5}]}
@@ -70,6 +65,29 @@ jq -e '.status == "ready_for_standby_first"' "$TMP/dg-eval.json" >/dev/null
 "$ROOT/bin/opu-dataguard-plan-order" --observe "$TMP/observe.json" --evaluation "$TMP/dg-eval.json" --output "$TMP/order.json" >/dev/null
 order_record=$(jq -r '.record_sha256' "$TMP/order.json")
 order_file_sha=$(sha256sum "$TMP/order.json" | awk '{print $1}')
+
+"$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/reconciliation.json" --snapshot "$TMP/node1-snapshot.json" \
+  --artifact "$TMP/artifact.json" --procedure-validation "$TMP/procedure.json" --compatibility "$TMP/compatibility.json" \
+  --policy "$TMP/policy.json" --recovery-evidence "$TMP/recovery.json" --dataguard "$TMP/dg-eval.json" --output "$TMP/readiness-gated.json" >/dev/null
+jq -e '.status == "ready_for_approval" and .dataguard_evaluation.maximum_age_seconds == 300 and
+  .valid_until == .dataguard_evaluation.valid_until and
+  (.valid_until | fromdateiso8601) < (.snapshot_evidence[0].valid_until | fromdateiso8601)' "$TMP/readiness-gated.json" >/dev/null
+
+# Passing Data Guard evidence does not waive the database adapter's explicit
+# non-CDB requirement. Bind the changed snapshot correctly so the rejection
+# demonstrates container scope, not a stale reconciliation digest.
+jq '.databases[0].runtime.cdb = "YES"' "$TMP/node1-snapshot.json" >"$TMP/cdb-snapshot.json"
+cdb_sha=$(sha256sum "$TMP/cdb-snapshot.json" | awk '{print $1}')
+jq --arg path "$TMP/cdb-snapshot.json" --arg sha "$cdb_sha" '.snapshot_evidence=[{path:$path,sha256:$sha}]' \
+  "$TMP/reconciliation.json" >"$TMP/cdb-reconciliation.json"
+if "$ROOT/bin/opu-readiness-evaluate" --reconciliation "$TMP/cdb-reconciliation.json" --snapshot "$TMP/cdb-snapshot.json" \
+  --artifact "$TMP/artifact.json" --procedure-validation "$TMP/procedure.json" --compatibility "$TMP/compatibility.json" \
+  --policy "$TMP/policy.json" --dataguard "$TMP/dg-eval.json" --output "$TMP/cdb-readiness.json" >/dev/null; then
+  echo 'passing Data Guard evidence admitted an unsupported CDB' >&2; exit 1
+fi
+jq -e '.status == "blocked" and
+  any(.gates[]; .name == "dataguard_standby_first" and .status == "pass") and
+  ([.gates[] | select(.status == "blocker") | .name] == ["database_container_scope"])' "$TMP/cdb-readiness.json" >/dev/null
 
 run() { OPU_PLAN_STATE_DIR="$TMP/state" "$PLAN" "$@"; }
 create_plan() {
@@ -88,7 +106,7 @@ jq -e '.dataguard == null and .plan_sha256' "$TMP/plan-nodg.json" >/dev/null
 # A sealed standby-first order plus a gated readiness seals the order digest.
 create_plan plan-dg "$TMP/readiness-gated.json" --dataguard-order "$TMP/order.json" >"$TMP/plan-dg.json"
 jq -e --arg record "$order_record" --arg file_sha "$order_file_sha" \
-  '.dataguard.order_sha256 == $record and .dataguard.order_file_sha256 == $file_sha and .dataguard.strategy == "standby_first" and .plan_sha256' \
+  '.dataguard.order_sha256 == $record and .dataguard.order_file_sha256 == $file_sha and .dataguard.strategy == "standby_first" and .source_documents.dataguard_order.sha256 == $file_sha and .source_documents.dataguard_evaluation.maximum_age_seconds == 300 and .source_documents.dataguard_evaluation.valid_until == .planning_evidence.readiness_valid_until and .plan_sha256' \
   "$TMP/plan-dg.json" >/dev/null
 
 # Readiness without the dataguard_standby_first pass gate must fail closed.
@@ -102,6 +120,35 @@ jq '.order[0].apply_lag_seconds = 1' "$TMP/order.json" >"$TMP/order-tampered.jso
 if create_plan plan-dg-tampered "$TMP/readiness-gated.json" --dataguard-order "$TMP/order-tampered.json" >/dev/null 2>&1; then
   echo 'a tampered Data Guard order was sealed into a plan' >&2
   exit 1
+fi
+
+# The shorter expiry is valid only with the exact sealed DG evidence binding.
+for mutation in 'del(.dataguard_evaluation)' '.dataguard_evaluation.maximum_age_seconds=true' '.dataguard_evaluation.maximum_age_seconds=3601' '.dataguard_evaluation.valid_until=.snapshot_evidence[0].valid_until' '.valid_until=.snapshot_evidence[0].valid_until' '.dataguard_evaluation.sha256=("f"*64)'; do
+  jq "$mutation" "$TMP/readiness-gated.json" >"$TMP/readiness-invalid.json"
+  if create_plan invalid-dg-binding "$TMP/readiness-invalid.json" --dataguard-order "$TMP/order.json" >/dev/null 2>&1; then
+    echo "plan accepted invalid DG freshness binding: $mutation" >&2; exit 1
+  fi
+done
+# A different sealed evaluation/order cannot substitute for readiness's evaluation.
+jq '.evidence.evaluation_sha256=("e"*64) | del(.record_sha256)' "$TMP/order.json" >"$TMP/order-other.raw"
+other_sha=$(jq -cS . "$TMP/order-other.raw" | tr -d '\n' | sha256sum | awk '{print $1}')
+jq --arg sha "$other_sha" '.record_sha256=$sha' "$TMP/order-other.raw" >"$TMP/order-other.json"
+if create_plan other-dg-order "$TMP/readiness-gated.json" --dataguard-order "$TMP/order-other.json" >/dev/null 2>&1; then
+  echo 'plan accepted an order from another DG evaluation' >&2; exit 1
+fi
+# Later approval must reread the exact evaluation; it cannot use cached readiness.
+cp "$TMP/dg-eval.json" "$TMP/dg-eval.saved"
+printf '\n' >>"$TMP/dg-eval.json"
+if run approve --plan-id plan-dg --actor dba-approver --approval-ticket CHG-DG-TAMPER >/dev/null 2>&1; then
+  echo 'approval accepted changed DG evaluation bytes' >&2; exit 1
+fi
+mv "$TMP/dg-eval.saved" "$TMP/dg-eval.json"
+# At a later clock, snapshots can remain fresh while DG evidence is expired.
+if OPU_PLAN_STATE_DIR="$TMP/state" bash -c '
+  . "$1" help >/dev/null
+  verify_readiness_current "$2" "$3" "$4" "$5"
+' fixture "$PLAN" "$TMP/readiness-gated.json" "$TMP/reconciliation.json" "$TMP/policy.json" "$((now+301))" >/dev/null 2>&1; then
+  echo 'plan verifier accepted expired DG evidence with fresh snapshots' >&2; exit 1
 fi
 
 # Dispatch re-verifies the sealed order file and refuses a changed one.

@@ -8,6 +8,7 @@ export LC_ALL=C LANG=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 . "$ROOT/lib/opu/common.sh"
+. "$ROOT/lib/opu/dataguard.sh"
 
 TEST_MODE=${OPU_DATAGUARD_TEST_MODE:-0}
 FIXTURE=${OPU_DATAGUARD_TEST_FIXTURE:-}
@@ -31,7 +32,7 @@ parse() {
   done
   opu_validate_identifier "$ORACLE_SID" oracle-sid || exit $?
   opu_validate_absolute_path "$ORACLE_HOME" oracle-home || exit $?
-  [ -z "$OUT" ] || opu_validate_absolute_path "$OUT" output || exit $?
+  opu_dataguard_validate_output "$OUT" || exit $?
   command -v jq >/dev/null || die 'jq is required'
 }
 
@@ -41,7 +42,8 @@ emit_from_fixture() {
     .schema_version == "1.0" and .collector.name == "oracle.dataguard.observe" and
     .target.oracle_home == $home and .target.oracle_sid == $sid
   ' "$FIXTURE" >/dev/null || die 'Data Guard fixture does not bind the requested home/SID'
-  if [ -n "$OUT" ]; then cp "$FIXTURE" "$OUT"; cat "$OUT"; else cat "$FIXTURE"; fi
+  opu_dataguard_verify_document "$FIXTURE" || exit $?
+  opu_dataguard_publish "$FIXTURE" "$OUT"
 }
 
 sqlplus_q() {
@@ -123,13 +125,9 @@ emit_live() {
      primary:($identity | del(.sampled_at_local)),broker:{status:$broker},members:$samples.members,
      sampling:{source:"live_sql",clock:"database_local",sampled_at_local:$samples.sampled_at_local}}' >"$tmp"
   canonical=$(jq -cS . "$tmp"); hash=$(opu_hash_string "$canonical")
-  if [ -n "$OUT" ]; then
-    [ ! -L "$OUT" ] || die 'output cannot be a symbolic link'
-    jq --arg hash "$hash" '.record_sha256=$hash' "$tmp" >"$OUT"
-    cat "$OUT"
-  else
-    jq --arg hash "$hash" '.record_sha256=$hash' "$tmp"
-  fi
+  jq --arg hash "$hash" '.record_sha256=$hash' "$tmp" >"$tmp.hashed"
+  opu_dataguard_publish "$tmp.hashed" "$OUT"
+  rm -f "$tmp.hashed"
   rm -f "$tmp"
   trap - EXIT
 }

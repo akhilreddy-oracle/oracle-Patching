@@ -7,13 +7,18 @@ never edited or re-derived here.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
+from contextlib import contextmanager
+from durable import file_lock
+import runtime_paths
 
-VAR_DIR = Path(__file__).resolve().parent / "var" / "hosts"
+VAR_DIR = runtime_paths.state_dir() / "hosts"
 
 # Matches lib/opu/common.sh opu_validate_identifier — rejects path separators.
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -30,7 +35,7 @@ class EvidenceError(ValueError):
 
 
 def validate_host_id(host_id: str) -> str:
-    if not host_id or not _ID_RE.match(host_id):
+    if not isinstance(host_id, str) or not _ID_RE.fullmatch(host_id):
         raise EvidenceError(f"host_id contains unsupported characters: {host_id!r}")
     return host_id
 
@@ -46,11 +51,12 @@ def evidence_dir(host_id: str) -> Path:
 
 
 def evidence_path(host_id: str, name: str) -> Path:
+    validate_evidence_name(name)
     return evidence_dir(host_id) / f"{name}.json"
 
 
 def validate_evidence_name(name: str) -> str:
-    if not name or not _ID_RE.match(name):
+    if not isinstance(name, str) or not _ID_RE.fullmatch(name):
         raise EvidenceError(f"evidence name contains unsupported characters: {name!r}")
     return name
 
@@ -90,6 +96,59 @@ def read_evidence(host_id: str, name: str) -> dict | None:
     return json.loads(path.read_text())
 
 
+def read_regular_bytes(path: Path, maximum: int = 4 * 1024 * 1024) -> bytes:
+    """Capture bounded evidence without following links or accepting a moving file."""
+    path = Path(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > maximum:
+            raise ValueError("source is not a bounded independent regular file")
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            data = stream.read(maximum + 1)
+        after, named = os.fstat(fd), path.lstat()
+        identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns, item.st_nlink, item.st_mode)
+        if identity(before) != identity(after) or identity(named) != identity(before):
+            raise ValueError("source changed while being verified")
+        if len(data) > maximum:
+            raise ValueError("source exceeds the evidence size limit")
+        return data
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def host_lock(host_id: str):
+    """Exclude managed evidence writers while a plan binds and seals its inputs."""
+    validate_host_id(host_id)
+    acquired = False
+    try:
+        with file_lock(VAR_DIR / ".locks" / f"{host_id}.lock", timeout=0):
+            acquired = True
+            yield
+    except TimeoutError:
+        if acquired:
+            raise
+        raise EvidenceError("Host evidence is in use; wait for the current operation and review again") from None
+
+
+def creation_binding(host_id: str, host: dict, patch_id: str, database: str) -> str:
+    """Digest the exact configuration and saved documents shown in a proposal.
+
+    Callers that seal a plan hold host_lock through the native create operation.
+    This is shared with the assistant so the two contracts cannot drift.
+    """
+    state = {"host": host, "evidence": {key: read_evidence(host_id, key) for key in (
+        "snapshot", "snapshot_nodes", "artifact", "procedure_input", "procedure", "policy", "readiness", "recovery",
+        "recovery_selection", "compatibility_reconciliation", "reconciliation", "dataguard_order")}}
+    procedure = state["evidence"]["procedure_input"]
+    target = procedure.get("target") if isinstance(procedure, dict) else None
+    if (not isinstance(procedure, dict) or not isinstance(target, dict)
+            or procedure.get("patch_id") != patch_id or target.get("database_unique_name") != database):
+        raise EvidenceError("Requested patch/database does not match the saved procedure; review requirements again")
+    return hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
 def clear_evidence(host_id: str, name: str) -> bool:
     """Remove a cached evidence document so pipeline_state no longer shows it done."""
     validate_evidence_name(name)
@@ -103,24 +162,36 @@ def clear_evidence(host_id: str, name: str) -> bool:
 def list_snapshot_paths(host_id: str) -> list[Path]:
     """Return topology snapshot paths for reconcile/readiness (one per discovered node).
 
-    Prefers the multi-node index written by discovery. Falls back to the legacy
-    single ``snapshot.json`` when no index exists.
+    An index is a completeness claim: every entry must resolve. A damaged or
+    incomplete index must never silently become a smaller node set or a legacy
+    primary-only snapshot.
     """
-    index = read_evidence(host_id, "snapshot_nodes")
-    nodes = (index or {}).get("nodes") if isinstance(index, dict) else None
-    if isinstance(nodes, list) and nodes:
+    index_path = evidence_path(host_id, "snapshot_nodes")
+    if index_path.exists() or index_path.is_symlink():
+        if not index_path.is_file() or index_path.is_symlink():
+            raise EvidenceError("Discovery node index is unsafe; refresh discovery")
+        try:
+            index = json.loads(index_path.read_text())
+        except (OSError, ValueError):
+            raise EvidenceError("Discovery node index is unreadable; refresh discovery") from None
+        nodes = index.get("nodes") if isinstance(index, dict) else None
+        if not isinstance(nodes, list) or not nodes:
+            raise EvidenceError("Discovery node index is invalid; refresh discovery")
         paths: list[Path] = []
+        seen_names, seen_files = set(), set()
         for entry in nodes:
             if not isinstance(entry, dict):
-                continue
+                raise EvidenceError("Discovery node index has an invalid entry; refresh discovery")
             name = entry.get("name") or entry.get("evidence")
-            if not name:
-                continue
+            if not isinstance(name, str) or not name or name.casefold() in seen_names:
+                raise EvidenceError("Discovery node identity is missing or duplicated; refresh discovery")
             evidence_name = entry.get("evidence") or node_snapshot_evidence_name(str(name))
-            path = evidence_path(host_id, str(evidence_name))
-            if path.is_file():
-                paths.append(path)
-        if paths:
-            return paths
+            path = evidence_path(host_id, evidence_name)
+            if evidence_name in seen_files or not path.is_file() or path.is_symlink():
+                raise EvidenceError(f"Discovery snapshot for {name} is missing, duplicated or unsafe; refresh discovery")
+            seen_names.add(name.casefold())
+            seen_files.add(evidence_name)
+            paths.append(path)
+        return paths
     legacy = evidence_path(host_id, "snapshot")
-    return [legacy] if legacy.is_file() else []
+    return [legacy] if legacy.is_file() and not legacy.is_symlink() else []

@@ -13,12 +13,15 @@ import re
 import secrets
 import datetime as dt
 import time
+import stat
 from pathlib import Path
+import runtime_paths
+from durable import file_lock
 
 TOKEN_ENV = "OPU_WEBAPP_TOKEN"
-TOKEN_FILE = Path(__file__).resolve().parent / "var" / "api-token"
+TOKEN_FILE = runtime_paths.state_dir() / "api-token"
 PRINCIPALS_ENV = "OPU_WEBAPP_PRINCIPALS_FILE"
-PRINCIPALS_FILE = Path(__file__).resolve().parent / "var" / "principals.json"
+PRINCIPALS_FILE = runtime_paths.state_dir() / "principals.json"
 RBAC_ENV = "OPU_WEBAPP_RBAC"
 _CACHED_TOKEN: str | None = None
 
@@ -46,37 +49,64 @@ class AuthError(Exception):
         return {"error": self.error, "message": self.message}
 
 
+def _protected_read(path: Path, *, private: bool = False) -> bytes:
+    """Read only an owned, non-linked regular credential/configuration file."""
+    try:
+        info = path.lstat()
+        forbidden = 0o077 if private else 0o022
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid not in {0, os.geteuid()} or info.st_mode & forbidden):
+            raise AuthError("Credential configuration has unsafe ownership, links or permissions", status=503)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as handle:
+            actual = os.fstat(handle.fileno())
+            if (actual.st_dev, actual.st_ino, actual.st_mode, actual.st_nlink) != (info.st_dev, info.st_ino, info.st_mode, info.st_nlink):
+                raise AuthError("Credential configuration changed while reading", status=503)
+            raw = handle.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise AuthError("Credential configuration is too large", status=503)
+        return raw
+    except OSError as exc:
+        raise AuthError("Credential configuration is unavailable", status=503) from exc
+
+
 def _read_token_file() -> str | None:
-    if not TOKEN_FILE.is_file():
+    if not TOKEN_FILE.exists() and not TOKEN_FILE.is_symlink():
         return None
-    raw = TOKEN_FILE.read_text(encoding="utf-8").strip()
-    return raw or None
+    try:
+        raw = _protected_read(TOKEN_FILE, private=True).decode("utf-8").strip()
+    except UnicodeError as exc:
+        raise AuthError("API token file is invalid", status=503) from exc
+    if not raw:
+        raise AuthError("API token file is empty", status=503)
+    return raw
 
 
 def ensure_token() -> str:
     """Return the active API token, creating var/api-token if needed."""
     global _CACHED_TOKEN
-    if _CACHED_TOKEN:
-        return _CACHED_TOKEN
-
     env_token = (os.environ.get(TOKEN_ENV) or "").strip()
     if env_token:
         _CACHED_TOKEN = env_token
         return _CACHED_TOKEN
 
-    file_token = _read_token_file()
-    if file_token:
-        _CACHED_TOKEN = file_token
-        return _CACHED_TOKEN
-
-    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    generated = secrets.token_urlsafe(32)
-    TOKEN_FILE.write_text(generated + "\n", encoding="utf-8")
+    # Serialize first creation and never follow or truncate an existing path.
+    # Re-read on later requests so replacing a lab token revokes the old one.
     try:
-        os.chmod(TOKEN_FILE, 0o600)
-    except OSError:
-        pass
-    _CACHED_TOKEN = generated
+        with file_lock(TOKEN_FILE.parent / ".api-token.lock"):
+            file_token = _read_token_file()
+            if file_token:
+                _CACHED_TOKEN = file_token
+                return file_token
+            generated = secrets.token_urlsafe(32)
+            fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(generated + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            _CACHED_TOKEN = generated
+    except (OSError, ValueError, TimeoutError) as exc:
+        raise AuthError("API token storage is unavailable or unsafe", status=503) from exc
     return _CACHED_TOKEN
 
 
@@ -114,12 +144,14 @@ def require_api_auth(authorization_header: str | None) -> str | None:
 
 
 def rbac_enabled() -> bool:
+    flag = (os.environ.get(RBAC_ENV) or "").strip().lower()
+    if flag not in {"", "0", "false", "no", "off", "1", "true", "yes", "on"}:
+        raise AuthError("OPU_WEBAPP_RBAC must be a boolean value; refusing ambiguous authentication configuration", status=503)
     if (os.environ.get("OPU_OIDC_CONFIG") or (TOKEN_FILE.parent / "oidc.json").exists()
             or (TOKEN_FILE.parent / "oidc.json").is_symlink()):
         return True
     if (os.environ.get("OPU_PRODUCTION_MODE") or "").strip().lower() in {"1", "true", "yes", "on"}:
         return True
-    flag = (os.environ.get(RBAC_ENV) or "").strip().lower()
     if flag in {"0", "false", "no", "off"}:
         return False
     if flag in {"1", "true", "yes", "on"}:
@@ -141,8 +173,8 @@ def _load_entries(*, required: bool = False) -> list[dict]:
             raise AuthError("Configured principal registry is missing or unsafe", status=503)
         return []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        data = json.loads(_protected_read(path))
+    except (OSError, ValueError) as exc:
         raise AuthError("Configured principal registry is unreadable", status=503) from exc
     if not isinstance(data, dict) or not isinstance(data.get("principals"), list) or not data["principals"]:
         raise AuthError("Principal registry must contain a nonempty principals array", status=503)

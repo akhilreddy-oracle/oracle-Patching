@@ -1,5 +1,6 @@
 import { el, badge, classifyStatus } from "../dom.js";
-import { apiFetch } from "../api.js";
+import { apiFetch, getReadSignal } from "../api.js";
+import { liveDiscoveryAccess } from "../actor.js";
 import { runToCompletion, RunStartError } from "../runs.js";
 import {
   field,
@@ -19,6 +20,7 @@ import { backupPolicyChooser, policyRecoveryBlock, getBackupPolicy, hydrateBacku
 import { PROCEDURE_ADAPTERS, REQUIRED_PRECHECKS, REQUIRED_POSTCHECKS, buildProcedure, procedureMatchesArtifact } from "../procedure_adapters.js";
 
 import { blockerCards } from "../readiness_blockers.js";
+import { readinessExpiryMessage } from "../patch_wizard.js";
 
 const STEP_LABELS = {
   reconcile: "Topology reconciliation",
@@ -66,7 +68,7 @@ function rememberArtifactDir(hostId, path) {
   localStorage.setItem(ARTIFACT_DIR_KEY, path);
 }
 
-export async function renderReadinessStage(mount, hostId) {
+export async function renderReadinessStage(mount, hostId, { onEvidenceChanged } = {}) {
   mount.innerHTML = "";
   mount.appendChild(
     el("div", { class: "stage-head" }, [
@@ -119,6 +121,7 @@ export async function renderReadinessStage(mount, hostId) {
     // Never paint fake "not run" cards when we do not have pipeline evidence —
     // that is exactly how a missing token looks like an empty inspect step.
     if (loadFailed) return;
+    onEvidenceChanged?.(steps);
     if (!policyLoaded) {
       hydrateBackupPolicy(hostId, savedPolicyFromSteps(steps));
       policyControls.appendChild(backupPolicyChooser(hostId));
@@ -164,7 +167,13 @@ export async function renderReadinessStage(mount, hostId) {
     }
     for (const stepId of READINESS_STEPS) {
       const stepState = steps.find((s) => s.step === stepId) || { step: stepId, done: false };
-      list.appendChild(stepCard(hostId, stepState, steps, refresh, selectedPolicyDraft));
+      list.appendChild(stepCard(hostId, stepState, steps, refresh, selectedPolicyDraft, (step) => {
+        const target = list.querySelector(`#readiness-step-${step}`);
+        const heading = target?.querySelector("h3");
+        if (!heading) return;
+        heading.focus({ preventScroll: true });
+        target.scrollIntoView({ block: "start" });
+      }));
     }
   }
 
@@ -190,24 +199,25 @@ function missingPrereqs(step, allSteps) {
   return need.filter((id) => !byId[id]?.done);
 }
 
-function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft) {
+function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft, onReviewStep) {
   const { step, evidence } = stepState;
   // Evidence presence means the step ran — don't rely only on a top-level status
   // (artifact-inspect nests status under evidence.artifact.status).
   const done = Boolean(stepState.done || evidence);
   const status = effectiveStatus(stepState);
-  const card = el("section", { class: "panel step-card" });
-  const displayStatus = done ? status || "done" : "not run";
-  const statusBadge = badge(displayStatus, done ? classifyStatus(displayStatus) : "neutral");
+  const expiryMessage = step === "readiness-evaluate" && status === "ready_for_approval" ? readinessExpiryMessage(evidence) : null;
+  const card = el("section", { class: "panel step-card", id: `readiness-step-${step}` });
+  const displayStatus = expiryMessage ? "refresh required" : done ? status || "done" : "not run";
+  const statusBadge = badge(displayStatus, expiryMessage ? "warn" : done ? classifyStatus(displayStatus) : "neutral");
 
   card.appendChild(
     el("div", { class: "step-card-head" }, [
-      el("h3", { text: STEP_LABELS[step] || step }),
+      el("h3", { text: STEP_LABELS[step] || step, tabindex: "-1" }),
       statusBadge,
     ])
   );
 
-  const explained = explainStatus(status, { done });
+  const explained = expiryMessage ? { text: expiryMessage, kind: "warn" } : explainStatus(status, { done });
   const statusExplanation = helperText(
     explained.text,
     explained.kind === "ok" ? null : explained.kind === "error" ? "error" : explained.kind === "warn" ? "warn" : null
@@ -228,7 +238,7 @@ function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft) {
 
   const blocked = done && /blocked|incomplete|failed/i.test(String(status));
   if (blocked) {
-    const findings = step === "readiness-evaluate" ? blockerCards(evidence, allSteps, hostId) : null;
+    const findings = step === "readiness-evaluate" ? blockerCards(evidence, allSteps, hostId, { onReviewStep }) : null;
     if (findings) card.appendChild(findings);
     const summary = summarizeBlockedEvidence(evidence);
     if (summary?.length && !findings) {
@@ -271,7 +281,7 @@ function stepCard(hostId, stepState, allSteps, refresh, selectedPolicyDraft) {
 
   buildControls(hostId, step, controls, logBox, refresh, allSteps, evidence, { statusBadge, statusExplanation, status, selectedPolicyDraft });
 
-  if (step === "readiness-evaluate" && status === "ready_for_approval") {
+  if (step === "readiness-evaluate" && status === "ready_for_approval" && !expiryMessage) {
     card.appendChild(
       el("p", { class: "stage-next" }, [
         el("a", { href: `#/hosts/${encodeURIComponent(hostId)}/plan`, text: "Continue to Plan →" }),
@@ -355,6 +365,7 @@ function buildControls(hostId, step, controls, logBox, refresh, allSteps, eviden
     const input = el("input", {
       type: "text",
       placeholder: "/absolute/path/to/staged/patch",
+      "aria-label": "Staged patch path",
       value: cachedPath,
     });
     const btn = runButton("Run", async () => {
@@ -429,6 +440,7 @@ function formatBytes(n) {
  * a zip already present on the host. Clears artifact-bound evidence on success.
  */
 function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
+  const signal = getReadSignal();
   const base = `/api/hosts/${encodeURIComponent(hostId)}`;
   const panel = el("section", { class: "panel panel-warn remediation" });
   panel.appendChild(el("h4", { text: `Fix from here: ${remedy.title}` }));
@@ -442,12 +454,29 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
     el("option", { value: "host", text: "Copy from another managed host" }),
     el("option", { value: "zip", text: "Unpack a zip already on this host" }),
   ]);
-  const sourceSel = el("select", {}, [el("option", { value: "", text: "Probing hosts…" })]);
+  const sourceSel = el("select", {}, [el("option", { value: "", text: "Probe managed hosts to find complete media" })]);
   const zipInput = el("input", { type: "text", placeholder: "/u01/stage/p39034528_190000_Linux-x86-64.zip" });
   const replace = el("input", { type: "checkbox" });
   const status = helperText("", null);
-  const probeBtn = runButton("Probe hosts", () => probe());
+  const probeBtn = runButton("Probe managed hosts", () => probe());
   const btn = runButton("Stage media", () => run());
+  const permissionHint = helperText("", "warn");
+  let probing = false, staging = false, probeRevision = 0;
+  const updateAccess = () => {
+    const access = liveDiscoveryAccess();
+    probeBtn.disabled = probing || staging || !access.allowed;
+    btn.disabled = probing || staging || !access.allowed;
+    permissionHint.hidden = access.allowed;
+    permissionHint.textContent = access.reason;
+    return access.allowed;
+  };
+  updateAccess();
+  dirInput.addEventListener("input", () => {
+    probeRevision++;
+    sourceSel.replaceChildren(el("option", { value: "", text: "Probe managed hosts for the changed path" }));
+    sourceSel.value = "";
+    status.textContent = "Artifact path changed; previous source observations no longer apply.";
+  });
 
   const hostRow = field("Source host", sourceSel, "Only hosts holding complete media at the same path are selectable.");
   const zipRow = field("Zip path on this host", zipInput, "Absolute path; every node of this host must have it.");
@@ -460,6 +489,7 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
 
   async function probe() {
     clearFormError(errBox);
+    if (signal?.aborted || !updateAccess() || probing || staging || !requireToken(errBox)) return;
     const dir = dirInput.value.trim();
     if (!isAbsolutePath(dir)) {
       showFormError(errBox, "Artifact path must be absolute.");
@@ -468,10 +498,13 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
     sourceSel.innerHTML = "";
     sourceSel.appendChild(el("option", { value: "", text: "Probing hosts…" }));
     status.textContent = "";
-    probeBtn.disabled = true;
+    probing = true;
+    const revision = ++probeRevision;
+    updateAccess();
     try {
-      const res = await apiFetch(`${base}/artifact-sources?artifact_dir=${encodeURIComponent(dir)}`);
+      const res = await apiFetch(`${base}/artifact-sources`, { method: "POST", body: JSON.stringify({ artifact_dir: dir }), signal });
       const data = await res.json();
+      if (signal?.aborted || revision !== probeRevision || dir !== dirInput.value.trim()) return;
       if (!res.ok) {
         showFormError(errBox, data.message || "Probe failed");
         return;
@@ -498,14 +531,16 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
       }
       if (complete.length) sourceSel.value = complete[0].host_id;
     } catch (err) {
-      showFormError(errBox, `Probe failed: ${err}`);
+      if (err.name !== "AbortError") showFormError(errBox, `Probe failed: ${err}`);
     } finally {
-      probeBtn.disabled = false;
+      probing = false;
+      updateAccess();
     }
   }
 
   async function run() {
     clearFormError(errBox);
+    if (signal?.aborted || !updateAccess() || probing || staging) return;
     if (!requireToken(errBox)) return;
     const dir = dirInput.value.trim();
     if (!isAbsolutePath(dir)) {
@@ -515,7 +550,7 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
     const body = { artifact_dir: dir, owner: ownerInput.value.trim() || undefined, replace: replace.checked };
     if (mode.value === "host") {
       if (!sourceSel.value) {
-        showFormError(errBox, "Pick a source host with complete media (Probe hosts first).");
+        showFormError(errBox, "Pick a source host with complete media (Probe managed hosts first).");
         return;
       }
       body.source = { host_id: sourceSel.value };
@@ -528,9 +563,17 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
       body.source = { zip_path: zip };
     }
     rememberArtifactDir(hostId, dir);
-    const record = await executeRun(logBox, btn, (onTick) =>
-      runToCompletion(`${base}/pipeline/stage-artifact`, body, { onTick })
-    );
+    staging = true;
+    updateAccess();
+    let record;
+    try {
+      record = await executeRun(logBox, btn, (onTick) =>
+        runToCompletion(`${base}/pipeline/stage-artifact`, body, { onTick })
+      );
+    } finally {
+      staging = false;
+      updateAccess();
+    }
     if (record?.status === "succeeded") {
       const nodes = (record.result?.nodes || []).map((n) => `${n.node}: ${n.status}${n.bytes ? ` (${formatBytes(n.bytes)})` : ""}`).join("; ");
       logBox.textContent = `staged — ${nodes}\n${record.result?.next || ""}`;
@@ -551,11 +594,11 @@ function stageMediaPanel(hostId, remedy, artifactDir, refresh) {
     ])
   );
   panel.appendChild(status);
+  panel.appendChild(helperText("Probe managed hosts inspects this path over SSH on this host's nodes and all other configured source hosts. Review the scope before starting the probe."));
+  panel.appendChild(permissionHint);
   panel.appendChild(errBox);
   panel.appendChild(el("div", { class: "pipeline-controls" }, [probeBtn, btn]));
   panel.appendChild(logBox);
-  // Kick off the probe so the source list is ready when the operator looks.
-  probe();
   return panel;
 }
 
@@ -767,7 +810,7 @@ function procedureForm(base, logBox, refresh, errBox, allSteps, presentation) {
 
   form.appendChild(
     helperText(
-      "Select the adapter specified by the patch README. Autofill fills empty fields from unambiguous artifact and discovery evidence, and verifies the selected README for its minimum OPatch version. Existing values are preserved. Enter the exact rollback condition from the README. Required prechecks are always retained."
+      "Database patch adapters currently support non-CDB databases only; CDB/PDB patching is unavailable. Select the adapter specified by the patch README. Autofill fills empty fields from unambiguous artifact and discovery evidence, and verifies the selected README for its minimum OPatch version. Existing values are preserved. Enter the exact rollback condition from the README. Required prechecks are always retained."
     )
   );
   form.appendChild(draftTarget);

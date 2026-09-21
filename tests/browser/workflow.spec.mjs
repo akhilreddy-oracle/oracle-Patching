@@ -1,6 +1,70 @@
-import { test, expect } from './fixtures.mjs';
+import { test, expect, actionReviewFixture } from './fixtures.mjs';
 
 const main = page => page.locator('#app');
+
+test('readiness reviews focus the relevant controls without losing an unsubmitted draft', async ({ page, fixture }) => {
+  fixture.steps.at(-1).evidence.gates = [
+    { name: 'artifact', status: 'blocker' }, { name: 'compatibility_contract', status: 'blocker' },
+    { name: 'patch_not_installed', status: 'blocker' }, { name: 'database_invalid_objects', status: 'blocker' },
+  ];
+  const reads = [];
+  fixture.custom = async ({ url, method }) => { if (method === 'GET') reads.push(url.pathname + url.search); return false; };
+  await page.goto('/#/hosts/source/readiness');
+  const view = main(page), draft = view.getByLabel('Rollback precondition', { exact: true });
+  await draft.fill('Keep this unsubmitted recovery condition');
+  const readCount = reads.length;
+  for (const [action, heading] of [['Review patch media', 'Artifact inspection'], ['Review compatibility checks', 'OPatch compatibility'],
+    ['Review installed patch and selection', 'Procedure validation'], ['Review readiness controls', 'Readiness evaluation']]) {
+    await view.getByRole('link', { name: action, exact: true }).click();
+    await expect(view.getByRole('heading', { name: heading, exact: true })).toBeFocused();
+    await expect(view.getByRole('heading', { name: heading, exact: true })).toBeInViewport();
+    await expect(draft).toHaveValue('Keep this unsubmitted recovery condition');
+  }
+  expect(reads.length).toBe(readCount);
+  expect(fixture.writes).toEqual([]);
+  await expect(page).toHaveURL(/#\/hosts\/source\/readiness$/);
+});
+
+test('saved workspace target and badges follow validation without extra recovery reads or discarded policy drafts', async ({ page, fixture }) => {
+  fixture.steps[0].evidence.databases.push({ db_unique_name: 'OTHER', oracle_home: '/fixture/oracle/other_home' });
+  fixture.recoveries.push({ request_id: 'saved-backup', host_id: 'source', state: 'completed', evidence_mode: 'saved' });
+  const recoveryReads = [];
+  fixture.custom = async ({ request, url, method, send }) => {
+    if (method === 'GET' && url.pathname === '/api/recovery') recoveryReads.push(url.search);
+    if (method === 'POST' && url.pathname === '/api/hosts/source/pipeline/procedure-validate') {
+      fixture.steps.find(step => step.step === 'procedure-validate').evidence.procedure = request.postDataJSON().procedure;
+      Object.assign(fixture.steps.at(-1), { done: false, status: null, evidence: null });
+      fixture.runs.validate = { status: 'succeeded' };
+      await send({ run_id: 'validate' }, 202); return true;
+    }
+    if (method === 'POST' && url.pathname === '/api/hosts/source/pipeline/readiness-evaluate') {
+      Object.assign(fixture.steps.at(-1), { done: true, status: 'ready_for_approval', evidence: { status: 'ready_for_approval', valid_until: '2099-01-01T00:00:00Z' } });
+      fixture.runs.ready = { status: 'succeeded' };
+      await send({ run_id: 'ready' }, 202); return true;
+    }
+    return false;
+  };
+  await page.goto('/#/hosts/source/readiness');
+  const view = main(page), target = view.getByRole('region', { name: 'Selected patch target', exact: true });
+  const readiness = view.locator('.stage-rail').getByRole('link', { name: /^Readiness/ });
+  await expect(target).toContainText('Database: ORCL');
+  await expect(readiness).toContainText('blocked');
+  await expect(view.locator('.stage-rail')).toContainText('Saved: completed');
+  const reserve = view.getByLabel('Filesystem free space reserve (GiB)', { exact: true });
+  await reserve.fill('17');
+  await view.getByRole('combobox', { name: 'Database unique name', exact: true }).selectOption('OTHER');
+  await view.getByRole('button', { name: 'Validate procedure', exact: true }).click();
+  await expect(target).toContainText('Database: OTHER');
+  await expect(target).toContainText('Patch: 39034528');
+  await expect(target).toContainText('Oracle home: /fixture/oracle/other_home');
+  await expect(readiness).toContainText('5/6');
+  await expect(reserve).toHaveValue('17');
+  await view.getByRole('button', { name: 'Evaluate readiness', exact: true }).click();
+  await expect(readiness).toContainText('ready_for_approval');
+  await expect(reserve).toHaveValue('17');
+  expect(recoveryReads).toEqual(['?host_id=source&view=saved']);
+  expect(fixture.writes.map(row => row.path)).toEqual(['/api/hosts/source/pipeline/procedure-validate', '/api/hosts/source/pipeline/readiness-evaluate']);
+});
 
 test('recovery target requirements distinguish native SPFILE analysis from unsupported or stale discovery', async ({ page, fixture }) => {
   await page.goto('/#/hosts/source/recovery');
@@ -35,20 +99,208 @@ test('wizard reviews target, verified README and Advanced fields before acceptin
   await expect(view.getByRole('region', { name: 'Selected patch target', exact: true }).getByText('Oracle home: /fixture/oracle/dbhome_1', { exact: true })).toBeVisible();
   await expect(view.getByRole('combobox', { name: 'Database unique name', exact: true })).toHaveValue('ORCL');
   await expect(view.getByLabel('Required OPatch', { exact: true })).toHaveValue('12.2.0.1.49');
+  await expect(view.getByRole('textbox', { name: 'Staged patch path', exact: true })).toHaveCount(2);
   await expect(view.getByLabel('Mandatory prechecks', { exact: true })).not.toBeVisible();
   await view.getByText('Advanced settings — procedure contract', { exact: true }).click();
   await expect(view.getByLabel('Mandatory prechecks', { exact: true })).toBeVisible();
   await expect(view.locator('.readiness-finding')).toContainText('ActualUnknown — evidence not supplied');
   await expect(view.locator('.readiness-finding')).toContainText('RequiredBackup age ≤ 1440 minutes');
   await page.screenshot({ path: testInfo.outputPath('readiness-wizard.png'), fullPage: true });
+  fixture.steps.at(-1).status = 'ready_for_approval';
+  fixture.steps.at(-1).evidence.valid_until = '2099-01-01T00:00:00Z';
   await view.locator('.stage-rail').getByRole('link', { name: 'Plan', exact: false }).click();
   await expect(view.getByText('README bound to validated procedure', { exact: true })).toBeVisible();
   await expect(view.getByLabel('Plan ID', { exact: true })).not.toBeVisible();
   await view.getByLabel('Window start (UTC)', { exact: true }).fill('2030-01-01T10:00:00');
   await view.getByRole('button', { name: 'Create plan', exact: true }).click();
-  await expect(view.getByText(/Use complete UTC timestamps/)).toBeVisible();
+  await expect(view.getByText(/Use valid UTC calendar timestamps/)).toBeVisible();
+  await view.getByLabel('Window start (UTC)', { exact: true }).fill('2030-02-30T10:00:00Z');
+  await view.getByLabel('Window end (UTC)', { exact: true }).fill('2030-03-03T10:00:00Z');
+  await view.getByRole('button', { name: 'Create plan', exact: true }).click();
+  await expect(view.getByText(/Use valid UTC calendar timestamps/)).toBeVisible();
   expect(fixture.writes).toEqual([]);
   await page.screenshot({ path: testInfo.outputPath('plan-review.png'), fullPage: true });
+});
+
+test('editing a plan ID during creation cannot redirect away from the submitted plan', async ({ page, fixture }) => {
+  fixture.steps.at(-1).status = 'ready_for_approval';
+  fixture.steps.at(-1).evidence.valid_until = '2099-01-01T00:00:00Z';
+  let releaseRun;
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'POST' && url.pathname === '/api/plans') {
+      fixture.plans.push({ plan_id: 'submitted-plan', state: 'awaiting_approval', requester: 'fixture-operator' });
+      await send({ run_id: 'create-plan' }, 202); return true;
+    }
+    if (method === 'GET' && url.pathname === '/api/runs/create-plan') {
+      await new Promise(resolve => { releaseRun = resolve; });
+      await send({ status: 'succeeded' }); return true;
+    }
+    if (method === 'GET' && url.pathname === '/api/plans/submitted-plan/execution') { await send({ runs: [], tasks: [] }); return true; }
+    if (method === 'GET' && url.pathname === '/api/plans/submitted-plan/tasks') { await send({ tasks: [] }); return true; }
+    if (method === 'GET' && url.pathname === '/api/itsm/tickets') { await send({ tickets: [] }); return true; }
+    return false;
+  };
+  await page.goto('/#/hosts/source/plan');
+  await main(page).getByText('Advanced settings', { exact: true }).click();
+  await main(page).getByLabel('Plan ID', { exact: true }).fill('submitted-plan');
+  await main(page).getByRole('button', { name: 'Create plan', exact: true }).click();
+  await expect.poll(() => Boolean(releaseRun)).toBe(true);
+  await main(page).getByLabel('Plan ID', { exact: true }).fill('edited-after-submit');
+  releaseRun();
+  await expect(page).toHaveURL(/#\/plans\/submitted-plan$/);
+  await expect(main(page).getByRole('heading', { name: 'submitted-plan', exact: true })).toBeVisible();
+  expect(fixture.writes).toHaveLength(1);
+  expect(fixture.writes[0].body.plan_id).toBe('submitted-plan');
+});
+
+test('plan creation submits the original reviewed target and binding until the operator reviews again', async ({ page, fixture }) => {
+  fixture.steps.at(-1).status = 'ready_for_approval';
+  fixture.steps.at(-1).evidence.valid_until = '2099-01-01T00:00:00Z';
+  let generation = 'a';
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'GET' && url.pathname === '/api/hosts/source/plan-preview') {
+      await send({ steps: fixture.steps, confirmation: {
+        expected_creation_binding_sha256: generation.repeat(64), patch_id: fixture.procedure.patch_id,
+        database: fixture.procedure.target.database_unique_name,
+      } }); return true;
+    }
+    if (method === 'POST' && url.pathname === '/api/plans') {
+      await send({ run_id: 'changed-review' }, 202); return true;
+    }
+    if (method === 'GET' && url.pathname === '/api/runs/changed-review') {
+      await send({ status: 'failed', error: { message: 'Host configuration or evidence changed after confirmation; review a new proposal' } }); return true;
+    }
+    return false;
+  };
+  await page.goto('/#/hosts/source/plan');
+  const view = main(page);
+  await expect(view.getByRole('region', { name: 'Selected patch target' })).toContainText('Database: ORCL');
+  // Simulate another session changing the server while this form stays open.
+  generation = 'b';
+  fixture.procedure.target.database_unique_name = 'SECOND';
+  fixture.steps[0].evidence.databases.push({ db_unique_name: 'SECOND', oracle_home: '/fixture/second-home' });
+  await view.getByRole('button', { name: 'Create plan', exact: true }).click();
+  await expect(view.locator('.run-log')).toContainText('changed after confirmation');
+  expect(fixture.writes[0].body).toMatchObject({ expected_creation_binding_sha256: 'a'.repeat(64), database: 'ORCL' });
+  await page.reload();
+  await expect(view.getByRole('region', { name: 'Selected patch target' })).toContainText('Database: SECOND');
+  await view.getByRole('button', { name: 'Create plan', exact: true }).click();
+  await expect.poll(() => fixture.writes.length).toBe(2);
+  expect(fixture.writes[1].body).toMatchObject({ expected_creation_binding_sha256: 'b'.repeat(64), database: 'SECOND' });
+});
+
+test('plan review remains available but cannot create while readiness is blocked', async ({ page, fixture }) => {
+  await page.goto('/#/hosts/source/plan');
+  await expect(main(page).getByText('README bound to validated procedure', { exact: true })).toBeVisible();
+  await expect(main(page).getByRole('button', { name: 'Create plan', exact: true })).toBeDisabled();
+  await expect(main(page).getByText('Complete readiness evaluation with ready_for_approval before creating a plan.', { exact: true })).toBeVisible();
+  expect(fixture.writes).toEqual([]);
+});
+
+test('expired readiness loses its green handoff and expiry during plan review stops submission', async ({ page, fixture }) => {
+  fixture.steps.at(-1).status = 'ready_for_approval';
+  fixture.steps.at(-1).evidence.valid_until = '2000-01-01T00:00:00Z';
+  await page.goto('/#/hosts/source/readiness');
+  const view = main(page);
+  await expect(view.locator('.stage-rail').getByRole('link', { name: /^Readiness/ })).toContainText('refresh required');
+  const card = view.locator('#readiness-step-readiness-evaluate');
+  await expect(card.locator('.badge').first()).toHaveText('refresh required');
+  await expect(card.getByText(/Readiness expired at/)).toBeVisible();
+  await expect(card.getByRole('link', { name: 'Continue to Plan →', exact: true })).toHaveCount(0);
+  await view.locator('.stage-rail').getByRole('link', { name: /^Plan/ }).click();
+  await expect(view.getByRole('button', { name: 'Create plan', exact: true })).toBeDisabled();
+  const expiry = Date.now() + 3600_000;
+  fixture.steps.at(-1).evidence.valid_until = new Date(expiry).toISOString();
+  await page.reload();
+  await expect(view.getByRole('button', { name: 'Create plan', exact: true })).toBeEnabled();
+  await page.evaluate(value => { Date.now = () => value; }, expiry);
+  await view.getByRole('button', { name: 'Create plan', exact: true }).click();
+  await expect(view.getByText(/Readiness expired at/)).toBeVisible();
+  await expect(view.getByRole('button', { name: 'Create plan', exact: true })).toBeDisabled();
+  expect(fixture.writes).toEqual([]);
+});
+
+test('discovery controls explain permissions and refresh them on navigation', async ({ page, fixture }) => {
+  fixture.session = { mode: 'principal', actor: 'fixture-requester', roles: ['requester'], rbac_enabled: true,
+    permissions: { live_discovery: false } };
+  await page.goto('/#/estate');
+  await expect(main(page).getByRole('button', { name: 'Refresh live SSH', exact: true })).toBeDisabled();
+  await expect(main(page).getByText(/Your account cannot run live discovery/)).toBeVisible();
+  await page.locator('#rail-hosts').getByRole('link', { name: /Source lab fixture/ }).click();
+  await expect(main(page).getByRole('button', { name: 'Run live discovery', exact: true })).toBeDisabled();
+  await expect(main(page).getByText(/Your account cannot run live discovery/)).toBeVisible();
+  fixture.session = { mode: 'principal', actor: 'fixture-operator', roles: ['operator'], rbac_enabled: true,
+    permissions: { live_discovery: true } };
+  await page.reload();
+  await expect(main(page).getByRole('button', { name: 'Run live discovery', exact: true })).toBeEnabled();
+  await page.goto('/#/estate');
+  await expect(main(page).getByRole('button', { name: 'Refresh live SSH', exact: true })).toBeEnabled();
+  delete fixture.session.permissions;
+  await page.reload();
+  await expect(main(page).getByRole('button', { name: 'Refresh live SSH', exact: true })).toBeDisabled();
+  await expect(main(page).getByText(/Live discovery permissions are unavailable/)).toBeVisible();
+  expect(fixture.writes).toEqual([]);
+});
+
+test('a discovery run with an unreadable refreshed snapshot never displays green success', async ({ page, fixture }) => {
+  let refreshed = false;
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'POST' && url.pathname === '/api/hosts/source/pipeline/discovery') {
+      refreshed = true;
+      fixture.runs.discover = { run_id: 'discover', status: 'succeeded' };
+      await send({ run_id: 'discover' }, 202); return true;
+    }
+    if (method === 'GET' && url.pathname === '/api/hosts/source/pipeline' && refreshed) {
+      await send({ message: 'Snapshot could not be read' }, 503); return true;
+    }
+    return false;
+  };
+  await page.goto('/#/hosts/source/discover');
+  const status = main(page).locator('#discover-status');
+  await expect(status).toHaveText('complete');
+  await main(page).getByRole('button', { name: 'Run live discovery', exact: true }).click();
+  await expect(status).toHaveText('unavailable');
+  await expect(status).toHaveClass(/is-bad/);
+  await expect(main(page).getByText(/Snapshot could not be read/)).toBeVisible();
+  await expect(main(page).getByRole('button', { name: 'Run live discovery', exact: true })).toBeEnabled();
+  expect(fixture.writes.map(row => row.path)).toEqual(['/api/hosts/source/pipeline/discovery']);
+});
+
+test('leaving estate during an accepted discovery keeps the new host selected without obsolete reads', async ({ page, fixture }) => {
+  let releaseDiscovery;
+  const reads = [];
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'GET') reads.push(url.pathname);
+    if (method === 'POST' && url.pathname === '/api/hosts/source/pipeline/discovery') {
+      await new Promise(resolve => { releaseDiscovery = resolve; });
+      await send({ run_id: 'late-estate-discovery' }, 202); return true;
+    }
+    return false;
+  };
+  await page.goto('/#/estate');
+  await main(page).getByRole('button', { name: 'Refresh live SSH', exact: true }).click();
+  await expect.poll(() => Boolean(releaseDiscovery)).toBe(true);
+  await page.locator('#rail-hosts').getByRole('link', { name: /Source lab fixture/ }).click();
+  await expect(main(page).locator('#discover-status')).toHaveText('complete');
+  await expect(main(page).locator('.route-view')).toHaveAttribute('aria-busy', 'false');
+  const count = reads.length;
+  const finished = page.waitForEvent('requestfinished', request => request.method() === 'POST'
+    && request.url().endsWith('/api/hosts/source/pipeline/discovery'));
+  releaseDiscovery(); await finished;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  expect(reads.length).toBe(count);
+  await expect(page.locator('#rail-hosts').getByRole('link', { name: /Source lab fixture/ })).toHaveAttribute('aria-current', 'page');
+  expect(fixture.writes.map(row => row.path)).toEqual(['/api/hosts/source/pipeline/discovery']);
+});
+
+test('reconnecting to an active backup analysis does not offer another analysis launch', async ({ page, fixture }) => {
+  fixture.recoveries.push({ request_id: 'active-analysis', state: 'awaiting_approval', mode: 'live',
+    analysis: { status: 'passed' }, latest_run: { run_id: 'existing-analysis', status: 'running' } });
+  await page.goto('/#/recovery/active-analysis');
+  await expect(main(page).getByRole('button', { name: 'Refresh analysis', exact: true })).toBeDisabled();
+  await expect(main(page).getByText('Existing operation must finish or be reconciled', { exact: true })).toBeVisible();
+  await expect(main(page).getByRole('button', { name: 'Approve', exact: true })).toHaveCount(0);
+  expect(fixture.writes).toEqual([]);
 });
 
 test('fleet filters preserve unknown and stale evidence instead of displaying compliant green status', async ({ page, fixture }, testInfo) => {
@@ -135,6 +387,7 @@ test('execution dashboard retains unknown outcome, distinguishes heartbeat, and 
     { label: 'Listener health', before: { status: 'verified', value: 'READY' }, after: { status: 'unknown', value: 'unverified text must not appear' } },
   ], rollback: { status: 'unknown', reason: 'Native eligibility has not been verified.' }, gaps: [{ source: 'final validation', reason: 'Pending task' }] };
   fixture.plans.push({ plan_id: 'patch-browser', host_id: 'source', state: 'paused', intent: 'patch_apply', patch_id: '39034528', requester: 'fixture-requester', unresolved_run: run, maintenance_window: { start: '2030-01-01T10:00:00Z', end: '2030-01-01T14:00:00Z' } });
+  fixture.planTasks['patch-browser'] = tasks;
   fixture.custom = async ({ url, method, send }) => {
     if (method === 'GET' && url.pathname === '/api/plans/patch-browser/tasks') { await send({ tasks }); return true; }
     if (method === 'GET' && url.pathname === '/api/plans/patch-browser/execution') { await send(dashboard); return true; }
@@ -163,4 +416,36 @@ test('execution dashboard retains unknown outcome, distinguishes heartbeat, and 
   await download.saveAs(testInfo.outputPath('patch-browser-evidence.json'));
   expect(fixture.writes.map(row => row.path)).toEqual(['/api/plans/patch-browser/execution-observe']);
   await page.screenshot({ path: testInfo.outputPath('execution-dashboard.png'), fullPage: true });
+});
+
+for (const hostView of [false, true]) test(`native ${hostView ? 'host' : 'detail'} execution keeps the reviewed target until a rejected action is reviewed again`, async ({ page, fixture }) => {
+  let generation = 'a'; const reads = [];
+  const plan = { plan_id: 'reviewed-plan', host_id: 'source', state: 'running', nodes: ['fixture-node'],
+    maintenance_window: { start: new Date(Date.now() - 60_000).toISOString(), end: new Date(Date.now() + 3600_000).toISOString() } };
+  fixture.plans.push(plan);
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'GET') reads.push(url.pathname);
+    if (method === 'GET' && url.pathname === '/api/plans/reviewed-plan/action-review') {
+      const review = actionReviewFixture(plan, [{ task_id: `reviewed-task-${generation}`, stage: 'validate', node: 'fixture-node', status: 'pending' }], generation.repeat(64));
+      review.confirmation.targets[0].ssh_alias = `reviewed-route-${generation}`;
+      await send(review); return true;
+    }
+    if (method === 'GET' && url.pathname === '/api/plans/reviewed-plan/execution') { await send({ tasks: [], runs: [] }); return true; }
+    if (method === 'POST' && url.pathname === '/api/plans/reviewed-plan/execute-remaining') {
+      await send({ error: 'review_changed', message: 'Reviewed target changed; review again.' }, 409); return true;
+    }
+    return false;
+  };
+  await page.goto(hostView ? '/#/hosts/source/execute' : '/#/plans/reviewed-plan');
+  const view = main(page);
+  await expect(view.getByRole('region', { name: 'Reviewed execution targets' })).toContainText('reviewed-route-a');
+  await expect(view.getByRole('cell', { name: 'reviewed-task-a', exact: true })).toBeVisible();
+  generation = 'b';
+  await view.getByRole('button', { name: hostView ? 'Execute remaining' : 'Execute remaining tasks', exact: true }).click();
+  await expect(view.getByRole('region', { name: 'Reviewed execution targets' })).toContainText('reviewed-route-b');
+  await expect(view.getByText('Reviewed target changed; review again.', { exact: true })).toBeVisible();
+  expect(fixture.writes).toEqual([{ path: '/api/plans/reviewed-plan/execute-remaining', method: 'POST',
+    body: { actor: 'fixture-operator', expected_action_binding_sha256: 'a'.repeat(64) } }]);
+  expect(reads.filter(path => path.endsWith('/action-review'))).toHaveLength(2);
+  expect(reads.filter(path => path.endsWith('/tasks'))).toEqual([]);
 });

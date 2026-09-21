@@ -118,14 +118,22 @@ def snapshot(plan_id):
         # bounded presentation data, never credentials or arbitrary result JSON.
         item = {key: data.get(key) for key in ('run_id', 'kind', 'status', 'created_at', 'started_at', 'finished_at',
                                               'elapsed_seconds', 'controller_poll', 'observation', 'log_tail')}
-        item['task_id'] = (data.get('context') or {}).get('task_id')
-        item['can_observe'] = data.get('key') == f'plan:{plan_id}:execute' and (data.get('context') or {}).get('detached_execution') is True
+        context = data.get('context') or {}
+        item['task_id'] = context.get('task_id')
+        detached = data.get('key') == f'plan:{plan_id}:execute' and context.get('detached_execution') is True
+        binding = context.get('execution_host_configuration_sha256')
+        bound = isinstance(binding, str) and re.fullmatch(r'[a-f0-9]{64}', binding) is not None
+        item['can_observe'] = detached and bound
+        if detached and not bound:
+            item['observe_blocked_reason'] = ('This launch has no verified host configuration binding. '
+                'Only saved logs are available. Preserve its unresolved outcome and inspect the original launch configuration before reconciliation.')
         item['error'] = redact_text((data.get('error') or {}).get('message') if isinstance(data.get('error'), dict) else '', 800)
         runs.append(redacted(item))
         for event in data.get('timeline') or []:
             if isinstance(event, dict):
                 timeline.append({**redacted(event), 'run_id': data['run_id']})
-    unresolved = any(run['status'] in {'unknown', 'reconciling'} and run['can_observe'] for run in runs)
+    unresolved = any(run['status'] in {'unknown', 'reconciling'} and
+                     (run['can_observe'] or run.get('observe_blocked_reason')) for run in runs)
     guidance = ('Inspect and reconcile the existing execution before starting another task.' if unresolved else
                 'A task failed or is blocked. Inspect verified evidence before using the existing retry workflow.' if plan.get('state') in {'paused', 'failed'} else
                 'Controller polling shows connectivity; the native lease observation shows worker heartbeat freshness. Neither proves task completion.')
@@ -149,16 +157,15 @@ def observe(plan_id, run_id):
         raise planctl.PlanError('run has no valid persisted detached launch')
     planctl.status(plan_id)  # Verify the local immutable plan before remote reads.
     task = planctl._run(['task-status', '--plan-id', plan_id, '--task-id', task_id])
-    host = planctl._resolve_node_host(str(context.get('node') or ''))
-    if any(host.get(key) != context.get(key) for key in ('ssh_alias', 'remote_root')) or host.get('id') != context.get('host_id'):
-        raise planctl.PlanError('host configuration changed since the existing launch')
+    host = planctl.resolve_bound_execution_host(context)
     prefix = planctl._remote_run_dir(host, plan_id, task_id) + '/'
     path = context.get('remote_run_dir')
     if not isinstance(path, str) or not path.startswith(prefix) or not _REMOTE_RUN.fullmatch(path[len(prefix):]):
         raise planctl.PlanError('persisted remote launch path is invalid')
-    # Historical launches predate the persisted attempt binding. Their exact
+    # A host-bound launch may predate the persisted attempt binding. Its exact
     # wrapper output remains observable, but never attach a later retry's
-    # native logs/lease to that earlier execution.
+    # native logs/lease to that earlier execution. Unbound legacy hosts were
+    # already rejected before any remote read.
     definition, generation = context.get('task_definition_sha256'), context.get('task_retry_count')
     attempt_bound = definition is not None or generation is not None
     if attempt_bound:
@@ -184,7 +191,9 @@ def observe(plan_id, run_id):
     # Captured output is an observation, never a replacement for sealed task
     # evidence. Preserve unknown/running/failed state and execution ownership.
     with record._lock:
-        if any(record.context.get(key) != context.get(key) for key in ('remote_run_dir', 'task_definition_sha256', 'task_retry_count')):
+        if any(record.context.get(key) != context.get(key) for key in (
+                'remote_run_dir', 'task_definition_sha256', 'task_retry_count',
+                'node', 'host_id', 'ssh_alias', 'remote_root', 'execution_host_configuration_sha256')):
             raise planctl.PlanError('execution advanced while diagnostics were read; observe the current task again')
         record.observation = payload
         record._persist()

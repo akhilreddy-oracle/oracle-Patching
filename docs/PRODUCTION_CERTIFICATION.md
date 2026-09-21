@@ -11,13 +11,24 @@ checklist in `IMPLEMENTATION_PLAN.md` is completed. This document describes the
 | `OPU_PRODUCTION_MODE=1` | Enable the production gate |
 | `OPU_PRODUCTION_CERT_FILE` | Optional path to the marker (default `/etc/oracle-patching/production.cert`; webapp uses `webapp/var/production.cert`) |
 
-The marker file must be a regular file (not a symlink) containing:
+The marker must be a regular file, owned by root or the effective service user,
+with a single hard link and no group/other write permission (for example, mode
+`0600`). Symlinks, special files, invalid UTF-8 and files larger than 16 KiB are
+rejected. Both native and webapp guards read one descriptor and reject a file
+that changes during that read.
+
+Each required switch must occur exactly once on its own line; contradictory or
+duplicate assignments are invalid. The minimum content is:
 
 ```text
 OPU_PRODUCTION_CERTIFIED=1
 ```
 
 When production mode is off (the lab default), the gate is a no-op.
+
+The marker is a local administrator-controlled admission switch. Its presence
+does not verify a release signature or constitute independent production
+approval; those checks and sign-off remain separate requirements.
 
 ## What is blocked
 

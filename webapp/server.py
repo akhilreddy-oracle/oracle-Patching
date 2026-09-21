@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""Control-plane API for the Oracle Patching Utility estate frontend.
+"""Application controller and supported FastAPI/Uvicorn entry point.
 
-Wraps existing bin/opu-* operations over SSH. Stdlib only — no new
-dependencies. This is a first slice, not the pull-based agent/control-plane
-model described in docs/ARCHITECTURE.md; it exists to give the frontend real
-data and a real (evidence-gated) execution path while that model is built
-out. See /Users/akhilreddy/.claude/plans/nested-humming-eagle.md for the
-phased plan this file implements.
+Controller owns existing authorization and native dispatch semantics. The ASGI
+transport in api_transport.py supplies request/response I/O; new typed routers
+live in api.py. Handler is retained solely for existing transport fixtures.
+Native execution remains in the independent plan/recovery/adapter services.
 """
 from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 import os
+import re
 import time
+from functools import wraps
 
 import auth
+import host_config
+import assistant
+import local_llm
+import live_inventory
 import company_auth
 import fleet
 import fleet_metadata
@@ -35,11 +39,12 @@ import production
 import procedure_hints
 import recoveryctl
 import remote
+import runtime_paths
+import application_views
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-HOSTS_FILE = ROOT / "hosts.json"
-SSH_TIMEOUT_SECONDS = 45
+HOSTS_FILE = runtime_paths.hosts_file()
 DISCOVERY_TIMEOUT_SECONDS = pipeline_steps.DISCOVERY_TIMEOUT_SECONDS
 
 STATIC_CONTENT_TYPES = {
@@ -50,13 +55,59 @@ STATIC_CONTENT_TYPES = {
 
 
 def load_hosts() -> dict[str, dict]:
-    data = json.loads(HOSTS_FILE.read_text())
-    return {host["id"]: host for host in data["hosts"]}
+    return host_config.load(HOSTS_FILE)
+
+
+def _confirmed_plan_hosts(tool: str, plan_id: str, expected: str | None) -> dict:
+    """Verify the original proposal again at admission and worker startup."""
+    if not isinstance(expected, str) or re.fullmatch(r"[a-f0-9]{64}", expected) is None:
+        raise planctl.PlanError("Plan action confirmation is missing or invalid; reload the plan and review its targets before executing")
+    hosts = load_hosts()
+    current = assistant.capabilities.binding(tool, {"plan_id": plan_id}, hosts)
+    if current != expected:
+        raise planctl.PlanError("Plan state or host configuration changed after confirmation; review a new proposal")
+    return hosts
+
+
+def _configuration_errors(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except host_config.HostConfigError as exc:
+            self._send_json(503, {"error": "invalid_host_config", "message": str(exc)})
+    return guarded
 
 
 def run_discovery(host: dict) -> dict:
-    """Run opu-topology-discover on a host over SSH. Raises remote.RemoteError."""
-    return pipeline_steps.step_discovery(host["id"], host, {})
+    """Legacy synchronous discovery shares the managed per-host pipeline lock."""
+    def discover(_record):
+        with evidence.host_lock(host["id"]):
+            return pipeline_steps.step_discovery(host["id"], host, {})
+    record = pipeline_runner.start_run("pipeline", f"host:{host['id']}:pipeline",
+        discover)
+    while record.status in {"queued", "running"}:
+        time.sleep(0.05)
+    if record.status == "succeeded":
+        return record.result
+    error = record.error if isinstance(record.error, dict) else {}
+    raise remote.RemoteError(error.get("error") or "discovery_failed",
+                            error.get("message") or "Discovery did not complete", error.get("stderr") or "")
+
+
+def _notify_execution(plan_id: str, actor: str, result, *, remaining: bool) -> None:
+    """Report the native outcome, not just successful completion of an HTTP call."""
+    payload = result if isinstance(result, dict) else {}
+    state = payload.get("plan_state" if remaining else "status")
+    state = state if isinstance(state, str) else None
+    failure = state in {"failed", "blocked", "error", "paused", "unknown"}
+    if remaining:
+        tasks = payload.get("task_results")
+        failure = failure or any(isinstance(task, dict) and task.get("status") in ("failed", "blocked", "error", "unknown")
+                                 for task in (tasks if isinstance(tasks, list) else []))
+    event = "failed" if failure else "succeeded" if state == "succeeded" else "idle" if result is None else "progress"
+    notifications.emit(f"plan.execute.{event}", {"plan_id": plan_id, "actor": actor,
+        "state": state, "stopped_reason": payload.get("stopped_reason"), "no_pending_task": result is None})
 
 
 def _cluster_is_standalone_no_crs(cluster: dict) -> bool:
@@ -69,7 +120,7 @@ def _cluster_is_standalone_no_crs(cluster: dict) -> bool:
 
 
 def summarize_discovery(host: dict, payload: dict | None, error: remote.RemoteError | None) -> dict:
-    summary = {"id": host["id"], "label": host["label"]}
+    summary = {"id": host["id"], "label": host.get("label") or host["id"]}
     if error is not None:
         summary["status"] = "error"
         summary["error"] = error.to_json()
@@ -129,7 +180,7 @@ def build_estate(*, live: bool = False) -> list[dict]:
             if cached is None:
                 out.append({
                     "id": host["id"],
-                    "label": host["label"],
+                    "label": host.get("label") or host["id"],
                     "status": "pending",
                     "message": "No live discovery yet — open the host to run SSH topology discovery.",
                 })
@@ -150,16 +201,21 @@ def build_estate(*, live: bool = False) -> list[dict]:
         except Exception as exc:  # noqa: BLE001 - estate must never drop the HTTP connection
             return {
                 "id": host["id"],
-                "label": host["label"],
+                "label": host.get("label") or host["id"],
                 "status": "error",
                 "error": {"error": "discovery_failed", "message": str(exc)},
             }
 
-    with ThreadPoolExecutor(max_workers=max(len(hosts), 1)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(hosts), 8)) as pool:
         return list(pool.map(probe, hosts))
 
 
-class Handler(BaseHTTPRequestHandler):
+class Controller:
+    """Transport-independent request controller during the route migration.
+
+The transport supplies headers/path/command, body reading and response writing.
+No socket, HTTP parser or listener is constructed by this class.
+"""
     server_version = "opu-webapp/0.1"
 
     def log_message(self, fmt, *args):  # keep default access logging, just tagged
@@ -169,6 +225,9 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[webapp] {self.address_string()} {fmt % args}", flush=True)
 
     def _send_json(self, status: int, payload) -> None:
+        if getattr(self, "_response_sink", None) is not None:
+            self._response_sink.append((status, payload))
+            return
         body = json.dumps(payload, indent=2, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -229,12 +288,30 @@ class Handler(BaseHTTPRequestHandler):
         hosts = load_hosts()
         return hosts.get(host_id)
 
+    def _live_discovery_get(self, path: str) -> bool:
+        return ((path.startswith("/api/hosts/") and path.endswith(("/discovery", "/artifact-sources")))
+                or (path == "/api/estate" and "1" in parse_qs(urlparse(self.path).query).get("live", [])))
+
+    def _send_artifact_sources(self, host_id: str, artifact_dir: str) -> None:
+        hosts = load_hosts()
+        host = hosts.get(host_id)
+        if host is None:
+            self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
+            return
+        try:
+            self._send_json(200, pipeline_steps.artifact_sources(host_id, host, hosts, artifact_dir))
+        except remote.RemoteError as exc:
+            self._send_json(400 if exc.error == "invalid_input" else 502, exc.to_json())
+
     def _require_api_auth(self) -> bool:
         try:
             self._company_session = None
             if company_auth.configured() and (company_auth.cookie_value(self.headers.get("Cookie"), company_auth.SESSION_COOKIE)
                                                or not self.headers.get("Authorization")):
-                self._company_session = company_auth.authenticate(self.headers.get("Cookie"), method=self.command,
+                # Legacy GET discovery changes host tools and saved evidence.
+                # Cookie-authenticated calls require the same CSRF proof as POST.
+                method = "POST" if self.command == "GET" and self._live_discovery_get(urlparse(self.path).path) else self.command
+                self._company_session = company_auth.authenticate(self.headers.get("Cookie"), method=method,
                     csrf=self.headers.get("X-CSRF-Token"), origin=self.headers.get("Origin"))
                 self._principal = self._company_session["actor"]
             else:
@@ -275,7 +352,9 @@ class Handler(BaseHTTPRequestHandler):
         """Default-deny role selection shared by every API route family."""
         actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
         if method == "GET":
-            action = "agent" if path == "/api/agent/jobs" else "read"
+            action = "execute" if self._live_discovery_get(path) else "agent" if path == "/api/agent/jobs" else "read"
+        elif path.startswith("/api/assistant/"):
+            action = "read"
         elif path.startswith("/api/agent/"):
             action = "agent"
         elif path.startswith("/api/fleet/hosts/") and path.endswith("/metadata"):
@@ -310,6 +389,7 @@ class Handler(BaseHTTPRequestHandler):
         except auth.AuthError:
             return False
 
+    @_configuration_errors
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         path = urlparse(self.path).path
 
@@ -337,7 +417,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/health":
             # Unauthenticated liveness probe for monitoring.
-            self._send_json(200, {"status": "ok", "time": time.time()})
+            self._send_json(200, application_views.health())
             return
 
         if path.startswith("/api/") and not self._require_api_auth():
@@ -346,10 +426,14 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/") and not self._authorize_path("GET", path):
             return
 
+        if path.startswith("/api/assistant/"):
+            self._assistant_route("GET", path, {})
+            return
+
         if path in {"/api/auth/whoami", "/api/session"}:
             actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
             company = getattr(self, "_company_session", None)
-            self._send_json(200, {key: value for key, value in company.items() if key != "groups"} if company else auth.whoami(actor))
+            self._send_json(200, application_views.session(actor, company, can_discover=self._has_role("execute")))
             return
 
         if path == "/api/fleet":
@@ -357,23 +441,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/validation":
-            import release_status
-            self._send_json(200, release_status.status())
+            self._send_json(200, application_views.validation())
             return
 
         if path == "/api/approvals":
             actor = getattr(self, "_principal", None) or self.headers.get("X-OPU-Actor")
-            items = []
-            for kind, records in (("plan", planctl.list_plans()), ("recovery", recoveryctl.list_requests())):
-                for item in records:
-                    if item.get("state") not in {"awaiting_approval", "approved"}:
-                        continue
-                    item_id = item.get("plan_id" if kind == "plan" else "request_id")
-                    items.append({"kind": kind, "id": item_id, "state": item["state"], "requester": item.get("requester"),
-                        "target": item.get("target"), "host_id": item.get("host_id"), "window": item.get("maintenance_window", item.get("window")),
-                        "next_action": "review_approval" if item["state"] == "awaiting_approval" else "review_authorization",
-                        "self_requested": bool(actor and item.get("requester") == actor)})
-            self._send_json(200, {"items": items, "actor": actor})
+            self._send_json(200, application_views.approvals(actor))
             return
 
         if path.startswith("/api/plans/") and path.endswith(("/execution", "/report")):
@@ -457,20 +530,17 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_role(self.headers.get("X-OPU-Actor"), "read"):
                 return
             hosts = load_hosts()
-            self._send_json(200, {"hosts": [{"id": h["id"], "label": h["label"]} for h in hosts.values()]})
+            self._send_json(200, {"hosts": [{"id": h["id"], "label": h.get("label") or h["id"]} for h in hosts.values()]})
             return
 
         if path == "/api/estate":
             if not self._require_role(self.headers.get("X-OPU-Actor"), "read"):
                 return
-            query = urlparse(self.path).query
-            live = any(
-                part.split("=", 1)[0] == "live" and part.split("=", 1)[-1] == "1"
-                for part in query.split("&")
-                if part
-            )
+            live = self._live_discovery_get(path)
             try:
                 self._send_json(200, {"hosts": build_estate(live=live), "live": live})
+            except host_config.HostConfigError:
+                raise
             except Exception as exc:  # noqa: BLE001 - never abort the socket mid-response
                 self._send_json(500, {"error": "estate_failed", "message": str(exc)})
             return
@@ -488,6 +558,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload = run_discovery(host)
                 print(f"[webapp] live discovery ok host={host_id}", flush=True)
                 self._send_json(200, payload)
+            except pipeline_runner.RunConflict as exc:
+                self._send_run_conflict(exc)
             except remote.RemoteError as exc:
                 print(f"[webapp] live discovery remote error host={host_id}: {exc.error}", flush=True)
                 status = 504 if exc.error == "ssh_timeout" else 502
@@ -495,6 +567,46 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001 - uncaught errors become Failed to fetch in the browser
                 print(f"[webapp] live discovery crashed host={host_id}: {exc}", flush=True)
                 self._send_json(500, {"error": "discovery_failed", "message": str(exc)})
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/plan-preview"):
+            host_id = path[len("/api/hosts/"):-len("/plan-preview")]
+            host = self._resolved_host(host_id)
+            if host is None:
+                self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
+                return
+            try:
+                # The rendered review and its confirmation must observe one
+                # generation, excluded from every managed evidence writer.
+                with evidence.host_lock(host_id):
+                    if pipeline_runner.active_run_id(f"host:{host_id}:pipeline"):
+                        self._send_json(409, {"error": "evidence_in_use", "message": "Host evidence has an active or unresolved pipeline; wait or reconcile before reviewing a plan."})
+                        return
+                    steps = pipeline_steps.pipeline_state(host_id)
+                    by_step = {entry["step"]: entry for entry in steps}
+                    validated = by_step.get("procedure-validate", {})
+                    procedure = validated.get("input")
+                    confirmation = None
+                    reason = "Validate the selected artifact and README procedure before creating a plan."
+                    if (validated.get("status") == "ready_for_planning" and isinstance(procedure, dict)
+                            and procedure == (validated.get("evidence") or {}).get("procedure")):
+                        reason = "Complete readiness evaluation with ready_for_approval before creating a plan."
+                        readiness_step = by_step.get("readiness-evaluate", {})
+                        if readiness_step.get("status") == "ready_for_approval":
+                            ready = readiness_step.get("evidence") or {}
+                            expiry = fleet.epoch(ready.get("valid_until"))
+                            reason = "Readiness has expired or has no verified expiry. Refresh evidence and evaluate readiness again before creating a plan."
+                        else:
+                            expiry = None
+                        if expiry is not None and expiry > time.time():
+                            patch_id = procedure.get("patch_id")
+                            database = (procedure.get("target") or {}).get("database_unique_name")
+                            binding = evidence.creation_binding(host_id, host, patch_id, database)
+                            confirmation = {"expected_creation_binding_sha256": binding, "patch_id": patch_id, "database": database}
+                            reason = None
+                    self._send_json(200, {"steps": steps, "confirmation": confirmation, "reason": reason})
+            except evidence.EvidenceError as exc:
+                self._send_json(409, {"error": "review_unavailable", "message": str(exc)})
             return
 
         if path.startswith("/api/hosts/") and path.endswith("/pipeline"):
@@ -524,19 +636,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/hosts/") and path.endswith("/artifact-sources"):
             host_id = path[len("/api/hosts/"):-len("/artifact-sources")]
-            hosts = load_hosts()
-            host = hosts.get(host_id)
-            if host is None:
-                self._send_json(404, {"error": "unknown_host", "message": f"No configured host: {host_id}"})
+            directories = parse_qs(urlparse(self.path).query, keep_blank_values=True).get("artifact_dir", [])
+            if len(directories) != 1 or not directories[0]:
+                self._send_json(400, {"error": "invalid_input", "message": "Provide one nonempty artifact_dir"})
                 return
-            artifact_dir = ""
-            for part in urlparse(self.path).query.split("&"):
-                if part.startswith("artifact_dir="):
-                    artifact_dir = unquote(part.split("=", 1)[1])
-            try:
-                self._send_json(200, pipeline_steps.artifact_sources(host_id, host, hosts, artifact_dir))
-            except remote.RemoteError as exc:
-                self._send_json(400 if exc.error == "invalid_input" else 502, exc.to_json())
+            self._send_artifact_sources(host_id, directories[0])
             return
 
         if path.startswith("/api/runs/"):
@@ -562,6 +666,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, exc.to_json())
             return
 
+        if path.startswith("/api/plans/") and path.endswith("/action-review"):
+            plan_id = path[len("/api/plans/"):-len("/action-review")]
+            try:
+                review = assistant.capabilities.plan_action_review(plan_id, load_hosts())
+                plan = review["plan"]
+                # Presentation-only fields are added after the exact native
+                # state has been bound, just as on the ordinary status route.
+                review["plan"] = {**plan, "sod": planctl.sod_summary(plan_id, plan),
+                                  "viability": planctl.viability(plan_id, plan)}
+                self._send_json(200, review)
+            except (planctl.PlanError, assistant.capabilities.ToolError) as exc:
+                self._send_json(400, {"error": "review_unavailable", "message": str(exc)})
+            return
+
         if path.startswith("/api/plans/"):
             plan_id = path[len("/api/plans/"):]
             try:
@@ -574,7 +692,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/recovery":
-            host_values = parse_qs(urlparse(self.path).query, keep_blank_values=True).get("host_id", [])
+            query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            host_values = query.get("host_id", [])
+            view_values = query.get("view", [])
+            if len(view_values) > 1 or (view_values and view_values[0] not in {"saved", "live"}):
+                self._send_json(400, {"error": "invalid_view", "message": "Provide one view: saved or live"})
+                return
             if len(host_values) > 1 or (host_values and not host_values[0]):
                 self._send_json(400, {"error": "invalid_host", "message": "Provide one nonempty host_id"})
                 return
@@ -584,7 +707,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 targets = recoveryctl.target_capabilities(host_id) if host_id is not None else {}
-                self._send_json(200, {"requests": recoveryctl.list_requests(host_id=host_id), **recoveryctl.capability(), **targets})
+                options = {"saved_only": True} if view_values == ["saved"] else {}
+                self._send_json(200, {"requests": recoveryctl.list_requests(host_id=host_id, **options), **recoveryctl.capability(), **targets})
             except ValueError as exc:
                 self._send_json(400, {"error": "invalid_host", "message": str(exc)})
             return
@@ -609,20 +733,61 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_static(path.lstrip("/"))
 
+    @_configuration_errors
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         self.__dict__.pop("_parsed_body", None)
+
+        # Logout only clears this browser's session. A revoked company cookie
+        # must not trap the browser ahead of otherwise valid service credentials.
+        if path == "/api/auth/logout":
+            try:
+                body = self._read_json_body()
+                if body:
+                    raise ValueError("Sign-out does not accept action fields")
+                cookie_header = company_auth.logout(self.headers.get("Cookie"),
+                    csrf=self.headers.get("X-CSRF-Token"), origin=self.headers.get("Origin"))
+            except (ValueError, UnicodeError) as exc:
+                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
+                return
+            except auth.AuthError as exc:
+                self._send_json(exc.status, exc.to_json())
+                return
+            self.send_response(204)
+            self.send_header("Set-Cookie", cookie_header)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
 
         if path.startswith("/api/") and not self._require_api_auth():
             return
 
         if path.startswith("/api/") and not self._authorize_path("POST", path):
             return
+        admitted_identity = (getattr(self, "_principal", None), bool(getattr(self, "_company_session", None)))
         try:
             body = self._read_json_body()
         except (ValueError, UnicodeError) as exc:
             self._send_json(400, {"error": "invalid_body", "message": str(exc)})
             return
+        if path.startswith("/api/"):
+            # A client can withhold the body after sending valid credentials.
+            # Recheck authority after that blocking read, before admitting any
+            # native work, and never transfer the request to a new identity.
+            if not self._require_api_auth():
+                return
+            current_identity = (getattr(self, "_principal", None), bool(getattr(self, "_company_session", None)))
+            if current_identity != admitted_identity:
+                self._send_json(403, {"error": "unauthorized", "message": "Authenticated identity changed before dispatch"})
+                return
+            if not self._authorize_path("POST", path):
+                return
+        self._dispatch_post(path, body)
+
+    def _dispatch_post(self, path: str, body: dict) -> None:
+        """Shared native command dispatcher for API and confirmed assistant actions."""
+        self._parsed_body = body
         submitted_body_fields = set(body)
         for field in ("actor", "requester", "plan_id", "request_id", "task_id", "run_id", "host_id", "node", "agent_id", "approval_ticket", "source_plan_id", "window_start", "window_end", "adapter", "artifact_dir", "agent_token", "claim_token"):
             if field in body and not isinstance(body[field], str):
@@ -647,6 +812,29 @@ class Handler(BaseHTTPRequestHandler):
             body.setdefault("actor", principal)
             body.setdefault("requester", principal)
 
+        if path.startswith("/api/assistant/"):
+            if submitted_body_fields & {"actor", "requester"}:
+                self._send_json(400, {"error": "invalid_body", "message": "Assistant identity comes only from the authenticated session"})
+                return
+            # Remove only the server-injected identity fields.
+            self._assistant_route("POST", path, {key: value for key, value in body.items() if key not in {"actor", "requester"}})
+            return
+
+        if path in {"/api/plans/testmode-demo", "/api/recovery/testmode-demo"}:
+            try:
+                runtime_paths.require_fixtures_allowed()
+            except ValueError as exc:
+                self._send_json(403, {"error": "fixtures_disabled", "message": str(exc)})
+                return
+
+        if path.startswith("/api/hosts/") and path.endswith("/artifact-sources"):
+            if submitted_body_fields != {"artifact_dir"}:
+                self._send_json(400, {"error": "invalid_body", "message": "Only artifact_dir is accepted"})
+                return
+            host_id = path[len("/api/hosts/"):-len("/artifact-sources")]
+            self._send_artifact_sources(host_id, body["artifact_dir"])
+            return
+
         if path.startswith("/api/fleet/hosts/") and path.endswith("/metadata"):
             host_id = unquote(path[len("/api/fleet/hosts/"):-len("/metadata")])
             fields = {"expected_version", "environment", "desired_patch_baseline"}
@@ -661,19 +849,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(exc.status, exc.to_json())
             return
 
-        if path == "/api/auth/logout":
-            if not getattr(self, "_company_session", None):
-                self._send_json(400, {"error": "no_company_session"})
-                return
-            cookie_header = company_auth.logout(self.headers.get("Cookie"))
-            self.send_response(204)
-            self.send_header("Set-Cookie", cookie_header)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
         if path == "/api/recovery":
-            allowed = {"request_id", "requester", "actor", "host_id", "database", "backup_parent", "window_start", "window_end", "policy"}
+            allowed = {"request_id", "requester", "actor", "host_id", "database", "backup_parent", "window_start", "window_end", "policy", "expected_configuration_sha256"}
             if set(body) - allowed:
                 self._send_json(400, {"error": "invalid_body", "message": "Unexpected live recovery fields"})
                 return
@@ -684,6 +861,10 @@ class Handler(BaseHTTPRequestHandler):
                 host = self._resolved_host(body["host_id"])
                 if host is None:
                     raise ValueError("Unknown configured recovery host")
+                if ("expected_configuration_sha256" in body
+                        and body["expected_configuration_sha256"] != live_inventory.configuration_digest(host)):
+                    self._send_json(409, {"error": "target_changed", "message": "Host configuration changed before backup creation. Review a new proposal."})
+                    return
                 recoveryctl._identifier(body["request_id"], "request_id")
                 def create(_record):
                     return recoveryctl.create_live(body["request_id"], body["requester"], host=host, host_id=body["host_id"],
@@ -764,21 +945,37 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "unknown_step", "message": f"No such pipeline step: {step}"})
                 return
 
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
+            expected_readiness_binding = None
+            if step == "readiness-chain" and "expected_action_binding_sha256" in body:
+                expected_readiness_binding = body["expected_action_binding_sha256"]
+                if (not isinstance(expected_readiness_binding, str)
+                        or not re.fullmatch(r"[a-f0-9]{64}", expected_readiness_binding)
+                        or submitted_body_fields & {"artifact_dir", "procedure", "policy"}):
+                    self._send_json(400, {"error": "invalid_confirmation", "message": "A confirmed readiness refresh requires a valid binding and cannot override its reviewed saved inputs."})
+                    return
+
             # Server-side host inventory for cross-host actions; never trust the client's copy.
             body.pop("_hosts", None)
             body.pop("_record", None)
+            if "expected_configuration_sha256" in body or step == "discovery" and body.get("inventory_receipt") is True:
+                if body.get("expected_configuration_sha256") != live_inventory.configuration_digest(host):
+                    self._send_json(409, {"error": "target_changed", "message": "Host configuration changed before execution. Select the host and review the request again."})
+                    return
             if step == "stage-artifact":
                 body["_hosts"] = load_hosts()
 
-            def run(record, host=host, body=body, step_fn=step_fn):
+            def run(record, host=host, body=body, step_fn=step_fn, expected_readiness_binding=expected_readiness_binding):
                 if step == "readiness-chain":
                     body["_record"] = record
-                return step_fn(host_id, host, body)
+                with evidence.host_lock(host_id):
+                    if expected_readiness_binding is not None:
+                        # Confirmation checked the saved inputs before queueing.
+                        # Recheck under the writer lock so a delayed worker cannot
+                        # silently use a newly selected artifact, procedure or policy.
+                        current = assistant.capabilities.binding("refresh_readiness", {"host_id": host_id}, {host_id: host})
+                        if current != expected_readiness_binding:
+                            raise ValueError("Saved readiness inputs changed after confirmation; review a new proposal.")
+                    return step_fn(host_id, host, body)
 
             # One pipeline run per host at a time: steps share the host's SSH
             # scratch dir and evidence files, and the chain wraps all of them.
@@ -792,20 +989,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/plans":
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_plan_action("create", None, body)
             return
 
         if path == "/api/plans/testmode-demo":
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             try:
                 plan_id = body["plan_id"]
                 requester = body["requester"]
@@ -896,11 +1083,6 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/plans/") and path.endswith("/retry-task"):
             plan_id = path[len("/api/plans/"):-len("/retry-task")]
             try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
-            try:
                 actor = body["actor"]
                 task_id = body["task_id"]
             except KeyError as exc:
@@ -923,25 +1105,29 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/plans/") and path.endswith("/execute-next"):
             plan_id = path[len("/api/plans/"):-len("/execute-next")]
             try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
-            try:
                 actor = body["actor"]
             except KeyError as exc:
                 self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
                 return
             if not self._require_role(actor, "execute"):
                 return
+            expected_binding = body.get("expected_action_binding_sha256")
+            try:
+                _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)
+            except (planctl.PlanError, assistant.capabilities.ToolError) as exc:
+                self._send_json(409, {"error": "confirmation_changed", "message": str(exc)})
+                return
 
-            def run(_record, plan_id=plan_id, actor=actor):
+            def run(_record, plan_id=plan_id, actor=actor, expected_binding=expected_binding):
                 try:
-                    result = planctl.execute_next_task(plan_id, actor)
+                    hosts = _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)
+                    with planctl.pinned_hosts(hosts), planctl.confirmed_action(plan_id,
+                            lambda: _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)):
+                        result = planctl.execute_next_task(plan_id, actor)
                 except Exception:
                     notifications.emit("plan.execute.failed", {"plan_id": plan_id, "actor": actor})
                     raise
-                notifications.emit("plan.execute.succeeded", {"plan_id": plan_id, "actor": actor, "no_pending_task": result is None})
+                _notify_execution(plan_id, actor, result, remaining=False)
                 return {"task_result": result, "no_pending_task": result is None}
 
             try:
@@ -955,11 +1141,6 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/plans/") and path.endswith("/execute-remaining"):
             plan_id = path[len("/api/plans/"):-len("/execute-remaining")]
             try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
-            try:
                 actor = body["actor"]
             except KeyError as exc:
                 self._send_json(400, {"error": "missing_field", "message": f"Missing required field: {exc}"})
@@ -967,14 +1148,23 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_role(actor, "execute"):
                 return
             max_tasks = int(body.get("max_tasks", 200))
+            expected_binding = body.get("expected_action_binding_sha256")
+            try:
+                _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)
+            except (planctl.PlanError, assistant.capabilities.ToolError) as exc:
+                self._send_json(409, {"error": "confirmation_changed", "message": str(exc)})
+                return
 
-            def run(_record, plan_id=plan_id, actor=actor, max_tasks=max_tasks):
+            def run(_record, plan_id=plan_id, actor=actor, max_tasks=max_tasks, expected_binding=expected_binding):
                 try:
-                    result = planctl.execute_remaining_tasks(plan_id, actor, max_tasks=max_tasks)
+                    hosts = _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)
+                    with planctl.pinned_hosts(hosts), planctl.confirmed_action(plan_id,
+                            lambda: _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)):
+                        result = planctl.execute_remaining_tasks(plan_id, actor, max_tasks=max_tasks)
                 except Exception:
                     notifications.emit("plan.execute.failed", {"plan_id": plan_id, "actor": actor})
                     raise
-                notifications.emit("plan.execute.succeeded", {"plan_id": plan_id, "actor": actor})
+                _notify_execution(plan_id, actor, result, remaining=True)
                 return result
 
             try:
@@ -987,11 +1177,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/plans/") and path.endswith("/publish-agent-queue"):
             plan_id = path[len("/api/plans/"):-len("/publish-agent-queue")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             actor = body.get("actor")
             if not self._require_role(actor, "dispatch"):
                 return
@@ -1004,11 +1189,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/agent/claim":
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             agent_id = body.get("agent_id") or body.get("actor")
             if not self._require_role(agent_id, "agent"):
                 return
@@ -1026,11 +1206,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/agent/complete":
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             agent_id = body.get("agent_id") or body.get("actor")
             if not self._require_role(agent_id, "agent"):
                 return
@@ -1050,104 +1225,129 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/plans/") and path.endswith("/approve"):
             plan_id = path[len("/api/plans/"):-len("/approve")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_plan_action("approve", plan_id, body)
             return
 
         if path.startswith("/api/plans/") and path.endswith("/authorize"):
             plan_id = path[len("/api/plans/"):-len("/authorize")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_plan_action("authorize", plan_id, body)
             return
 
         if path.startswith("/api/plans/") and path.endswith("/dispatch"):
             plan_id = path[len("/api/plans/"):-len("/dispatch")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_plan_action("dispatch", plan_id, body)
             return
 
         if path.startswith("/api/plans/") and path.endswith("/create-rollback"):
             plan_id = path[len("/api/plans/"):-len("/create-rollback")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_plan_action("create-rollback", plan_id, body)
             return
 
         if path == "/api/recovery/testmode-demo":
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("create", None, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/analyze"):
             request_id = path[len("/api/recovery/"):-len("/analyze")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("analyze", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/approve"):
             request_id = path[len("/api/recovery/"):-len("/approve")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("approve", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/authorize"):
             request_id = path[len("/api/recovery/"):-len("/authorize")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("authorize", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/execute"):
             request_id = path[len("/api/recovery/"):-len("/execute")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("execute", request_id, body)
             return
 
         if path.startswith("/api/recovery/") and path.endswith("/reconcile"):
             request_id = path[len("/api/recovery/"):-len("/reconcile")]
-            try:
-                body = self._read_json_body()
-            except json.JSONDecodeError as exc:
-                self._send_json(400, {"error": "invalid_body", "message": str(exc)})
-                return
             self._post_recovery_action("reconcile", request_id, body)
             return
 
         self.send_error(404)
+
+    def _submit_assistant_action(self, path, body):
+        """Reuse normal role checks, native guards, dedupe keys and notifications."""
+        responses = []
+        previous_body = getattr(self, "_parsed_body", None)
+        self._response_sink = responses
+        try:
+            # The model/native preparation may outlive a token or session.
+            # Authenticate again immediately before crossing the native boundary.
+            if getattr(self, "_company_session", None):
+                current = company_auth.authenticate(self.headers.get("Cookie"), method="POST",
+                    csrf=self.headers.get("X-CSRF-Token"), origin=self.headers.get("Origin"))
+                owner = current["actor"]
+                self._company_session = current
+            else:
+                owner = auth.require_api_auth(self.headers.get("Authorization"))
+            if not owner or owner != getattr(self, "_principal", None):
+                raise auth.AuthError("Assistant identity changed before execution", status=403)
+            if self._authorize_path("POST", path):
+                self._dispatch_post(path, dict(body))
+        except auth.AuthError as exc:
+            self._send_json(exc.status, exc.to_json())
+        finally:
+            self._response_sink = None
+            self._parsed_body = previous_body
+        if len(responses) != 1:
+            raise assistant.AssistantError("Native command did not return one verified response", 502)
+        return responses[0]
+
+    def _assistant_route(self, method, path, body):
+        owner = getattr(self, "_principal", None)
+        try:
+            allowed = {action for action in auth.ACTION_ROLES if owner and self._has_role(action)}
+            if path == "/api/assistant/config" and method == "GET":
+                self._send_json(200, {**local_llm.config_status(), "can_chat": bool(owner),
+                    "can_live_inventory": "read" in allowed and "execute" in allowed,
+                    "allowed_tools": [name for name, spec in assistant.capabilities.SPECS.items() if spec[2] in allowed]})
+                return
+            if not owner:
+                raise assistant.AssistantError("Sign in with an individual identity to use the assistant", 403)
+            parts = path.strip("/").split("/")
+            if parts[:3] != ["api", "assistant", "conversations"]:
+                raise assistant.AssistantError("Unknown assistant route", 404)
+            if len(parts) == 3:
+                if method == "GET":
+                    self._send_json(200, {"conversations": assistant.list_conversations(owner)})
+                elif not body:
+                    self._send_json(201, {"conversation": assistant.create(owner)})
+                else:
+                    raise assistant.AssistantError("Conversation creation accepts an empty object")
+                return
+            conversation_id = parts[3]
+            if len(parts) == 4 and method == "GET":
+                self._send_json(200, {"conversation": assistant.get(owner, conversation_id)})
+                return
+            if method == "POST" and len(parts) == 5 and parts[4] == "messages":
+                if set(body) != {"content"}:
+                    raise assistant.AssistantError("Messages accept only content")
+                run_id = assistant.send(owner, conversation_id, body["content"], allowed, load_hosts,
+                    submit=self._submit_assistant_action)
+                self._send_json(202, {"run_id": run_id})
+                return
+            if method == "POST" and len(parts) == 7 and parts[4] == "actions" and parts[6] in {"execute", "dismiss"}:
+                dismiss = parts[6] == "dismiss"
+                if set(body) != (set() if dismiss else {"digest"}):
+                    raise assistant.AssistantError("Unexpected action fields")
+                result = assistant.action(owner, conversation_id, parts[5], dismiss=dismiss, digest=body.get("digest"),
+                    allowed=allowed, load_hosts=load_hosts, submit=self._submit_assistant_action)
+                self._send_json(200 if dismiss else 202, {"conversation": result} if dismiss else {"run_id": result})
+                return
+            raise assistant.AssistantError("Unknown assistant route", 404)
+        except pipeline_runner.RunConflict as exc:
+            self._send_run_conflict(exc)
+        except (assistant.AssistantError, assistant.capabilities.ToolError, local_llm.LLMError, planctl.PlanError, recoveryctl.RecoveryError) as exc:
+            self._send_json(getattr(exc, "status", 400), {"error": "assistant_error", "message": str(exc)})
 
     def _post_plan_action(self, action: str, plan_id: str | None, body: dict) -> None:
         try:
@@ -1165,7 +1365,10 @@ class Handler(BaseHTTPRequestHandler):
                 key = f"plan:{plan_id}:create"
 
                 def run(_record, plan_id=plan_id, requester=requester, host_id=host_id, window_start=window_start, window_end=window_end):
-                    return planctl.create(plan_id, requester, host_id, window_start, window_end)
+                    confirmation = {key: body[key] for key in ("expected_creation_binding_sha256", "patch_id", "database") if key in body}
+                    if confirmation:
+                        confirmation["hosts"] = load_hosts()
+                    return planctl.create(plan_id, requester, host_id, window_start, window_end, **confirmation)
 
             elif action == "approve":
                 actor = body["actor"]
@@ -1198,10 +1401,19 @@ class Handler(BaseHTTPRequestHandler):
                 actor = body["actor"]
                 if not self._require_role(actor, "dispatch"):
                     return
+                expected_binding = body.get("expected_action_binding_sha256")
+                try:
+                    _confirmed_plan_hosts("dispatch_plan", plan_id, expected_binding)
+                except (planctl.PlanError, assistant.capabilities.ToolError) as exc:
+                    self._send_json(409, {"error": "confirmation_changed", "message": str(exc)})
+                    return
                 key = f"plan:{plan_id}:dispatch"
 
-                def run(_record, plan_id=plan_id, actor=actor):
-                    return planctl.dispatch(plan_id, actor)
+                def run(_record, plan_id=plan_id, actor=actor, expected_binding=expected_binding):
+                    hosts = _confirmed_plan_hosts("dispatch_plan", plan_id, expected_binding)
+                    with planctl.pinned_hosts(hosts), planctl.confirmed_action(plan_id,
+                            lambda: _confirmed_plan_hosts("dispatch_plan", plan_id, expected_binding)):
+                        return planctl.dispatch(plan_id, actor)
 
             elif action == "create-rollback":
                 # Path plan_id is the source apply plan; body must agree when present.
@@ -1314,16 +1526,30 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(202, {"run_id": record.run_id})
 
 
-def main() -> None:
-    port = int(os.environ.get("OPU_WEBAPP_PORT") or "8765")
+class Handler(Controller, BaseHTTPRequestHandler):
+    """Legacy HTTP fixture adapter. Production startup uses ASGI exclusively."""
+
+
+def validate_startup() -> dict:
+    """Fail before serving when identity or production configuration is invalid."""
     if company_auth.configured():
         company_auth.config()
     elif auth.rbac_enabled():
         auth.validate_configuration()
     else:
         auth.ensure_token()
-    production_state = production.status()
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    return production.status()
+
+
+def main() -> None:
+    # Import only on controller startup: native host tools remain stdlib-only.
+    import uvicorn
+    from api import create_app
+
+    port = int(os.environ.get("OPU_WEBAPP_PORT") or "8765")
+    if not 1 <= port <= 65535:
+        raise SystemExit("OPU_WEBAPP_PORT must be between 1 and 65535")
+    production_state = validate_startup()
 
     cert = (os.environ.get("OPU_WEBAPP_TLS_CERT") or "").strip()
     key = (os.environ.get("OPU_WEBAPP_TLS_KEY") or "").strip()
@@ -1331,11 +1557,6 @@ def main() -> None:
     if cert or key:
         if not cert or not key:
             raise SystemExit("OPU_WEBAPP_TLS_CERT and OPU_WEBAPP_TLS_KEY must both be set")
-        import ssl
-
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(certfile=cert, keyfile=key)
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
     print(f"opu webapp listening on {scheme}://127.0.0.1:{port}", flush=True)
@@ -1347,11 +1568,18 @@ def main() -> None:
         f"certified={production_state['certified']}",
         flush=True,
     )
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    # Multiple API processes are not supported by the current run registry.
+    # Never inherit WEB_CONCURRENCY or forwarded client identity from the shell.
+    # Access logs are disabled because OIDC callback queries contain credentials.
+    uvicorn.run(create_app(), host="127.0.0.1", port=port, workers=1,
+                proxy_headers=False, access_log=False, server_header=False,
+                ssl_certfile=cert or None, ssl_keyfile=key or None,
+                timeout_keep_alive=5, timeout_graceful_shutdown=30)
 
 
 if __name__ == "__main__":
+    # api imports this controller by its stable module name. Reuse this module
+    # when launched as a script so ASGI and startup share one configuration.
+    import sys
+    sys.modules["server"] = sys.modules[__name__]
     main()

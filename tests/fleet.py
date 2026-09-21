@@ -19,7 +19,8 @@ class FleetTests(unittest.TestCase):
         self.now = 1800000000
         self.host = {'id':'h','label':'Host', 'environment':'test', 'desired_patch_baseline':'12345'}
         self.snapshot = {'collected_at': self.iso(self.now-60), 'oracle_homes': [
-            {'path':'/oracle','version':'19','patches':['12345'],'opatch_inventory_xml_status':'collected'}],
+            {'path':'/oracle','version':'19','patches':['12345'],'opatch_inventory_xml_status':'collected',
+             'patch_inventory_source':'opatch_lsinventory_xml','opatch_inventory_xml_sha256':'a'*64}],
             'databases':[{'db_unique_name':'ORCL','oracle_home':'/oracle','runtime':{
                 'status':'complete','database_version':'19.31','backup_age_minutes':10,
                 'latest_backup_completed_at':self.iso(self.now-660)}}]}
@@ -30,10 +31,19 @@ class FleetTests(unittest.TestCase):
     def write(self):
         snapshot_path=evidence.write_evidence('h','snapshot',self.snapshot)
         policy_path=evidence.write_evidence('h','policy',self.policy)
-        evidence.write_evidence('h','procedure_input',{'database_unique_name':'ORCL'})
-        self.ready={'status':'ready_for_approval','valid_until':self.iso(self.now+900),
+        procedure={'patch_id':'12345','target':{'database_unique_name':'ORCL','family':'database','method':'opatch'}}
+        procedure_input=evidence.write_evidence('h','procedure_input',procedure)
+        validated=evidence.write_evidence('h','procedure',{'status':'ready_for_planning','procedure':procedure,
+            'evidence':{'procedure_path':str(procedure_input),'procedure_sha256':hashlib.sha256(procedure_input.read_bytes()).hexdigest()}})
+        bindings={'policy_sha256':hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+                  'procedure_validation_sha256':hashlib.sha256(validated.read_bytes()).hexdigest()}
+        for field,name in (('reconciliation_sha256','reconciliation'),('artifact_manifest_sha256','artifact'),
+                           ('compatibility_sha256','compatibility_reconciliation')):
+            path=evidence.write_evidence('h',name,{'status':'fixture-verified','source':name})
+            bindings[field]=hashlib.sha256(path.read_bytes()).hexdigest()
+        self.ready={'status':'ready_for_approval','patch_id':'12345','valid_until':self.iso(self.now+900),
             'snapshot_evidence':[{'path':str(snapshot_path),'sha256':hashlib.sha256(snapshot_path.read_bytes()).hexdigest()}],
-            'evidence':{'policy_sha256':hashlib.sha256(policy_path.read_bytes()).hexdigest()},'gates':[]}
+            'evidence':bindings,'gates':[]}
         evidence.write_evidence('h','readiness',self.ready)
     def row(self): return fleet.build({'h':self.host},now=self.now)['databases'][0]
 
@@ -56,6 +66,62 @@ class FleetTests(unittest.TestCase):
     def test_no_cross_database_readiness(self):
         self.snapshot['databases'][0]['db_unique_name']='OTHER'; self.write()
         self.assertEqual(self.row()['readiness'],'unknown')
+
+    def test_current_wizard_target_and_validated_dependencies_are_required(self):
+        self.assertEqual(self.row()['readiness'],'ready_for_approval')
+        for name in ('procedure_input','procedure','artifact','reconciliation','compatibility_reconciliation'):
+            with self.subTest(name=name):
+                self.write()
+                current=evidence.read_evidence('h',name)
+                evidence.write_evidence('h',name,{**current,'changed_since_evaluation':True})
+                self.assertEqual(self.row()['readiness'],'unknown')
+        self.write()
+        self.ready['patch_id']='98765'
+        evidence.write_evidence('h','readiness',self.ready)
+        self.assertEqual(self.row()['readiness'],'unknown')
+
+    def test_unverified_inventory_cannot_be_reported_baseline_compliant(self):
+        for source,digest in (('text_log','a'*64),('opatch_lsinventory_xml',None),('opatch_lsinventory_xml','bad')):
+            with self.subTest(source=source,digest=digest):
+                self.snapshot['oracle_homes'][0].update(patch_inventory_source=source,opatch_inventory_xml_sha256=digest)
+                self.write()
+                self.assertEqual(self.row()['baseline_status'],'unknown')
+                self.assertIsNone(self.row()['patch_baseline'])
+
+    def test_primary_inventory_does_not_establish_rac_baseline_compliance(self):
+        self.host['nodes']=[{'name':'rac-one'},{'name':'rac-two'}]
+        row=self.row()
+        self.assertEqual(row['baseline_status'],'unknown')
+        self.assertIn('primary node',row['baseline_reason'])
+        self.assertEqual(row['patch_baseline'],'12345', 'Dated primary inventory remains available as an observation')
+
+    def test_observed_cluster_blocks_primary_only_compliance_without_configured_nodes(self):
+        self.assertNotIn('nodes',self.host)
+        for cluster in ({'status':'detected','nodes':[{'name':'node-a'},{'name':'node-b'}]},
+                        {'status':'detected','nodes':[]},
+                        {'status':'detected'},
+                        {'status':'unknown','nodes':[{'name':'node-a'},{'name':'node-b'}]}):
+            with self.subTest(cluster=cluster):
+                self.snapshot['cluster']=cluster
+                self.write()
+                row=self.row()
+                self.assertEqual(row['baseline_status'],'unknown')
+                self.assertIn('primary node',row['baseline_reason'])
+                self.assertEqual(row['patch_baseline'],'12345')
+
+    def test_optional_recovery_and_dataguard_changes_invalidate_readiness(self):
+        for field,name in (('recovery_sha256','recovery'),('dataguard_sha256','dataguard_evaluation')):
+            with self.subTest(field=field):
+                self.write()
+                path=evidence.write_evidence('h',name,{'status':'ready'})
+                sha=hashlib.sha256(path.read_bytes()).hexdigest()
+                self.ready['evidence'][field]=sha
+                if field=='dataguard_sha256':
+                    self.ready['dataguard_evaluation']={'path':str(path),'sha256':sha}
+                evidence.write_evidence('h','readiness',self.ready)
+                self.assertEqual(self.row()['readiness'],'ready_for_approval')
+                evidence.write_evidence('h',name,{'status':'blocked'})
+                self.assertEqual(self.row()['readiness'],'unknown')
     def test_missing_backups_and_expired_readiness(self):
         self.snapshot['databases'][0]['runtime']['latest_backup_completed_at']=None; self.write()
         self.assertEqual(self.row()['backup_status'],'missing')

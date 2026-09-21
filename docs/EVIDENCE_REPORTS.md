@@ -24,6 +24,9 @@ does not mean current live health. Missing or unverifiable fields remain
 **Unknown**. A paused plan reports its latest verified completed stages with
 final validation incomplete. Completion requires a succeeded plan and a
 verified succeeded final validation whose local evidence remains intact.
+Completion recognizes the native standalone, RAC, Grid, OPatchAuto, OJVM and
+out-of-place apply/rollback final stages. Adapter prechecks populate the
+before column. Completion alone does not supply missing comparison metrics.
 
 New standalone apply/rollback executions retain bounded, hash-bound precheck
 and final inventory, dictionary, SQL patch and listener observations. This adds

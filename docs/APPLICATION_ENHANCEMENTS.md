@@ -34,6 +34,29 @@ The [execution dashboard](EXECUTION_DASHBOARD.md) and
 
 ## Correcting configuration and blocked workflows
 
+The host lifecycle rail reads host-scoped saved recovery summaries without
+contacting managed servers. It labels the state as saved and shows its observation
+time when recorded; legacy observations retain an unknown time. Opening Recovery
+still performs the existing native status refresh. Saved navigation state never
+authorizes backup selection or execution.
+
+Readiness findings that refer to another section on the same page focus and scroll
+to that section without discarding form drafts. Discovery and readiness updates
+also refresh the workspace's saved target and lifecycle badges, so the header
+does not keep showing a previous database or patch after evidence changes.
+
+The Plan page reads one locked evidence generation and submits that generation's
+confirmation with its displayed patch and database. Changes made by another
+session require a new review before creation. This includes recovery policy and
+Data Guard ordering. The older plan-creation route uses the same review and
+target display. A blocked readiness result has no creation confirmation.
+
+Artifact remediation does not search other machines when the page opens.
+An operator explicitly selects **Probe managed hosts**, which explains the SSH
+scope and sends a permission-checked POST with CSRF protection for company
+sessions. Editing the path invalidates any old source selection or in-flight
+result. Legacy GET callers require the same operator permission and CSRF proof.
+
 Fleet metadata edits require the `admin` role when RBAC or company login is
 enabled. The existing authenticated lab mode can also edit these fields. Values
 are retained in `webapp/var/fleet-metadata.json`; host connection settings are
@@ -64,3 +87,23 @@ after the workflow is committed and pushed.
 Deploying the application does not resume a paused plan, repair an Oracle host,
 create a backup or apply a patch. Those operations continue through their
 explicit application controls and native admission checks.
+
+## Acceptance still required
+
+The eight implemented surfaces above are not eight accepted production
+capabilities. The next acceptance work must demonstrate:
+
+- A complete live lab backup, supported restore-and-open drill, approval,
+  patch, database/listener verification and evidence report for the same release.
+  RMAN validation and simulated Oracle commands do not establish this result.
+- Interrupted execution reconciliation and supported rollback on each claimed
+  topology. Existing unresolved runs retain their evidence and remain blocked.
+- Reliable local-model behavior in the actual conversation loop. Chat cannot
+  yet bootstrap artifact inspection, reviewed README requirements and policy on
+  an unprepared host; those inputs must first be supplied through the wizard.
+  See the separate [model assessment](MODEL_ACCEPTANCE.md).
+- Login, logout, role mapping and approval separation against the company
+  identity provider after it is selected, followed by remote deployment checks.
+- Fixture evidence matching the exact installed source, followed separately by
+  live lab acceptance and production signoff. An older passing receipt cannot
+  validate new changes.

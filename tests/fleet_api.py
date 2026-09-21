@@ -152,6 +152,21 @@ class FleetApiTests(unittest.TestCase):
                     self.assertEqual(self.request("/api/recovery?" + query, actor="viewer")["status"], status)
             targets.assert_not_called(); requests.assert_not_called()
 
+    def test_recovery_saved_view_is_explicit_and_rejects_ambiguous_views(self):
+        with patch.object(server.recoveryctl, "target_capabilities", return_value={}), \
+             patch.object(server.recoveryctl, "list_requests", return_value=[{"state": "unknown", "evidence_mode": "saved"}]) as requests:
+            result = self.request("/api/recovery?host_id=source&view=saved", actor="viewer")
+            self.assertEqual(result["status"], 200)
+            self.assertEqual(result["body"]["requests"][0]["evidence_mode"], "saved")
+            requests.assert_called_once_with(host_id="source", saved_only=True)
+            requests.reset_mock()
+            for view in ("", "cached", "saved&view=live", "saved&view=saved"):
+                with self.subTest(view=view):
+                    result = self.request("/api/recovery?host_id=source&view=" + view, actor="viewer")
+                    self.assertEqual(result["status"], 400)
+                    self.assertEqual(result["body"]["error"], "invalid_view")
+            requests.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

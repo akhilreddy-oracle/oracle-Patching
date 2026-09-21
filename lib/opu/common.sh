@@ -1,5 +1,43 @@
 #!/usr/bin/env bash
 
+# SQL*Plus can emit diagnostics with exit status zero (notably SP2 errors).
+# Consume the entire probe before publishing one required scalar: conflicting
+# or repeated rows must never turn into success by selecting the last row.
+# Banners, blank lines and unrelated multi-row results remain permitted.
+opu_sql_probe_value() {
+    local key=$1 file=$2
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 64
+    LC_ALL=C awk -v key="$key" '
+        /^[[:space:]]*(ORA-[0-9][0-9][0-9][0-9][0-9]|SP2-[0-9][0-9][0-9][0-9]):/ { diagnostic = 1 }
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            if (index(line, key "=") == 1) {
+                count++
+                value = substr(line, length(key) + 2)
+                sub(/^[[:space:]]*/, "", value)
+                sub(/[[:space:]]*$/, "", value)
+            }
+        }
+        END {
+            if (diagnostic || count != 1 || value == "") exit 65
+            print value
+        }
+    ' "$file"
+}
+
+# Current database adapters verify one database's SQL registry. They do not
+# restore or validate every PDB and the seed; admitting a CDB would allow a
+# root-only datapatch success to be mistaken for complete patching.
+opu_require_non_cdb_probe() {
+    local file=$1
+    if [ "$(opu_sql_probe_value CDB "$file")" = NO ]; then
+        return 0
+    fi
+    printf '%s\n' 'Database patch execution currently supports non-CDB databases only; CDB=NO must be observed. Multitenant or unknown container scope requires a supported per-container procedure.' >&2
+    return 65
+}
+
 # Shared primitives for the Oracle Patching Utility agent.
 # This file is sourced only from code shipped with the agent.
 
@@ -53,6 +91,24 @@ opu_error() {
 
 opu_now_utc() {
     date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+# SSH passes its command through the remote login shell. Quote each argument
+# with POSIX single quotes before crossing that boundary, including empty args.
+opu_shell_join() {
+    local argument separator=""
+    for argument in "$@"; do
+        printf "%s'%s'" "$separator" "${argument//\'/\'\\\'\'}"
+        separator=" "
+    done
+}
+
+# A status command can exit successfully while reporting stopped resources.
+# Require positive state text and reject mixed/explicitly unhealthy output.
+opu_service_status_running() {
+    local output=${1:-}
+    grep -qiE '(^|[^[:alnum:]_])(online|running)([^[:alnum:]_]|$)' <<<"$output" &&
+        ! grep -qiE '(^|[^[:alnum:]_])(offline|not[[:space:]]+(running|online)|fail(ed|ure)?|cannot)([^[:alnum:]_]|$)' <<<"$output"
 }
 
 opu_json_escape() {
@@ -183,16 +239,6 @@ opu_resolve_directory() {
     return 0
 }
 
-# Back-compat wrapper: require a directory (symlink-to-dir allowed via resolve).
-opu_require_real_directory() {
-    local path label resolved
-    path=${1-}
-    label=${2:-path}
-    resolved=$(opu_resolve_directory "$path" "$label") || return $?
-    [ -n "$resolved" ] || return 66
-    return 0
-}
-
 opu_safe_field() {
     if printf '%s' "${1-}" | grep '[[:cntrl:]]' >/dev/null 2>&1; then
         return 1
@@ -281,41 +327,31 @@ opu_operation_error() {
     OPU_ERROR_RETRYABLE=${3:-false}
 }
 
-# Exact line match for production certification markers. Substring grep would
-# accept OPU_PRODUCTION_CERTIFIED=10 / =1foo and fail open.
-opu_cert_marker_line() {
-    local file=$1 key=$2
-    [ -f "$file" ] && [ ! -L "$file" ] || return 1
-    grep -Eq "^${key}$" "$file"
+opu_boolean_value() {
+    local value label
+    value=${1-}
+    label=${2:-boolean flag}
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$value" in
+        1|[tT][rR][uU][eE]|[yY][eE][sS]|[oO][nN]) printf '1';;
+        ''|0|[fF][aA][lL][sS][eE]|[nN][oO]|[oO][fF][fF]) printf '0';;
+        *) opu_error "$label must be a boolean (1/0, true/false, yes/no, on/off)"; return 64;;
+    esac
 }
 
 # S13 starter gate: when OPU_PRODUCTION_MODE is enabled, mutation authority
 # requires an explicit local certification marker. Lab/default builds leave
 # production mode off and are unaffected.
 opu_require_production_certified() {
-    local mode cert
-    mode=${OPU_PRODUCTION_MODE:-0}
-    case "$mode" in
-        1|true|yes|on) ;;
-        *) return 0 ;;
-    esac
+    local mode cert checklist helper
+    mode=$(opu_boolean_value "${OPU_PRODUCTION_MODE:-0}" OPU_PRODUCTION_MODE) || return $?
+    [ "$mode" = 1 ] || return 0
+    checklist=$(opu_boolean_value "${OPU_PRODUCTION_REQUIRE_CHECKLIST:-0}" OPU_PRODUCTION_REQUIRE_CHECKLIST) || return $?
     cert=${OPU_PRODUCTION_CERT_FILE:-/etc/oracle-patching/production.cert}
-    [ -f "$cert" ] && [ ! -L "$cert" ] || {
-        opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is missing: $cert"
+    helper="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/production_cert.py"
+    opu_python "$helper" "$cert" "$checklist" || {
+        opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is missing, unsafe, invalid or incomplete: $cert"
         return 77
     }
-    opu_cert_marker_line "$cert" 'OPU_PRODUCTION_CERTIFIED=1' || {
-        opu_error "OPU_PRODUCTION_MODE is enabled but certification marker is invalid: $cert"
-        return 77
-    }
-    case "${OPU_PRODUCTION_REQUIRE_CHECKLIST:-0}" in
-        1|true|yes|on)
-            for key in OPU_SBOM_VERIFIED=1 OPU_RELEASE_SIGNED=1 OPU_THREAT_MODEL_SIGNED=1; do
-                opu_cert_marker_line "$cert" "$key" || {
-                    opu_error "OPU_PRODUCTION_MODE checklist incomplete; missing $key in $cert"
-                    return 77
-                }
-            done
-            ;;
-    esac
 }

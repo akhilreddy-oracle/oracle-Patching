@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from runtime_fixture import runtime_receipt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "webapp"))
 import evidence
@@ -23,6 +25,10 @@ class RecoveryCapabilityTests(unittest.TestCase):
         self.enterContext(patch.object(evidence, "VAR_DIR", self.root / "hosts"))
         self.enterContext(patch.object(recoveryctl, "LIVE_DIR", self.root / "live"))
         self.enterContext(patch.object(recoveryctl, "RECOVERY_DIR", self.root / "fixtures"))
+        self.host = {"id": "source", "ssh_alias": "source", "remote_root": "/opt/opu", "sudo": True}
+        self.hostfile = self.root / "configured-hosts.json"
+        self.hostfile.write_text(json.dumps({"hosts": [self.host]}))
+        self.enterContext(patch.object(recoveryctl, "HOSTS_FILE", self.hostfile))
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         self.snapshot = {
             "schema_version": "1.0", "collector": {"name": "oracle.topology.discover"},
@@ -31,7 +37,7 @@ class RecoveryCapabilityTests(unittest.TestCase):
             "oracle_homes": [{"path": "/u01/db", "owner": "oracle"}],
             "databases": [{"db_unique_name": "ORCL", "oracle_home": "/u01/db", "runtime": {
                 "status": "complete", "instance": "ORCL", "database_role": "PRIMARY",
-                "open_mode": "READ WRITE", "instance_state": "OPEN", "log_mode": "NOARCHIVELOG"}}],
+                "open_mode": "READ WRITE", "instance_state": "OPEN", "log_mode": "NOARCHIVELOG", "cdb": "NO"}}],
         }
         self.policy = {"schema_version": "1.0", "maximum_snapshot_age_seconds": 1800,
                        "require_xml_inventory": True, "database": {}, "recovery": {"require_backup": True}}
@@ -51,7 +57,7 @@ class RecoveryCapabilityTests(unittest.TestCase):
 
     def test_archivelog_standby_and_unknown_modes_fail_closed(self):
         for field, value in (("log_mode", "ARCHIVELOG"), ("log_mode", None), ("database_role", "PHYSICAL STANDBY"),
-                             ("open_mode", "MOUNTED"), ("status", "partial")):
+                             ("open_mode", "MOUNTED"), ("status", "partial"), ("cdb", "YES"), ("cdb", None)):
             with self.subTest(field=field, value=value):
                 snapshot = copy.deepcopy(self.snapshot)
                 snapshot["databases"][0]["runtime"][field] = value
@@ -94,6 +100,8 @@ class RecoveryCapabilityTests(unittest.TestCase):
         self.assertEqual(result["target_capabilities"][0]["status"], "unknown")
         self.assertFalse((self.root / "hosts").exists())
         evidence.write_evidence("source", "snapshot", self.snapshot)
+        evidence.write_evidence("source", "snapshot_nodes", {"nodes": [
+            {"name": "source", "ssh_alias": "source", "evidence": "snapshot"}]})
         evidence.write_evidence("source", "policy", self.policy)
         self.assertTrue(recoveryctl.target_capabilities("source")["target_capabilities"][0]["can_create"])
         path = evidence.evidence_path("source", "snapshot")
@@ -103,13 +111,35 @@ class RecoveryCapabilityTests(unittest.TestCase):
         self.assertFalse(recoveryctl.target_capabilities("source")["target_capabilities"][0]["can_create"])
         self.assertFalse(recoveryctl.target_capabilities("target")["target_capabilities"][0]["can_create"])
 
+    def test_capability_exposes_missing_index_and_divergent_routes_without_writes(self):
+        evidence.write_evidence("source", "snapshot", self.snapshot)
+        evidence.write_evidence("source", "policy", self.policy)
+        with patch.object(recoveryctl.tools_sync, "ensure_tools") as sync, patch.object(recoveryctl.remote, "run_remote_raw") as remote:
+            result = recoveryctl.target_capabilities("source")["target_capabilities"][0]
+            self.assertFalse(result["can_create"])
+            blocker = next(item for item in result["blockers"] if item["id"] == "discovery_routing")
+            self.assertIn("refresh Discover", blocker["next_action"])
+            evidence.write_evidence("source", "snapshot_nodes", {"nodes": [
+                {"name": "source", "ssh_alias": "source", "evidence": "snapshot"}]})
+            self.assertTrue(recoveryctl.target_capabilities("source")["target_capabilities"][0]["can_create"])
+            self.host["nodes"] = [{"name": "other", "ssh_alias": "other"}]
+            self.hostfile.write_text(json.dumps({"hosts": [self.host]}))
+            result = recoveryctl.target_capabilities("source")["target_capabilities"][0]
+            self.assertFalse(result["can_create"])
+            blocker = next(item for item in result["blockers"] if item["id"] == "discovery_routing")
+            self.assertIn("aliases differ", blocker["observed"])
+            self.assertFalse((self.root / "hosts" / ".locks").exists())
+            sync.assert_not_called(); remote.assert_not_called()
+
     def test_create_rechecks_exact_saved_snapshot_after_ui_capability_was_eligible(self):
         evidence.write_evidence("source", "snapshot", self.snapshot)
+        evidence.write_evidence("source", "snapshot_nodes", {"nodes": [
+            {"name": "source", "ssh_alias": "source", "evidence": "snapshot"}]})
         evidence.write_evidence("source", "policy", self.policy)
         self.assertTrue(recoveryctl.target_capabilities("source")["target_capabilities"][0]["can_create"])
         host = {"id": "source", "ssh_alias": "source", "remote_root": "/opt/opu", "sudo": True}
         with patch.object(recoveryctl, "_configured_host", return_value=host), \
-             patch.object(recoveryctl.tools_sync, "ensure_tools") as sync, \
+             patch.object(recoveryctl.tools_sync, "ensure_tools", side_effect=runtime_receipt) as sync, \
              patch.object(recoveryctl.remote, "run_remote_raw") as remote:
             for log_mode in ("ARCHIVELOG", None):
                 self.snapshot["databases"][0]["runtime"]["log_mode"] = log_mode

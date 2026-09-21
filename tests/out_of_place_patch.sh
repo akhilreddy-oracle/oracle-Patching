@@ -68,6 +68,7 @@ else
     'INSTANCE_NAME=ORCL' \
     'INSTANCE_STATUS=OPEN' \
     'DATABASE_UNIQUE_NAME=ORCL' \
+    'CDB=NO' \
     'DATABASE_ROLE=PRIMARY' \
     'OPEN_MODE=READ WRITE' \
     'LOG_MODE=ARCHIVELOG' \
@@ -119,6 +120,7 @@ EOF
 cat >"$TEST_HOME/OPatch/datapatch" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+[ "$#" -eq 1 ] && [ "$1" = -verbose ] || { echo "forced SQL action or inventory bypass is prohibited" >&2; exit 97; }
 [ "$(cat "$OPU_TEST_DATABASE_STATE")" = up ] || { printf 'datapatch requires an open database\n' >&2; exit 74; }
 [ "$ORACLE_HOME" = "$(cat "$OPU_TEST_ACTIVE_HOME_STATE")" ] || { printf 'datapatch attempted from a non-active home\n' >&2; exit 74; }
 printf '%s\n' "$ORACLE_HOME" >>"$OPU_TEST_DATAPATCH_HOME_LOG"

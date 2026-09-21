@@ -42,9 +42,7 @@ def _scope(plan_id, actor, run_id=None, *, record=None, allow_closed=False):
     task_id = context.get("task_id")
     _require(context.get("plan_id") == plan_id and context.get("detached_execution") is True
              and isinstance(task_id, str) and _IDENTIFIER.fullmatch(task_id), "invalid persisted execution context")
-    host = planctl._resolve_node_host(str(context.get("node") or ""))
-    _require(all(host.get(field) == context.get(field) for field in ("ssh_alias", "remote_root"))
-             and host.get("id") == context.get("host_id"), "host configuration changed since the rejected launch")
+    host = planctl.resolve_bound_execution_host(context)
     path = context.get("remote_run_dir") or ""
     prefix = planctl._remote_run_dir(host, plan_id, task_id) + "/"
     _require(isinstance(path, str) and path.startswith(prefix)
@@ -60,10 +58,10 @@ def _scope(plan_id, actor, run_id=None, *, record=None, allow_closed=False):
             "app_run_id": run_id, "plan_sha256": plan["plan_sha256"], "host": host, "original": record}
 
 
-def _argv(scope, operation):
+def _argv(scope, operation, runtimes):
     host = scope["host"]
     return ["/usr/bin/env", f"OPU_PLAN_STATE_DIR={planctl._remote_plan_root(host)}",
-            host["remote_root"] + "/bin/opu-database-lock-recover", operation,
+            tools_sync.tool_path(host, runtimes, "bin/opu-database-lock-recover"), operation,
             "--plan-id", scope["plan_id"], "--task-id", scope["task_id"],
             "--run-id", scope["run_id"], "--actor", scope["actor"]]
 
@@ -100,8 +98,8 @@ def _verify_report(report, scope, *, completed=False):
 def inspect(plan_id, actor, run_id=None):
     scope = _scope(plan_id, actor, run_id)
     host = scope["host"]
-    tools_sync.ensure_host_tools(host)
-    response = remote.run_remote_raw(host["ssh_alias"], _argv(scope, "inspect"), timeout=240, sudo=bool(host.get("sudo")))
+    runtimes = tools_sync.ensure_host_tools(host)
+    response = remote.run_remote_raw(host["ssh_alias"], _argv(scope, "inspect", runtimes), timeout=240, sudo=bool(host.get("sudo")))
     _require(response.returncode in (0, 65) and response.stdout.strip(),
              "native lock inspection could not complete: " + planctl._redacted_diagnostic(response.stderr))
     report = _verify_report(json.loads(response.stdout), scope)
@@ -138,14 +136,24 @@ def recover(plan_id, actor, run_id=None, *, maintenance_run_id):
     original = pipeline_runner.get_run(scope["app_run_id"])
     with original._lock:
         _require(not original.context.get("lock_recovery_run_id"), "a lock recovery was already submitted; inspect its existing outcome")
+    # Synchronization cannot launch recovery. Keep failures here retryable;
+    # reserve the original launch only immediately before a possible worker.
+    runtimes = tools_sync.ensure_host_tools(scope["host"])
+    scope = _scope(plan_id, actor, run_id)
+    runtime = tools_sync.runtime_for_host(scope["host"], runtimes)
+    current = pipeline_runner.get_run(maintenance_run_id)
+    _require(current is not None and current.key == f"plan:{plan_id}:lock-recovery" and current.status == "running",
+             "maintenance run ownership changed during tool synchronization")
+    original = pipeline_runner.get_run(scope["app_run_id"])
+    with original._lock:
+        _require(not original.context.get("lock_recovery_run_id"), "a lock recovery was already submitted; inspect its existing outcome")
         original.context["lock_recovery_run_id"] = maintenance_run_id
         original._persist()
     host = scope["host"]
-    pipeline_runner.set_execution_context(lock_recovery=True, actor=actor, original_run_id=scope["app_run_id"],
+    pipeline_runner.set_execution_context(runtime_root=runtime["runtime_root"], runtime_fingerprint=runtime["fingerprint"], lock_recovery=True, actor=actor, original_run_id=scope["app_run_id"],
                                           original_task_id=scope["task_id"], original_remote_run_id=scope["run_id"],
                                           original_plan_sha256=scope["plan_sha256"])
-    tools_sync.ensure_host_tools(host)
-    rc, stdout, stderr = planctl._run_detached_remote(host, plan_id, "lock-recover-" + scope["task_id"], _argv(scope, "recover"))
+    rc, stdout, stderr = planctl._run_detached_remote(host, plan_id, "lock-recover-" + scope["task_id"], _argv(scope, "recover", runtimes))
     if rc != 0:
         try:
             report = _verify_report(json.loads(stdout), scope)
@@ -188,9 +196,9 @@ def _maintenance_outcome(record):
              and context.get("original_task_id") == scope["task_id"]
              and context.get("original_remote_run_id") == scope["run_id"]
              and context.get("original_plan_sha256") == scope["plan_sha256"], "maintenance scope differs from original execution")
-    host = scope["host"]
-    _require(all(context.get(key) == host.get(key) for key in ("ssh_alias", "remote_root"))
-             and context.get("host_id") == host.get("id"), "maintenance host changed")
+    host = planctl.resolve_bound_execution_host(context)
+    _require(planctl.execution_host_binding(host) == planctl.execution_host_binding(scope["host"]),
+             "maintenance host differs from the rejected launch")
     task = "lock-recover-" + scope["task_id"]
     prefix = planctl._remote_run_dir(host, scope["plan_id"], task) + "/"
     path = context.get("remote_run_dir") or ""

@@ -82,7 +82,7 @@ class LoginTests(unittest.TestCase):
         self.assertEqual(self.request_form['code'], 'fixture-code')
         self.assertEqual(len(self.request_form['code_verifier']), 43)
         c.authenticate(header, method='POST', csrf=session['csrf_token'], origin='https://patching.example')
-        c.logout(header)
+        c.logout(header, csrf=session['csrf_token'], origin='https://patching.example')
         with self.assertRaises(auth.AuthError): c.authenticate(header)
 
     def test_browser_binding_and_one_time_state(self):
@@ -122,6 +122,33 @@ class LoginTests(unittest.TestCase):
         self.path.unlink()
         self.assertTrue(auth.rbac_enabled())
         with self.assertRaises(auth.AuthError): c.config()
+
+    def test_configuration_rejects_malformed_endpoint_and_auth_method_without_uncontrolled_errors(self):
+        for key, value in [('issuer', 'https://identity.example:bad'), ('issuer', 'https://identity.example:0'),
+                           ('issuer', 'https://[broken'), ('issuer', 'https://identity.example\n/tenant'),
+                           ('token_endpoint_auth_method', [])]:
+            with self.subTest(key=key, value=value):
+                original = dict(self.settings); self.settings[key] = value; self.save()
+                with self.assertRaises(auth.AuthError): c.config()
+                self.settings = original
+
+    def test_configuration_fifo_swap_during_open_is_nonblocking_and_rejected(self):
+        open_file = c.os.open
+        def swap(path, flags):
+            self.assertTrue(flags & os.O_NONBLOCK, 'admission must not block before fstat can reject a FIFO')
+            self.path.unlink(); os.mkfifo(self.path)
+            return open_file(path, flags)
+        with patch.object(c.os, 'open', side_effect=swap):
+            with self.assertRaises(auth.AuthError): c.config()
+
+    def test_browser_origin_matches_equivalent_configured_hostname_and_default_port(self):
+        self.settings['redirect_uri'] = 'https://PATCHING.EXAMPLE:443/auth/callback'; self.save()
+        header = self.finish(); session = c.authenticate(header)
+        c.authenticate(header, method='POST', csrf=session['csrf_token'], origin='https://patching.example')
+        with self.assertRaises(auth.AuthError):
+            c.authenticate(header, method='POST', csrf=session['csrf_token'], origin='https://patching.example:444')
+        self.settings['group_roles'] = {'different': ['viewer']}; self.save()
+        self.assertIn('Max-Age=0', c.logout(header, origin='https://patching.example'))
 
     def test_wrong_signature_and_algorithm_fail(self):
         self.nonce = 'nonce'; settings = c.config()

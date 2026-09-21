@@ -90,3 +90,15 @@ test("invalid baseline is explained without sending a metadata mutation", async 
   assert.equal(writes.length, 0);
   assert.match(mount.textContent, /positive patch ID/);
 });
+
+test("cluster baseline uncertainty shows its supplied evidence limitation as plain text", async () => {
+  const reason = "All-node baseline compliance is unavailable: this view contains the primary node's inventory. <img src=x>";
+  rows = [{ ...fixture, evidence_status: "fresh", patch_baseline: "39034528", baseline_reason: reason }];
+  await renderFleet(mount);
+  const baseline = mount.all("td").find(cell => cell.attrs["data-label"] === "Patch baseline");
+  assert.ok(baseline.textContent.includes(reason));
+  assert.equal(baseline.all("span")[0].textContent, "unknown");
+  assert.match(baseline.all("span")[0].className, /badge-warn/);
+  assert.equal(mount.all("img").length, 0);
+  assert.equal(writes.length, 0);
+});

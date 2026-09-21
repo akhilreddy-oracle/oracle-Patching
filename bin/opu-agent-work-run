@@ -12,7 +12,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=lib/opu/python.sh
 . "$ROOT/lib/opu/python.sh"
 NODE=""; AGENT=""; LEASE=120; TOKEN=""
-QUEUE_DIR=${OPU_AGENT_QUEUE_DIR:-"$ROOT/webapp/var/agent-queue"}
+QUEUE_DIR=${OPU_AGENT_QUEUE_DIR:-}
 
 usage() {
   printf '%s\n' \
@@ -39,6 +39,7 @@ if [ -z "${OPU_PLAN_STATE_DIR:-}" ]; then
   echo 'opu-agent-work-run: OPU_PLAN_STATE_DIR must be set to the sealed plan state directory (fail closed)' >&2
   exit 78
 fi
+# An empty override lets Python resolve the stable deployment path.
 export OPU_AGENT_QUEUE_DIR="$QUEUE_DIR"
 
 OPU_WR_ROOT="$ROOT" OPU_WR_NODE="$NODE" OPU_WR_AGENT="$AGENT" \

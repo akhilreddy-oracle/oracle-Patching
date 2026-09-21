@@ -9,9 +9,15 @@ jq -n --arg digest "$digest" '{schema_version:"1.0",status:"ready_for_planning",
 for node in node1 node2; do jq -n --arg node "$node" --arg digest "$digest" '{schema_version:"1.0",status:"passed",patch_id:"12345678",artifact_sha256:$digest,target:{family:"grid",platform_id:"226"},checks:[{node:$node,home:"/u01/grid",status:"passed",platform:{host_id:"226",host_name:"Linux x86-64",artifact_ids:["226"],procedure_id:"226",status:"passed"},opatch:{status:"passed"},applicability_check:{name:"CheckPatchApplicableOnCurrentPlatform",status:"passed",exit_code:0,evidence_path:("/tmp/"+$node+"-platform.log"),evidence_sha256:$digest},conflict_check:{name:"CheckConflictAgainstOHWithDetail",status:"passed",exit_code:0,evidence_path:("/tmp/"+$node+"-conflict.log"),evidence_sha256:$digest}}]}' >"$TMP/$node.json"; done
 "$ROOT/bin/opu-compatibility-reconcile" --reconciliation "$TMP/reconciliation.json" --procedure-validation "$TMP/procedure.json" --compatibility "$TMP/node1.json" --compatibility "$TMP/node2.json" --output "$TMP/result.json" >/dev/null
 jq -e '.status == "passed" and .target.platform_id == "226" and (.checks | length == 2)' "$TMP/result.json" >/dev/null
-if "$ROOT/bin/opu-compatibility-reconcile" --reconciliation "$TMP/reconciliation.json" --procedure-validation "$TMP/procedure.json" --compatibility "$TMP/node1.json" >/dev/null 2>&1; then echo 'missing node compatibility was accepted' >&2; exit 1; fi
+rc=0
+"$ROOT/bin/opu-compatibility-reconcile" --reconciliation "$TMP/reconciliation.json" --procedure-validation "$TMP/procedure.json" --compatibility "$TMP/node1.json" >"$TMP/missing-node.json" || rc=$?
+[ "$rc" -eq 2 ] || { echo "missing node compatibility must exit 2, got $rc" >&2; exit 1; }
+jq -e '.status == "blocked" and any(.findings[]; .code == "COMPATIBILITY_MISSING")' "$TMP/missing-node.json" >/dev/null
 jq 'del(.checks[0].applicability_check)' "$TMP/node2.json" >"$TMP/node2-no-platform-check.json"
-if "$ROOT/bin/opu-compatibility-reconcile" --reconciliation "$TMP/reconciliation.json" --procedure-validation "$TMP/procedure.json" --compatibility "$TMP/node1.json" --compatibility "$TMP/node2-no-platform-check.json" >/dev/null 2>&1; then echo 'missing platform applicability evidence was accepted' >&2; exit 1; fi
+rc=0
+"$ROOT/bin/opu-compatibility-reconcile" --reconciliation "$TMP/reconciliation.json" --procedure-validation "$TMP/procedure.json" --compatibility "$TMP/node1.json" --compatibility "$TMP/node2-no-platform-check.json" >"$TMP/missing-platform.json" || rc=$?
+[ "$rc" -eq 2 ] || { echo "missing platform applicability must exit 2, got $rc" >&2; exit 1; }
+jq -e '.status == "blocked" and any(.findings[]; .code == "COMPATIBILITY_FAILED")' "$TMP/missing-platform.json" >/dev/null
 
 # Standalone databases have no Grid Infrastructure home: cluster.grid_home is
 # legitimately null. The database-family path must not require it.
