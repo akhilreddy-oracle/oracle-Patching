@@ -85,9 +85,19 @@ class AssistantApiTests(unittest.TestCase):
                 self.native[module.__name__ + "." + name] = self.enterContext(patch.object(module, name, return_value={"state": "fixture"}))
         self.steps = {name: Mock(return_value={"status": "fixture"}) for name in ("discovery", "readiness-chain", "recovery-collect")}
         self.enterContext(patch.object(server.pipeline_steps, "STEPS", self.steps))
-        evidence.write_evidence("source", "procedure_input", {
+        procedure = {
             "patch_id": "39034528", "target": {"database_unique_name": "ORCL"},
-        })
+            "artifact_sha256": "a" * 64,
+            "oracle_references": [{"kind": "patch_readme", "identifier": "README.html", "sha256": "b" * 64}],
+        }
+        evidence.write_evidence("source", "procedure_input", procedure)
+        evidence.write_evidence("source", "procedure", {"status": "ready_for_planning", "procedure": procedure})
+        evidence.write_evidence("source", "artifact", {"artifact": {
+            "path": "/fixture/stage/39034528", "sha256": "a" * 64,
+            "readme_files": [{"path": "README.html", "sha256": "b" * 64}],
+        }})
+        evidence.write_evidence("source", "policy", {"schema_version": "1.0", "recovery": {"require_backup": True}})
+        evidence.write_evidence("source", "readiness", {"status": "ready_for_approval", "valid_until": "2099-01-01T00:00:00Z"})
         self.addCleanup(self.finish_workers)
 
     def write_principals(self):
@@ -285,12 +295,80 @@ class AssistantApiTests(unittest.TestCase):
                         "expected_configuration_sha256": assistant.live_inventory.configuration_digest(self.host)}
                 if step == "readiness-chain":
                     body["_record"] = record
+                    body["expected_action_binding_sha256"] = assistant._read(
+                        assistant._path("operator", conversation_id), "operator")["actions"][0]["binding"]
                 if step == "recovery-collect":
                     body["request_id"] = "backup-a"
                 if name == "check_live_inventory":
                     body["inventory_receipt"] = True
                 self.steps[step].assert_called_once_with("source", self.host, body)
                 self.steps[step].reset_mock()
+
+    def test_confirmed_readiness_rejects_malformed_binding_and_input_overrides(self):
+        path = "/api/hosts/source/pipeline/readiness-chain"
+        cases = [{"expected_action_binding_sha256": value}
+                 for value in (None, [], 42, "", "a" * 63, "A" * 64)]
+        cases.extend({"expected_action_binding_sha256": "a" * 64, field: value}
+                     for field, value in (("artifact_dir", "/other/patch"), ("procedure", {}), ("policy", {})))
+        for body in cases:
+            with self.subTest(body=body):
+                response = self.request(path, method="POST", actor="operator", body=body)
+                self.assertEqual(response["status"], 400, response)
+                self.assertEqual(response["body"]["error"], "invalid_confirmation")
+        self.assertFalse(pipeline_runner.RUNS)
+        self.assert_no_native_calls()
+
+    def test_direct_readiness_refresh_keeps_explicit_wizard_inputs(self):
+        body = {"artifact_dir": "/fixture/patch", "procedure": {"fixture": "reviewed"},
+                "policy": {"fixture": "reviewed"}}
+        response = self.request("/api/hosts/source/pipeline/readiness-chain", method="POST",
+                                actor="operator", body=body)
+        self.assertEqual(response["status"], 202, response)
+        record = self.wait_run(response["body"]["run_id"])
+        self.assertEqual(record.status, "succeeded", record.error)
+        self.steps["readiness-chain"].assert_called_once_with("source", self.host,
+            {**body, "actor": "operator", "requester": "operator", "_record": record})
+
+    def test_confirmed_readiness_rechecks_saved_inputs_after_worker_queue_delay(self):
+        original_start = pipeline_runner.start_run
+        entered, release = threading.Event(), threading.Event()
+
+        def delayed_start(kind, key, function):
+            def delayed(record):
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("Readiness worker barrier timed out")
+                return function(record)
+            return original_start(kind, key, delayed)
+
+        conversation_id, action = self.prepare("refresh_readiness", {"host_id": "source"}, actor="operator")
+        try:
+            with patch.object(pipeline_runner, "start_run", side_effect=delayed_start):
+                response = self.execute(conversation_id, action, actor="operator")
+            self.assertEqual(response["status"], 202, response)
+            self.assertTrue(entered.wait(2))
+            # Keep the prerequisites valid while changing the reviewed policy.
+            policy = evidence.read_evidence("source", "policy") or {}
+            evidence.write_evidence("source", "policy", {**policy, "maximum_snapshot_age_seconds": 600})
+        finally:
+            release.set()
+        record = self.wait_run(response["body"]["run_id"])
+        self.assertEqual(record.status, "failed", record.error)
+        self.assertIn("changed after confirmation", record.error["message"])
+        self.assert_no_native_calls()
+
+    def test_confirmed_readiness_unchanged_saved_inputs_reach_native_worker(self):
+        conversation_id, action = self.prepare("refresh_readiness", {"host_id": "source"}, actor="operator")
+        saved = assistant._read(assistant._path("operator", conversation_id), "operator")["actions"][0]
+        response = self.execute(conversation_id, action, actor="operator")
+        self.assertEqual(response["status"], 202, response)
+        record = self.wait_run(response["body"]["run_id"])
+        self.assertEqual(record.status, "succeeded", record.error)
+        self.steps["readiness-chain"].assert_called_once_with("source", self.host, {
+            "actor": "operator", "requester": "operator", "_record": record,
+            "expected_configuration_sha256": assistant.live_inventory.configuration_digest(self.host),
+            "expected_action_binding_sha256": saved["binding"],
+        })
 
     def test_confirmation_rechecks_current_roles_and_does_not_allow_another_owner(self):
         conversation_id, action = self.prepare("refresh_discovery", {"host_id": "source"}, actor="operator")

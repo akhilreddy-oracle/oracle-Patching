@@ -43,6 +43,57 @@ function renderActionReceipt(receipt) {
   ]);
 }
 
+const SETUP_STEPS = Object.freeze({
+  "artifact-inspect": "Artifact inspection",
+  "procedure-validate": "Procedure validation",
+  "readiness-evaluate": "Readiness evaluation",
+});
+const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
+const boundedText = (value, limit) => typeof value === "string" && value.trim().length > 0
+  && value.length <= limit && !/[\u0000-\u001f\u007f]/.test(value);
+const utcTimestamp = value => typeof value === "string"
+  && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)$/.test(value)
+  && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 19) === value.slice(0, 19);
+
+function validSetupCapability(capability) {
+  return record(capability) && typeof capability.available === "boolean"
+    && Array.isArray(capability.blockers) && capability.blockers.length <= 12
+    && capability.available === (capability.blockers.length === 0)
+    && capability.blockers.every(blocker => record(blocker)
+      && typeof blocker.code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(blocker.code)
+      && typeof blocker.step === "string" && Object.hasOwn(SETUP_STEPS, blocker.step)
+      && boundedText(blocker.label, 160) && boundedText(blocker.detail, 1200));
+}
+
+function renderWorkflowGuidance(guidance) {
+  const valid = Array.isArray(guidance) && guidance.length > 0 && guidance.length <= 3
+    && guidance.every(report => record(report) && report.source === "controller_saved_evidence"
+      && identifier(report.host_id) && utcTimestamp(report.observed_at) && report.live_state_verified === false
+      && validSetupCapability(report.refresh_readiness) && validSetupCapability(report.create_patch_plan)
+      && (!report.refresh_readiness.available || !report.create_patch_plan.available));
+  if (!valid) return [el("section", { class: "assistant-workflow-guidance", "aria-label": "Setup guidance unavailable" }, [
+    el("h3", { text: "Setup guidance unavailable" }),
+    el("p", { text: "The controller setup record is unavailable or invalid. Open the host workspace to review its saved setup. Model text is not a setup assessment." }),
+  ])];
+  return guidance.map(report => el("section", { class: "assistant-workflow-guidance", "aria-label": `Setup required for ${report.host_id}` }, [
+    el("h3", { text: "Setup required" }),
+    el("p", { text: `Host: ${report.host_id}` }),
+    el("p", {}, [document.createTextNode("Saved setup assessed at: "), el("time", { datetime: report.observed_at, text: report.observed_at })]),
+    el("p", { class: "helper", text: "Historical controller assessment of saved evidence. Live state, current readiness and approvals were not verified." }),
+    ...[["Refresh readiness", report.refresh_readiness], ["Create patch plan", report.create_patch_plan]].map(([label, capability]) => el("div", {}, [
+      el("h4", { text: label }),
+      ...(capability.available
+        ? [el("p", { text: "Saved setup inputs were present. This does not establish readiness or approval." })]
+        : [el("ul", {}, capability.blockers.map(blocker => el("li", {}, [
+          el("strong", { text: `${blocker.label}: ` }), document.createTextNode(blocker.detail),
+          el("p", { class: "helper", text: SETUP_STEPS[blocker.step] }),
+        ]))) ]),
+    ])),
+    el("a", { href: `#/hosts/${encodeURIComponent(report.host_id)}/readiness`, text: "Open setup in host workspace" }),
+    el("p", { class: "helper", text: "Review and complete the indicated steps, then ask the assistant again. Opening the workspace does not run an operation." }),
+  ]));
+}
+
 export function actionAvailability(action, { canChat = true, allowedTools, busy = false, now = Date.now() } = {}) {
   if (!TOOLS[action?.tool]) return { allowed: false, reason: "This action type is not supported by this application." };
   if (action.state !== "pending") return { allowed: false, reason: action.state === "unknown"
@@ -281,9 +332,12 @@ export async function renderAssistant(mount, conversationId = null) {
     for (const message of conversation.messages || []) {
       if (!["user", "assistant"].includes(message.role)) continue;
       const hasReceipt = message.role === "assistant" && Object.hasOwn(message, "action_receipt");
+      const hasGuidance = message.role === "assistant" && Object.hasOwn(message, "workflow_guidance");
       transcript.appendChild(el("article", { class: `assistant-message assistant-message-${message.role}`, "aria-label": message.role === "user" ? "Your message" : "Assistant response" }, [
         el("p", { class: "assistant-message-author", text: message.role === "user" ? "You" : "Patching assistant" }),
-        ...(hasReceipt ? [renderActionReceipt(message.action_receipt), el("h3", { text: "Model response" })] : []),
+        ...(hasReceipt ? [renderActionReceipt(message.action_receipt)] : []),
+        ...(hasGuidance ? renderWorkflowGuidance(message.workflow_guidance) : []),
+        ...(hasReceipt || hasGuidance ? [el("h3", { text: hasReceipt ? "Model response" : "Response" })] : []),
         el("div", { class: "assistant-message-content", text: message.content || "" }),
         el("time", { datetime: message.created_at || "", text: message.created_at || "" }),
       ]));

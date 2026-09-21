@@ -29,9 +29,16 @@ class AssistantTests(unittest.TestCase):
         self.enterContext(patch.object(runner, '_ACTIVE_KEYS', {}))
         self.enterContext(patch.object(runner.notifications, 'emit'))
         self.enterContext(patch.object(assistant.local_llm, 'config_status', return_value={'enabled': True, 'configured': True}))
+        procedure = {'patch_id': '39034528', 'target': {'database_unique_name': 'ORCL'},
+                     'artifact_sha256': 'a' * 64,
+                     'oracle_references': [{'kind': 'patch_readme', 'identifier': 'README.html', 'sha256': 'b' * 64}]}
         self.evidence = {'snapshot': {'databases': [{'db_unique_name': 'ORCL', 'oracle_home': '/fixture/dbhome'}]},
-                         'procedure_input': {'patch_id': '39034528', 'target': {'database_unique_name': 'ORCL'}},
-                         'readiness': {'status': 'ready_for_approval'}}
+                         'procedure_input': procedure,
+                         'procedure': {'status': 'ready_for_planning', 'procedure': procedure},
+                         'artifact': {'artifact': {'path': '/fixture/stage/39034528', 'sha256': 'a' * 64,
+                                      'readme_files': [{'path': 'README.html', 'sha256': 'b' * 64}]}},
+                         'policy': {'schema_version': '1.0', 'recovery': {'require_backup': True}},
+                         'readiness': {'status': 'ready_for_approval', 'valid_until': '2099-01-01T00:00:00Z'}}
         self.enterContext(patch.object(capabilities.evidence, 'read_evidence', side_effect=lambda host, kind: self.evidence.get(kind)))
         self.enterContext(patch.object(capabilities.planctl, 'PLAN_STATE_DIR', self.root / 'plans'))
         self.enterContext(patch.object(capabilities.recoveryctl, 'LIVE_DIR', self.root / 'recovery-live'))
@@ -364,7 +371,9 @@ class AssistantTests(unittest.TestCase):
         self.assertIn('cache_file_updated_at', result['requests'][0])
         self.assertNotIn('private contents', json.dumps(result))
         self.assertNotIn('hidden configuration', json.dumps(result))
-        self.assertLessEqual(len(capabilities.definitions({'read', 'create', 'execute', 'dispatch'})), 16)
+        self.assertLessEqual(len(capabilities.definitions({'read', 'create', 'execute', 'dispatch'})), assistant.local_llm.MAX_TOOLS)
+        self.assertIn('inspect_preparation', capabilities.READ_TOOLS)
+        self.assertEqual(capabilities.SPECS['inspect_preparation'][2], 'read')
 
     def test_cached_backup_binding_is_stable_until_exact_saved_bytes_or_host_change(self):
         path = self.cached_record()
@@ -451,6 +460,93 @@ class AssistantTests(unittest.TestCase):
         args['database'] = 'ORCL'; args['patch_id'] = 'wrong-patch'
         with self.assertRaisesRegex(capabilities.ToolError, 'does not match'):
             self.proposal('create_patch_plan', args)
+
+    def test_missing_setup_blocks_proposal_and_reports_each_real_wizard_step(self):
+        self.evidence.clear()
+        report = capabilities.read('inspect_host', {'host_id': 'fixture'}, self.hosts)['preparation']
+        self.assertFalse(report['live_state_verified'])
+        self.assertEqual([row['step'] for row in report['refresh_readiness']['blockers']],
+                         ['artifact-inspect', 'procedure-validate', 'readiness-evaluate'])
+        with self.assertRaises(capabilities.PreparationRequired):
+            self.proposal('refresh_readiness')
+        self.assertEqual(self.conversation_data()['actions'], [])
+        self.submit.assert_not_called()
+
+    def test_setup_rejects_changed_readme_and_malformed_policy_without_blocking_refresh_of_expired_readiness(self):
+        self.evidence['readiness'] = {'status': 'blocked'}
+        self.assertTrue(capabilities.preparation('fixture')['refresh_readiness']['available'])
+        self.assertFalse(capabilities.preparation('fixture')['create_patch_plan']['available'])
+        self.evidence['readiness'] = {'status': 'ready_for_approval', 'valid_until': '2000-01-01T00:00:00Z'}
+        self.assertEqual(capabilities.preparation('fixture')['create_patch_plan']['blockers'][0]['code'], 'readiness_expired')
+        self.proposal('refresh_readiness')
+        self.evidence['artifact']['artifact']['readme_files'][0]['sha256'] = 'c' * 64
+        with self.assertRaises(capabilities.PreparationRequired) as blocked:
+            self.proposal('refresh_readiness')
+        self.assertEqual(blocked.exception.report['refresh_readiness']['blockers'][0]['code'], 'procedure_binding_invalid')
+        self.evidence['artifact']['artifact']['readme_files'][0]['sha256'] = 'b' * 64
+        self.evidence['policy']['recovery'] = ['malformed']
+        with self.assertRaises(capabilities.PreparationRequired) as blocked:
+            self.proposal('refresh_readiness')
+        self.assertEqual(blocked.exception.report['refresh_readiness']['blockers'][0]['code'], 'policy_invalid')
+        self.submit.assert_not_called()
+
+    def test_setup_changed_before_confirmation_expires_proposal_without_dispatch(self):
+        proposal = self.proposal('refresh_readiness')
+        del self.evidence['policy']
+        with self.assertRaisesRegex(assistant.AssistantError, 'Required setup'):
+            self.confirm(proposal)
+        data = self.conversation_data()
+        self.assertEqual(data['actions'][0]['state'], 'expired')
+        self.assertEqual(data['messages'][-1]['workflow_guidance'][0]['host_id'], 'fixture')
+        self.submit.assert_not_called()
+
+    def test_blocked_model_proposal_persists_controller_guidance_even_if_prose_claims_success(self):
+        self.evidence.clear()
+        responses = [
+            {'role': 'assistant', 'tool_calls': [{'id': 'setup', 'type': 'function',
+              'function': {'name': 'refresh_readiness', 'arguments': '{"host_id":"fixture"}'}}]},
+            {'role': 'assistant', 'content': 'I prepared everything.',
+             'workflow_guidance': [{'source': 'model', 'host_id': 'invented'}]},
+        ]
+        with patch.object(assistant.local_llm, 'complete', side_effect=responses) as model:
+            run_id = assistant.send(self.owner, self.conversation, 'Prepare patching for fixture',
+                                    {'read', 'execute'}, lambda: self.hosts, submit=self.submit)
+            self.assertEqual(self.wait_run(run_id).status, 'succeeded')
+        data = self.conversation_data()
+        self.assertEqual(data['actions'], [])
+        message = data['messages'][-1]
+        self.assertEqual(message['action_receipt']['proposals'], [])
+        report = message['workflow_guidance'][0]
+        self.assertEqual((report['source'], report['host_id']), ('controller_saved_evidence', 'fixture'))
+        self.assertFalse(report['refresh_readiness']['available'])
+        wire = model.call_args.args[0]
+        self.assertTrue(any(row['role'] == 'tool' and 'preparation' in row['content'] for row in wire))
+        self.submit.assert_not_called()
+
+    def test_normal_setup_explanation_also_retains_controller_guidance_without_needing_a_rejected_action(self):
+        self.evidence.clear()
+        responses = [
+            {'role': 'assistant', 'tool_calls': [{'id': 'setup', 'type': 'function',
+             'function': {'name': 'inspect_preparation', 'arguments': '{"host_id":"fixture","operation":"refresh_readiness"}'}}]},
+            {'role': 'assistant', 'content': 'Complete the saved setup first.'},
+        ]
+        with patch.object(assistant.local_llm, 'complete', side_effect=responses):
+            run_id = assistant.send(self.owner, self.conversation, 'Help prepare fixture for patching',
+                                    {'read'}, lambda: self.hosts, submit=self.submit)
+            self.assertEqual(self.wait_run(run_id).status, 'succeeded')
+        message = self.conversation_data()['messages'][-1]
+        self.assertEqual(message['workflow_guidance'][0]['host_id'], 'fixture')
+        self.assertEqual(message['action_receipt']['proposals'], [])
+        self.submit.assert_not_called()
+
+    def test_inventory_question_never_gets_setup_guidance_just_because_host_setup_is_missing(self):
+        self.evidence.clear()
+        with patch.object(assistant.local_llm, 'complete', return_value={'role': 'assistant', 'content': 'Operator access is required for a current inventory check.'}):
+            run_id = assistant.send(self.owner, self.conversation, 'What is the current RU for fixture?',
+                                    {'read'}, lambda: self.hosts, submit=self.submit)
+            self.assertEqual(self.wait_run(run_id).status, 'succeeded')
+        self.assertNotIn('workflow_guidance', self.conversation_data()['messages'][-1])
+        self.submit.assert_not_called()
 
     def test_model_can_read_and_propose_but_never_launch_and_context_is_redacted(self):
         wires = []

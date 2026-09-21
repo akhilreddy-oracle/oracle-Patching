@@ -99,3 +99,21 @@ including inventory-proposal targeting and missing-target handling. They have
 different coverage and do not override the failed protocol assessment. Neither
 assessment qualifies unattended patching or a complete live backup-to-patch
 workflow.
+
+The subsequent operation-scoped setup tool was also exercised through the real
+conversation loop on synthetic hosts. An unprepared host produced its three
+missing refresh inputs; a prepared host produced a pending refresh proposal;
+a viewer's RU question started no action and showed no unrelated setup card.
+Those three structural checks passed with five model completions and zero
+native dispatches. Earlier versions of that check exposed an explanation that
+mixed plan-only blockers into refresh prerequisites; those runs were retained,
+and the tool now returns prerequisites for the selected operation only.
+
+The separate six-case single-request assessment of this updated tool catalogue
+still **failed: two passed and four failed** (`inspect_target`,
+`typed_patch_proposal`, `missing_evidence`, `untrusted_evidence`). These failures
+are protocol mismatches, not evidence of native execution: the assessment never
+dispatches a proposed action. The failed result remains a qualification gap;
+the three targeted conversation cases cannot replace it. Local records are
+`webapp/var/mac-local/setup-real-model-loop-scoped-20260921.json` and
+`webapp/var/mac-local/model-protocol-setup-scoped-20260921.json`.

@@ -52,6 +52,37 @@ authorize plans, change maintenance windows, reset tasks, waive backup policy,
 repair executables, force locks or perform rollback. Existing native pages
 provide supported review and recovery operations.
 
+## Preparing a host that is not set up yet
+
+Ask, "What is missing before refreshing readiness for this host?" The model can
+select the read-only `inspect_preparation` tool with the configured host and
+operation (`refresh_readiness` or `create_patch_plan`). Its answer is derived
+from that host's saved inputs, not fixed host names or patch IDs. Inspection
+does not contact managed hosts. The model receives prerequisites for the chosen
+operation; the controller retains the full assessment in a dated setup card with
+a link to the real host wizard.
+
+A readiness refresh needs a saved absolute artifact path, procedure inputs
+bound to the inspected media and README, and a saved policy. A blocked or expired
+readiness decision does not prevent refreshing those observations. Preparing a
+patch plan additionally needs a matching validated procedure and an unexpired
+`ready_for_approval` decision. Native commands still validate schemas, seals,
+platform, backup and other eligibility requirements; a setup check grants no
+execution authority.
+
+The controller refuses a proposal when those prerequisites are missing or
+unusable. The response keeps its controller setup card even if model prose is
+incorrect. Setup lost before confirmation expires the proposal. A confirmed
+readiness refresh carries the reviewed evidence digest into the worker, which
+checks it under the host evidence lock before starting the native chain. A
+confirmed refresh cannot override the saved artifact, procedure or policy.
+The ordinary wizard can still submit explicit inputs through its existing flow.
+
+Setup cards describe their recorded assessment time. Complete the indicated
+wizard steps, then ask again; opening the link starts no operation. Chat still
+cannot supply missing Oracle README requirements or create an initial patch
+procedure autonomously.
+
 ## Confirmation and storage
 
 Inventory questions use live discovery by default. Explicit saved, cached or

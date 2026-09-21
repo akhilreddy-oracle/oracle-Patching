@@ -183,7 +183,10 @@ class LocalLLMTests(LocalLLMFixture, unittest.TestCase):
         self.assertEqual(before, self.path.read_bytes())
 
     def test_invalid_inputs_and_size_limits_fail_before_transport(self):
-        cases = [([], TOOLS), (MESSAGES * 65, TOOLS), (MESSAGES, TOOLS * 17),
+        excess_tools = [json.loads(json.dumps(TOOLS[0])) for _ in range(llm.MAX_TOOLS + 1)]
+        for index, tool in enumerate(excess_tools):
+            tool['function']['name'] = f'inspect_fixture_{index}'
+        cases = [([], TOOLS), (MESSAGES * 65, TOOLS), (MESSAGES, excess_tools), (MESSAGES, TOOLS * 2),
             ([{"role": [], "content": "bad"}], []), ([{"role": "user", "content": ["image"]}], []),
             ([{"role": "user", "content": "test", "base_url": "https://cloud.example"}], []),
             ([{"role": "user", "content": "x" * 131073}], []),
@@ -196,6 +199,15 @@ class LocalLLMTests(LocalLLMFixture, unittest.TestCase):
                     llm.complete(messages, tools)
                 self.assertEqual(caught.exception.status, 400)
         exchange.assert_not_called()
+
+    def test_complete_accepts_entire_role_scoped_catalogue_including_setup_inspection(self):
+        import assistant_tools
+        tools = assistant_tools.definitions({'read', 'create', 'execute', 'dispatch'})
+        self.assertLessEqual(len(tools), llm.MAX_TOOLS)
+        with patch.object(llm, '_exchange', return_value=answer()) as exchange:
+            llm.complete(MESSAGES, tools)
+        names = [tool['function']['name'] for tool in json.loads(exchange.call_args.args[1])['tools']]
+        self.assertIn('inspect_preparation', names)
 
     def test_malformed_completion_never_returns_a_partial_tool_proposal(self):
         invalid = [None, [], {}, {"choices": []}, {"choices": [{}, {}]}, answer(finish="length"), answer(finish=[]),

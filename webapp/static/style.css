@@ -841,6 +841,7 @@ tr:last-child td { border-bottom: none; }
 .assistant-message-assistant { border-left: 3px solid var(--oracle-red); }
 .assistant-message-author { margin: 0 0 8px; font-size: 12px; font-weight: 700; color: var(--muted); }
 .assistant-message-content { white-space: pre-wrap; overflow-wrap: anywhere; }
+.assistant-workflow-guidance { overflow-wrap: anywhere; }
 .assistant-message time { display: block; margin-top: 10px; }
 .assistant-actions > h2 { font-size: 17px; }
 .assistant-action-targets { display: grid; grid-template-columns: minmax(110px, 150px) minmax(0, 1fr); gap: 6px 12px; }

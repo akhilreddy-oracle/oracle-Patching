@@ -926,6 +926,15 @@ No socket, HTTP parser or listener is constructed by this class.
                 self._send_json(404, {"error": "unknown_step", "message": f"No such pipeline step: {step}"})
                 return
 
+            expected_readiness_binding = None
+            if step == "readiness-chain" and "expected_action_binding_sha256" in body:
+                expected_readiness_binding = body["expected_action_binding_sha256"]
+                if (not isinstance(expected_readiness_binding, str)
+                        or not re.fullmatch(r"[a-f0-9]{64}", expected_readiness_binding)
+                        or submitted_body_fields & {"artifact_dir", "procedure", "policy"}):
+                    self._send_json(400, {"error": "invalid_confirmation", "message": "A confirmed readiness refresh requires a valid binding and cannot override its reviewed saved inputs."})
+                    return
+
             # Server-side host inventory for cross-host actions; never trust the client's copy.
             body.pop("_hosts", None)
             body.pop("_record", None)
@@ -936,10 +945,17 @@ No socket, HTTP parser or listener is constructed by this class.
             if step == "stage-artifact":
                 body["_hosts"] = load_hosts()
 
-            def run(record, host=host, body=body, step_fn=step_fn):
+            def run(record, host=host, body=body, step_fn=step_fn, expected_readiness_binding=expected_readiness_binding):
                 if step == "readiness-chain":
                     body["_record"] = record
                 with evidence.host_lock(host_id):
+                    if expected_readiness_binding is not None:
+                        # Confirmation checked the saved inputs before queueing.
+                        # Recheck under the writer lock so a delayed worker cannot
+                        # silently use a newly selected artifact, procedure or policy.
+                        current = assistant.capabilities.binding("refresh_readiness", {"host_id": host_id}, {host_id: host})
+                        if current != expected_readiness_binding:
+                            raise ValueError("Saved readiness inputs changed after confirmation; review a new proposal.")
                     return step_fn(host_id, host, body)
 
             # One pipeline run per host at a time: steps share the host's SSH

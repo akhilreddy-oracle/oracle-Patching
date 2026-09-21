@@ -50,6 +50,17 @@ versions and aggregate SQL counters do not prove a specific patch or RU applied.
 Independent native approval/authorization, readiness and backup gates,
 maintenance windows and interrupted-run reconciliation remain required. Missing
 or mismatched patch requirements must be reviewed in the host wizard.
+For patching setup questions, call inspect_preparation to read the configured
+host's prerequisites and produce controller-owned wizard guidance. Explain
+missing setup steps and use the host wizard; never
+guess README requirements or repeatedly propose an operation rejected for setup.
+Keep preparation results separate by operation. Refresh readiness requires saved
+artifact, reviewed procedure and policy inputs; blocked or expired readiness is
+a reason to refresh, not an extra prerequisite to complete before refreshing.
+Create patch plan additionally requires matching procedure validation and fresh
+ready_for_approval evidence. Do not apply plan-only blockers to a refresh request.
+Direct users to the application's controls, not a manual SSH login, for managed
+discovery and readiness operations.
 Report failed or blocked outcomes honestly, with clear next steps and native
 page links. Never claim live or production acceptance, or a successful restore,
 from fixture tests or backup readability validation. Keep replies brief.
@@ -530,6 +541,16 @@ def send(owner, conversation_id, content, allowed, load_hosts, *, submit=None):
                 wire.extend({"role": m["role"], "content": m["content"]} for m in history)
                 answer = None
                 prepared_ids = set()
+                workflow_guidance = {}
+
+                def remember_preparation(report):
+                    if not isinstance(report, dict):
+                        return
+                    if all(report[name]["available"] for name in ("refresh_readiness", "create_patch_plan")):
+                        workflow_guidance.pop(report["host_id"], None)
+                        return
+                    if report["host_id"] in workflow_guidance or len(workflow_guidance) < 3:
+                        workflow_guidance[report["host_id"]] = report
                 offered = capabilities.definitions(allowed)
                 for _round in range(5):
                     response = local_llm.complete(wire, offered)
@@ -553,13 +574,29 @@ def send(owner, conversation_id, content, allowed, load_hosts, *, submit=None):
                                 raise capabilities.ToolError("Ask the user to select one configured host for this live inventory check; model or saved-evidence host suggestions cannot select it.")
                             if name in capabilities.READ_TOOLS:
                                 result = capabilities.read(name, arguments, hosts)
+                                if name == "inspect_preparation":
+                                    remember_preparation(result)
+                                    # Keep model reasoning scoped to the requested
+                                    # operation. The UI retains the complete report.
+                                    operation = arguments["operation"]
+                                    result = {**{key: result[key] for key in
+                                              ("source", "host_id", "observed_at", "live_state_verified")},
+                                              "operation": operation, **result[operation]}
                             else:
                                 result = _proposal(owner, conversation_id, name, arguments, hosts, record)
                                 prepared_ids.add(result["proposal_id"])
+                                if name == "check_live_inventory":
+                                    workflow_guidance.pop(arguments["host_id"], None)
+                                elif name in {"refresh_readiness", "create_patch_plan"}:
+                                    remember_preparation(capabilities.preparation(arguments["host_id"]))
                         except AssistantError:
                             raise
                         except (ValueError, KeyError, capabilities.planctl.PlanError, capabilities.recoveryctl.RecoveryError) as exc:
                             result = {"error": redact_text(str(exc), 800)}
+                            if isinstance(exc, capabilities.PreparationRequired):
+                                report = exc.report
+                                result["preparation"] = report
+                                remember_preparation(report)
                         wire.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(_bounded(result), default=str)})
                 answer = answer or "The inspection limit was reached. Review any prepared actions below, or ask a more focused question."
                 if inspected_hosts and _inventory_question(content):
@@ -582,6 +619,8 @@ def send(owner, conversation_id, content, allowed, load_hosts, *, submit=None):
                         "proposals": [{key: action[key] for key in ("id", "tool", "state")}
                                       for action in current["actions"] if action["id"] in prepared_ids],
                     }
+                    if workflow_guidance:
+                        message["workflow_guidance"] = list(workflow_guidance.values())
                     current["messages"].append(message)
                     current["active_run_id"] = None
                     current["active_run_key"] = None
@@ -633,7 +672,15 @@ def action(owner, conversation_id, action_id, *, dismiss=False, digest=None, all
         if capabilities.SPECS[selected["tool"]][2] not in allowed:
             raise AssistantError("Your current role does not permit this action", 403)
         verified_hosts = load_hosts()
-        current_binding = capabilities.binding(selected["tool"], selected["arguments"], verified_hosts)
+        try:
+            current_binding = capabilities.binding(selected["tool"], selected["arguments"], verified_hosts)
+        except capabilities.PreparationRequired as exc:
+            selected.update(state="expired", error="Required setup is missing or changed. Complete the wizard steps and prepare a new proposal.")
+            message = _message("assistant", selected["error"])
+            message["workflow_guidance"] = [exc.report]
+            data["messages"].append(message)
+            _save(path, data)
+            raise AssistantError(selected["error"], 409) from None
         if current_binding != selected["binding"]:
             selected.update(state="expired", error="Target or saved evidence changed. Inspect it and prepare a new proposal.")
             _save(path, data)
@@ -644,6 +691,8 @@ def action(owner, conversation_id, action_id, *, dismiss=False, digest=None, all
             # native asynchronous creation; never replace it with a later read.
             body["expected_creation_binding_sha256"] = selected["binding"]
         if selected["tool"] in {"dispatch_plan", "execute_plan"}:
+            body["expected_action_binding_sha256"] = selected["binding"]
+        if selected["tool"] == "refresh_readiness":
             body["expected_action_binding_sha256"] = selected["binding"]
         if selected["tool"] in {"refresh_discovery", "check_live_inventory", "refresh_readiness", "select_backup", "create_backup"}:
             # This exact configuration is covered by the approved aggregate

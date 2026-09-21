@@ -9,6 +9,7 @@ import stat
 
 import evidence
 import planctl
+import pipeline_steps
 import recoveryctl
 from diagnostics import redacted
 
@@ -17,13 +18,21 @@ class ToolError(ValueError):
     pass
 
 
+class PreparationRequired(ToolError):
+    def __init__(self, operation, report):
+        self.report = report
+        super().__init__("Setup required before " + operation + ": "
+                         + "; ".join(item["detail"] for item in report[operation]["blockers"]))
+
+
 # Every argument is required; actors, policies and credentials are deliberately
 # absent. All writes are proposals dispatched through the normal HTTP commands.
 SPECS = {
     "list_estate": ("List configured hosts and saved database observations. Use inspect_host for dated installed binary patch IDs and inventory provenance.", (), "read"),
     "list_plans": ("List saved patch plans and their states.", (), "read"),
     "list_backups": ("List saved local recovery summaries for a configured host. No SSH; current native state remains unverified until explicitly inspected.", ("host_id",), "read"),
-    "inspect_host": ("Inspect saved installed binary patch inventory, Oracle/OPatch versions, observation dates and freshness, readiness, requirements and backup summaries. SQL counters are aggregate evidence, not per-patch confirmation. Does not refresh SSH.", ("host_id",), "read"),
+    "inspect_host": ("Inspect saved installed binary patch inventory, Oracle/OPatch versions, dates, readiness, setup prerequisites and backup summaries. preparation identifies missing artifact/README/policy inputs and the wizard steps to complete. SQL counters are aggregate evidence, not per-patch confirmation. Does not refresh SSH.", ("host_id",), "read"),
+    "inspect_preparation": ("Inspect saved prerequisites for one host and one operation: refresh_readiness or create_patch_plan. Choose the operation the user wants to prepare. A refresh can collect new evidence despite blocked/expired readiness; a plan needs fresh passing readiness. Read only, no SSH. Returns controller-owned setup guidance, not live inventory.", ("host_id", "operation"), "read"),
     "inspect_plan": ("Inspect a saved plan and its tasks.", ("plan_id",), "read"),
     "inspect_backup": ("Inspect a saved local recovery summary without SSH. Use an analyze_backup proposal for explicit native inspection.", ("request_id",), "read"),
     "refresh_discovery": ("Propose live SSH discovery. May synchronize collector tools and replace saved discovery evidence.", ("host_id",), "execute"),
@@ -37,7 +46,7 @@ SPECS = {
     "dispatch_plan": ("Propose dispatching an already authorized patch plan within its sealed maintenance window.", ("plan_id",), "dispatch"),
     "execute_plan": ("Propose executing remaining tasks of an already running/authorized plan. May stop database/listener and change Oracle binaries. Stops on failure, blocker or unknown outcome.", ("plan_id",), "execute"),
 }
-READ_TOOLS = {"list_estate", "list_plans", "list_backups", "inspect_host", "inspect_plan", "inspect_backup"}
+READ_TOOLS = {"list_estate", "list_plans", "list_backups", "inspect_host", "inspect_preparation", "inspect_plan", "inspect_backup"}
 
 
 def definitions(allowed):
@@ -57,6 +66,8 @@ def validate(name, arguments, hosts):
             raise ToolError(f"Invalid {key}")
     if "host_id" in arguments and arguments["host_id"] not in hosts:
         raise ToolError("Unknown configured host")
+    if name == "inspect_preparation" and arguments["operation"] not in {"refresh_readiness", "create_patch_plan"}:
+        raise ToolError("Preparation inspection requires refresh_readiness or create_patch_plan")
     if "window_start" in arguments:
         try:
             start, end = [datetime.fromisoformat(arguments[key].replace("Z", "+00:00")) for key in ("window_start", "window_end")]
@@ -97,6 +108,70 @@ def _saved_document(host_id, name):
         return value if isinstance(value, dict) else None
     except (OSError, ValueError, TypeError):
         return None
+
+
+def preparation(host_id):
+    """Explain saved setup only; availability never proves native readiness.
+
+    Refresh can repair stale observations, but cannot invent reviewed inputs.
+    Proposal confirmation and native worker admission recheck the full binding.
+    Native tools retain schema, seal, platform, recovery and execution checks.
+    """
+    evidence.validate_host_id(host_id)
+    documents = {key: _saved_document(host_id, key) for key in
+                 ("artifact", "procedure_input", "procedure", "policy", "readiness")}
+    artifact = (documents["artifact"] or {}).get("artifact")
+    artifact = artifact if isinstance(artifact, dict) else {}
+    procedure = documents["procedure_input"]
+    refresh = []
+
+    def blocker(code, step, label, detail):
+        return {"code": code, "step": step, "label": label, "detail": detail}
+
+    path = artifact.get("path")
+    if (not isinstance(path, str) or not path.startswith("/") or len(path) > 4096
+            or any(ord(char) < 32 for char in path)):
+        refresh.append(blocker("artifact_path_missing", "artifact-inspect", "Inspect staged patch media",
+                               "Inspect the patch directory on this host to save an absolute artifact path."))
+    if not procedure:
+        refresh.append(blocker("procedure_missing", "procedure-validate", "Review README requirements",
+                               "Review the selected patch README and validate its procedure for this host."))
+    else:
+        try:
+            # Reuse the native chain's rule, including exact media/README hashes.
+            # The chain repeats this check after live artifact inspection too.
+            pipeline_steps._refresh_procedure_input(host_id, procedure)
+        except (pipeline_steps.localtools.LocalToolError, OSError, ValueError, TypeError, AttributeError):
+            refresh.append(blocker("procedure_binding_invalid", "procedure-validate", "Review README requirements",
+                                   "Saved requirements do not match readable patch media and README evidence. Review and validate the procedure again."))
+    policy = documents["policy"]
+    if not policy:
+        refresh.append(blocker("policy_missing", "readiness-evaluate", "Save readiness policy",
+                               "Choose the readiness and backup requirements, then evaluate readiness once to save the policy."))
+    elif any(key in policy and not isinstance(policy[key], dict) for key in ("recovery", "database")):
+        refresh.append(blocker("policy_invalid", "readiness-evaluate", "Correct readiness policy",
+                               "Saved database or recovery policy has an invalid structure. Review the requirements and evaluate readiness again."))
+    create = list(refresh)
+    validation = documents["procedure"] or {}
+    if not procedure or validation.get("status") != "ready_for_planning" or validation.get("procedure") != procedure:
+        create.append(blocker("procedure_not_validated", "procedure-validate", "Validate selected procedure",
+                              "The saved procedure must have a matching ready_for_planning validation before preparing a plan."))
+    ready = documents["readiness"] or {}
+    if ready.get("status") != "ready_for_approval":
+        create.append(blocker("readiness_not_ready", "readiness-evaluate", "Resolve readiness blockers",
+                              "Evaluate readiness and resolve its blockers before preparing a patch plan."))
+    else:
+        try:
+            expiry = datetime.fromisoformat(ready["valid_until"].replace("Z", "+00:00"))
+            if expiry.tzinfo is None or expiry <= datetime.now(timezone.utc):
+                raise ValueError()
+        except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+            create.append(blocker("readiness_expired", "readiness-evaluate", "Refresh readiness evidence",
+                                  "Readiness has expired or has no verified expiry. Refresh evidence and evaluate readiness again."))
+    return {"source": "controller_saved_evidence", "host_id": host_id,
+            "observed_at": datetime.now(timezone.utc).isoformat(), "live_state_verified": False,
+            "refresh_readiness": {"available": not refresh, "blockers": refresh},
+            "create_patch_plan": {"available": not create, "blockers": create}}
 
 
 def _snapshot_inventory(snapshot, evidence_name, maximum_age, now):
@@ -251,7 +326,7 @@ def grounding(content, hosts):
             row = _fields(inspected, ("host_id", "source", "host_link", "inventory"))
             if not row.get("inventory", {}).get("nodes"):
                 row["status"] = "unavailable"
-            row["additional_evidence"] = "Use inspect_host for saved requirements, readiness and backup selection."
+            row["additional_evidence"] = "Use inspect_host for saved requirements and backup selection; inspect_preparation for patching setup and wizard guidance."
         except (OSError, ValueError, TypeError, AttributeError, OverflowError):
             row = {"host_id": host_id, "status": "unavailable", "host_link": f"#/hosts/{host_id}/discover",
                    "reason": "Saved host evidence could not be read; other hosts remain available."}
@@ -402,6 +477,8 @@ def cached_backups(host_id):
 
 def read(name, args, hosts):
     validate(name, args, hosts)
+    if name == "inspect_preparation":
+        return {**preparation(args["host_id"]), "operation": args["operation"]}
     if name == "list_estate":
         result = []
         for host_id, host in list(hosts.items())[:100]:
@@ -429,7 +506,7 @@ def read(name, args, hosts):
         # Only structured evidence; raw logs, README bodies, host credentials and
         # server configuration never enter the model context.
         return redacted({"host_id": host_id, "source": "saved_evidence", "host_link": f"#/hosts/{host_id}/discover",
-            "inventory": saved_inventory(host_id), **{key: evidence.read_evidence(host_id, key)
+            "inventory": saved_inventory(host_id), "preparation": preparation(host_id), **{key: _saved_document(host_id, key)
             for key in ("procedure_input", "readiness", "recovery_selection")}})
     if name == "inspect_plan":
         plan = planctl.status(args["plan_id"])
@@ -449,6 +526,10 @@ def read(name, args, hosts):
 def binding(name, args, hosts):
     """Bind confirmation to exact saved target/config/evidence, without sending it to the model."""
     validate(name, args, hosts)
+    if name in {"refresh_readiness", "create_patch_plan"}:
+        report = preparation(args["host_id"])
+        if not report[name]["available"]:
+            raise PreparationRequired(name, report)
     if name == "create_patch_plan":
         if (planctl.PLAN_STATE_DIR / "plans" / args["plan_id"]).exists():
             raise ToolError("Plan ID already exists")

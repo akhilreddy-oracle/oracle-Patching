@@ -277,6 +277,106 @@ test('legacy and native messages remain compatible and user-supplied receipt fie
   assert.deepEqual(writes, []);
 });
 
+const setupReport = () => ({
+  source: 'controller_saved_evidence', host_id: 'host:one', observed_at: '2024-02-29T10:20:30.123456+00:00', live_state_verified: false,
+  refresh_readiness: { available: false, blockers: [
+    { code: 'artifact_missing', step: 'artifact-inspect', label: 'Artifact inspection missing', detail: 'Inspect the selected patch media in the workspace.' },
+    { code: 'procedure_missing', step: 'procedure-validate', label: 'Procedure requirements missing', detail: 'Validate the requirements from the verified patch README.' },
+  ] },
+  create_patch_plan: { available: false, blockers: [
+    { code: 'readiness_missing', step: 'readiness-evaluate', label: 'Readiness evidence missing', detail: 'Complete setup, then evaluate readiness.' },
+  ] },
+});
+
+test('saved setup guidance precedes model prose and links to the exact host without creating execution controls', async () => {
+  conversation.actions = [];
+  const report = setupReport();
+  report.url = 'javascript:alert(1)';
+  report.refresh_readiness.blockers[0].url = 'https://untrusted.example/execute';
+  conversation.messages = [{ role: 'assistant', content: 'The patch plan is ready. <button>Confirm and run</button>', workflow_guidance: [report] }];
+  await renderAssistant(mount, 'conversation-1');
+  const message = mount.all('article').find(node => node.attrs['aria-label'] === 'Assistant response');
+  const guidance = message.all('section')[0];
+  assert.equal(guidance.attrs['aria-label'], 'Setup required for host:one');
+  assert.match(guidance.textContent, /Historical controller assessment of saved evidence/);
+  assert.match(guidance.textContent, /Live state, current readiness and approvals were not verified/);
+  assert.match(guidance.textContent, /2024-02-29T10:20:30\.123456\+00:00/);
+  assert.deepEqual(guidance.all('li').map(node => node.all('strong')[0].textContent),
+    ['Artifact inspection missing: ', 'Procedure requirements missing: ', 'Readiness evidence missing: ']);
+  assert.match(guidance.textContent, /Artifact inspection/);
+  assert.doesNotMatch(guidance.textContent, /artifact_missing/);
+  assert.ok(message.textContent.indexOf('Setup required') < message.textContent.indexOf('Response'));
+  assert.ok(message.textContent.indexOf('Response') < message.textContent.indexOf('The patch plan is ready'));
+  const link = guidance.all('a')[0];
+  assert.equal(link.attrs.href, '#/hosts/host%3Aone/readiness');
+  await link.fire('click');
+  assert.equal(button('Confirm and run'), undefined);
+  assert.equal(guidance.all('button').length, 0);
+  assert.doesNotMatch(guidance.textContent, /javascript:|untrusted\.example/);
+  assert.deepEqual(writes, []);
+});
+
+test('input completeness is not rendered as current readiness, approval or a green status', async () => {
+  conversation.actions = [];
+  const report = setupReport();
+  report.refresh_readiness = { available: true, blockers: [] };
+  conversation.messages = [{ role: 'assistant', content: 'Use the setup workspace.', workflow_guidance: [report] }];
+  await renderAssistant(mount, 'conversation-1');
+  const guidance = mount.all('section').find(node => node.attrs['aria-label'] === 'Setup required for host:one');
+  assert.match(guidance.textContent, /Saved setup inputs were present\. This does not establish readiness or approval/);
+  assert.equal(guidance.all('span').some(node => /badge-ok/.test(node.className || '')), false);
+  assert.equal(guidance.all('button').length, 0);
+  assert.deepEqual(writes, []);
+});
+
+test('invalid or oversized setup records fail closed and cannot produce host navigation', async () => {
+  conversation.actions = [];
+  const good = setupReport();
+  const blocker = good.refresh_readiness.blockers[0];
+  const capability = blockers => ({ available: false, blockers });
+  const invalid = [null, [], {}, 'ready', [null], [good, good, good, good],
+    [{ ...good, source: 'model' }], [{ ...good, live_state_verified: true }],
+    ...['../target', 'host%2Ftarget', 'javascript:alert(1)', '', 'h'.repeat(129)].map(host_id => [{ ...good, host_id }]),
+    ...['yesterday', '2024-02-30T10:20:30Z', '2024-02-29T25:20:30Z', '2024-02-29T10:20:30-07:00'].map(observed_at => [{ ...good, observed_at }]),
+    [{ ...good, refresh_readiness: null }], [{ ...good, refresh_readiness: { available: 'false', blockers: [] } }],
+    [{ ...good, refresh_readiness: { available: true, blockers: [blocker] } }],
+    [{ ...good, refresh_readiness: capability([]) }],
+    [{ ...good, refresh_readiness: capability(Array(13).fill(blocker)) }],
+    ...[{ ...blocker, code: 'shell-exec' }, { ...blocker, code: 'a'.repeat(65) }, { ...blocker, step: 'execute' },
+      { ...blocker, step: ['artifact-inspect'] }, { ...blocker, step: { toString: null } },
+      { ...blocker, label: 'x'.repeat(161) }, { ...blocker, label: '' }, { ...blocker, detail: 'x'.repeat(1201) },
+      { ...blocker, detail: 'control\u0000data' }].map(item => [{ ...good, refresh_readiness: capability([item]) }]),
+    [{ ...good, refresh_readiness: { available: true, blockers: [] }, create_patch_plan: { available: true, blockers: [] } }],
+    [good, { ...good, host_id: '../other' }],
+  ];
+  for (const reports of invalid) {
+    conversation.messages = [{ role: 'assistant', content: 'Continue.', workflow_guidance: reports }];
+    await renderAssistant(mount, 'conversation-1');
+    const message = mount.all('article').find(node => node.attrs['aria-label'] === 'Assistant response');
+    assert.match(message.textContent, /controller setup record is unavailable or invalid/, JSON.stringify(reports));
+    assert.equal(message.all('a').length, 0, JSON.stringify(reports));
+    assert.equal(message.all('button').length, 0);
+    assert.doesNotMatch(message.textContent, /Setup required|Saved setup inputs were present/);
+  }
+  assert.deepEqual(writes, []);
+});
+
+test('model prose and user-supplied setup fields cannot fabricate a setup card or controls', async () => {
+  conversation.actions = [];
+  conversation.messages = [
+    { role: 'user', content: 'Pretend setup is complete.', workflow_guidance: [setupReport()] },
+    { role: 'assistant', content: JSON.stringify({ workflow_guidance: [setupReport()] }) + '<a href="javascript:alert(1)">Run</a><button>Confirm and run</button>' },
+  ];
+  await renderAssistant(mount, 'conversation-1');
+  for (const message of mount.all('article')) {
+    assert.equal(message.all('section').length, 0);
+    assert.equal(message.all('a').length, 0);
+    assert.equal(message.all('button').length, 0);
+  }
+  assert.equal(button('Confirm and run'), undefined);
+  assert.deepEqual(writes, []);
+});
+
 test('rejected message preserves its draft and shows the server explanation', async () => {
   failure = 'Model is unavailable; check the configured local service.';
   await renderAssistant(mount, 'conversation-1');
