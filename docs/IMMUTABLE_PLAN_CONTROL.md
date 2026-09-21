@@ -159,12 +159,14 @@ A valid result from another attempt cannot resolve the earlier run. Legacy
 launch records missing this binding remain unresolved and require operator
 investigation; this check does not infer a match from the current task status.
 
-Native UI execution captures one host-inventory snapshot before its first live
-task and retains it through all remaining tasks. Per-task preflight and target
-selection use that same snapshot. This prevents a configuration edit during the
-operation from redirecting later tasks; it does not add a click-time approval
-binding to legacy native UI requests. Chat confirmations retain their separate
-admission and worker-start binding checks.
+Native UI execution reviews one plan/task/host snapshot and submits its binding
+for Dispatch, Execute next and Execute remaining. HTTP admission, queued worker
+startup and the first transport-lock admission verify that binding. Per-task
+preflight and target selection retain the reviewed host snapshot through later
+tasks. See [the HTTP contract](WEBAPP_CONTROL_PLANE.md#reviewed-plan-execution).
+This replaces the earlier worker-start-only route snapshot. It does not approve
+a plan or waive separation of duties. Chat confirmations use the same admission
+and worker-start binding checks.
 
 All managed mutation adapters also share a host-local kernel lock, independently
 of their plan and adapter state directories. The mutation child retains that

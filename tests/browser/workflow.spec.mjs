@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures.mjs';
+import { test, expect, actionReviewFixture } from './fixtures.mjs';
 
 const main = page => page.locator('#app');
 
@@ -387,6 +387,7 @@ test('execution dashboard retains unknown outcome, distinguishes heartbeat, and 
     { label: 'Listener health', before: { status: 'verified', value: 'READY' }, after: { status: 'unknown', value: 'unverified text must not appear' } },
   ], rollback: { status: 'unknown', reason: 'Native eligibility has not been verified.' }, gaps: [{ source: 'final validation', reason: 'Pending task' }] };
   fixture.plans.push({ plan_id: 'patch-browser', host_id: 'source', state: 'paused', intent: 'patch_apply', patch_id: '39034528', requester: 'fixture-requester', unresolved_run: run, maintenance_window: { start: '2030-01-01T10:00:00Z', end: '2030-01-01T14:00:00Z' } });
+  fixture.planTasks['patch-browser'] = tasks;
   fixture.custom = async ({ url, method, send }) => {
     if (method === 'GET' && url.pathname === '/api/plans/patch-browser/tasks') { await send({ tasks }); return true; }
     if (method === 'GET' && url.pathname === '/api/plans/patch-browser/execution') { await send(dashboard); return true; }
@@ -415,4 +416,36 @@ test('execution dashboard retains unknown outcome, distinguishes heartbeat, and 
   await download.saveAs(testInfo.outputPath('patch-browser-evidence.json'));
   expect(fixture.writes.map(row => row.path)).toEqual(['/api/plans/patch-browser/execution-observe']);
   await page.screenshot({ path: testInfo.outputPath('execution-dashboard.png'), fullPage: true });
+});
+
+for (const hostView of [false, true]) test(`native ${hostView ? 'host' : 'detail'} execution keeps the reviewed target until a rejected action is reviewed again`, async ({ page, fixture }) => {
+  let generation = 'a'; const reads = [];
+  const plan = { plan_id: 'reviewed-plan', host_id: 'source', state: 'running', nodes: ['fixture-node'],
+    maintenance_window: { start: new Date(Date.now() - 60_000).toISOString(), end: new Date(Date.now() + 3600_000).toISOString() } };
+  fixture.plans.push(plan);
+  fixture.custom = async ({ url, method, send }) => {
+    if (method === 'GET') reads.push(url.pathname);
+    if (method === 'GET' && url.pathname === '/api/plans/reviewed-plan/action-review') {
+      const review = actionReviewFixture(plan, [{ task_id: `reviewed-task-${generation}`, stage: 'validate', node: 'fixture-node', status: 'pending' }], generation.repeat(64));
+      review.confirmation.targets[0].ssh_alias = `reviewed-route-${generation}`;
+      await send(review); return true;
+    }
+    if (method === 'GET' && url.pathname === '/api/plans/reviewed-plan/execution') { await send({ tasks: [], runs: [] }); return true; }
+    if (method === 'POST' && url.pathname === '/api/plans/reviewed-plan/execute-remaining') {
+      await send({ error: 'review_changed', message: 'Reviewed target changed; review again.' }, 409); return true;
+    }
+    return false;
+  };
+  await page.goto(hostView ? '/#/hosts/source/execute' : '/#/plans/reviewed-plan');
+  const view = main(page);
+  await expect(view.getByRole('region', { name: 'Reviewed execution targets' })).toContainText('reviewed-route-a');
+  await expect(view.getByRole('cell', { name: 'reviewed-task-a', exact: true })).toBeVisible();
+  generation = 'b';
+  await view.getByRole('button', { name: hostView ? 'Execute remaining' : 'Execute remaining tasks', exact: true }).click();
+  await expect(view.getByRole('region', { name: 'Reviewed execution targets' })).toContainText('reviewed-route-b');
+  await expect(view.getByText('Reviewed target changed; review again.', { exact: true })).toBeVisible();
+  expect(fixture.writes).toEqual([{ path: '/api/plans/reviewed-plan/execute-remaining', method: 'POST',
+    body: { actor: 'fixture-operator', expected_action_binding_sha256: 'a'.repeat(64) } }]);
+  expect(reads.filter(path => path.endsWith('/action-review'))).toHaveLength(2);
+  expect(reads.filter(path => path.endsWith('/tasks'))).toEqual([]);
 });

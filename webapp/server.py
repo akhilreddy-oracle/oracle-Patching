@@ -58,12 +58,10 @@ def load_hosts() -> dict[str, dict]:
     return host_config.load(HOSTS_FILE)
 
 
-def _confirmed_plan_hosts(tool: str, plan_id: str, expected: str | None) -> dict | None:
+def _confirmed_plan_hosts(tool: str, plan_id: str, expected: str | None) -> dict:
     """Verify the original proposal again at admission and worker startup."""
-    if expected is None:
-        return None
     if not isinstance(expected, str) or re.fullmatch(r"[a-f0-9]{64}", expected) is None:
-        raise planctl.PlanError("Plan action confirmation is invalid; review a new proposal")
+        raise planctl.PlanError("Plan action confirmation is missing or invalid; reload the plan and review its targets before executing")
     hosts = load_hosts()
     current = assistant.capabilities.binding(tool, {"plan_id": plan_id}, hosts)
     if current != expected:
@@ -668,6 +666,20 @@ No socket, HTTP parser or listener is constructed by this class.
                 self._send_json(400, exc.to_json())
             return
 
+        if path.startswith("/api/plans/") and path.endswith("/action-review"):
+            plan_id = path[len("/api/plans/"):-len("/action-review")]
+            try:
+                review = assistant.capabilities.plan_action_review(plan_id, load_hosts())
+                plan = review["plan"]
+                # Presentation-only fields are added after the exact native
+                # state has been bound, just as on the ordinary status route.
+                review["plan"] = {**plan, "sod": planctl.sod_summary(plan_id, plan),
+                                  "viability": planctl.viability(plan_id, plan)}
+                self._send_json(200, review)
+            except (planctl.PlanError, assistant.capabilities.ToolError) as exc:
+                self._send_json(400, {"error": "review_unavailable", "message": str(exc)})
+            return
+
         if path.startswith("/api/plans/"):
             plan_id = path[len("/api/plans/"):]
             try:
@@ -1099,10 +1111,19 @@ No socket, HTTP parser or listener is constructed by this class.
                 return
             if not self._require_role(actor, "execute"):
                 return
+            expected_binding = body.get("expected_action_binding_sha256")
+            try:
+                _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)
+            except (planctl.PlanError, assistant.capabilities.ToolError) as exc:
+                self._send_json(409, {"error": "confirmation_changed", "message": str(exc)})
+                return
 
-            def run(_record, plan_id=plan_id, actor=actor):
+            def run(_record, plan_id=plan_id, actor=actor, expected_binding=expected_binding):
                 try:
-                    result = planctl.execute_next_task(plan_id, actor)
+                    hosts = _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)
+                    with planctl.pinned_hosts(hosts), planctl.confirmed_action(plan_id,
+                            lambda: _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)):
+                        result = planctl.execute_next_task(plan_id, actor)
                 except Exception:
                     notifications.emit("plan.execute.failed", {"plan_id": plan_id, "actor": actor})
                     raise
@@ -1137,7 +1158,8 @@ No socket, HTTP parser or listener is constructed by this class.
             def run(_record, plan_id=plan_id, actor=actor, max_tasks=max_tasks, expected_binding=expected_binding):
                 try:
                     hosts = _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)
-                    with planctl.pinned_hosts(hosts):
+                    with planctl.pinned_hosts(hosts), planctl.confirmed_action(plan_id,
+                            lambda: _confirmed_plan_hosts("execute_plan", plan_id, expected_binding)):
                         result = planctl.execute_remaining_tasks(plan_id, actor, max_tasks=max_tasks)
                 except Exception:
                     notifications.emit("plan.execute.failed", {"plan_id": plan_id, "actor": actor})
@@ -1389,7 +1411,8 @@ No socket, HTTP parser or listener is constructed by this class.
 
                 def run(_record, plan_id=plan_id, actor=actor, expected_binding=expected_binding):
                     hosts = _confirmed_plan_hosts("dispatch_plan", plan_id, expected_binding)
-                    with planctl.pinned_hosts(hosts):
+                    with planctl.pinned_hosts(hosts), planctl.confirmed_action(plan_id,
+                            lambda: _confirmed_plan_hosts("dispatch_plan", plan_id, expected_binding)):
                         return planctl.dispatch(plan_id, actor)
 
             elif action == "create-rollback":

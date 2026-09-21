@@ -55,6 +55,28 @@ For a local development session without configured principals, the existing
 are editable in that mode and are not authenticated identities. Startup no longer
 prints the credential. JSON request bodies must be objects of at most 1 MiB.
 
+## Reviewed plan execution
+
+Before Dispatch, Execute next or Execute remaining, read
+`GET /api/plans/{plan_id}/action-review`. This returns the exact `plan`, `tasks`
+and noncredential target routes used for its `confirmation`. Both browser
+execution views render that snapshot. Submit its
+`confirmation.expected_action_binding_sha256` as the POST field
+`expected_action_binding_sha256` on `/dispatch`, `/execute-next` or
+`/execute-remaining`. Existing actor, role, CSRF, approval and window rules still
+apply; a review digest is not execution authority.
+
+These three HTTP commands reject missing, malformed or stale confirmations with
+409 before launching a run. Recheck the displayed plan and targets after a
+rejection; do not silently obtain a new digest and repeat the old click. The
+worker rechecks the reviewed binding when it starts and under its first native
+transport admission lock. Accepted work retains the reviewed host snapshot
+through subsequent tasks. Chat uses the same binding contract.
+
+This is an intentional API compatibility change: older clients submitting only
+an actor must obtain and present a review. Read-only status, tasks and reports
+retain their existing routes. The review endpoint performs no managed-host SSH.
+
 ## Interrupted runs
 
 The controller fsyncs a run's ownership before starting its worker. A filesystem
@@ -75,6 +97,15 @@ automatically launch the remaining tasks; explicitly resume the plan afterward.
 Each launch has a unique remote log directory. Previous launch logs and executor
 attempt evidence are retained on retries. Do not delete those directories to
 force a retry.
+
+New detached launches record a digest of the complete effective configured host
+mapping, including privilege settings, before the first launch SSH call.
+Reconciliation, execution observation and lock recovery verify this mapping
+before contacting the host. Configuration drift or a missing legacy digest
+blocks those remote operations. Saved logs remain readable; missing historical
+authority is never reconstructed from current configuration. This digest covers
+the application's host inventory, not external OpenSSH alias files or host-key
+trust configuration, which remain deployment responsibilities.
 
 For interrupted work that never registered a detached executor, first verify the
 old controller has exited and no child operation remains active. An operator may

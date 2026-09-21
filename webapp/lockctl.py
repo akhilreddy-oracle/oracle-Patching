@@ -42,9 +42,7 @@ def _scope(plan_id, actor, run_id=None, *, record=None, allow_closed=False):
     task_id = context.get("task_id")
     _require(context.get("plan_id") == plan_id and context.get("detached_execution") is True
              and isinstance(task_id, str) and _IDENTIFIER.fullmatch(task_id), "invalid persisted execution context")
-    host = planctl._resolve_node_host(str(context.get("node") or ""))
-    _require(all(host.get(field) == context.get(field) for field in ("ssh_alias", "remote_root"))
-             and host.get("id") == context.get("host_id"), "host configuration changed since the rejected launch")
+    host = planctl.resolve_bound_execution_host(context)
     path = context.get("remote_run_dir") or ""
     prefix = planctl._remote_run_dir(host, plan_id, task_id) + "/"
     _require(isinstance(path, str) and path.startswith(prefix)
@@ -198,9 +196,9 @@ def _maintenance_outcome(record):
              and context.get("original_task_id") == scope["task_id"]
              and context.get("original_remote_run_id") == scope["run_id"]
              and context.get("original_plan_sha256") == scope["plan_sha256"], "maintenance scope differs from original execution")
-    host = scope["host"]
-    _require(all(context.get(key) == host.get(key) for key in ("ssh_alias", "remote_root"))
-             and context.get("host_id") == host.get("id"), "maintenance host changed")
+    host = planctl.resolve_bound_execution_host(context)
+    _require(planctl.execution_host_binding(host) == planctl.execution_host_binding(scope["host"]),
+             "maintenance host differs from the rejected launch")
     task = "lock-recover-" + scope["task_id"]
     prefix = planctl._remote_run_dir(host, scope["plan_id"], task) + "/"
     path = context.get("remote_run_dir") or ""

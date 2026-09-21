@@ -30,6 +30,7 @@ class ExecutionTests(unittest.TestCase):
         self.record.context = {'detached_execution': True, 'plan_id': 'p', 'task_id': '004-datapatch-local',
                                'node': 'source', 'host_id': 'source', 'ssh_alias': 'source', 'remote_root': '/opt/opu',
                                'remote_run_dir': '/opt/opu/var/webapp-runs/p/004-datapatch-local/' + 'b' * 32,
+                               'execution_host_configuration_sha256': planctl.execution_host_binding(self.host),
                                'task_definition_sha256': 'c' * 64, 'task_retry_count': 0}
         self.task = {'task_id': '004-datapatch-local', 'stage': 'datapatch', 'adapter': 'database_single_instance_opatch',
                      'task_definition_sha256': 'c' * 64, 'retry_count': 0, 'status': 'pending'}
@@ -72,6 +73,32 @@ class ExecutionTests(unittest.TestCase):
         console.observe('p', self.record.run_id)
         self.assertEqual(self.ssh.call_args.args[1][-3:], ['', '', ''])
 
+    def test_observation_rejects_missing_or_invalid_launch_host_binding(self):
+        for value in (None, '', 'not-a-digest'):
+            with self.subTest(value=value), patch.dict(self.record.context, {'execution_host_configuration_sha256': value}):
+                with self.assertRaises(planctl.PlanError):
+                    console.observe('p', self.record.run_id)
+        self.ssh.assert_not_called()
+        self.assertIsNone(self.record.observation)
+
+    def test_observation_rejects_privilege_and_full_host_mapping_drift(self):
+        for changes in ({'sudo': False}, {'label': 'Reconfigured host'},
+                        {'nodes': [{'name': 'source', 'ssh_alias': 'another-route'}]}):
+            with self.subTest(changes=changes), patch.dict(self.host, changes):
+                with self.assertRaises(planctl.PlanError):
+                    console.observe('p', self.record.run_id)
+        self.ssh.assert_not_called()
+        self.assertIsNone(self.record.observation)
+
+    def test_binding_change_during_observation_does_not_attach_previous_host_logs(self):
+        def advanced(*args, **kwargs):
+            self.record.context['execution_host_configuration_sha256'] = 'e' * 64
+            return SimpleNamespace(returncode=0, stdout=json.dumps(self.payload), stderr='')
+        self.ssh.side_effect = advanced
+        with self.assertRaises(planctl.PlanError):
+            console.observe('p', self.record.run_id)
+        self.assertIsNone(self.record.observation)
+
     def test_advanced_context_does_not_attach_old_observation(self):
         def advanced(*args, **kwargs):
             self.record.context['remote_run_dir'] += 'f'
@@ -104,6 +131,20 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(value['state'], 'paused'); self.assertIn('reconcile', value['guidance'])
         self.assertEqual(value['tasks'][0]['status'], 'unknown')
         self.assertNotIn('result', value['runs'][0]); self.ssh.assert_not_called()
+
+    def test_unbound_legacy_snapshot_preserves_saved_logs_and_reconciliation_guidance(self):
+        self.record.observation = {'logs': {'stdout.log': {'text': 'Saved original launch output'}}}
+        for binding in (None, 'invalid'):
+            with self.subTest(binding=binding), patch.dict(self.record.context, {'execution_host_configuration_sha256': binding}), \
+                    patch.object(console, 'tasks', return_value=[]):
+                value = console.snapshot('p')
+            run = value['runs'][0]
+            self.assertFalse(run['can_observe'])
+            self.assertIn('no verified host configuration binding', run['observe_blocked_reason'])
+            self.assertEqual(run['observation'], self.record.observation)
+            self.assertEqual(run['status'], 'unknown')
+            self.assertIn('reconcile', value['guidance'])
+        self.ssh.assert_not_called()
 
 
 class RemoteScriptTests(unittest.TestCase):

@@ -306,6 +306,37 @@ test('replaced execution panel cannot start native log following while its page 
   controller.abort();
 });
 
+test('unbound legacy execution keeps saved logs and recovery guidance without offering a fresh observation', async () => {
+  const controller = new AbortController(); api.setReadSignal(controller.signal);
+  const posts = [];
+  const data = { guidance: 'Inspect and reconcile the existing execution before starting another task.', runs: [
+    { run_id: 'older-bound-run', status: 'succeeded', can_observe: true,
+      observation: { logs: { 'stdout.log': { text: 'Older completed execution output' } } } },
+    { run_id: 'legacy-run', status: 'running', can_observe: false,
+      observe_blocked_reason: 'This launch has no verified host configuration binding. Only saved logs are available.',
+      observation: { logs: { 'stdout.log': { text: 'Saved original launch output' } } } },
+  ] };
+  fetch = async (url, options = {}) => {
+    if (options.method === 'POST') { posts.push(url); return response({ run_id: 'unexpected-observe' }); }
+    assert.equal(url, '/api/plans/P1/execution'); return response(data);
+  };
+  const page = mount(); const panel = executionConsole('P1'); page.appendChild(panel);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(panel.textContent, /no verified host configuration binding/);
+  assert.match(panel.textContent, /Saved original launch output/);
+  assert.match(panel.textContent, /Inspect and reconcile/);
+  assert.doesNotMatch(panel.textContent, /Older completed execution output/);
+  const observe = button(panel, 'Refresh native logs');
+  assert.equal(observe.disabled, true); await observe.fire('click');
+  const follow = panel.querySelector('input');
+  assert.equal(follow.disabled, true);
+  follow.checked = true; await follow.fire('change');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(follow.checked, false);
+  assert.deepEqual(posts, []);
+  controller.abort();
+});
+
 test('obsolete estate discovery completion cannot clear the new active host or launch new reads', async () => {
   actor.setSessionIdentity({ mode: 'lab', permissions: { live_discovery: true } });
   const controller = new AbortController(); api.setReadSignal(controller.signal);
@@ -805,6 +836,67 @@ test('an artifact change while editing cannot silently rebind a saved procedure 
 });
 
 const openWindow = () => ({ start: new Date(Date.now() - 60000).toISOString(), end: new Date(Date.now() + 3600000).toISOString() });
+const actionReview = (plan, tasks = [], digest = 'a'.repeat(64)) => ({ plan, tasks, confirmation: {
+  source: 'controller', plan_id: plan.plan_id, expected_action_binding_sha256: digest,
+  targets: (plan.nodes || []).map(node => ({ node, host_id: 'prod', ssh_alias: 'reviewed-ssh', remote_root: '/reviewed/tools', sudo: true, available: true })),
+} });
+
+test('detail and host execution submit exactly the displayed review for all native launch actions', async () => {
+  for (const hostView of [false, true]) for (const action of ['dispatch', 'execute-next', 'execute-remaining']) {
+    let generation = 'a'; const calls = [], writes = [];
+    const plan = { plan_id: 'review-plan', host_id: 'prod', nodes: ['node-one'], state: action === 'dispatch' ? 'execution_authorized' : 'running', maintenance_window: openWindow() };
+    const reviewed = () => {
+      const value = actionReview(plan, [{ task_id: `task-${generation}`, stage: 'validate', node: 'node-one', status: 'pending' }], generation.repeat(64));
+      value.confirmation.targets[0].ssh_alias = `route-${generation}`;
+      return value;
+    };
+    fetch = async (url, options) => {
+      calls.push(url);
+      if (options.method === 'POST') { writes.push({ url, body: JSON.parse(options.body) }); return response({ error: 'review_changed', message: 'Reviewed target changed; review again.' }, 409); }
+      if (url === '/api/plans') return response({ plans: [plan] });
+      if (url.endsWith('/action-review')) return response(reviewed());
+      if (url.endsWith('/execution')) return response({ tasks: [], runs: [] });
+      throw new Error(`Unexpected independent read: ${url}`);
+    };
+    const page = mount();
+    if (hostView) await renderExecuteStage(page, 'prod'); else await renderPlanDetail(page, plan.plan_id);
+    assert.match(page.textContent, /route-a/);
+    if (action !== 'dispatch' || hostView) assert.match(page.querySelector('tbody').textContent, /task-a/);
+    generation = 'b';
+    const label = action === 'dispatch' ? 'Dispatch' : action === 'execute-next' ? hostView ? 'Execute next' : 'Execute next task' : hostView ? 'Execute remaining' : 'Execute remaining tasks';
+    await button(page, label).fire('click');
+    assert.deepEqual(writes, [{ url: `/api/plans/review-plan/${action}`, body: { actor: 'fixture-operator', expected_action_binding_sha256: 'a'.repeat(64) } }]);
+    assert.equal(calls.filter(url => url.endsWith('/action-review')).length, 2, 'Only rendering and rejection refresh read a review');
+    assert.equal(calls.some(url => url.endsWith('/tasks')), false, 'Displayed tasks must come from the bound review');
+    assert.match(page.textContent, /Reviewed target changed/);
+    assert.match(page.textContent, /route-b/);
+    page.remove(); actor.setActor('fixture-operator');
+  }
+});
+
+test('missing or malformed native action reviews cannot dispatch or execute even through synthetic clicks', async () => {
+  for (const hostView of [false, true]) for (const state of ['execution_authorized', 'running']) for (const corrupt of [
+    value => { value.confirmation = null; },
+    value => { value.confirmation.source = 'model'; },
+    value => { value.confirmation.plan_id = 'another-plan'; },
+    value => { value.confirmation.expected_action_binding_sha256 = 'bad'; },
+    value => { value.confirmation.targets[0].node = 'unreviewed-node'; },
+  ]) {
+    const plan = { plan_id: 'review-plan', host_id: 'prod', nodes: ['node-one'], state, maintenance_window: openWindow() };
+    const review = actionReview(plan); corrupt(review); const writes = [];
+    fetch = async (url, options) => {
+      if (options.method === 'POST') writes.push(url);
+      return response(url === '/api/plans' ? { plans: [plan] } : url.endsWith('/action-review') ? review : { tasks: [], runs: [] });
+    };
+    const page = mount();
+    if (hostView) await renderExecuteStage(page, 'prod'); else await renderPlanDetail(page, plan.plan_id);
+    assert.match(page.textContent, /Execution review is unavailable or incomplete/);
+    const labels = state === 'execution_authorized' ? ['Dispatch'] : hostView ? ['Execute next', 'Execute remaining'] : ['Execute next task', 'Execute remaining tasks'];
+    for (const label of labels) { const control = button(page, label); assert.equal(control.disabled, true); await control.fire('click'); }
+    assert.deepEqual(writes, []);
+    page.remove(); actor.setActor('fixture-operator');
+  }
+});
 
 test('execution window rejects missing, impossible and closed bounds and preserves the native 30 second limit', () => {
   const now = Date.parse('2030-01-01T12:00:00Z');
@@ -824,6 +916,7 @@ test('paused plans with expired or absent windows preserve completed tasks and c
     fetch = async (url, options) => {
       if (options.method === 'POST') { writes.push(url); throw new Error('Unexpected retry'); }
       if (url === '/api/plans') return response({ plans: [plan] });
+      if (url.endsWith('/action-review')) return response(actionReview(plan, [{ task_id: '002-apply', stage: 'apply', status: 'succeeded' }, { task_id: '005-final', stage: 'final_validate', status: 'failed' }]));
       if (url.endsWith('/tasks')) return response({ tasks: [{ task_id: '002-apply', stage: 'apply', status: 'succeeded' }, { task_id: '005-final', stage: 'final_validate', status: 'failed' }] });
       return response(plan);
     };
@@ -844,7 +937,7 @@ test('execution controls recheck window expiry after the page has rendered', asy
   const writes = [];
   fetch = async (url, options) => {
     if (options.method === 'POST') { writes.push(url); throw new Error('Unexpected execution'); }
-    return response(url.endsWith('/tasks') ? { tasks: [] } : plan);
+    return response(url.endsWith('/action-review') ? actionReview(plan) : url.endsWith('/tasks') ? { tasks: [] } : plan);
   };
   const page = mount(); await renderPlanDetail(page, plan.plan_id);
   assert.equal(button(page, 'Execute next task').disabled, false);
@@ -873,6 +966,7 @@ test('Execute preserves a failed operation while refreshing task and plan status
     if (options.method === 'POST') { state = 'paused'; return response({ run_id: 'failure-run' }); }
     if (url.startsWith('/api/runs/')) return response({ status: 'failed', error: { message: 'Native prerequisite failed', stderr: 'OPatch conflict' } });
     if (url === '/api/plans') return response({ plans: [{ plan_id: 'CHG-42', host_id: 'prod', state }] });
+    if (url.endsWith('/action-review')) return response(actionReview({ plan_id: 'CHG-42', state, maintenance_window: openWindow() }));
     if (url.endsWith('/tasks')) return response({ tasks: [] });
     return response({ plan_id: 'CHG-42', state, maintenance_window: openWindow() });
   };
@@ -894,6 +988,7 @@ test('unknown run preserves native diagnostics and offers only reconciliation un
       return response(terminal ? { status: 'succeeded' } : unknown);
     }
     if (url.endsWith('/tasks')) return response({ tasks: [{ task_id: '003-validate', stage: 'validate', status: 'pending' }] });
+    if (url.endsWith('/action-review')) return response(actionReview({ plan_id: 'P1', state: 'running', maintenance_window: openWindow(), unresolved_run: terminal ? null : unknown }, [{ task_id: '003-validate', stage: 'validate', status: 'pending' }]));
     return response({ plan_id: 'P1', state: 'running', maintenance_window: openWindow(), unresolved_run: terminal ? null : unknown });
   };
   const page = mount(); await renderPlanDetail(page, 'P1');
@@ -920,6 +1015,7 @@ test('an unknown poll retains run identity and the host Execute page offers reco
   fetch = async (url, options) => {
     if (options.method === 'POST') { writes.push(url); return response(unknown); }
     if (url === '/api/plans') return response({ plans: [{ plan_id: 'P1', state: 'running', host_id: 'prod' }] });
+    if (url.endsWith('/action-review')) return response(actionReview({ plan_id: 'P1', state: 'running', unresolved_run: unknown }));
     if (url.endsWith('/tasks')) return response({ tasks: [] });
     return response({ plan_id: 'P1', state: 'running', unresolved_run: unknown });
   };

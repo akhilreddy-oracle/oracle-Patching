@@ -107,7 +107,8 @@ class PlanTransportTests(unittest.TestCase):
         context = {"plan_id": "plan", "task_id": "task", "node": "node", "host_id": "node",
             "ssh_alias": "never-connect", "remote_root": "/fixture",
             "remote_run_dir": "/fixture/var/webapp-runs/plan/task/" + "a" * 32,
-            "task_definition_sha256": "b" * 64, "task_retry_count": 1}
+            "task_definition_sha256": "b" * 64, "task_retry_count": 1,
+            "execution_host_configuration_sha256": planctl.execution_host_binding(host)}
         terminal = {"plan_id": "plan", "task_id": "task", "status": "succeeded",
                     "task_definition_sha256": "b" * 64, "retry_count": 1}
         for difference in ({}, {"retry_count": 2}, {"retry_count": True}, {"task_definition_sha256": "c" * 64},
@@ -139,6 +140,49 @@ class PlanTransportTests(unittest.TestCase):
                 result = planctl.reconcile_detached_run({"context": legacy})
                 self.assertEqual(result["status"], "unknown")
                 self.assertIn("no verified task-attempt binding", result["error"]["message"])
+
+    def test_reconciliation_rejects_changed_effective_host_before_any_remote_access(self):
+        host = {"id": "node", "node_name": "node", "ssh_alias": "never-connect", "remote_root": "/fixture",
+                "sudo": False, "nodes": [{"name": "node", "ssh_alias": "never-connect"}]}
+        context = {"plan_id": "plan", "task_id": "task", "node": "node", "host_id": "node",
+                   "ssh_alias": "never-connect", "remote_root": "/fixture",
+                   "remote_run_dir": "/fixture/var/webapp-runs/plan/task/" + "a" * 32,
+                   "execution_host_configuration_sha256": planctl.execution_host_binding(host)}
+        for difference in ({"sudo": True}, {"ssh_alias": "changed"}, {"remote_root": "/other"},
+                           {"id": "other"}, {"node_name": "other"}, {"future_transport_option": "changed"},
+                           {"nodes": [{"name": "node", "ssh_alias": "changed"}]}):
+            with self.subTest(difference=difference), \
+                 patch.object(planctl, "_resolve_node_host", return_value={**host, **difference}), \
+                 patch.object(planctl.remote, "run_remote_shell") as shell, \
+                 patch.object(planctl.remote, "run_remote_raw") as raw, \
+                 patch.object(planctl, "_sync_plan_from_host") as sync:
+                result = planctl.reconcile_detached_run({"context": context})
+                self.assertEqual(result["status"], "unknown")
+                self.assertIn("host configuration changed", result["error"]["message"])
+                shell.assert_not_called()
+                raw.assert_not_called()
+                sync.assert_not_called()
+
+    def test_legacy_or_invalid_host_binding_is_never_inferred_from_current_hosts(self):
+        base = {"plan_id": "plan", "task_id": "task", "node": "node", "host_id": "node",
+                "ssh_alias": "never-connect", "remote_root": "/fixture"}
+        for binding in (None, "", "not-a-digest", True, 42, "a" * 63):
+            context = dict(base)
+            if binding is not None:
+                context["execution_host_configuration_sha256"] = binding
+            with self.subTest(binding=binding), \
+                 patch.object(planctl, "_resolve_node_host") as resolve, \
+                 patch.object(planctl.remote, "run_remote_shell") as shell:
+                result = planctl.reconcile_detached_run({"context": context})
+                self.assertEqual(result["status"], "unknown")
+                self.assertIn("no verified execution-host configuration binding", result["error"]["message"])
+                resolve.assert_not_called()
+                shell.assert_not_called()
+
+    def test_effective_host_defaults_and_mapping_order_do_not_change_binding(self):
+        host = {"id": "node", "ssh_alias": "never-connect", "remote_root": "/fixture"}
+        with_defaults = {"sudo": False, "node_name": "node", **dict(reversed(list(host.items())))}
+        self.assertEqual(planctl.execution_host_binding(host), planctl.execution_host_binding(with_defaults))
 
     def test_live_completion_cannot_mark_another_valid_retry_terminal(self):
         task = {"task_id": "task", "adapter": "database_single_instance_opatch",
@@ -174,7 +218,14 @@ class PlanTransportTests(unittest.TestCase):
 
     def test_successful_fixture_launch_uses_private_run_directory_and_returns_result(self):
         self.host["sudo"] = False
+        expected = hashlib.sha256(json.dumps({**self.host, "node_name": self.host["id"]},
+                                  sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
         def local_shell(alias, script, **kwargs):
+            # The binding must survive a disconnect at the very first SSH call.
+            context = planctl.pipeline_runner.set_execution_context.call_args.kwargs
+            self.assertEqual(context["execution_host_configuration_sha256"], expected)
+            self.assertEqual(context["ssh_alias"], alias)
+            self.assertEqual(kwargs["sudo"], False)
             return subprocess.run(["bash", "-c", script], cwd=self.root, capture_output=True, text=True, timeout=5)
         with patch.object(planctl.remote, "run_remote_shell", side_effect=local_shell), \
              patch.object(planctl.remote, "pull_file", side_effect=lambda alias, name, **kw: Path(name).read_bytes()), \

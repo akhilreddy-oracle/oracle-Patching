@@ -6,6 +6,7 @@ import { executionConsole } from "../execution_console.js";
 import { evidenceReport } from "../report_view.js";
 import { executionWindow } from "../plan_window.js";
 import { extjobInspection } from "../extjob_inspection.js";
+import { actionReviewBinding, actionReviewPanel } from "../plan_action_review.js";
 import { getActor } from "../actor.js";
 import { planBelongsToHost, newestFirst } from "../host_scope.js";
 import {
@@ -62,8 +63,11 @@ export async function renderExecuteStage(mount, hostId, failure = null) {
 
 async function planExecutePanel(planId, reload, unresolved = false) {
   const panel = el("section", { class: "panel" });
-  const res = await apiFetch(`/api/plans/${encodeURIComponent(planId)}`);
-  const plan = await res.json();
+  const res = await apiFetch(`/api/plans/${encodeURIComponent(planId)}/action-review`);
+  const review = await res.json();
+  const plan = review.plan;
+  if (!plan || plan.plan_id !== planId || !Array.isArray(review.tasks)) throw new Error("The controller did not return a matching plan and task review. Reload the plan.");
+  const binding = actionReviewBinding(review, planId);
   if (!res.ok) {
     panel.appendChild(helperText(plan.message || "Failed to load plan", "error"));
     return panel;
@@ -88,8 +92,13 @@ async function planExecutePanel(planId, reload, unresolved = false) {
   const errBox = formErrorBox();
   const logBox = el("pre", { class: "run-log", style: "display:none" });
   panel.appendChild(errBox);
+  panel.appendChild(actionReviewPanel(review, planId));
+  const requireReview = () => {
+    if (!binding) showFormError(errBox, "Reload this plan to review its current tasks and targets before dispatching or executing.");
+    return Boolean(binding);
+  };
 
-  const tasks = await loadTasks(planId);
+  const tasks = review.tasks;
   const window = executionWindow(plan);
   if (["execution_authorized", "running", "paused"].includes(plan.state) && !window.open) {
     panel.appendChild(helperText(window.detail, "warn"));
@@ -99,16 +108,16 @@ async function planExecutePanel(planId, reload, unresolved = false) {
     const actor = el("input", { type: "text", value: getActor() });
     bindActorField(actor);
     const btn = el("button", { type: "button", text: "Dispatch" });
-    btn.disabled = !window.open || unresolved;
+    btn.disabled = !window.open || unresolved || !binding;
     btn.addEventListener("click", async () => {
       clearFormError(errBox);
-      if (unresolved) return;
+      if (unresolved || !requireReview()) return;
       const currentWindow = executionWindow(plan);
       if (!currentWindow.open) { showFormError(errBox, currentWindow.detail); return; }
       if (!requireToken(errBox)) return;
       const who = requireActor(actor, errBox);
       if (!who) return;
-      await runAction(logBox, btn, `/api/plans/${encodeURIComponent(planId)}/dispatch`, { actor: who }, reload, errBox);
+      await runAction(logBox, btn, `/api/plans/${encodeURIComponent(planId)}/dispatch`, { actor: who, expected_action_binding_sha256: binding }, reload, errBox);
     });
     panel.appendChild(el("div", { class: "pipeline-controls" }, [field("Actor", actor), btn]));
   } else if (plan.state === "running") {
@@ -116,20 +125,20 @@ async function planExecutePanel(planId, reload, unresolved = false) {
     bindActorField(actor);
     const btn = el("button", { type: "button", text: "Execute next" });
     const btnAll = el("button", { type: "button", text: "Execute remaining" });
-    btn.disabled = unresolved || !window.open;
-    btnAll.disabled = unresolved || !window.open;
+    btn.disabled = unresolved || !window.open || !binding;
+    btnAll.disabled = unresolved || !window.open || !binding;
     btn.addEventListener("click", async () => {
-      if (unresolved) return;
+      if (unresolved || !requireReview()) return;
       clearFormError(errBox);
       const currentWindow = executionWindow(plan);
       if (!currentWindow.open) { showFormError(errBox, currentWindow.detail); return; }
       if (!requireToken(errBox)) return;
       const who = requireActor(actor, errBox);
       if (!who) return;
-      await runAction(logBox, btn, `/api/plans/${encodeURIComponent(planId)}/execute-next`, { actor: who }, reload, errBox);
+      await runAction(logBox, btn, `/api/plans/${encodeURIComponent(planId)}/execute-next`, { actor: who, expected_action_binding_sha256: binding }, reload, errBox);
     });
     btnAll.addEventListener("click", async () => {
-      if (unresolved) return;
+      if (unresolved || !requireReview()) return;
       clearFormError(errBox);
       const currentWindow = executionWindow(plan);
       if (!currentWindow.open) { showFormError(errBox, currentWindow.detail); return; }
@@ -140,7 +149,7 @@ async function planExecutePanel(planId, reload, unresolved = false) {
         logBox,
         btnAll,
         `/api/plans/${encodeURIComponent(planId)}/execute-remaining`,
-        { actor: who },
+        { actor: who, expected_action_binding_sha256: binding },
         reload,
         errBox
       );
@@ -189,12 +198,6 @@ async function planExecutePanel(planId, reload, unresolved = false) {
   panel.appendChild(executionConsole(planId));
   panel.appendChild(evidenceReport(planId));
   return panel;
-}
-
-async function loadTasks(planId) {
-  const res = await apiFetch(`/api/plans/${encodeURIComponent(planId)}/tasks`);
-  const data = await res.json();
-  return data.tasks || [];
 }
 
 function renderTaskTable(tasks) {

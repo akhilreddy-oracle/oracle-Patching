@@ -140,6 +140,9 @@ test('actual HTTP patch: create, independent approval, five native fixture stage
     '/api/plans/testmode-demo', '/api/plans/browser-patch/approve', '/api/plans/browser-patch/authorize',
     '/api/plans/browser-patch/dispatch', '/api/plans/browser-patch/execute-remaining',
   ]);
+  for (const row of audit.writes.filter(row => /\/(dispatch|execute-remaining)$/.test(row.path))) {
+    expect(row.body.expected_action_binding_sha256).toMatch(/^[a-f0-9]{64}$/);
+  }
   await testInfo.attach('verified-fixture-report', { path: reportPath, contentType: 'application/json' });
   await page.screenshot({ path: testInfo.outputPath('real-backend-patch-report.png'), fullPage: true });
 });

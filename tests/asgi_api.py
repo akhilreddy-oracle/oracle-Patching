@@ -103,6 +103,15 @@ class AsgiApiTests(unittest.IsolatedAsyncioTestCase):
         self.principals.write_text(json.dumps({"principals": self.entries}))
         self.principals.chmod(0o600)
 
+    def execution_review_body(self):
+        # Native status/task reads are fixtures; the confirmation contract and
+        # authenticated ASGI admission remain real in transport-positive cases.
+        self.enterContext(patch.object(server.planctl, 'status', return_value={
+            'plan_id': 'plan-a', 'state': 'running', 'host_id': 'source', 'nodes': ['source']}))
+        self.enterContext(patch.object(server.planctl, 'list_tasks', return_value=[]))
+        return {'expected_action_binding_sha256': assistant.capabilities.binding(
+            'execute_plan', {'plan_id': 'plan-a'}, {'source': self.host})}
+
     async def request(self, path, *, actor="operator", method="GET", body=None, headers=None):
         fields = {} if actor is None else {"Authorization": "Bearer " + actor + "-token"}
         fields.update(headers or {})
@@ -222,7 +231,7 @@ class AsgiApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.request(EXECUTE, method="POST", body={"actor": "admin"})).status_code, 403)
             self.assertEqual((await self.request("/api/plans/p/approve", method="POST", body={"approval_ticket": "CHG-42"})).status_code, 403)
             start.assert_not_called()
-            reply = await self.request(EXECUTE, method="POST")
+            reply = await self.request(EXECUTE, method="POST", body=self.execution_review_body())
             self.assertEqual((reply.status_code, reply.json()), (202, {"run_id": "fixture-run"}))
             self.assertEqual(start.call_args.args[:2], ("plan", "plan:plan-a:execute"))
             self.assertEqual((await self.request("/api/plans/p/approve", actor="approver", method="POST", body={"approval_ticket": "CHG-42"})).status_code, 202)
@@ -334,7 +343,9 @@ class AsgiApiTests(unittest.IsolatedAsyncioTestCase):
                     result = await self.raw_request(chunks=[content])
                     self.assertEqual(result.status, 400, result.raw)
             start.assert_not_called()
-            exact = b'{"padding":"' + b"x" * (LIMIT - len(b'{"padding":""}')) + b'"}'
+            payload = {**self.execution_review_body(), 'padding': ''}
+            payload['padding'] = 'x' * (LIMIT - len(json.dumps(payload, separators=(',', ':')).encode()))
+            exact = json.dumps(payload, separators=(',', ':')).encode()
             self.assertEqual(len(exact), LIMIT)
             accepted = await self.raw_request(chunks=[exact[:100], exact[100:]])
             self.assertEqual(accepted.status, 202, accepted.raw)
@@ -486,7 +497,8 @@ class AsgiApiTests(unittest.IsolatedAsyncioTestCase):
             for invalid in ({"Cookie": cookie}, {**headers, "X-CSRF-Token": "wrong"}, {**headers, "Origin": "https://other.example"}):
                 self.assertEqual((await self.request(EXECUTE, actor=None, method="POST", headers=invalid)).status_code, 403)
             start.assert_not_called()
-            self.assertEqual((await self.request(EXECUTE, actor=None, method="POST", headers=headers)).status_code, 202)
+            self.assertEqual((await self.request(EXECUTE, actor=None, method="POST", headers=headers,
+                                                body=self.execution_review_body())).status_code, 202)
             start.assert_called_once()
 
     async def test_company_delayed_body_rechecks_role_and_logout(self):

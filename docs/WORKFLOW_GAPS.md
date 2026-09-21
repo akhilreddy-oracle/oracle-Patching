@@ -14,6 +14,8 @@ passed. It is not a claim that every line or every Oracle configuration is corre
 | Chat schedule → native command | Offset timestamps passed tool validation and appeared in cards, but native creation requires UTC. Unsupported fractional instants could also be proposed. | Normalize the same instant to whole-second UTC before review and hashing. Unsupported precision/range is rejected. Legacy noncanonical cards expire instead of silently rewriting confirmed arguments. |
 | Execute remaining → later tasks | The ordinary UI path could reload host routes between tasks; the assistant path already retained its reviewed routes. | One inventory snapshot is retained for the whole native operation, and each task's preflight and route selection share it. |
 | Interrupted launch → terminal result | A valid later retry's terminal result could satisfy reconciliation of an older launch. | Verify plan, task, definition digest and retry number against the original launch. Mismatches remain unresolved, including legacy launches without a verifiable attempt binding. |
+| Displayed execution review → queued native work | Ordinary UI actions could omit the configuration binding used by chat, allowing a changed route between review and worker startup. | Both execution views display one plan/task/route snapshot and submit its required binding. Admission, worker startup and the first transport lock recheck it; stale reviews are rejected. |
+| Detached launch → inspection/reconciliation | Matching alias/root/id did not detect changed privilege settings or other host options. | Persist the complete effective host-map digest before launch and check it before reconciliation, observation or lock recovery contacts the host. Missing legacy bindings remain unresolved with saved logs available. |
 
 Reproductions use isolated state, synthetic host names, simulated Oracle commands
 and controlled failures. No managed-host SSH, live backup, patch, rollback or
@@ -21,9 +23,9 @@ database restart was used for this review.
 
 The expiry display is evaluated when rendered and again when Create is clicked;
 it is not a continuously ticking lease display. Native sealing remains the
-authority. Ordinary UI execution pins routes when its worker starts; this is not
-a new click-time route approval contract. Existing assistant admission still
-rechecks its reviewed binding.
+authority. Ordinary UI execution now shares the reviewed binding contract with
+chat, replacing the earlier worker-start-only snapshot. A read-only review never
+grants native approval or waives maintenance-window or backup requirements.
 
 ## Remaining capability and acceptance gaps
 
@@ -38,7 +40,7 @@ rechecks its reviewed binding.
 | Medium | End-to-end AI preparation | Chat can diagnose setup and prepare bounded actions. Initial media/README/procedure preparation and independent approvals still use the native wizard; autonomous end-to-end planning is unfinished. |
 | Deployment | Company identity and remote server | Provider selection/tenant acceptance and remote installation remain deferred work. The Mac runtime is not proof of remote capacity, TLS, host trust or company login. |
 | Architecture | Distributed execution | The controller uses one worker and filesystem state. The lab pull queue is not a qualified distributed control plane. |
-| Architecture | Complete route binding on native UI actions | Unlike confirmed assistant actions, ordinary UI execution does not yet bind the click-time configuration through queue admission. Detached reconciliation compares recorded host identity/alias/root but does not seal the `sudo` setting. The operation snapshot fix does not establish those additional guarantees. |
+| Deployment | External SSH trust | Execution bindings cover the application's effective host map. External OpenSSH alias files and host-key trust are not attested by that digest and need deployment controls. |
 | Release | Exact-runtime acceptance | Fixture receipts, live-lab verification and production approval remain separate. A previous revision's CI pass cannot certify these changes or replace a matching Mac receipt. |
 
 Relevant regression suites are `assistant_workflow.py`, `assistant_api.py`,

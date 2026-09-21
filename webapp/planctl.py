@@ -42,6 +42,7 @@ HOSTS_FILE = runtime_paths.hosts_file()
 DEFAULT_TIMEOUT_SECONDS = 30
 LIVE_EXECUTE_TIMEOUT_SECONDS = 3600
 _PINNED_HOSTS: ContextVar[dict | None] = ContextVar("plan_execution_hosts", default=None)
+_CONFIRMED_ACTION: ContextVar[dict | None] = ContextVar("plan_confirmed_action", default=None)
 
 # Matches lib/opu/common.sh opu_validate_identifier.
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -136,11 +137,32 @@ def _require_controller_transport(plan_id: str) -> None:
         raise PlanError(str(exc)) from exc
 
 
+@contextmanager
+def confirmed_action(plan_id, verify):
+    """Recheck reviewed state under the first native transport admission lock.
+
+    One Execute remaining action advances its own task state after admission;
+    later stages retain the reviewed host snapshot and native execution guards.
+    """
+    token = _CONFIRMED_ACTION.set({"plan_id": plan_id, "verify": verify, "admitted": False})
+    try:
+        yield
+    finally:
+        _CONFIRMED_ACTION.reset(token)
+
+
 def _controller_plan_operation(fn):
     @wraps(fn)
     def guarded(plan_id, *args, **kwargs):
         with transport_lock(plan_id):
             _require_controller_transport(plan_id)
+            review = _CONFIRMED_ACTION.get()
+            if review is not None:
+                if review["plan_id"] != plan_id:
+                    raise PlanError("Reviewed action belongs to another plan")
+                if not review["admitted"]:
+                    review["verify"]()
+                    review["admitted"] = True
             return fn(plan_id, *args, **kwargs)
     return guarded
 
@@ -795,6 +817,35 @@ def _resolve_node_host(node_name: str) -> dict:
     return {**host, "ssh_alias": alias, "node_name": str(node["name"]).lower()}
 
 
+def execution_host_binding(host: dict) -> str:
+    """Bind a detached launch to the complete effective host configuration.
+
+    Keep future transport options and nested node configuration in the seal,
+    rather than maintaining an allowlist that can silently omit a new option.
+    Only the digest is persisted; configuration values stay out of run records.
+    """
+    effective = {**host, "node_name": host.get("node_name") or host.get("id"),
+                 "sudo": bool(host.get("sudo"))}
+    return hashlib.sha256(json.dumps(effective, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+
+
+def resolve_bound_execution_host(context: dict) -> dict:
+    """Resolve an existing launch without inferring its original configuration."""
+    expected = context.get("execution_host_configuration_sha256")
+    if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+        raise PlanError("persisted launch has no verified execution-host configuration binding; "
+                        "keep it unresolved and inspect the original launch configuration")
+    host = _resolve_node_host(str(context.get("node") or ""))
+    if (host.get("ssh_alias") != context.get("ssh_alias")
+            or host.get("remote_root") != context.get("remote_root")
+            or host.get("id") != context.get("host_id")
+            or execution_host_binding(host) != expected):
+        raise PlanError("host configuration changed since the persisted launch; "
+                        "cannot safely inspect it using the current configuration")
+    return host
+
+
 def preflight_live_plan_nodes(plan: dict) -> None:
     """Refuse live execute unless every sealed plan node has an SSH alias."""
     nodes = plan.get("nodes") or []
@@ -1089,6 +1140,7 @@ def _run_detached_remote(host: dict, plan_id: str, task_id: str, remote_argv: li
         task_id=task_id, node=host.get("node_name") or host.get("id"),
         host_id=host.get("id"), ssh_alias=ssh_alias,
         remote_root=host["remote_root"], remote_run_dir=run_dir,
+        execution_host_configuration_sha256=execution_host_binding(host),
     )
     pipeline_runner.record_event('remote_launch', 'Launching the sealed worker', task_id=task_id, node=host.get('node_name') or host.get('id'))
     try:
@@ -1171,9 +1223,7 @@ def reconcile_detached_run(record: dict) -> dict:
         task_id = str(context.get("task_id") or "")
         if not _ID_RE.fullmatch(task_id):
             raise PlanError("invalid persisted task identity")
-        host = _resolve_node_host(str(context.get("node") or ""))
-        if host.get("ssh_alias") != context.get("ssh_alias") or host.get("remote_root") != context.get("remote_root") or host.get("id") != context.get("host_id"):
-            raise PlanError("host configuration changed; cannot safely reconcile the persisted launch")
+        host = resolve_bound_execution_host(context)
         run_dir = str(context.get("remote_run_dir") or "")
         prefix = _remote_run_dir(host, plan_id, task_id) + "/"
         if not run_dir.startswith(prefix) or not re.fullmatch(r"[a-f0-9]{32}", run_dir[len(prefix):]):

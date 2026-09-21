@@ -1,6 +1,10 @@
 import { test as base, expect } from '@playwright/test';
 
 export const origin = 'http://127.0.0.1:18765';
+export const actionReviewFixture = (plan, tasks = [], digest = 'a'.repeat(64)) => ({ plan, tasks, confirmation: {
+  source: 'controller', plan_id: plan.plan_id, expected_action_binding_sha256: digest,
+  targets: (plan.nodes || []).map(node => ({ node, host_id: 'source', ssh_alias: 'fixture-reviewed-host', remote_root: '/fixture/tools', sudo: true, available: true })),
+} });
 export function fixtureState() {
   const now = new Date().toISOString();
   const artifact = { sha256: 'a'.repeat(64), status: 'ready_for_catalog', patch_ids: ['39034528'], platforms: [{ id: '226' }], path: '/fixture/stage/39034528', readme_files: [{ path: 'README.html', sha256: 'b'.repeat(64) }] };
@@ -31,7 +35,7 @@ export function fixtureState() {
         required: 'Database is using an SPFILE', status: 'unknown', stage: 'native_analysis',
         next_action: 'Create the request and run Analyze recovery; approval remains blocked until the native probe passes' }],
       next_action: 'Create a request for native analysis; this is not approval to execute' }],
-    recoveries: [], plans: [], runs: {}, custom: null,
+    recoveries: [], plans: [], planTasks: {}, runs: {}, custom: null,
   };
 }
 
@@ -79,6 +83,8 @@ export const test = base.extend({
         if (recovery) return send(recovery);
         const plan = state.plans.find(row => url.pathname === `/api/plans/${row.plan_id}`);
         if (plan) return send(plan);
+        const reviewed = state.plans.find(row => url.pathname === `/api/plans/${row.plan_id}/action-review`);
+        if (reviewed) return send(actionReviewFixture(reviewed, state.planTasks[reviewed.plan_id] || []));
         if (url.pathname.startsWith('/api/runs/')) {
           const run = state.runs[url.pathname.split('/').at(-1)]; if (run) return send(run);
         }

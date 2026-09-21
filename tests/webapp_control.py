@@ -885,7 +885,8 @@ os._exit(0)
     def test_remote_reconciliation_inspects_existing_launch_only(self):
         host = {"id": "h", "node_name": "n", "ssh_alias": "alias", "remote_root": "/opt/opu"}
         context = {"plan_id": "p", "task_id": "t", "node": "n", "host_id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu", "remote_run_dir": "/opt/opu/var/webapp-runs/p/t/" + "a" * 32,
-                   "task_definition_sha256": "b" * 64, "task_retry_count": 0}
+                   "task_definition_sha256": "b" * 64, "task_retry_count": 0,
+                   "execution_host_configuration_sha256": planctl.execution_host_binding(host)}
         terminal = {"plan_id": "p", "task_id": "t", "status": "succeeded", "task_definition_sha256": "b" * 64, "retry_count": 0}
         with patch.object(planctl, "_resolve_node_host", return_value=host), patch.object(planctl.remote, "run_remote_shell", return_value=SimpleNamespace(returncode=0, stdout="RC\n0\n")) as shell, patch.object(planctl.remote, "run_remote_raw", side_effect=[SimpleNamespace(returncode=0, stdout='{"status":"succeeded","task_id":"t"}'), SimpleNamespace(returncode=0, stdout="")]), patch.object(planctl, "_sync_plan_from_host") as sync, patch.object(planctl, "status", return_value={"state": "running"}), patch.object(planctl, "_run", return_value=terminal) as verified:
             result = planctl.reconcile_detached_run({"context": context})
@@ -939,6 +940,7 @@ os._exit(0)
     def test_reconciliation_reports_preclaim_error_without_clearing_unknown(self):
         host = {"id": "h", "node_name": "n", "ssh_alias": "alias", "remote_root": "/opt/opu"}
         context = {"detached_execution": True, "plan_id": "p", "task_id": "t", "node": "n", "host_id": "h", "ssh_alias": "alias", "remote_root": "/opt/opu", "remote_run_dir": "/opt/opu/var/webapp-runs/p/t/" + "a" * 32}
+        context["execution_host_configuration_sha256"] = planctl.execution_host_binding(host)
         old = self.orphan(context=context)
         stderr = "another Oracle executor owns this host\ntoken=private-token"
         with patch.object(planctl, "_resolve_node_host", return_value=host), \

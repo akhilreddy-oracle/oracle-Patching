@@ -532,6 +532,45 @@ def read(name, args, hosts):
     raise ToolError("This tool requires a confirmed proposal")
 
 
+def _plan_action_state(plan, tasks, hosts):
+    """One reviewed plan/task snapshot and its effective configured routes."""
+    host_id = planctl._host_id_for_plan(plan)
+    state = {"plan": plan, "tasks": tasks, "host": hosts.get(host_id) if host_id else None,
+             "execution_hosts": {}}
+    with planctl.pinned_hosts(hosts):
+        for node in plan.get("nodes") or []:
+            try:
+                target = planctl._resolve_node_host(str(node))
+            except planctl.PlanError as exc:
+                # Dispatch may prepare pull-agent work without an SSH route.
+                # Native execution still performs its live-node preflight.
+                target = {"error": str(exc)}
+            state["execution_hosts"][str(node)] = target
+    return state
+
+
+def _state_digest(state):
+    return hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def plan_action_review(plan_id, hosts):
+    """Read-only review shared with typed chat confirmations; never runs SSH.
+
+    Return the same plan and tasks used in the digest. A separate status read
+    could otherwise display a different generation from the confirmed one.
+    Only noncredential route fields are returned to the browser.
+    """
+    plan = planctl.status(plan_id)
+    tasks = planctl.list_tasks(plan_id)
+    state = _plan_action_state(plan, tasks, hosts)
+    targets = [{"node": node, "host_id": host.get("id"), "ssh_alias": host.get("ssh_alias"),
+                "remote_root": host.get("remote_root"), "sudo": bool(host.get("sudo")),
+                "available": "error" not in host}
+               for node, host in state["execution_hosts"].items()]
+    return {"plan": plan, "tasks": tasks, "confirmation": {"source": "controller", "plan_id": plan_id,
+            "expected_action_binding_sha256": _state_digest(state), "targets": targets}}
+
+
 def binding(name, args, hosts):
     """Bind confirmation to exact saved target/config/evidence, without sending it to the model."""
     validate(name, args, hosts)
@@ -553,22 +592,8 @@ def binding(name, args, hosts):
         state["evidence"] = {key: evidence.read_evidence(host_id, key) for key in (
             "snapshot", "snapshot_nodes", "artifact", "procedure_input", "procedure", "policy", "readiness", "recovery", "recovery_selection", "compatibility_reconciliation", "reconciliation")}
     if "plan_id" in args:
-        state["plan"] = planctl.status(args["plan_id"])
-        state["tasks"] = planctl.list_tasks(args["plan_id"])
-        host_id = planctl._host_id_for_plan(state["plan"])
-        state["host"] = hosts.get(host_id) if host_id else None
-        # A plan can address nodes configured under several inventory entries.
-        # Bind the effective routes too, not merely its display host attribution.
-        state["execution_hosts"] = {}
-        with planctl.pinned_hosts(hosts):
-            for node in state["plan"].get("nodes") or []:
-                try:
-                    target = planctl._resolve_node_host(str(node))
-                except planctl.PlanError as exc:
-                    # Dispatch can still prepare work for a pull agent when
-                    # SSH is unavailable; live execution retains its preflight.
-                    target = {"error": str(exc)}
-                state["execution_hosts"][str(node)] = target
+        state.update(_plan_action_state(planctl.status(args["plan_id"]),
+                                        planctl.list_tasks(args["plan_id"]), hosts))
         # Native commands verify sealed documents again at execution.
     if "request_id" in args:
         if name == "create_backup":
@@ -579,7 +604,7 @@ def binding(name, args, hosts):
             state["backup_host"] = hosts.get(backup.get("host_id"))
             if name == "select_backup" and backup.get("host_id") != args["host_id"]:
                 raise ToolError("Selected backup belongs to a different configured host")
-    return hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    return _state_digest(state)
 
 
 def route(name, args):

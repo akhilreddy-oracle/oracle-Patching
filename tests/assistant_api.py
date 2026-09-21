@@ -6,6 +6,7 @@ remains real so a confirmed action exercises the nested native response sink.
 Native Oracle functions and model responses are the explicit test seams.
 """
 from email.message import Message
+from contextlib import contextmanager
 import hashlib
 import io
 import json
@@ -279,6 +280,104 @@ class AssistantApiTests(unittest.TestCase):
                 self.native["recoveryctl." + method].assert_called_once_with(*args)
         self.native["recoveryctl.approve"].assert_not_called()
         self.native["recoveryctl.authorize"].assert_not_called()
+
+    def action_review(self):
+        reply = self.request('/api/plans/plan-a/action-review', actor='operator')
+        self.assertEqual(reply['status'], 200, reply)
+        return reply['body']
+
+    def test_native_action_review_binds_the_displayed_plan_tasks_and_all_routes(self):
+        self.saved_plan['nodes'] = ['source']
+        tasks = [{'task_id': 't1', 'status': 'pending', 'node': 'source'}]
+        with patch.object(server.planctl, 'list_tasks', return_value=tasks) as read_tasks, \
+             patch.object(server.planctl, 'status', side_effect=[self.saved_plan, {'plan_id': 'wrong-generation'}]) as read_plan:
+            review = self.action_review()
+        read_plan.assert_called_once_with('plan-a')
+        read_tasks.assert_called_once_with('plan-a')
+        self.assertEqual(review['plan']['target'], self.saved_plan['target'])
+        self.assertEqual(review['tasks'], tasks)
+        with patch.object(server.planctl, 'list_tasks', return_value=tasks):
+            expected = assistant.capabilities.binding('execute_plan', {'plan_id': 'plan-a'}, {'source': self.host})
+        self.assertEqual(review['confirmation']['expected_action_binding_sha256'], expected)
+        self.assertEqual(review['confirmation']['targets'][0]['ssh_alias'], self.host['ssh_alias'])
+        self.assertNotIn('never-read-fixture-key', json.dumps(review))
+        self.assertNotIn('ssh_key', json.dumps(review))
+        self.assertFalse(pipeline_runner.RUNS)
+        self.assert_no_native_calls()
+
+    def test_native_plan_actions_require_review_even_without_chat(self):
+        for action in ('dispatch', 'execute-next', 'execute-remaining'):
+            for value in (None, '', 7, [], 'a' * 63, 'A' * 64):
+                with self.subTest(action=action, value=value):
+                    body = {} if value is None else {'expected_action_binding_sha256': value}
+                    reply = self.request('/api/plans/plan-a/' + action, method='POST', actor='operator', body=body)
+                    self.assertEqual(reply['status'], 409, reply)
+                    self.assertEqual(reply['body']['error'], 'confirmation_changed')
+        self.assertFalse(pipeline_runner.RUNS)
+        self.assert_no_native_calls()
+
+    def test_native_review_drift_is_rejected_before_launch(self):
+        self.saved_plan['nodes'] = ['source']
+        for action in ('dispatch', 'execute-next', 'execute-remaining'):
+            with self.subTest(action=action):
+                self.hosts_file.write_bytes(self.original_hosts)
+                body = {'expected_action_binding_sha256': self.action_review()['confirmation']['expected_action_binding_sha256']}
+                self.hosts_file.write_text(json.dumps({'hosts': [{**self.host, 'sudo': True}]}))
+                with patch.object(self, 'original_hosts', self.hosts_file.read_bytes()):
+                    reply = self.request('/api/plans/plan-a/' + action, method='POST', actor='operator', body=body)
+                self.assertEqual(reply['status'], 409, reply)
+        self.assertFalse(pipeline_runner.RUNS)
+        self.assert_no_native_calls()
+
+    def test_native_review_drift_after_queueing_never_reaches_executor(self):
+        original_start = pipeline_runner.start_run
+        for action in ('dispatch', 'execute-next', 'execute-remaining'):
+            with self.subTest(action=action):
+                self.hosts_file.write_bytes(self.original_hosts)
+                body = {'expected_action_binding_sha256': self.action_review()['confirmation']['expected_action_binding_sha256']}
+                entered, release = threading.Event(), threading.Event()
+                def delayed_start(kind, key, function):
+                    def delayed(record):
+                        entered.set()
+                        if not release.wait(5):
+                            raise AssertionError('Worker barrier timed out')
+                        return function(record)
+                    return original_start(kind, key, delayed)
+                try:
+                    with patch.object(pipeline_runner, 'start_run', side_effect=delayed_start):
+                        reply = self.request('/api/plans/plan-a/' + action, method='POST', actor='operator', body=body)
+                    self.assertEqual(reply['status'], 202, reply)
+                    self.assertTrue(entered.wait(2))
+                    self.hosts_file.write_text(json.dumps({'hosts': [{**self.host, 'ssh_alias': 'changed.invalid'}]}))
+                finally:
+                    release.set()
+                record = self.wait_run(reply['body']['run_id'])
+                self.assertEqual(record.status, 'failed', record.error)
+                self.assertIn('changed after confirmation', record.error['message'])
+        self.assert_no_native_calls()
+
+    def test_native_next_task_rechecks_review_under_transport_admission(self):
+        self.saved_plan['nodes'] = ['source']
+        body = {'expected_action_binding_sha256': self.action_review()['confirmation']['expected_action_binding_sha256']}
+        original_lock = server.planctl.transport_lock
+        @contextmanager
+        def change_before_lock(plan_id):
+            # Simulates another operation completing after the worker's check
+            # but before it obtains the serialized native transport admission.
+            self.saved_plan['target'] = {'database_unique_name': 'OTHER'}
+            with original_lock(plan_id):
+                yield
+        with patch.object(server.planctl, 'transport_lock', side_effect=change_before_lock), \
+             patch.object(server.planctl, '_require_controller_transport'), \
+             patch.object(server.planctl, 'next_task', side_effect=AssertionError('Changed review must stop before selecting a task')) as next_task:
+            reply = self.request('/api/plans/plan-a/execute-next', method='POST', actor='operator', body=body)
+            self.assertEqual(reply['status'], 202, reply)
+            record = self.wait_run(reply['body']['run_id'])
+        self.assertEqual(record.status, 'failed', record.error)
+        self.assertIn('changed after confirmation', record.error['message'])
+        next_task.assert_not_called()
+        self.assertIsNone(server.planctl._CONFIRMED_ACTION.get())
+        self.assertIsNone(server.planctl._PINNED_HOSTS.get())
 
     def test_offset_backup_window_reaches_native_handler_as_reviewed_utc(self):
         arguments = {"host_id": "source", "request_id": "offset-backup", "database": "ORCL",
